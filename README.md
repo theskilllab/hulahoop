@@ -1159,6 +1159,8 @@ An unsigned `.dmg` triggers Gatekeeper: macOS says the app is damaged or from an
 - Ad-hoc signing (`codesign --force --deep --sign -`) is mandatory on Apple Silicon, since arm64 refuses to execute an unsigned binary at all. Tauri does this by default, `tauri.conf.json` pins it with `"signingIdentity": "-"`, and the release step asserts the result: it verifies `Contents/MacOS/Hulahoop` and checks that the signature reads `Signature=adhoc`. Verifying the whole bundle with `--deep --strict` instead reports "code has no resources but signature indicates they must be present" for an ad-hoc signed `.app` — a `codesign` quirk, not a bundling defect.
 - The release notes and `README` give the one-line fix: right-click → Open, or `xattr -dr com.apple.quarantine /Applications/Hulahoop.app`.
 
+The bundle is built inside the nix dev shell, whose linker resolves libraries through `/nix/store`. A Mach-O that records those paths launches only on a machine that has nix installed — dyld aborts with `Library not loaded: /nix/*/libiconv.2.dylib`, which is how the first shipped `.dmg` failed. `scripts/macos-fix-deps.sh` therefore runs on every macOS bundle: it rewrites each `/nix/store` dependency to the system library of the same name (`/usr/lib/libiconv.2.dylib`), carries anything without a system counterpart inside `Contents/Frameworks`, drops store rpaths, re-signs ad-hoc, and fails the build if a store path survives. The release job repeats the `otool -L` check and refuses to publish a dmg that still points into `/nix/store`.
+
 The upgrade path is a paid Apple Developer account ($99/year) for Developer ID signing plus notarization, wired in as repository secrets. Nothing else in the pipeline changes when that happens: same job, two extra steps.
 
 ---

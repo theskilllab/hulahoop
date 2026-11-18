@@ -38,6 +38,18 @@ jobs:
       # the signature really is ad-hoc: `--verify --deep` on the whole bundle reports
       # "code has no resources but signature indicates they must be present" for an
       # ad-hoc signed .app, which is a codesign quirk, not a bundling defect.
+      - name: verify the app needs nothing but macOS
+        run: |
+          APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
+          # The bundle is built inside the nix shell, so a leaked /nix/store path
+          # means the app dies at launch on a machine without nix (dyld: Library
+          # not loaded). Refuse to publish one.
+          for bin in "$APP"/Contents/MacOS/*; do
+            echo "dependencies of $bin"
+            otool -L "$bin"
+            ! otool -L "$bin" | grep -q "/nix/store/"
+          done
+          ! otool -l "$APP"/Contents/MacOS/hulahoop-desktop | grep -A2 LC_RPATH | grep -q "/nix/store/"
       - name: verify signature
         run: |
           APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
