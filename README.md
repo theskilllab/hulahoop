@@ -1124,7 +1124,10 @@ jobs:
             . -> target
             apps/desktop/src-tauri -> target
       - run: nix develop --command just bundle ${{ matrix.target }}
-      - run: codesign --verify --deep --strict target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
+      - run: |
+          APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
+          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/Hulahoop"
+          codesign -dvv "$APP" 2>&1 | grep -q "Signature=adhoc"
       - uses: actions/upload-artifact@v4
         with:
           name: dmg-${{ matrix.target }}
@@ -1151,7 +1154,7 @@ The leg builds its own architecture natively, so no cross toolchain is involved.
 
 An unsigned `.dmg` triggers Gatekeeper: macOS says the app is damaged or from an unidentified developer. Two things keep that tolerable:
 
-- Ad-hoc signing (`codesign --force --deep --sign -`) is mandatory on Apple Silicon, since arm64 refuses to execute an unsigned binary at all. Tauri does this by default; the release step asserts it ran.
+- Ad-hoc signing (`codesign --force --deep --sign -`) is mandatory on Apple Silicon, since arm64 refuses to execute an unsigned binary at all. Tauri does this by default, `tauri.conf.json` pins it with `"signingIdentity": "-"`, and the release step asserts the result: it verifies `Contents/MacOS/Hulahoop` and checks that the signature reads `Signature=adhoc`. Verifying the whole bundle with `--deep --strict` instead reports "code has no resources but signature indicates they must be present" for an ad-hoc signed `.app` — a `codesign` quirk, not a bundling defect.
 - The release notes and `README` give the one-line fix: right-click → Open, or `xattr -dr com.apple.quarantine /Applications/Hulahoop.app`.
 
 The upgrade path is a paid Apple Developer account ($99/year) for Developer ID signing plus notarization, wired in as repository secrets. Nothing else in the pipeline changes when that happens: same job, two extra steps.
