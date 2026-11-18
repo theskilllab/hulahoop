@@ -47,8 +47,25 @@ if [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" || "$HOST" == "$(hostname
   if command -v ss >/dev/null; then
     bound=$(ss -ltn 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $4}' | head -1)
     if [[ -z "$bound" ]]; then
+      data="${HULAHOOP_DATA:-$HOME/.local/share/hulahoop}"
+      file="$data/connection.json"
+      # -x on the process name: matching the command line also matches this script,
+      # which mentions the binaries in its own arguments.
+      processes=$(pgrep -ax hulahoop-server 2>/dev/null | head -3)
+      if [[ -n "$processes" ]]; then
+        info "a hulahoop process is running, but on another port"
+        printf '       %s\n' "$processes"
+      elif [[ -f "$file" ]]; then
+        info "$file is stale: nothing holds the port, but the file is still here"
+        printf '       %s\n' "the last server was killed before it could clean up"
+      else
+        info "no hulahoop-server process and no $file"
+        printf '       %s\n' "the server exited, and with it the token it minted"
+      fi
       fail "nothing is listening on port $PORT on this machine" \
-        "start it: hulahoop up --listen 0.0.0.0 --port $PORT"
+        "start it, and leave it running: hulahoop up --listen 0.0.0.0 --port $PORT" \
+        "the token is printed by that process: --print-connection, or read" \
+        "  $file once it is up (mode 0600)"
     elif [[ "$bound" == 127.0.0.1:* ]]; then
       info "listening on $bound — loopback only, so another machine cannot reach it"
       printf '  !!   %s\n' "restart with --listen 0.0.0.0 to accept other machines"
