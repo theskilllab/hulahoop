@@ -1309,6 +1309,17 @@ with `--server` and `--token`, and stops the other process when either exits. Ru
 by hand when they live on different machines (`hulahoop serve` and `hulahoop runner
 --server http://host:5123 --token <token>`), which is what the internal API is for.
 
+Where the binaries come from:
+
+- **In the app.** `Hulahoop.app/Contents/MacOS/` already holds `hulahoop-server` and
+  `hulahoop-runner`; the app starts them itself in local mode.
+- **A release asset.** Each release publishes `hulahoop-<target>.tar.gz` with the
+  server, the runner, and the `hulahoop` CLI — unpack it and run `./hulahoop up`, no
+  checkout needed.
+- **From source.** `nix develop --command cargo build --release -p hulahoop-server
+  -p hulahoop-runner -p hulahoop-cli` writes all three into `target/release/`, which is
+  the path that works on Linux, where the release leg does not build.
+
 Then paste `http://workstation:5123` and the token into the app's connect screen; the
 host is remembered per machine, and "use this machine" switches back to the bundled
 local server. The runner takes `--server`/`--token`, or `HULAHOOP_SERVER` and

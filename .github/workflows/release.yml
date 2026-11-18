@@ -61,10 +61,20 @@ jobs:
           done
           codesign -dvv "$APP" 2>&1 | tee /tmp/codesign.txt
           grep -q "Signature=adhoc" /tmp/codesign.txt
+      # The host that runs the agents needs the same binaries without an .app
+      # around them, so it does not need a checkout to get started.
+      - name: pack the headless binaries
+        run: |
+          mkdir -p dist
+          tar -czf "dist/hulahoop-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" hulahoop-server hulahoop-runner hulahoop
+          tar -tzf "dist/hulahoop-${{ matrix.target }}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
           name: dmg-${{ matrix.target }}
-          path: apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          path: |
+            apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            dist/*.tar.gz
 
   publish:
     needs: bundle
@@ -80,4 +90,6 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Requires macOS 14 (Sonoma) or newer on Apple silicon. Unsigned build: right-click the app, choose Open, then confirm — arm64 requires at least an ad-hoc signature, which this build carries." artifacts/**/*.dmg
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
+            --notes "Requires macOS 14 (Sonoma) or newer on Apple silicon; the build is unsigned, so right-click the app and choose Open. The hulahoop-<target>.tar.gz asset holds hulahoop-server, hulahoop-runner and the hulahoop CLI: unpack it on the machine with the repos and the toolchain, then run hulahoop up --listen 0.0.0.0 --port 5123 there." \
+            artifacts/**/*.dmg artifacts/**/*.tar.gz

@@ -5,7 +5,7 @@ set -euo pipefail
 TARGET="${1:?usage: bundle <target-triple>}"
 cd "$(dirname "$0")/.."
 
-cargo build --release --target "$TARGET" -p hulahoop-server -p hulahoop-runner
+cargo build --release --target "$TARGET" -p hulahoop-server -p hulahoop-runner -p hulahoop-cli
 
 mkdir -p apps/desktop/src-tauri/binaries
 cp "target/$TARGET/release/hulahoop-server" "apps/desktop/src-tauri/binaries/hulahoop-server-$TARGET"
