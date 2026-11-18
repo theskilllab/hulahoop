@@ -102,7 +102,12 @@ async fn main() -> anyhow::Result<()> {
     if print_connection {
         println!("{}", serde_json::to_string(&connection)?);
     }
-    tracing::info!(port = address.port(), "listening");
+    tracing::info!(
+        listen = %listen,
+        port = address.port(),
+        url = %format!("http://{}:{}", advertise_host(listen), address.port()),
+        "listening"
+    );
 
     // A runner that dies leaves runs `running`; the reaper is the only place
     // that can tell a dead run from a slow one.
@@ -134,12 +139,23 @@ async fn main() -> anyhow::Result<()> {
 /// The host a client should dial: loopback when the server listens everywhere,
 /// otherwise the address it was told to bind. A runner on the same machine reads
 /// this file, and the desktop only uses the same value for its local mode.
+/// The address to put in `connection.json`, and so the one a remote desktop pastes
+/// into its connect screen. Binding `0.0.0.0` accepts every interface; advertising
+/// `0.0.0.0` or `127.0.0.1` would send a Mac on the LAN to itself.
 fn advertise_host(listen: std::net::IpAddr) -> std::net::IpAddr {
     if listen.is_unspecified() {
-        std::net::IpAddr::from([127, 0, 0, 1])
+        primary_ip().unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]))
     } else {
         listen
     }
+}
+
+/// The address this machine reaches the default route with. A UDP socket sends no
+/// packets here; `connect` only resolves which local address the kernel would use.
+fn primary_ip() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    socket.local_addr().ok().map(|addr| addr.ip())
 }
 
 fn default_data_dir() -> std::path::PathBuf {

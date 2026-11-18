@@ -103,6 +103,8 @@ TOKEN="${HULAHOOP_TOKEN:-}"
 source="HULAHOOP_TOKEN"
 if [[ -z "$TOKEN" ]]; then
   DATA="${HULAHOOP_DATA:-$HOME/.local/share/hulahoop}"
+  # `just dev` runs against a scratch dir beside the code, so look there too.
+  [[ -f "$DATA/connection.json" ]] || DATA="$PWD/.hulahoop-dev"
   [[ -f "$DATA/connection.json" ]] || DATA="$HOME/Library/Application Support/hulahoop"
   if [[ -f "$DATA/connection.json" ]]; then
     TOKEN=$(jq -r '.token // empty' "$DATA/connection.json" 2>/dev/null)

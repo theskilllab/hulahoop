@@ -40,8 +40,8 @@ ci: fmt-check lint test
     pnpm --prefix apps/desktop build
 
 # Start the server and the runner against a scratch data directory.
-dev:
-    ./scripts/dev.sh
+dev host="127.0.0.1" port="9000":
+    ./scripts/dev.sh {{host}} {{port}}
 
 # Attach a repository and create the three agents.
 seed path:

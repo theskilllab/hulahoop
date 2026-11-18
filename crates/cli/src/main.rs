@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("serve") => passthrough("hulahoop-server", &args[1..]),
         Some("runner") => passthrough("hulahoop-runner", &args[1..]),
-        Some("up") => up(&args[1..]),
+        Some("up") => up(&args[1..]).await,
         Some("doctor") => doctor(),
         Some("seed") => seed(&args[1..]).await,
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
 /// the runner owns the checkouts, the agents, and the replays. `up` starts both,
 /// waits for the server's connection file, points the runner at it, and shuts the
 /// other one down when either exits.
-fn up(args: &[String]) -> Result<()> {
+async fn up(args: &[String]) -> Result<()> {
     let mut data_dir: Option<PathBuf> = None;
     let mut listen: Option<String> = None;
     let mut port: Option<String> = None;
@@ -127,12 +127,21 @@ fn up(args: &[String]) -> Result<()> {
     ];
 
     let mut runner = spawn("hulahoop-runner", &runner_args)?;
-    tracing::info!(server = %url, data_dir = %data_dir.display(), "server and runner are up");
+    tracing::info!(
+        server = %url,
+        data_dir = %data_dir.display(),
+        token_file = %connection_path.display(),
+        "server and runner are up; the desktop needs the token in that file (jq -r .token …)"
+    );
 
+    // Ctrl-C in `just dev` reaches this process only, so the children have to be
+    // stopped here. Otherwise the server keeps the port and the next `just dev`
+    // fails with "Address already in use".
     loop {
         if let Some(status) = runner.try_wait()? {
             let _ = server.kill();
             let _ = server.wait();
+            let _ = std::fs::remove_file(&connection_path);
             if !status.success() {
                 bail!("the runner exited with {status}");
             }
@@ -141,10 +150,58 @@ fn up(args: &[String]) -> Result<()> {
         if let Some(status) = server.try_wait()? {
             let _ = runner.kill();
             let _ = runner.wait();
+            let _ = std::fs::remove_file(&connection_path);
             bail!("the server exited with {status}");
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if interrupted() {
+            let _ = runner.kill();
+            let _ = server.kill();
+            let _ = runner.wait();
+            let _ = server.wait();
+            // The server removes this itself on its own Ctrl-C; a SIGKILL leaves it
+            // behind, and a stale file tells the next reader the wrong token.
+            let _ = std::fs::remove_file(&connection_path);
+            tracing::info!("stopped");
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+/// Ctrl-C or SIGTERM, watched once in the background: `timeout`, `kill`, and a
+/// closed terminal all send the second one.
+fn interrupted() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    static ONCE: std::sync::Once = std::sync::Once::new();
+
+    ONCE.call_once(|| {
+        tokio::spawn(async {
+            #[cfg(unix)]
+            {
+                let mut term =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = async {
+                        match term.as_mut() {
+                            Some(stream) => {
+                                stream.recv().await;
+                            }
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => {}
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+            FLAG.store(true, Ordering::SeqCst);
+        });
+    });
+
+    FLAG.load(Ordering::SeqCst)
 }
 
 fn spawn(program: &str, args: &[String]) -> Result<std::process::Child> {
