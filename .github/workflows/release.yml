@@ -41,7 +41,12 @@ jobs:
       - name: verify signature
         run: |
           APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
-          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/Hulahoop"
+          # Every executable in Contents/MacOS must be signed: on arm64 the kernel
+          # refuses to launch an unsigned binary, and that includes the two sidecars.
+          for bin in "$APP"/Contents/MacOS/*; do
+            echo "verifying $bin"
+            codesign --verify --strict --verbose=2 "$bin"
+          done
           codesign -dvv "$APP" 2>&1 | tee /tmp/codesign.txt
           grep -q "Signature=adhoc" /tmp/codesign.txt
       - uses: actions/upload-artifact@v4

@@ -1126,7 +1126,7 @@ jobs:
       - run: nix develop --command just bundle ${{ matrix.target }}
       - run: |
           APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
-          codesign --verify --strict --verbose=2 "$APP/Contents/MacOS/Hulahoop"
+          for bin in "$APP"/Contents/MacOS/*; do codesign --verify --strict "$bin"; done
           codesign -dvv "$APP" 2>&1 | grep -q "Signature=adhoc"
       - uses: actions/upload-artifact@v4
         with:
