@@ -17,9 +17,12 @@ import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-// `gql<T>(` and the untyped `gql(` both carry documents; the second form was how
-// the settings screen escaped this check the first time.
-const DOCUMENT = /gql(?:<[^>]*>)?\(\s*`([^`]*)`/g;
+// Documents reach the server three ways in this app: `gql<T>(`template``, the untyped
+// `gql(`template``, and `run("label", `template`, vars)` in the issue screen. Matching
+// the call shape missed the third and shipped `approveCriteria(id:)` against a schema
+// that names the argument `issueId`. A template literal that starts with an operation
+// keyword is a document wherever it appears.
+const DOCUMENT = /`(\s*(?:query|mutation|subscription)\b[^`]*)`/g;
 // Documents are assembled from constants (`${ISSUE_FIELDS}`), so the literals have to
 // be substituted before the text is valid GraphQL. Harvest first, then expand.
 const CONSTANT = /const\s+([A-Za-z_$][\w$]*)\s*=\s*`([^`]*)`/g;

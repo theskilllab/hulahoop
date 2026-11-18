@@ -83,7 +83,7 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
           <button
             className="primary"
             disabled={busy !== null}
-            onClick={() => run("ready", `mutation ($id: UUID!) { approveCriteria(id: $id) { id } }`, { id: issue.id })}
+            onClick={() => run("ready", `mutation ($id: UUID!) { approveCriteria(issueId: $id) { id } }`, { id: issue.id })}
           >
             Approve criteria
           </button>
