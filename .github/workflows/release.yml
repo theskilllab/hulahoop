@@ -71,7 +71,7 @@ jobs:
           tar -tzf "dist/hulahoop-${{ matrix.target }}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
-          name: dmg-${{ matrix.target }}
+          name: bundle-${{ matrix.target }}
           path: |
             apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
             dist/*.tar.gz
@@ -90,6 +90,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
+          # upload-artifact keeps the paths it was given, and with two of them the
+          # least common ancestor is the repository root, so the files land deep.
+          mkdir -p release
+          find artifacts -name '*.dmg' -exec cp {} release/ \;
+          find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          ls -l release
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
             --notes "Requires macOS 14 (Sonoma) or newer on Apple silicon; the build is unsigned, so right-click the app and choose Open. The hulahoop-<target>.tar.gz asset holds hulahoop-server, hulahoop-runner and the hulahoop CLI: unpack it on the machine with the repos and the toolchain, then run hulahoop up --listen 0.0.0.0 --port 5123 there." \
-            artifacts/**/*.dmg artifacts/**/*.tar.gz
+            release/*
