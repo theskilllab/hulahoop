@@ -51,7 +51,7 @@ if [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" || "$HOST" == "$(hostname
       file="$data/connection.json"
       # -x on the process name: matching the command line also matches this script,
       # which mentions the binaries in its own arguments.
-      processes=$(pgrep -ax hulahoop-server 2>/dev/null | head -3)
+      processes=$(pgrep -ax hulahoop 2>/dev/null | head -3)
       if [[ -n "$processes" ]]; then
         info "a hulahoop process is running, but on another port"
         printf '       %s\n' "$processes"
@@ -59,7 +59,7 @@ if [[ "$HOST" == "127.0.0.1" || "$HOST" == "localhost" || "$HOST" == "$(hostname
         info "$file is stale: nothing holds the port, but the file is still here"
         printf '       %s\n' "the last server was killed before it could clean up"
       else
-        info "no hulahoop-server process and no $file"
+        info "no hulahoop process and no $file"
         printf '       %s\n' "the server exited, and with it the token it minted"
       fi
       fail "nothing is listening on port $PORT on this machine" \
@@ -95,7 +95,7 @@ if [[ "$code" == "200" && "$body" == "ok" ]]; then
   ok "/health answers ok"
 else
   fail "/health answered $code" "the port is open but this is not a hulahoop server" \
-    "check the port, and that hulahoop-server is the process holding it"
+    "check the port, and that `hulahoop serve` is the process holding it"
 fi
 
 # 4. Does the token get through?

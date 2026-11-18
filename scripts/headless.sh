@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Packs the server, the runner, and the CLI for one target triple. This is what a
-# host needs to run the agents; the desktop app is a separate build.
+# Packs the hulahoop binary for one target triple. One executable covers the
+# server, the runner, and the CLI: a host runs `hulahoop up`, the desktop bundles
+# the same file as its sidecar.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -11,15 +12,14 @@ HOST=$(rustc -vV | awk '/^host:/ {print $2}')
 TARGET="${1:-$HOST}"
 
 if [[ "$TARGET" == "$HOST" ]]; then
-  cargo build --release -p hulahoop-server -p hulahoop-runner -p hulahoop-cli
+  cargo build --release -p hulahoop-cli
   OUT="target/release"
 else
-  cargo build --release --target "$TARGET" -p hulahoop-server -p hulahoop-runner -p hulahoop-cli
+  cargo build --release --target "$TARGET" -p hulahoop-cli
   OUT="target/$TARGET/release"
 fi
 
 mkdir -p dist
-tar -czf "dist/hulahoop-$TARGET.tar.gz" -C "$OUT" \
-  hulahoop-server hulahoop-runner hulahoop
+tar -czf "dist/hulahoop-$TARGET.tar.gz" -C "$OUT" hulahoop
 tar -tzf "dist/hulahoop-$TARGET.tar.gz"
 echo "built dist/hulahoop-$TARGET.tar.gz"

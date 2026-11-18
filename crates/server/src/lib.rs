@@ -1,26 +1,19 @@
 //! Hulahoop server: GraphQL for the desktop, an internal HTTP API for the
 //! runner, and the single writer for the SQLite database.
 
-mod api;
-mod db;
-mod engine;
-mod gql;
-mod model;
+pub mod api;
+pub mod db;
+pub mod engine;
+pub mod gql;
+pub mod model;
 
 use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,hulahoop_server=debug")
-            }),
-        )
-        .init();
-
+/// Runs the server until Ctrl-C. The caller owns the runtime and log filter,
+/// so `hulahoop serve` and any test can start this without a second main.
+pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut data_dir = std::env::var_os("HULAHOOP_DATA")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(default_data_dir);
@@ -28,7 +21,6 @@ async fn main() -> anyhow::Result<()> {
     let mut listen: std::net::IpAddr = std::net::IpAddr::from([127, 0, 0, 1]);
     let mut print_connection = false;
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {

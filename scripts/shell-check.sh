@@ -10,11 +10,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 triple="$(rustc -vV | awk '/^host:/{print $2}')"
-cargo build --bin hulahoop-server --bin hulahoop-runner
+cargo build --bin hulahoop
 
 mkdir -p apps/desktop/src-tauri/binaries
-cp target/debug/hulahoop-server "apps/desktop/src-tauri/binaries/hulahoop-server-$triple"
-cp target/debug/hulahoop-runner "apps/desktop/src-tauri/binaries/hulahoop-runner-$triple"
+cp target/debug/hulahoop "apps/desktop/src-tauri/binaries/hulahoop-$triple"
 
 if [[ -d apps/desktop/dist ]]; then
   (cd apps/desktop/src-tauri && cargo check)
@@ -24,6 +23,5 @@ else
   (cd apps/desktop/src-tauri && cargo check)
 fi
 
-rm -f apps/desktop/src-tauri/binaries/hulahoop-server-"$triple"
-rm -f apps/desktop/src-tauri/binaries/hulahoop-runner-"$triple"
+rm -f apps/desktop/src-tauri/binaries/hulahoop-"$triple"
 echo "shell check ok ($triple)"

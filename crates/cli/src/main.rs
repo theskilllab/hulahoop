@@ -1,5 +1,8 @@
-//! `hulahoop` runs the three pieces a developer needs: the server, the runner,
-//! and a seed that turns a repo into a project with agents.
+//! One binary, several jobs: `hulahoop up` runs the server and the runner,
+//! `serve` and `runner` run one of them, and `seed`/`doctor` set a repo up and
+//! check the machine. The server and runner are still separate *processes* —
+//! `up` re-execs this same executable — because a crashed agent must not take the
+//! server with it, and each run is killed by process group.
 
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -17,20 +20,21 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("serve") => passthrough("hulahoop-server", &args[1..]),
-        Some("runner") => passthrough("hulahoop-runner", &args[1..]),
+        Some("serve") => hulahoop_server::serve(args[1..].to_vec()).await,
+        Some("runner") => hulahoop_runner::run(args[1..].to_vec()).await,
         Some("up") => up(&args[1..]).await,
         Some("doctor") => doctor(),
         Some("seed") => seed(&args[1..]).await,
         Some("help") | Some("--help") | Some("-h") | None => {
             println!(
-                "hulahoop — the acceptance loop that keeps coding agents honest\n\n\
+                "hulahoop — the acceptance loop that keeps coding agents honest\n\
+                 \n\
                  usage:\n  \
-                 hulahoop up [--listen ADDR] [--port N] [--data-dir DIR]\n                                               server and runner, one host\n  \
-                 hulahoop serve [--data-dir DIR] [--port N]   just the server\n  \
-                 hulahoop runner                              just the runner\n  \
-                 hulahoop seed --repo PATH [--name NAME]      register a repo as a project\n  \
-                 hulahoop doctor                              check this machine"
+                 hulahoop up [--listen ADDR] [--port N] [--data-dir DIR]   server and runner\n  \
+                 hulahoop serve [--data-dir DIR] [--port N]                just the server\n  \
+                 hulahoop runner [--server URL --token T]                  just the runner\n  \
+                 hulahoop seed --repo PATH [--name NAME]                   register a repo\n  \
+                 hulahoop doctor                                           check this machine"
             );
             Ok(())
         }
@@ -88,7 +92,7 @@ async fn up(args: &[String]) -> Result<()> {
         server_args.push(port.clone());
     }
 
-    let mut server = spawn("hulahoop-server", &server_args)?;
+    let mut server = spawn(&["serve"], &server_args)?;
     let connection_path = data_dir.join("connection.json");
     let _ = std::fs::remove_file(&connection_path);
 
@@ -126,7 +130,7 @@ async fn up(args: &[String]) -> Result<()> {
         token,
     ];
 
-    let mut runner = spawn("hulahoop-runner", &runner_args)?;
+    let mut runner = spawn(&["runner"], &runner_args)?;
     tracing::info!(
         server = %url,
         data_dir = %data_dir.display(),
@@ -204,11 +208,14 @@ fn interrupted() -> bool {
     FLAG.load(Ordering::SeqCst)
 }
 
-fn spawn(program: &str, args: &[String]) -> Result<std::process::Child> {
-    Command::new(program_path(program))
+/// Starts another instance of this executable, so `up` needs no second binary.
+fn spawn(command: &[&str], args: &[String]) -> Result<std::process::Child> {
+    let exe = std::env::current_exe().context("locating this executable")?;
+    Command::new(&exe)
+        .args(command)
         .args(args)
         .spawn()
-        .with_context(|| format!("starting {program}; is it installed next to this binary?"))
+        .with_context(|| format!("starting {}", command.join(" ")))
 }
 
 fn platform_data_dir() -> Result<PathBuf> {
@@ -226,33 +233,6 @@ fn platform_data_dir() -> Result<PathBuf> {
         return Ok(home.join(".local/share/hulahoop"));
     }
     bail!("cannot locate a data directory; pass --data-dir or set HULAHOOP_DATA")
-}
-
-fn program_path(program: &str) -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join(program)))
-        .filter(|path| path.exists())
-        .unwrap_or_else(|| PathBuf::from(program))
-}
-
-fn passthrough(program: &str, args: &[String]) -> Result<()> {
-    // `cargo run` puts the binary next to the CLI, and an installed app ships all
-    // three side by side, so the sibling binary wins over PATH.
-    let program_path = program_path(program);
-    let status = Command::new(&program_path)
-        .args(args)
-        .status()
-        .with_context(|| {
-            format!(
-                "starting {}; is it installed next to this binary?",
-                program_path.display()
-            )
-        })?;
-    if !status.success() {
-        bail!("{program} exited with {status}");
-    }
-    Ok(())
 }
 
 fn doctor() -> Result<()> {

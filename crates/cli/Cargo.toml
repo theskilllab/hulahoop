@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 hulahoop-core = { path = "../core" }
+hulahoop-server = { path = "../server" }
+hulahoop-runner = { path = "../runner" }
 anyhow.workspace = true
 tokio.workspace = true
 serde_json.workspace = true

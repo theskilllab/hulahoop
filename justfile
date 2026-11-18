@@ -55,7 +55,7 @@ bundle target:
 debug target="127.0.0.1:9000" port="":
     ./scripts/debug.sh {{target}} {{port}}
 
-# Pack hulahoop-server, hulahoop-runner, and the CLI. No argument means this host.
+# Pack the hulahoop binary. No argument means this host.
 headless target="":
     ./scripts/headless.sh {{target}}
 

@@ -162,7 +162,7 @@ In v0 the merge is a human action with a Hulahoop-verified pre-merge replay. Hul
 
 ### Components
 
-**`hulahoop-server`**
+**`hulahoop serve`**
 - Rust, Axum, `async-graphql`, SeaORM.
 - Owns the state machine, database, approvals, run history, the log files, and the artifact directories.
 - The only process that writes SQLite. The runner reports facts over HTTP, so there is one writer and no cross-process lock contest.
@@ -172,7 +172,7 @@ In v0 the merge is a human action with a Hulahoop-verified pre-merge replay. Hul
 - Exposes GraphQL for the desktop.
 - Exposes a small internal API for the runner.
 
-**`hulahoop-runner`**
+**`hulahoop runner`**
 - Rust.
 - Connects outbound to the server.
 - Claims one run at a time.
@@ -187,7 +187,7 @@ In v0 the merge is a human action with a Hulahoop-verified pre-merge replay. Hul
 - Tauri 2 + React + TypeScript.
 - Vite for the renderer; Tauri CLI for packaging.
 - `urql` + `graphql-codegen`; subscriptions over `graphql-ws`.
-- Spawns sidecar `hulahoop-server` and `hulahoop-runner` binaries in local mode.
+- Spawns sidecar `hulahoop serve` and `hulahoop runner` binaries in local mode.
 - Opens the UI against the local server, or against any server whose address and token you paste into the connect screen (saved per machine).
 - Polls `run_events` while a run is live, and re-reads issues every 2.5 s.
 
@@ -1297,26 +1297,28 @@ processes, and the replays. One command starts both:
 
 ```sh
 # on the workstation that holds the repo and the toolchain
-hulahoop up --listen 0.0.0.0 --port 5123
-#   server starting … listening port=5123
-#   server and runner are up server=http://127.0.0.1:5123
-#   runner watching for work server=http://127.0.0.1:5123
+hulahoop up --listen 0.0.0.0 --port 9000
+#   listening listen=0.0.0.0 port=9000 url=http://192.168.1.19:9000
+#   server and runner are up server=http://192.168.1.19:9000 …
 
-hulahoop-server --print-connection   # the token, from another shell
-#   {"listen":"0.0.0.0","port":5123,"token":"…","url":"http://127.0.0.1:5123",…}
+jq -r .token ~/.local/share/hulahoop/connection.json   # the token, from another shell
 ```
 
-`hulahoop up` starts the server, waits for its connection file, then starts the runner
-with `--server` and `--token`, and stops the other process when either exits. Run the two
-by hand when they live on different machines (`hulahoop serve` and `hulahoop runner
---server http://host:5123 --token <token>`), which is what the internal API is for.
+One executable does all of it: `hulahoop up`, `hulahoop serve`, `hulahoop runner`,
+`hulahoop seed`, `hulahoop doctor`, `hulahoop debug`. `up` starts `hulahoop serve`,
+waits for the connection file, starts `hulahoop runner` with `--server` and `--token`,
+and stops the other when either exits. The two roles stay separate *processes* on
+purpose: a crashed agent must not take the server with it, and each run is killed by
+process group. Run them by hand when they live on different machines
+(`hulahoop serve --listen 0.0.0.0` and `hulahoop runner --server http://host:9000
+--token <token>`).
 
 Where the binaries come from:
 
-- **In the app.** `Hulahoop.app/Contents/MacOS/` already holds `hulahoop-server` and
-  `hulahoop-runner`; the app starts them itself in local mode.
-- **A release asset.** Each release publishes three tarballs with the server, the
-  runner, and the `hulahoop` CLI: `hulahoop-aarch64-apple-darwin.tar.gz`,
+- **In the app.** `Hulahoop.app/Contents/MacOS/hulahoop` is the same binary; the app
+  runs it as `hulahoop serve` and `hulahoop runner` in local mode.
+- **A release asset.** Each release publishes three tarballs, each holding one
+  `hulahoop` binary: `hulahoop-aarch64-apple-darwin.tar.gz`,
   `hulahoop-x86_64-unknown-linux-gnu.tar.gz`, and
   `hulahoop-aarch64-unknown-linux-gnu.tar.gz`. Unpack the one that matches the host and
   run `./hulahoop up`; no checkout, no nix. The Linux builds come from plain `cargo`
@@ -1324,10 +1326,10 @@ Where the binaries come from:
   `/nix/store` paths for glibc — the same trap the macOS bundle had. The glibc floor
   is 2.35 on x86_64 (Ubuntu 22.04) and 2.39 on arm64 (the oldest hosted arm image).
   The desktop app ships for Apple silicon only; a desktop build for Linux is M3.
-- **From source.** `nix develop --command cargo build --release -p hulahoop-server
-  -p hulahoop-runner -p hulahoop-cli` writes all three into `target/release/`.
+- **From source.** `nix develop --command cargo build --release -p hulahoop-cli`
+  writes `target/release/hulahoop`.
 
-Then paste `http://workstation:5123` and the token into the app's connect screen; the
+Then paste `http://workstation:9000` and the token into the app's connect screen; the
 host is remembered per machine, and "use this machine" switches back to the bundled
 local server. The runner takes `--server`/`--token`, or `HULAHOOP_SERVER` and
 `HULAHOOP_TOKEN`; without them it reads the `connection.json` a local server wrote,
@@ -1335,7 +1337,7 @@ which is what `just dev` relies on. `tests/e2e/loop.sh` starts its runner the re
 way for exactly that reason, so the path is exercised on every CI run.
 
 Two limits worth knowing. The token is one bearer secret over plain HTTP: keep the port
-on a private network (Tailscale) or behind `ssh -L 5123:localhost:5123 workstation`.
+on a private network (Tailscale) or behind `ssh -L 9000:localhost:9000 workstation`.
 And the repo path the server stores is a path on the server's host, so the repo has to
 live there; two machines sharing one checkout is not a supported topology yet.
 

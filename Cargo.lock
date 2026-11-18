@@ -1005,6 +1005,8 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hulahoop-core",
+ "hulahoop-runner",
+ "hulahoop-server",
  "reqwest",
  "serde_json",
  "tokio",

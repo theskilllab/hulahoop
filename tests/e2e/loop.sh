@@ -69,14 +69,14 @@ copy_fixture
 echo "repo prepared at $REPO"
 
 # CI runs this after `cargo test`, which builds test targets but not the binaries.
-for bin in hulahoop-server hulahoop-runner; do
+for bin in hulahoop; do
   if [[ ! -x "$ROOT/target/debug/$bin" ]]; then
     echo "building $bin"
     (cd "$ROOT" && cargo build --bin "$bin") || { echo "could not build $bin" >&2; exit 1; }
   fi
 done
 
-HULAHOOP_DATA="$DATA" "$ROOT/target/debug/hulahoop-server" --data-dir "$DATA" --listen 127.0.0.1 >"$WORK/server.log" 2>&1 &
+HULAHOOP_DATA="$DATA" "$ROOT/target/debug/hulahoop" serve --data-dir "$DATA" --listen 127.0.0.1 >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 100); do [[ -f "$CONN" ]] && break; sleep 0.1; done
 [[ -f "$CONN" ]] || { echo "server did not start" >&2; cat "$WORK/server.log" >&2; exit 1; }
@@ -87,7 +87,7 @@ SERVER_URL=$(jq -r .url "$CONN")
 [[ -n "$SERVER_URL" && "$SERVER_URL" != "null" ]] || SERVER_URL="http://127.0.0.1:$(jq -r .port "$CONN")"
 
 HULAHOOP_DATA="$DATA" HULAHOOP_FAKE_SCRIPT="$ROOT/tests/e2e/fake_agent.sh" \
-  "$ROOT/target/debug/hulahoop-runner" --data-dir "$DATA" --server "$SERVER_URL" --token "$(jq -r .token "$CONN")" \
+  "$ROOT/target/debug/hulahoop" runner --data-dir "$DATA" --server "$SERVER_URL" --token "$(jq -r .token "$CONN")" \
   >"$WORK/runner.log" 2>&1 &
 RUNNER_PID=$!
 

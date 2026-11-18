@@ -13,12 +13,12 @@ use std::time::Duration;
 /// `HULAHOOP_TOKEN`) point the runner at a host that already runs the server;
 /// without them it reads the `connection.json` a local server wrote.
 fn resolve_connection(
+    args: &[String],
     mut data_dir: std::path::PathBuf,
 ) -> anyhow::Result<(client::Connection, std::path::PathBuf)> {
     let mut server = std::env::var("HULAHOOP_SERVER").ok();
     let mut token = std::env::var("HULAHOOP_TOKEN").ok();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -59,16 +59,9 @@ fn resolve_connection(
     Ok((connection, data_dir))
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::new("info,hulahoop_runner=debug")
-            }),
-        )
-        .init();
-
+/// Runs the runner loop until it is killed. The caller owns the runtime and the
+/// log filter.
+pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let data_dir = std::env::var_os("HULAHOOP_DATA")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -89,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&direnv_data)?;
     std::env::set_var("XDG_DATA_HOME", &direnv_data);
 
-    let (connection, data_dir) = resolve_connection(data_dir)?;
+    let (connection, data_dir) = resolve_connection(&args, data_dir)?;
     let client = client::Client::new(&connection)?;
     let executor = exec::Executor::new(client, data_dir.clone());
     let runner_id = std::env::var("HULAHOOP_RUNNER_ID")

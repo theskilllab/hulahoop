@@ -38,7 +38,7 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/hulahoop-server", "binaries/hulahoop-runner"],
+    "externalBin": ["binaries/hulahoop"],
     "resources": [],
     "macOS": {
       "minimumSystemVersion": "14.0",

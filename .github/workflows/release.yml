@@ -98,12 +98,11 @@ jobs:
           tar -xzf "dist/hulahoop-${{ matrix.target }}.tar.gz" -C /tmp/pack
           /tmp/pack/hulahoop help
           data=$(mktemp -d)
-          /tmp/pack/hulahoop-server --data-dir "$data" --port 5199 &
+          /tmp/pack/hulahoop serve --data-dir "$data" --port 5199 &
           server=$!
           for _ in $(seq 1 50); do curl -sf http://127.0.0.1:5199/health && break; sleep 0.2; done
           kill "$server"
-          ! ldd /tmp/pack/hulahoop-server | grep -q '/nix/store/'
-          ! ldd /tmp/pack/hulahoop-runner | grep -q '/nix/store/'
+          ! ldd /tmp/pack/hulahoop | grep -q '/nix/store/'
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
@@ -134,5 +133,5 @@ jobs:
 
           **The desktop app** (\`Hulahoop_<version>_aarch64.dmg\`) needs macOS 14 on Apple silicon. The build is unsigned: right-click the app and choose Open.
 
-          **The host that runs the agents** takes one of the \`hulahoop-*.tar.gz\` assets — \`hulahoop-server\`, \`hulahoop-runner\`, and the \`hulahoop\` CLI. Pick the triple that matches it, unpack it there, and run \`./hulahoop up --listen 0.0.0.0 --port 5123\`. That machine needs nix, direnv, jj, and the agent CLIs; the Mac only needs the app." \
+          **The host that runs the agents** takes one of the \`hulahoop-*.tar.gz\` assets — one \`hulahoop\` binary that runs the server, the runner, and the CLI. Pick the triple that matches it, unpack it there, and run \`./hulahoop up --listen 0.0.0.0 --port 9000\`. That machine needs nix, direnv, jj, and the agent CLIs; the Mac only needs the app." \
             release/*

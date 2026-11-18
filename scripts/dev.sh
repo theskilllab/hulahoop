@@ -24,7 +24,7 @@ PORT="${2:-9000}"
 DATA_DIR="${HULAHOOP_DATA:-$PWD/.hulahoop-dev}"
 mkdir -p "$DATA_DIR"
 
-cargo build --quiet -p hulahoop-server -p hulahoop-runner -p hulahoop-cli
+cargo build --quiet -p hulahoop-cli
 BIN="$PWD/target/debug"
 
 echo "building done; starting on $HOST:$PORT (data in $DATA_DIR)"

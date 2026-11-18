@@ -59,25 +59,27 @@ fn data_dir() -> PathBuf {
 
 /// Bundled builds ship the binaries next to the app executable; a development
 /// build can point at the cargo target directory instead.
-fn find_binary(name: &str) -> Option<PathBuf> {
-    if let Some(explicit) = std::env::var_os(format!("HULAHOOP_{}_BIN", name.to_uppercase())) {
+/// One sidecar serves both roles: it is the same `hulahoop` executable that runs
+/// `serve` or `runner` as a subcommand.
+fn find_binary() -> Option<PathBuf> {
+    if let Some(explicit) = std::env::var_os("HULAHOOP_BIN") {
         return Some(PathBuf::from(explicit));
     }
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    let sibling = dir.join(name);
+    let sibling = dir.join("hulahoop");
     if sibling.exists() {
         return Some(sibling);
     }
-    let resource = dir.join("../Resources").join(name);
+    let resource = dir.join("../Resources").join("hulahoop");
     if resource.exists() {
         return Some(resource);
     }
-    Some(PathBuf::from(name))
+    Some(PathBuf::from("hulahoop"))
 }
 
-fn spawn(name: &str, args: &[&str], data_dir: &Path) -> Result<Child, String> {
-    let binary = find_binary(name).ok_or_else(|| format!("cannot locate {name}"))?;
+fn spawn(args: &[&str], data_dir: &Path) -> Result<Child, String> {
+    let binary = find_binary().ok_or_else(|| "cannot locate hulahoop".to_string())?;
     Command::new(&binary)
         .args(args)
         .env("HULAHOOP_DATA", data_dir)
@@ -115,11 +117,14 @@ fn main() {
             // the port and the token; starting a second one would fight for it.
             let already_running = dir.join("connection.json").exists();
             if !already_running {
-                let server = spawn("hulahoop-server", &["--data-dir", &dir.to_string_lossy()], &dir)?;
+                let server = spawn(
+                    &["serve", "--data-dir", &dir.to_string_lossy()],
+                    &dir,
+                )?;
                 *shell.server.lock().unwrap() = Some(server);
                 wait_for_connection(&dir)?;
             }
-            let runner = spawn("hulahoop-runner", &[], &dir)?;
+            let runner = spawn(&["runner"], &dir)?;
             *shell.runner.lock().unwrap() = Some(runner);
             Ok(())
         })
