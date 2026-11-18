@@ -175,6 +175,15 @@ impl Executor {
                     "verdict": outcome.verdict,
                     "body": outcome.final_text,
                     "artifact_limit_hit": artifact_limit_hit,
+                    "transcript": outcome
+                        .lines
+                        .iter()
+                        .rev()
+                        .take(40)
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 }),
             )
             .await?;

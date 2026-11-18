@@ -58,6 +58,22 @@ const GOAL_PHRASES: &[&str] = &[
     "works well",
 ];
 
+/// The provider's own refusal, when the adapter recorded one. pi reports a rejected
+/// model as a transcript line and an exit code of 0, which is why this looks at the
+/// text instead of the status.
+fn adapter_failure(payload: &RunCompletion) -> Option<String> {
+    let transcript = payload.transcript.as_deref().unwrap_or_default();
+    let marker = "\"finalError\":\"";
+    let start = transcript.rfind(marker)? + marker.len();
+    let rest = &transcript[start..];
+    let end = rest.find("\"}").or_else(|| rest.find('"'))?;
+    let reason = rest[..end].trim();
+    if reason.is_empty() {
+        return None;
+    }
+    Some(reason.to_string())
+}
+
 pub struct Engine {
     pub db: Db,
 }
@@ -1003,6 +1019,27 @@ impl Engine {
                 summary.frozen_hits.join(", ")
             ));
         }
+        // A run that changed nothing did no work. pi exits 0 even when its provider
+        // rejected the model, so "the process ended" is not evidence that the role ran;
+        // without this, the issue sits at tests_in_progress offering a suite to freeze
+        // that was never written.
+        let asked = payload
+            .question
+            .as_deref()
+            .is_some_and(|question| !question.trim().is_empty());
+        let answered = payload
+            .verdict
+            .as_deref()
+            .is_some_and(|verdict| !verdict.trim().is_empty());
+        if final_status == RunStatus::Succeeded && changed_paths.is_empty() && !asked && !answered {
+            final_status = RunStatus::Failed;
+            error = Some(match adapter_failure(&payload) {
+                Some(reason) => format!(
+                    "the agent changed no files: {reason}. Nothing was run for this role, so the issue stays where it is; fix the agent in Settings and retry."
+                ),
+                None => "the agent changed no files and said nothing. A role that edits nothing did no work; check its transcript in the run log, then retry.".to_string(),
+            });
+        }
         if final_status == RunStatus::Succeeded && payload.artifact_limit_hit {
             final_status = RunStatus::Failed;
             error = Some(format!(
@@ -1551,6 +1588,10 @@ pub struct RunCompletion {
     pub body: String,
     #[serde(default)]
     pub artifact_limit_hit: bool,
+    /// The last lines the agent wrote, so a failure can quote the adapter instead of
+    /// saying "it exited".
+    #[serde(default)]
+    pub transcript: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1588,6 +1629,43 @@ pub fn prompt_hash() -> String {
         all.push_str(prompt_for(role));
     }
     sha256_hex(all.as_bytes())
+}
+
+#[cfg(test)]
+mod adapter_failure_tests {
+    use super::*;
+
+    fn completion(transcript: &str) -> RunCompletion {
+        RunCompletion {
+            status: "succeeded".into(),
+            exit_code: Some(0),
+            error: None,
+            diff: String::new(),
+            changed_paths: Vec::new(),
+            commit: None,
+            question: None,
+            verdict: None,
+            body: String::new(),
+            artifact_limit_hit: false,
+            transcript: Some(transcript.to_string()),
+        }
+    }
+
+    #[test]
+    fn the_provider_refusal_is_quoted_instead_of_exiting_quietly() {
+        let payload = completion(
+            r#"{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"400: {\"type\":\"server_error\",\"message\":\"Model deepseek-4.1-flash isn't included in OpenCode Go.\"}"}"#,
+        );
+        let said = adapter_failure(&payload).expect("a reason");
+        assert!(said.contains("isn't included in OpenCode Go"), "got {said}");
+    }
+
+    #[test]
+    fn a_quiet_transcript_has_no_reason_to_quote() {
+        assert!(
+            adapter_failure(&completion(r#"{"type":"agent_settled","aborted":false}"#)).is_none()
+        );
+    }
 }
 
 #[cfg(test)]

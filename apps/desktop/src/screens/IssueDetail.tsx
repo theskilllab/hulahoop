@@ -96,7 +96,7 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
         {issue.status === "tests_in_progress" && (
           <>
             {current && <RunSummary issue={issue} run={current} onToggleDiff={() => setShowDiff(!showDiff)} showDiff={showDiff} />}
-            {current && current.status !== "running" && current.status !== "queued" && (
+            {current && current.status === "succeeded" && (
               <button
                 className="primary"
                 disabled={busy !== null}
@@ -323,7 +323,7 @@ function RunSummary({
   onToggleDiff,
 }: {
   issue: Issue;
-  run: { id: string; status: string; flags: string[] };
+  run: { id: string; status: string; flags: string[]; error: string | null };
   showDiff: boolean;
   onToggleDiff: () => void;
 }) {
@@ -341,6 +341,7 @@ function RunSummary({
 
   return (
     <div className="running">
+      {run.error && <p className="error">{run.error}</p>}
       <div className="row">
         <button className="ghost" onClick={() => void load()}>
           {log ? "Reload log" : "Show log"}
