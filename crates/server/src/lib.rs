@@ -75,9 +75,23 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         .layer(tower_http::cors::CorsLayer::very_permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from((listen, port)))
+    let socket = SocketAddr::from((listen, port));
+    let listener = tokio::net::TcpListener::bind(socket)
         .await
-        .context("binding the server port")?;
+        .map_err(|cause| {
+            if cause.kind() == std::io::ErrorKind::AddrInUse {
+                anyhow::anyhow!(
+                    "{socket} is already taken, so this server cannot start. \
+                 Something else is listening there — a Hulahoop server from an earlier run \
+                 answers `pgrep -ax hulahoop` and can be stopped with `kill <pid>`. \
+                 Pass a different --port, or use the server that is already up: its token \
+                 is in {}/connection.json.",
+                    data_dir.display()
+                )
+            } else {
+                anyhow::Error::new(cause).context(format!("binding {socket}"))
+            }
+        })?;
     let address = listener.local_addr()?;
 
     let connection_path = hulahoop_core::contract::connection_file(&data_dir);

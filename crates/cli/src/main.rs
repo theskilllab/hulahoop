@@ -92,9 +92,34 @@ async fn up(args: &[String]) -> Result<()> {
         server_args.push(port.clone());
     }
 
-    let mut server = spawn(&["serve"], &server_args)?;
     let connection_path = data_dir.join("connection.json");
+
+    // One data directory holds exactly one connection file, so it can hold exactly one
+    // live server: a second one would overwrite the file the first one's clients are
+    // using, and the token with it.
+    if let Some((url, pid, running_port)) = already_running(&connection_path) {
+        let wanted = port
+            .as_deref()
+            .and_then(|text| text.parse::<i64>().ok())
+            .unwrap_or(running_port);
+        if wanted == running_port {
+            tracing::info!(
+                "a server is already up on this data directory; nothing to do url={url} pid={pid} \
+                 (stop it with `kill {pid}`)"
+            );
+            return Ok(());
+        }
+        bail!(
+            "a server is already up on this data directory at {url} (pid {pid}, port {running_port}), \
+             and the data directory holds one connection file. Stop it with `kill {pid}` first, \
+             use that server, or pick another --data-dir."
+        );
+    }
+
+    // Anything left here is stale, and a stale file reads like a live server.
     let _ = std::fs::remove_file(&connection_path);
+
+    let mut server = spawn(&["serve"], &server_args)?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let connection = loop {
@@ -216,6 +241,25 @@ fn spawn(command: &[&str], args: &[String]) -> Result<std::process::Child> {
         .args(args)
         .spawn()
         .with_context(|| format!("starting {}", command.join(" ")))
+}
+
+/// The url and pid of a server that is still alive on this data directory, if the
+/// connection file names one and the requested port matches.
+fn already_running(path: &std::path::Path) -> Option<(String, i64, i64)> {
+    let bytes = std::fs::read(path).ok()?;
+    let value: Value = serde_json::from_slice(&bytes).ok()?;
+    let pid = value.get("pid")?.as_i64()?;
+    let port = value.get("port")?.as_i64()?;
+    let alive = std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !alive {
+        return None;
+    }
+    let url = value.get("url")?.as_str()?.to_string();
+    Some((url, pid, port))
 }
 
 fn platform_data_dir() -> Result<PathBuf> {
