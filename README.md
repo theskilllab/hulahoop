@@ -1274,6 +1274,13 @@ tests/e2e/loop.sh       # the loop with the fake adapter, no model calls, no net
 HULAHOOP_E2E_ADAPTER=real tests/e2e/loop.sh   # the same loop with real agents
 ```
 
+A build takes its version from the release tag, not from `tauri.conf.json`:
+`scripts/release-version.sh` answers `0.0.12` for `v0.0.12` (from `HULAHOOP_VERSION`,
+which the release workflow sets from `github.ref_name`, or from the tags at `HEAD`),
+and `just bundle` passes it through `--config`, so the dmg, the bundle and the About box
+all say the same number as the release. `tauri.conf.json` holds `0.0.0` as a placeholder
+for a tree with no tags at all.
+
 `just check-ui` exists because the desktop sends GraphQL as strings: no compiler sees
 them, so a field the server stops exposing fails at the first request instead of at
 build time. It posts every document from `apps/desktop/src` to a throwaway server and

@@ -33,6 +33,9 @@ jobs:
         with:
           version: 12.9.0
       - name: bundle the app
+        # The tag names the release, and the tag is what the dmg says.
+        env:
+          HULAHOOP_VERSION: ${{ github.ref_name }}
         run: nix develop --command just bundle aarch64-apple-darwin
       - name: pack the server, the runner, and the cli
         run: nix develop --command just headless aarch64-apple-darwin

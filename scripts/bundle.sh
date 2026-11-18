@@ -5,6 +5,11 @@ set -euo pipefail
 TARGET="${1:?usage: bundle <target-triple>}"
 cd "$(dirname "$0")/.."
 
+# The app version follows the release tag, not tauri.conf.json, so the dmg and the
+# bundle both say 0.0.12 while the release is v0.0.12.
+VERSION=$(scripts/release-version.sh)
+CONFIG=$(printf '{"version":"%s"}' "$VERSION")
+
 cargo build --release --target "$TARGET" -p hulahoop-cli
 
 mkdir -p apps/desktop/src-tauri/binaries
@@ -16,11 +21,10 @@ if [[ "$TARGET" == *apple-darwin ]]; then
   # The nix shell's linker is convenient and toxic: it records /nix/store paths
   # in the Mach-O, and then the app only starts on a machine with nix. Build the
   # app bundle, strip those paths, re-sign, and make the dmg from the result.
-  pnpm --prefix apps/desktop tauri build --target "$TARGET" --bundles app
+  pnpm --prefix apps/desktop tauri build --target "$TARGET" --bundles app --config "$CONFIG"
   BUNDLE="apps/desktop/src-tauri/target/$TARGET/release/bundle"
   APP=$(find "$BUNDLE/macos" -maxdepth 1 -name '*.app' -print -quit)
   scripts/macos-fix-deps.sh "$APP"
-  VERSION=$(jq -r .version apps/desktop/src-tauri/tauri.conf.json)
   DMG="$BUNDLE/dmg/Hulahoop_${VERSION}_${TARGET%%-*}.dmg"
   mkdir -p "$(dirname "$DMG")"
   rm -f "$DMG"
@@ -31,5 +35,5 @@ if [[ "$TARGET" == *apple-darwin ]]; then
   rm -rf "$STAGE"
   echo "built $DMG"
 else
-  pnpm --prefix apps/desktop tauri build --target "$TARGET" --bundles app
+  pnpm --prefix apps/desktop tauri build --target "$TARGET" --bundles app --config "$CONFIG"
 fi
