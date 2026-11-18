@@ -6,10 +6,19 @@ import { probe, saveRemote, useLocalServer } from "../api";
  * the runner, so the desktop only needs an address and a token: point it at a
  * machine with nix, direnv, jj, and the agent CLIs and the loop runs there.
  */
-export default function Connect({ onConnected, onCancel }: { onConnected: () => void; onCancel?: () => void }) {
+export default function Connect({
+  onConnected,
+  onCancel,
+  failure,
+}: {
+  onConnected: () => void;
+  onCancel?: () => void;
+  /** Why the last attempt did not get as far as the board. */
+  failure?: string | null;
+}) {
   const [url, setUrl] = useState("http://");
   const [token, setToken] = useState("");
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(failure ?? null);
   const [busy, setBusy] = useState(false);
 
   async function connectTo(url: string, token: string) {
@@ -33,8 +42,8 @@ export default function Connect({ onConnected, onCancel }: { onConnected: () => 
         The server runs the agents, so this machine needs the app and nothing else. On the host:
       </p>
       <pre>
-        hulahoop-server --listen 0.0.0.0 --port 9000 --print-connection{"\n"}
-        hulahoop-runner --server http://host:9000 --token &lt;token&gt;
+        hulahoop up --listen 0.0.0.0 --port 9000{"\n"}
+        jq -r .token path/to/data/connection.json
       </pre>
 
       <form
@@ -53,7 +62,7 @@ export default function Connect({ onConnected, onCancel }: { onConnected: () => 
             value={token}
             onChange={(event) => setToken(event.target.value)}
             spellCheck={false}
-            placeholder="from --print-connection"
+            placeholder="the token in connection.json"
           />
         </label>
         {error && <p className="error">{error}</p>}
@@ -79,7 +88,7 @@ export default function Connect({ onConnected, onCancel }: { onConnected: () => 
       </form>
       <p className="hint dim">
         The token travels as a bearer header over plain HTTP, so keep the port on a private network: a
-        Tailscale address, or an SSH tunnel like <code>ssh -L 5123:localhost:5123 host</code>.
+        Tailscale address, or an SSH tunnel like <code>ssh -L 9000:localhost:9000 host</code>.
       </p>
     </main>
   );

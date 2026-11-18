@@ -35,8 +35,23 @@ shell-check:
 lint:
     cargo clippy --workspace --all-targets -- -D warnings
 
+# The desktop sends GraphQL as strings, so nothing compiles them: this posts every
+# document to a throwaway server and fails on a field the schema dropped.
+check-ui:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build -q --bin hulahoop
+    data="$(mktemp -d)"
+    ./target/debug/hulahoop serve --data-dir "$data" --port 9123 >"$data/server.log" 2>&1 &
+    server=$!
+    trap 'kill "$server" 2>/dev/null || true' EXIT
+    for _ in $(seq 1 60); do [ -f "$data/connection.json" ] && break; sleep 0.5; done
+    HULAHOOP_SERVER=http://127.0.0.1:9123 \
+      HULAHOOP_TOKEN="$(jq -r .token "$data/connection.json")" \
+      node scripts/check-ui-queries.mjs
+
 # What CI runs.
-ci: fmt-check lint test
+ci: fmt-check lint test check-ui
     pnpm --prefix apps/desktop build
 
 # Start the server and the runner against a scratch data directory.

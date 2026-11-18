@@ -718,6 +718,20 @@ pub struct RoleBinding {
 /// Nested reads stay on one screen's worth of data: the board asks for issues,
 /// the detail screen asks for the rest.
 #[ComplexObject]
+impl Project {
+    /// The repositories of this project. A project holds one in v0, but the
+    /// screen asks for the list and the spec models a list.
+    async fn repos(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Repo>> {
+        Ok(sqlx::query_as::<_, Repo>(
+            "select * from repos where project_id = ? order by created_at",
+        )
+        .bind(self.id)
+        .fetch_all(&engine(ctx).db.pool)
+        .await?)
+    }
+}
+
+#[ComplexObject]
 impl Issue {
     async fn criteria(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Criterion>> {
         Ok(engine(ctx).criteria(self.id).await?)

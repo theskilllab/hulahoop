@@ -1269,9 +1269,15 @@ just seed /path/to/repo # create a project, a repo, three agents, three role bin
 hulahoop up             # server and runner on this host, one command (--listen, --port, --data-dir)
 just dev 0.0.0.0 9000   # debug build of server + runner, on every interface, so a Mac can connect
 just debug 192.168.1.19 9000   # why can't the app reach it: address, port, /health, token
+just check-ui           # every document the UI sends, against a live schema
 tests/e2e/loop.sh       # the loop with the fake adapter, no model calls, no network
 HULAHOOP_E2E_ADAPTER=real tests/e2e/loop.sh   # the same loop with real agents
 ```
+
+`just check-ui` exists because the desktop sends GraphQL as strings: no compiler sees
+them, so a field the server stops exposing fails at the first request instead of at
+build time. It posts every document from `apps/desktop/src` to a throwaway server and
+names the file and the message when the schema has moved on.
 
 `HULAHOOP_E2E_ADAPTER=real` uses `pi` for the Test Author and the Implementer. The
 Reviewer uses `pi` on a machine without a Claude Code login and `claude_code` on one

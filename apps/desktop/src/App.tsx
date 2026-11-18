@@ -84,6 +84,7 @@ export default function App() {
   if (view.name === "connect" || !connected) {
     return (
       <Connect
+        failure={error}
         onCancel={connected ? () => setView({ name: "board" }) : undefined}
         onConnected={() => {
           setConnected(false);

@@ -13,7 +13,9 @@ pub struct Workspace {
     pub created_at: DateTime<Utc>,
 }
 
+// `complex` lets the resolvers in `gql.rs` add the nested reads to this object.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Project {
     pub id: Uuid,
     pub workspace_id: Uuid,
