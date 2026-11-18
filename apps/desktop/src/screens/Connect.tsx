@@ -33,8 +33,8 @@ export default function Connect({ onConnected, onCancel }: { onConnected: () => 
         The server runs the agents, so this machine needs the app and nothing else. On the host:
       </p>
       <pre>
-        hulahoop-server --listen 0.0.0.0 --port 5123 --print-connection{"\n"}
-        hulahoop-runner --server http://host:5123 --token &lt;token&gt;
+        hulahoop-server --listen 0.0.0.0 --port 9000 --print-connection{"\n"}
+        hulahoop-runner --server http://host:9000 --token &lt;token&gt;
       </pre>
 
       <form

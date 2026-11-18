@@ -152,8 +152,10 @@ export function savedRemote(): SavedRemote | null {
 }
 
 export function saveRemote(url: string, token: string) {
-  const trimmed = url.trim().replace(/\/+$/, "");
-  localStorage.setItem(REMOTE_KEY, JSON.stringify({ url: trimmed, token: token.trim() }));
+  localStorage.setItem(
+    REMOTE_KEY,
+    JSON.stringify({ url: normalizeServer(url), token: token.trim() }),
+  );
   connection = null;
 }
 
@@ -218,14 +220,51 @@ export function rememberConnection(url: string, token: string) {
 }
 
 /** One cheap query, so a wrong host or token fails at the connect screen. */
-export async function probe(url: string, token: string): Promise<void> {
-  const response = await fetch(`${url.replace(/\/+$/, "")}/graphql`, {
-    method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-    body: JSON.stringify({ query: "{ workspaces { id name } }" }),
-  });
+/**
+ * What people type in the connect screen: `192.168.1.19:9000`, `http://host:9000/`,
+ * or a full URL. Without a scheme, `fetch("192.168.1.19:9000/graphql")` is parsed as
+ * the custom scheme `192.168.1.19`, and WebKit reports that as "The string did not
+ * match the expected pattern" — an error that says nothing about the real problem.
+ */
+export function normalizeServer(input: string): string {
+  const trimmed = input.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    throw new Error("enter the server address, for example 192.168.1.19:9000");
+  }
+  const withScheme = trimmed.includes("://") ? trimmed : `http://${trimmed}`;
+  let parsed: URL;
+  try {
+    parsed = new URL(withScheme);
+  } catch {
+    throw new Error(`"${input}" is not a server address; try 192.168.1.19:9000`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`use http:// or https://, not ${parsed.protocol}`);
+  }
+  if (!parsed.hostname) {
+    throw new Error(`"${input}" has no host; try 192.168.1.19:9000`);
+  }
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+export async function probe(server: string, token: string): Promise<void> {
+  const url = normalizeServer(server);
+  const trimmed = token.trim();
+  if (!trimmed) {
+    throw new Error("enter the token the server printed");
+  }
+  let response: Response;
+  try {
+    response = await fetch(`${url}/graphql`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${trimmed}` },
+      body: JSON.stringify({ query: "{ workspaces { id name } }" }),
+    });
+  } catch {
+    throw new Error(`could not reach ${url}. Is the server running, and does it listen on that address?`);
+  }
   if (!response.ok) {
-    throw new Error(`the server answered ${response.status}`);
+    throw new Error(`${url} answered ${response.status}; check the token`);
   }
   const payload = await response.json();
   if (payload.errors?.length) {
