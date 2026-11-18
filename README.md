@@ -1286,14 +1286,14 @@ value rather than shipping that mismatch.
 
 ### Running the loop on another machine
 
-The desktop is a client. The server owns the database, the artifacts, and the state
-machine, and the runner runs the agents next to the server — so the machine with
-`nix`, `direnv`, `jj`, and the agent CLIs is the machine that does the work. The laptop
-only needs the app.
+The desktop is a client in the strict sense: it holds no state. One machine does the
+work — the one with `nix`, `direnv`, `jj`, and the agent CLIs — and it runs two
+processes there. The server owns the database, the state machine, and the artifacts;
+the runner owns the checkouts, the agent processes, and the replays. They stay separate
+so a crashed agent cannot take the server with it, and so each run is killed by process
+group. The laptop only needs the app.
 
-Two processes run there, because they do different jobs: the server owns the database,
-the state machine, and the artifacts, and the runner owns the checkouts, the agent
-processes, and the replays. One command starts both:
+One command starts both:
 
 ```sh
 # on the workstation that holds the repo and the toolchain
@@ -1304,14 +1304,10 @@ hulahoop up --listen 0.0.0.0 --port 9000
 jq -r .token ~/.local/share/hulahoop/connection.json   # the token, from another shell
 ```
 
-One executable does all of it: `hulahoop up`, `hulahoop serve`, `hulahoop runner`,
-`hulahoop seed`, `hulahoop doctor`, `hulahoop debug`. `up` starts `hulahoop serve`,
-waits for the connection file, starts `hulahoop runner` with `--server` and `--token`,
-and stops the other when either exits. The two roles stay separate *processes* on
-purpose: a crashed agent must not take the server with it, and each run is killed by
-process group. Run them by hand when they live on different machines
-(`hulahoop serve --listen 0.0.0.0` and `hulahoop runner --server http://host:9000
---token <token>`).
+One executable covers both roles: `up` runs `serve`, waits for the connection file,
+then runs `runner` with `--server` and `--token`, and stops the other when either exits.
+Running one role by hand (`hulahoop serve --listen 0.0.0.0`, `hulahoop runner --server
+http://host:9000 --token <token>`) is what you do when they live on different machines.
 
 Where the binaries come from:
 
@@ -1329,9 +1325,10 @@ Where the binaries come from:
 - **From source.** `nix develop --command cargo build --release -p hulahoop-cli`
   writes `target/release/hulahoop`.
 
-Then paste `http://workstation:9000` and the token into the app's connect screen; the
-host is remembered per machine, and "use this machine" switches back to the bundled
-local server. The runner takes `--server`/`--token`, or `HULAHOOP_SERVER` and
+Then paste `http://workstation:9000` and the token into the app's connect screen. The
+app remembers the address; the token it does not, because a server mints a fresh one
+on every start, so a restarted host means pasting again. "Use this machine" switches
+back to the bundled local server. The runner takes `--server`/`--token`, or `HULAHOOP_SERVER` and
 `HULAHOOP_TOKEN`; without them it reads the `connection.json` a local server wrote,
 which is what `just dev` relies on. `tests/e2e/loop.sh` starts its runner the remote
 way for exactly that reason, so the path is exercised on every CI run.
@@ -1341,9 +1338,15 @@ on a private network (Tailscale) or behind `ssh -L 9000:localhost:9000 workstati
 And the repo path the server stores is a path on the server's host, so the repo has to
 live there; two machines sharing one checkout is not a supported topology yet.
 
-`--listen` defaults to `127.0.0.1`, and `connection.json` advertises loopback even when
-the server listens on `0.0.0.0`, so a remote client uses the address the operator typed
-in. Opening a port is a decision, never a default.
+`--listen` defaults to `127.0.0.1`. With `--listen 0.0.0.0` the connection file
+advertises the first outside address the host has, which is the address to give the
+Mac; opening a port is a decision, never a default.
+
+The app reaches that address over plain HTTP. Its content-security policy permits
+`http://` and `ws://` to any host, and macOS asks for Local Network permission the
+first time an app really opens a socket to the LAN — an entry can only appear after
+that first attempt, so a request that never shows up means the app is running from a
+translocated path such as `~/Downloads`, or a VPN is handling the traffic first.
 
 ### Where the implementation differs from the spec
 
