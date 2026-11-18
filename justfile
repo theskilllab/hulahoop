@@ -51,6 +51,10 @@ seed path:
 bundle target:
     ./scripts/bundle.sh {{target}}
 
+# Why can't the app reach the server? Steps through address, port, /health, token.
+debug target="127.0.0.1:9000" port="":
+    ./scripts/debug.sh {{target}} {{port}}
+
 # Pack hulahoop-server, hulahoop-runner, and the CLI. No argument means this host.
 headless target="":
     ./scripts/headless.sh {{target}}

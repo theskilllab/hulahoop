@@ -1267,6 +1267,7 @@ just ci                 # what CI runs
 just dev                # server + runner + desktop against .hulahoop-dev
 just seed /path/to/repo # create a project, a repo, three agents, three role bindings
 hulahoop up             # server and runner on this host, one command (--listen, --port, --data-dir)
+just debug 192.168.1.19 9000   # why can't the app reach it: address, port, /health, token
 tests/e2e/loop.sh       # the loop with the fake adapter, no model calls, no network
 HULAHOOP_E2E_ADAPTER=real tests/e2e/loop.sh   # the same loop with real agents
 ```
