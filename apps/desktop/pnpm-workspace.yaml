@@ -1,0 +1,8 @@
+# esbuild ships a postinstall script, and pnpm refuses to run it unless the package is
+# listed here: without this, a clean `pnpm install` fails with ERR_PNPM_IGNORED_BUILDS
+# and vite never gets a working binary.
+#
+# pnpm 11 moved this setting out of package.json (where `pnpm.onlyBuiltDependencies`
+# is now ignored with a warning), and pnpm 12 writes it back as this `allowBuilds` map.
+allowBuilds:
+  esbuild: true

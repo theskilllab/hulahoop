@@ -27,7 +27,7 @@ jobs:
             apps/desktop/src-tauri -> target
       - uses: pnpm/action-setup@v4
         with:
-          version: 10.29.1
+          version: 12.9.0
       - name: ci
         run: nix develop --command just ci
       # The loop itself: the fake adapter, the real state machine, a throwaway repo.
