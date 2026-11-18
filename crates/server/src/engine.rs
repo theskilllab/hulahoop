@@ -11,6 +11,43 @@ use hulahoop_core::junit;
 use hulahoop_core::{AgentRole, IssueEvent, IssueStatus, ReplayKind, RunFlag, RunStatus};
 use uuid::Uuid;
 
+/// Words that fill a sentence without naming anything. A criterion built only from these
+/// says "it works", which is true of every program and assertable by no test.
+const FILLER: &[&str] = &[
+    "it",
+    "is",
+    "are",
+    "the",
+    "a",
+    "an",
+    "works",
+    "work",
+    "fine",
+    "good",
+    "correct",
+    "ok",
+    "okay",
+    "should",
+    "will",
+    "be",
+    "able",
+    "to",
+    "properly",
+    "correctly",
+    "well",
+    "and",
+    "this",
+    "that",
+    "must",
+    "do",
+    "does",
+    "not",
+    "crash",
+    "fast",
+    "handles",
+    "errors",
+];
+
 /// Future-tense intent: true of a product goal, and true of nothing a test can read.
 const GOAL_PHRASES: &[&str] = &[
     "be able to",
@@ -20,28 +57,6 @@ const GOAL_PHRASES: &[&str] = &[
     "should work",
     "works well",
 ];
-
-/// Behaviour a test can assert. Verb list first because that is how people write it,
-/// then the shapes that carry a readable value: a number, a code span, an arrow, a path.
-const OBSERVABLE_VERBS: &[&str] = &[
-    "returns", "shows", "rejects", "accepts", "creates", "stores", "writes", "reads", "equals",
-    "is ", "contains", "appears", "lists", "requires", "refuses", "fails", "succeeds", "displays",
-    "records", "sets ", "sends", "responds", "keeps ",
-];
-
-fn names_observable(trimmed: &str, lowered: &str) -> bool {
-    trimmed.chars().any(|c| c.is_ascii_digit())
-        || OBSERVABLE_VERBS.iter().any(|verb| lowered.contains(verb))
-        || trimmed.contains('`')
-        || trimmed.contains("->")
-        || trimmed.contains('\u{2192}')
-        || trimmed.split_whitespace().any(|word| {
-            word.starts_with('/') && word.len() > 2
-                || word.contains("()")
-                || word.contains("==")
-                || word.contains(": ")
-        })
-}
 
 pub struct Engine {
     pub db: Db,
@@ -150,7 +165,17 @@ impl Engine {
                 "does not crash",
                 "is correct",
             ];
-            if generic.iter().any(|g| lowered == *g) {
+            let words: Vec<String> = trimmed
+                .split_whitespace()
+                .map(|word| {
+                    word.trim_matches(|c: char| !c.is_alphanumeric())
+                        .to_lowercase()
+                })
+                .filter(|word| !word.is_empty())
+                .collect();
+            let filler_only =
+                !words.is_empty() && words.iter().all(|word| FILLER.iter().any(|f| f == word));
+            if filler_only || generic.iter().any(|g| lowered == *g) {
                 bail!(
                     "criterion {} is generic: {trimmed:?}. Name the observable behavior, for example `add(2,3) returns 5`.",
                     index + 1
@@ -159,12 +184,6 @@ impl Engine {
             if GOAL_PHRASES.iter().any(|goal| lowered.contains(goal)) {
                 bail!(
                     "criterion {} states a goal rather than an observable result: {trimmed:?}. Name what a test can read back, for example `the connections query lists github after the app is created`.",
-                    index + 1
-                );
-            }
-            if !names_observable(trimmed, &lowered) {
-                bail!(
-                    "criterion {} names a goal without an observable result: {trimmed:?}. A test has to be able to assert something concrete — a value, a stored row, a response, a rendered list. Write it as `<behavior> when <condition>`, such as `the commit author is hulahoop-test-author when the implementer commits`.",
                     index + 1
                 );
             }
@@ -1583,37 +1602,38 @@ mod criterion_tests {
     }
 
     #[test]
-    fn a_goal_is_refused_with_a_sentence_that_teaches() {
+    fn a_goal_is_refused_by_name() {
         assert!(verdict("As a user, I will be able to create a Github app")
             .contains("states a goal rather than an observable result"));
         assert!(
-            verdict("The app will use that information to do the commits")
-                .contains("names a goal without an observable result")
+            verdict("In the UI, I will be able to see a list of my connections").is_empty()
+                == false
         );
     }
 
     #[test]
-    fn behaviour_plus_condition_is_accepted() {
-        assert!(
-            verdict("the commit author is hulahoop-test-author when the implementer commits")
-                .is_empty()
-        );
-        assert!(verdict("GET /connections lists github after the app is created").is_empty());
-        assert!(verdict("`connections` contains one row after the app is created").is_empty());
-        assert!(verdict("the token is stored encrypted when the app is created").is_empty());
-    }
-
-    #[test]
-    fn the_four_real_criteria_are_each_explained() {
+    fn a_sentence_a_test_can_assert_is_accepted() {
+        // A keyword whitelist refused two of these; the freeze gate is what judges them,
+        // by demanding one failing test per criterion.
         for line in [
-            "As a user, I will be able to create a Github app and then the app will store the information in the server / database / vault.",
+            "the commit author is hulahoop-test-author when the implementer commits",
+            "the github app credentials are used for the commit when the implementer commits",
+            "Each agents who commits will have their own names in the commit username",
             "The app will use that information to do the commits on.",
-            "Each agents who commits will have their own names in the commit username so that I can identify who commits what easily.",
-            "In the UI, I will be able to see a list of my connections (which are available — e.g GitHub) and which ones I am already connected to.",
+            "subtract(5, 3) returns 2",
         ] {
-            let said = verdict(line);
-            assert!(!said.is_empty(), "should be refused: {line}");
-            assert!(said.contains("criterion 1"), "names the line: {said}");
+            assert!(
+                verdict(line).is_empty(),
+                "should be accepted: {line} -> {}",
+                verdict(line)
+            );
         }
+    }
+
+    #[test]
+    fn the_generic_and_the_too_short_still_go() {
+        assert!(verdict("works").contains("too short"));
+        assert!(verdict("it is correct").contains("generic"));
+        assert!(verdict("the connections screen should work").contains("states a goal"));
     }
 }
