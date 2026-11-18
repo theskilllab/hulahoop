@@ -188,6 +188,7 @@ impl Run {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Replay {
     pub id: Uuid,
     pub issue_id: Uuid,
@@ -231,6 +232,7 @@ pub struct Comment {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Approval {
     pub id: Uuid,
     pub issue_id: Uuid,
@@ -238,6 +240,7 @@ pub struct Approval {
     pub head_revision: String,
     pub diff_sha: String,
     pub landing_bookmark: Option<String>,
+    #[graphql(skip)]
     pub acknowledged_flags: String,
     pub approved_by: Uuid,
     pub voided_at: Option<DateTime<Utc>>,

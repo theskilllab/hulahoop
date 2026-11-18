@@ -834,4 +834,35 @@ impl Run {
         .fetch_all(&engine(ctx).db.pool)
         .await?)
     }
+
+    /// Which adapter ran this role, so a run list can say `pi` or `claude_code`
+    /// without a second round trip to the agent.
+    async fn adapter(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
+        let adapter: Option<String> = sqlx::query_scalar("select adapter from agents where id = ?")
+            .bind(self.agent_id)
+            .fetch_optional(&engine(ctx).db.pool)
+            .await?;
+        Ok(adapter.unwrap_or_else(|| "unknown".to_string()))
+    }
+}
+
+#[ComplexObject]
+impl Replay {
+    /// The tests that failed, read from the JUnit report this replay stored. A
+    /// red base replay is the wanted outcome, so this is evidence, not an error.
+    async fn failed_tests(&self) -> async_graphql::Result<Vec<String>> {
+        let path = std::path::Path::new(&self.artifact_dir).join("junit.xml");
+        match hulahoop_core::junit::parse_file(&path) {
+            Ok(report) => Ok(report.failed_names()),
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+}
+
+#[ComplexObject]
+impl Approval {
+    /// The gate flags the human acknowledged when approving this diff.
+    async fn flags(&self) -> Vec<String> {
+        crate::db::json_list(&self.acknowledged_flags)
+    }
 }

@@ -18,6 +18,9 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 
 const DOCUMENT = /gql<[^>]*>\(\s*`([^`]*)`/g;
+// Documents are assembled from constants (`${ISSUE_FIELDS}`), so the literals have to
+// be substituted before the text is valid GraphQL. Harvest first, then expand.
+const CONSTANT = /const\s+([A-Za-z_$][\w$]*)\s*=\s*`([^`]*)`/g;
 
 async function files(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -59,12 +62,34 @@ const DRIFT = /Unknown field|Unknown argument|Unknown type|Unknown directive|Syn
 
 const { url, token } = await resolve();
 const sources = await files("apps/desktop/src");
+const texts = new Map();
+for (const source of sources) texts.set(source, await readFile(source, "utf8"));
+
+const constants = new Map();
+for (const text of texts.values()) {
+  for (const match of text.matchAll(CONSTANT)) constants.set(match[1], match[2]);
+}
+
+function expand(document) {
+  let text = document;
+  for (let round = 0; round < 8; round += 1) {
+    const next = text.replace(/\$\{([A-Za-z_$][\w$]*)\}/g, (whole, name) =>
+      constants.has(name) ? constants.get(name) : whole,
+    );
+    if (next === text) break;
+    text = next;
+  }
+  return text;
+}
+
 const documents = new Map();
-for (const source of sources) {
-  const text = await readFile(source, "utf8");
+const unresolved = [];
+for (const [source, text] of texts) {
   for (const match of text.matchAll(DOCUMENT)) {
-    const document = match[1].replace(/\\n/g, "\n").trim();
-    if (document && !documents.has(document)) documents.set(document, source);
+    const document = expand(match[1].replace(/\\n/g, "\n")).trim();
+    if (!document) continue;
+    if (document.includes("${")) unresolved.push({ source, document });
+    if (!documents.has(document)) documents.set(document, source);
   }
 }
 
@@ -85,5 +110,9 @@ for (const [document, source] of documents) {
   }
 }
 
-console.log(`${documents.size} documents from ${sources.length} files, ${failed} with drift`);
-process.exit(failed === 0 ? 0 : 1);
+for (const { source, document } of unresolved) {
+  console.log(`? ${source}\n  unresolved interpolation, so it was not checked:\n  ${document.split("\n")[0].slice(0, 90)}`);
+}
+
+console.log(`${documents.size} documents from ${sources.length} files, ${failed} with drift, ${unresolved.length} unchecked`);
+process.exit(failed === 0 && unresolved.length === 0 ? 0 : 1);
