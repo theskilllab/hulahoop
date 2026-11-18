@@ -1072,7 +1072,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
       - run: nix develop --command just ci
       - if: failure()
         uses: actions/upload-artifact@v4
@@ -1081,7 +1089,7 @@ jobs:
           path: .hulahoop/junit.xml
 ```
 
-CI calls `nix develop` rather than `direnv exec`, since a hosted runner has no direnv and nothing to allow. `magic-nix-cache` keeps the store warm between runs, so a no-op CI pass re-evaluates flake metadata and reuses every derivation. Determinate Systems has narrowed `magic-nix-cache` for public repos, so `cachix/cachix-action` with a free public cache is the drop-in fallback: one action in, one action out, same workflow shape.
+CI calls `nix develop` rather than `direnv exec`, since a hosted runner has no direnv and nothing to allow. Two caches keep a no-op pass cheap: `nix-community/cache-nix-action` restores `/nix/store` through the Actions cache, keyed on `flake.lock`, and `Swatinem/rust-cache` restores `target/` for both Cargo workspaces. `DeterminateSystems/magic-nix-cache` was the obvious pick, but it now requires FlakeHub registration, so the community action stands in; `cachix/cachix-action` with a free public cache is the other drop-in.
 
 ### Release
 
@@ -1106,7 +1114,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-${{ runner.os }}-
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            apps/desktop/src-tauri -> target
       - run: nix develop --command just bundle ${{ matrix.target }}
       - run: codesign --verify --deep --strict target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
       - uses: actions/upload-artifact@v4

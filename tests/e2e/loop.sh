@@ -68,6 +68,14 @@ trap cleanup EXIT
 copy_fixture
 echo "repo prepared at $REPO"
 
+# CI runs this after `cargo test`, which builds test targets but not the binaries.
+for bin in hulahoop-server hulahoop-runner; do
+  if [[ ! -x "$ROOT/target/debug/$bin" ]]; then
+    echo "building $bin"
+    (cd "$ROOT" && cargo build --bin "$bin") || { echo "could not build $bin" >&2; exit 1; }
+  fi
+done
+
 HULAHOOP_DATA="$DATA" "$ROOT/target/debug/hulahoop-server" --data-dir "$DATA" >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 for _ in $(seq 1 100); do [[ -f "$CONN" ]] && break; sleep 0.1; done
