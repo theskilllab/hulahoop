@@ -997,7 +997,7 @@ The suite loop is not on this list: the Test Author, the freeze gate, and the ba
 - Create/edit issue.
 - Criteria editor: one line per criterion, numbered, and the `ac<position>` naming rule applied to test names.
 - `flake.nix`, `.envrc`, and `justfile` for the Hulahoop repo itself, using the contract names: `setup`, `test`, `fmt-check`, `lint`, `ci`.
-- `.github/workflows/ci.yml` running `nix develop --command just ci` on `ubuntu-latest` and `macos-15`.
+- `.github/workflows/ci.yml` running `nix develop --command just ci` on `ubuntu-latest` and `macos-latest` (macOS 26 on arm64 today).
 - Repo contract 26.11: `flake.nix` and `justfile` preflight, generated `.envrc`, `direnv exec` entry, JUnit parsing.
 - Suite freeze gate: base-revision red replay stored as a `replays` row, head-revision green replay at implementer completion, and the reviewer's `approved` verdict before an approval is accepted.
 - Pi Test Author, Pi Implementer, Claude Code Reviewer, with three role prompts and adapter preflight.
@@ -1067,7 +1067,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-15]
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -1100,7 +1100,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15      # aarch64-apple-darwin
+          - runner: macos-latest  # aarch64-apple-darwin
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.runner }}
     steps:

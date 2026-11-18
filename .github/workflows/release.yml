@@ -10,10 +10,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-15
+          - os: macos-latest
             target: aarch64-apple-darwin
           # Intel needs an x86_64 runner GitHub no longer offers by default; add a
-          # `macos-15-intel` (or a paid larger runner) leg here when it matters, and
+          # `macos-26-intel` (or a paid larger runner) leg here when it matters, and
           # keep the artifact name distinct.
     runs-on: ${{ matrix.os }}
     steps:
