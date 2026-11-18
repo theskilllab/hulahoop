@@ -1251,7 +1251,7 @@ difference between the spec and the code, and how to run it.
 | `crates/core` | The state machine, the repo contract, the JUnit and diff rules, the run spec. No I/O, no framework. |
 | `crates/server` | SQLite, the transition engine, the GraphQL API, and the internal API the runner talks to. The only writer of state and artifacts. |
 | `crates/runner` | One loop: claim work, create a jj workspace, run `just setup`, spawn the adapter in its own process group, stream events, post the completion, run replays and jobs. |
-| `crates/cli` | `hulahoop serve`, `hulahoop runner`, `hulahoop seed <repo>`, `hulahoop doctor`. |
+| `crates/cli` | `hulahoop up`, `hulahoop serve`, `hulahoop runner`, `hulahoop seed <repo>`, `hulahoop doctor`. |
 | `apps/desktop` | Tauri 2 + React: connect screen, board, issue detail with criteria and gates, approval dialog, settings, run log. Spawns a server and runner for local mode, and is a plain client of whatever host it is pointed at. |
 | `fixtures/repo` | A contract-compliant repository with `flake.nix`, `.envrc`, `justfile` and a `calc.py` the loop can extend. |
 | `tests/e2e/loop.sh` | The whole loop, driven over GraphQL, against a throwaway copy of the fixture. |
@@ -1266,6 +1266,7 @@ just lint               # clippy, warnings are errors
 just ci                 # what CI runs
 just dev                # server + runner + desktop against .hulahoop-dev
 just seed /path/to/repo # create a project, a repo, three agents, three role bindings
+hulahoop up             # server and runner on this host, one command (--listen, --port, --data-dir)
 tests/e2e/loop.sh       # the loop with the fake adapter, no model calls, no network
 HULAHOOP_E2E_ADAPTER=real tests/e2e/loop.sh   # the same loop with real agents
 ```
@@ -1288,14 +1289,25 @@ machine, and the runner runs the agents next to the server — so the machine wi
 `nix`, `direnv`, `jj`, and the agent CLIs is the machine that does the work. The laptop
 only needs the app.
 
+Two processes run there, because they do different jobs: the server owns the database,
+the state machine, and the artifacts, and the runner owns the checkouts, the agent
+processes, and the replays. One command starts both:
+
 ```sh
 # on the workstation that holds the repo and the toolchain
-hulahoop-server --listen 0.0.0.0 --port 5123 --print-connection
-#   {"listen":"0.0.0.0","port":5123,"token":"…","url":"http://127.0.0.1:5123",…}
+hulahoop up --listen 0.0.0.0 --port 5123
+#   server starting … listening port=5123
+#   server and runner are up server=http://127.0.0.1:5123
+#   runner watching for work server=http://127.0.0.1:5123
 
-hulahoop-runner --server http://workstation:5123 --token <token>
-#   runner watching for work server=http://workstation:5123
+hulahoop-server --print-connection   # the token, from another shell
+#   {"listen":"0.0.0.0","port":5123,"token":"…","url":"http://127.0.0.1:5123",…}
 ```
+
+`hulahoop up` starts the server, waits for its connection file, then starts the runner
+with `--server` and `--token`, and stops the other process when either exits. Run the two
+by hand when they live on different machines (`hulahoop serve` and `hulahoop runner
+--server http://host:5123 --token <token>`), which is what the internal API is for.
 
 Then paste `http://workstation:5123` and the token into the app's connect screen; the
 host is remembered per machine, and "use this machine" switches back to the bundled
