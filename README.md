@@ -1313,12 +1313,17 @@ Where the binaries come from:
 
 - **In the app.** `Hulahoop.app/Contents/MacOS/` already holds `hulahoop-server` and
   `hulahoop-runner`; the app starts them itself in local mode.
-- **A release asset.** Each release publishes `hulahoop-<target>.tar.gz` with the
-  server, the runner, and the `hulahoop` CLI — unpack it and run `./hulahoop up`, no
-  checkout needed.
+- **A release asset.** Each release publishes three tarballs with the server, the
+  runner, and the `hulahoop` CLI: `hulahoop-aarch64-apple-darwin.tar.gz`,
+  `hulahoop-x86_64-unknown-linux-gnu.tar.gz`, and
+  `hulahoop-aarch64-unknown-linux-gnu.tar.gz`. Unpack the one that matches the host and
+  run `./hulahoop up`; no checkout, no nix. The Linux builds come from plain `cargo`
+  on Ubuntu runners rather than the nix shell, because the nix linker records
+  `/nix/store` paths for glibc — the same trap the macOS bundle had. The glibc floor
+  is 2.35 on x86_64 (Ubuntu 22.04) and 2.39 on arm64 (the oldest hosted arm image).
+  The desktop app ships for Apple silicon only; a desktop build for Linux is M3.
 - **From source.** `nix develop --command cargo build --release -p hulahoop-server
-  -p hulahoop-runner -p hulahoop-cli` writes all three into `target/release/`, which is
-  the path that works on Linux, where the release leg does not build.
+  -p hulahoop-runner -p hulahoop-cli` writes all three into `target/release/`.
 
 Then paste `http://workstation:5123` and the token into the app's connect screen; the
 host is remembered per machine, and "use this machine" switches back to the bundled

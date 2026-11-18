@@ -4,18 +4,19 @@ on:
   push:
     tags: ["v*"]
 
+# Three artifacts come out of here.
+#
+#   Hulahoop_<version>_aarch64.dmg          the desktop app, Apple silicon only
+#   hulahoop-aarch64-apple-darwin.tar.gz    server + runner + cli, macOS arm64
+#   hulahoop-x86_64-unknown-linux-gnu.tar.gz
+#   hulahoop-aarch64-unknown-linux-gnu.tar.gz
+#
+# The desktop is a macOS product (Tauri + WKWebView); the host that runs the agents
+# is whatever machine has nix, direnv, jj, and the agent CLIs, so it gets binaries
+# for both Linux architectures and for macOS.
 jobs:
-  bundle:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-          # Intel needs an x86_64 runner GitHub no longer offers by default; add a
-          # `macos-26-intel` (or a paid larger runner) leg here when it matters, and
-          # keep the artifact name distinct.
-    runs-on: ${{ matrix.os }}
+  app:
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
@@ -31,16 +32,13 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 12.9.0
-      - name: bundle
-        run: nix develop --command just bundle ${{ matrix.target }}
-      # arm64 refuses to execute an unsigned binary at all, so an ad-hoc signature is
-      # mandatory. Verify the executable (what the kernel checks on launch) and assert
-      # the signature really is ad-hoc: `--verify --deep` on the whole bundle reports
-      # "code has no resources but signature indicates they must be present" for an
-      # ad-hoc signed .app, which is a codesign quirk, not a bundling defect.
+      - name: bundle the app
+        run: nix develop --command just bundle aarch64-apple-darwin
+      - name: pack the server, the runner, and the cli
+        run: nix develop --command just headless aarch64-apple-darwin
       - name: verify the app needs nothing but macOS
         run: |
-          APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
+          APP=apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Hulahoop.app
           # The bundle is built inside the nix shell, so a leaked /nix/store path
           # means the app dies at launch on a machine without nix (dyld: Library
           # not loaded). Refuse to publish one.
@@ -52,7 +50,7 @@ jobs:
           ! otool -l "$APP"/Contents/MacOS/hulahoop-desktop | grep -A2 LC_RPATH | grep -q "/nix/store/"
       - name: verify signature
         run: |
-          APP=apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Hulahoop.app
+          APP=apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Hulahoop.app
           # Every executable in Contents/MacOS must be signed: on arm64 the kernel
           # refuses to launch an unsigned binary, and that includes the two sidecars.
           for bin in "$APP"/Contents/MacOS/*; do
@@ -61,23 +59,58 @@ jobs:
           done
           codesign -dvv "$APP" 2>&1 | tee /tmp/codesign.txt
           grep -q "Signature=adhoc" /tmp/codesign.txt
-      # The host that runs the agents needs the same binaries without an .app
-      # around them, so it does not need a checkout to get started.
-      - name: pack the headless binaries
-        run: |
-          mkdir -p dist
-          tar -czf "dist/hulahoop-${{ matrix.target }}.tar.gz" \
-            -C "target/${{ matrix.target }}/release" hulahoop-server hulahoop-runner hulahoop
-          tar -tzf "dist/hulahoop-${{ matrix.target }}.tar.gz"
       - uses: actions/upload-artifact@v4
         with:
-          name: bundle-${{ matrix.target }}
+          name: darwin-aarch64
           path: |
-            apps/desktop/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            apps/desktop/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
             dist/*.tar.gz
 
+  headless:
+    # Deliberately built with the runner's own toolchain, not the nix shell: the
+    # binaries have to run on a machine without nix, and the nix stdenv's linker
+    # records /nix/store paths for glibc. Ubuntu 22.04 for x86_64 keeps the glibc
+    # floor at 2.35; arm64 has no older hosted image, so it needs 2.39.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+      - name: pack the server, the runner, and the cli
+        run: bash scripts/headless.sh ${{ matrix.target }}
+      - name: the binaries run without nix
+        run: |
+          mkdir -p /tmp/pack
+          tar -xzf "dist/hulahoop-${{ matrix.target }}.tar.gz" -C /tmp/pack
+          /tmp/pack/hulahoop help
+          data=$(mktemp -d)
+          /tmp/pack/hulahoop-server --data-dir "$data" --port 5199 &
+          server=$!
+          for _ in $(seq 1 50); do curl -sf http://127.0.0.1:5199/health && break; sleep 0.2; done
+          kill "$server"
+          ! ldd /tmp/pack/hulahoop-server | grep -q '/nix/store/'
+          ! ldd /tmp/pack/hulahoop-runner | grep -q '/nix/store/'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+
   publish:
-    needs: bundle
+    needs: [app, headless]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -90,12 +123,16 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          # upload-artifact keeps the paths it was given, and with two of them the
-          # least common ancestor is the repository root, so the files land deep.
+          # upload-artifact keeps the paths it was given, so collect what the jobs
+          # produced into one flat directory before publishing.
           mkdir -p release
           find artifacts -name '*.dmg' -exec cp {} release/ \;
           find artifacts -name '*.tar.gz' -exec cp {} release/ \;
           ls -l release
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" \
-            --notes "Requires macOS 14 (Sonoma) or newer on Apple silicon; the build is unsigned, so right-click the app and choose Open. The hulahoop-<target>.tar.gz asset holds hulahoop-server, hulahoop-runner and the hulahoop CLI: unpack it on the machine with the repos and the toolchain, then run hulahoop up --listen 0.0.0.0 --port 5123 there." \
+            --notes "Hulahoop $TAG.
+
+          **The desktop app** (\`Hulahoop_<version>_aarch64.dmg\`) needs macOS 14 on Apple silicon. The build is unsigned: right-click the app and choose Open.
+
+          **The host that runs the agents** takes one of the \`hulahoop-*.tar.gz\` assets — \`hulahoop-server\`, \`hulahoop-runner\`, and the \`hulahoop\` CLI. Pick the triple that matches it, unpack it there, and run \`./hulahoop up --listen 0.0.0.0 --port 5123\`. That machine needs nix, direnv, jj, and the agent CLIs; the Mac only needs the app." \
             release/*

@@ -51,6 +51,10 @@ seed path:
 bundle target:
     ./scripts/bundle.sh {{target}}
 
+# Pack hulahoop-server, hulahoop-runner, and the CLI. No argument means this host.
+headless target="":
+    ./scripts/headless.sh {{target}}
+
 # Redraw the app icon (PNG, icns, ico) from scripts/make-icons.py.
 icons:
     python3 scripts/make-icons.py
