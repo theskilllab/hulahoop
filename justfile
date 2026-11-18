@@ -50,3 +50,7 @@ seed path:
 # Build the unsigned macOS bundle for a Rust target triple.
 bundle target:
     ./scripts/bundle.sh {{target}}
+
+# Redraw the app icon (PNG, icns, ico) from scripts/make-icons.py.
+icons:
+    python3 scripts/make-icons.py
