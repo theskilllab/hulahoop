@@ -55,8 +55,17 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
     let workspace_id = database.seed_local().await?;
     tracing::info!(%workspace_id, data_dir = %data_dir.display(), "server starting");
 
+    // The token lives with the data, so restarting the server — a rebuild, a crash, a
+    // laptop that woke up — does not sign every client out of its own workspace.
     let engine = Arc::new(engine::Engine::new(database));
-    let token = random_token();
+    let token = match stored_token(&engine).await? {
+        Some(token) => token,
+        None => {
+            let token = random_token();
+            remember_token(&engine, &token).await?;
+            token
+        }
+    };
 
     let api_state = Arc::new(api::ApiState {
         engine: engine.clone(),
@@ -186,6 +195,23 @@ fn dirs_data_dir() -> Option<std::path::PathBuf> {
                     .map(|home| std::path::PathBuf::from(home).join(".local/share"))
             })
     }
+}
+
+async fn stored_token(engine: &engine::Engine) -> anyhow::Result<Option<String>> {
+    let stored: Option<(String,)> = sqlx::query_as("select value from meta where key = 'token'")
+        .fetch_optional(&engine.db.pool)
+        .await?;
+    Ok(stored
+        .map(|(value,)| value)
+        .filter(|value| !value.is_empty()))
+}
+
+async fn remember_token(engine: &engine::Engine, token: &str) -> anyhow::Result<()> {
+    sqlx::query("insert into meta (key, value) values ('token', ?) on conflict(key) do update set value = excluded.value")
+        .bind(token)
+        .execute(&engine.db.pool)
+        .await?;
+    Ok(())
 }
 
 fn random_token() -> String {

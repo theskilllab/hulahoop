@@ -244,8 +244,12 @@ impl Executor {
                     // What the Test Author wrote, relative to the base it branched
                     // from. These files are laid on top of the untouched base, so a
                     // green suite there would mean the tests prove nothing.
-                    let base = spec["base_revision"]
+                    // Where the candidate was authored, not where the repo stands now:
+                    // a candidate branched before later commits landed must still lay
+                    // down only its own files.
+                    let base = spec["candidate_base_revision"]
                         .as_str()
+                        .or_else(|| spec["base_revision"].as_str())
                         .filter(|value| !value.is_empty())
                         .map(str::to_string)
                         .unwrap_or_else(|| revision.clone());

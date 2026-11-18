@@ -545,6 +545,16 @@ async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<V
         None => None,
     };
 
+    // The candidate was authored on the base of *its own* run, and the paths to lay
+    // back down are the difference from there. Diffing against the repo's current base
+    // would turn every commit landed since then into a "change" and lay the old files
+    // back over the new ones.
+    let candidate_bookmark = candidate
+        .as_ref()
+        .and_then(|c| c.candidate_bookmark.clone());
+    let candidate_revision = candidate.as_ref().and_then(|c| c.head_revision.clone());
+    let candidate_base_revision = candidate.as_ref().and_then(|c| c.base_revision.clone());
+
     Ok(json!({
         "replay_id": replay.id,
         "issue_id": issue.id,
@@ -562,8 +572,9 @@ async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<V
         "data_dir": engine.db.data_dir,
         "caller_role": "replay",
         "head_bookmark": head_bookmark,
-        "candidate_bookmark": candidate.clone().and_then(|c| c.candidate_bookmark),
-        "candidate_revision": candidate.and_then(|c| c.head_revision),
+        "candidate_bookmark": candidate_bookmark,
+        "candidate_revision": candidate_revision,
+        "candidate_base_revision": candidate_base_revision,
         "landing_bookmark": approval.clone().and_then(|a| a.landing_bookmark),
         "approval_head_revision": approval.map(|a| a.head_revision),
         "timeout_minutes": hulahoop_core::REPLAY_WALL_CLOCK_MINUTES,
