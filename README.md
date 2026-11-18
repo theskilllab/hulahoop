@@ -49,7 +49,8 @@ The first version exists to answer one question:
 - A per-run sandbox: a scratch `HOME` and a clean environment in v0, extended to a read-only host outside the checkout in M1.
 - Local notifications when an issue needs a human: `in_review`, `blocked`, and `merging`.
 - SQLite database.
-- Local server on `127.0.0.1`.
+- One server that owns the work, on `127.0.0.1` by default and on any address with `--listen`. The desktop is a client: it points at a server, and the server's host runs the agents.
+
 - Desktop app with:
   - project picker
   - issue list
@@ -70,7 +71,7 @@ The first version exists to answer one question:
 ### Out of scope
 
 - Multi-user, teams, invitations, RBAC.
-- Cloud hosting, remote runners, public ingress.
+- Cloud hosting, public ingress, hosted multi-tenant runners. Remote mode is local-first: you run the server yourself (see §18).
 - GitHub/GitLab PR creation.
 - QA agent; the Test Author ships in v0, QA in M2.
 - Mobile, chat integrations, desktop voice input.
@@ -166,8 +167,8 @@ In v0 the merge is a human action with a Hulahoop-verified pre-merge replay. Hul
 - Owns the state machine, database, approvals, run history, the log files, and the artifact directories.
 - The only process that writes SQLite. The runner reports facts over HTTP, so there is one writer and no cross-process lock contest.
 - Owns `repo_locks`. The runner asks for and releases a lock over the internal API, so every lock has one owner and one expiration.
-- Binds `127.0.0.1` on a random port.
-- Writes a connection file with `{ port, token }` for the desktop app.
+- Binds `127.0.0.1` on a random port by default; `--listen <address>` opens it deliberately, which is what remote mode uses.
+- Writes a connection file with `{ port, token, listen, url }` for the desktop app; `--print-connection` prints the same JSON for a remote operator.
 - Exposes GraphQL for the desktop.
 - Exposes a small internal API for the runner.
 
@@ -187,7 +188,8 @@ In v0 the merge is a human action with a Hulahoop-verified pre-merge replay. Hul
 - Vite for the renderer; Tauri CLI for packaging.
 - `urql` + `graphql-codegen`; subscriptions over `graphql-ws`.
 - Spawns sidecar `hulahoop-server` and `hulahoop-runner` binaries in local mode.
-- Opens the UI against the local server.
+- Opens the UI against the local server, or against any server whose address and token you paste into the connect screen (saved per machine).
+- Polls `run_events` while a run is live, and re-reads issues every 2.5 s.
 
 **`hulahoop` CLI**
 - Bootstrap and debugging helper.
@@ -199,7 +201,7 @@ In v0 the merge is a human action with a Hulahoop-verified pre-merge replay. Hul
 - Direct access to local repos, jj, Git credentials, and agent CLIs.
 - No public ingress, TLS, or account system.
 - One machine to debug.
-- The server and runner stay headless, so a remote mode can reuse them later.
+- The server and runner stay headless, so the same binaries serve a laptop and a workstation: the desktop points at either one.
 
 The desktop app is a client. It never owns the state machine.
 
@@ -1031,7 +1033,7 @@ The suite loop is not on this list: the Test Author, the freeze gate, and the ba
 - Review gate before QA.
 - Evidence checklist.
 
-### M3 — Remote mode (later)
+### M3 — Hosted mode (later)
 
 - Postgres.
 - Auth and users.
@@ -1248,7 +1250,7 @@ difference between the spec and the code, and how to run it.
 | `crates/server` | SQLite, the transition engine, the GraphQL API, and the internal API the runner talks to. The only writer of state and artifacts. |
 | `crates/runner` | One loop: claim work, create a jj workspace, run `just setup`, spawn the adapter in its own process group, stream events, post the completion, run replays and jobs. |
 | `crates/cli` | `hulahoop serve`, `hulahoop runner`, `hulahoop seed <repo>`, `hulahoop doctor`. |
-| `apps/desktop` | Tauri 2 + React: board, issue detail with criteria and gates, approval dialog, settings, run log. Owns the server and runner processes. |
+| `apps/desktop` | Tauri 2 + React: connect screen, board, issue detail with criteria and gates, approval dialog, settings, run log. Spawns a server and runner for local mode, and is a plain client of whatever host it is pointed at. |
 | `fixtures/repo` | A contract-compliant repository with `flake.nix`, `.envrc`, `justfile` and a `calc.py` the loop can extend. |
 | `tests/e2e/loop.sh` | The whole loop, driven over GraphQL, against a throwaway copy of the fixture. |
 
@@ -1276,6 +1278,38 @@ standard library with a 14.0 deployment target, so linking against 12.0 prints
 `was built for newer macOS version (14.0) than being linked (12.0)` and would promise
 APIs macOS 12 does not have; `tauri.conf.json` pins `minimumSystemVersion` to the same
 value rather than shipping that mismatch.
+
+### Running the loop on another machine
+
+The desktop is a client. The server owns the database, the artifacts, and the state
+machine, and the runner runs the agents next to the server — so the machine with
+`nix`, `direnv`, `jj`, and the agent CLIs is the machine that does the work. The laptop
+only needs the app.
+
+```sh
+# on the workstation that holds the repo and the toolchain
+hulahoop-server --listen 0.0.0.0 --port 5123 --print-connection
+#   {"listen":"0.0.0.0","port":5123,"token":"…","url":"http://127.0.0.1:5123",…}
+
+hulahoop-runner --server http://workstation:5123 --token <token>
+#   runner watching for work server=http://workstation:5123
+```
+
+Then paste `http://workstation:5123` and the token into the app's connect screen; the
+host is remembered per machine, and "use this machine" switches back to the bundled
+local server. The runner takes `--server`/`--token`, or `HULAHOOP_SERVER` and
+`HULAHOOP_TOKEN`; without them it reads the `connection.json` a local server wrote,
+which is what `just dev` relies on. `tests/e2e/loop.sh` starts its runner the remote
+way for exactly that reason, so the path is exercised on every CI run.
+
+Two limits worth knowing. The token is one bearer secret over plain HTTP: keep the port
+on a private network (Tailscale) or behind `ssh -L 5123:localhost:5123 workstation`.
+And the repo path the server stores is a path on the server's host, so the repo has to
+live there; two machines sharing one checkout is not a supported topology yet.
+
+`--listen` defaults to `127.0.0.1`, and `connection.json` advertises loopback even when
+the server listens on `0.0.0.0`, so a remote client uses the address the operator typed
+in. Opening a port is a decision, never a default.
 
 ### Where the implementation differs from the spec
 
@@ -1308,6 +1342,10 @@ above when the loop has run for a while.
    boundary; the login stays usable.
 8. **`runs.agent.jsonl` is written by the runner** while it streams, because the
    review screen needs the transcript and the server only sees events.
+9. **The desktop connects to a URL, not a port.** The first build wired the app to
+   `http://127.0.0.1:<port>`; the server now advertises a `url`, the shell passes it
+   through, and a saved host in `localStorage` wins over the bundled one. Without that
+   the app could only ever be a single-machine tool.
 
 ### What is not built yet
 
@@ -1317,6 +1355,9 @@ above when the loop has run for a while.
   allowlist plus a scratch `HOME`; `~/.ssh`, `~/.aws` and the rest are never passed.
 - Linux desktop builds and Windows. The flake builds and tests on Linux, the bundle
   path targets macOS.
+- Hosted mode: one server per person, one bearer token, no users, roles, or TLS.
+  Remote mode is "point the desktop at your own workstation", which is what §18 above
+  documents; the hosted variant with Postgres and per-user auth is M3.
 - The macOS artifact: `.dmg` bundling runs in GitHub Actions
   (`.github/workflows/release.yml`) on a `v*` tag, unsigned, with the quarantine
   instructions from [13. Open source and delivery](#13-open-source-and-delivery).

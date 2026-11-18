@@ -13,9 +13,12 @@ export type IssueStatus =
 export type Role = "test_author" | "implementer" | "reviewer";
 
 export interface Connection {
-  port: number;
+  /** The server's GraphQL endpoint root, like `http://127.0.0.1:51234`. */
+  url: string;
   token: string;
   dataDir: string;
+  /** What to show in the rail: a host name, or `local`. */
+  label: string;
 }
 
 export interface Criterion {
@@ -129,9 +132,64 @@ export interface Workspace {
 
 let connection: Connection | null = null;
 
-/** The Tauri shell owns the server, so the port and token come from it. */
+const REMOTE_KEY = "hulahoop.remote";
+
+interface SavedRemote {
+  url: string;
+  token: string;
+}
+
+/** A server saved from the connect screen; work runs wherever it listens. */
+export function savedRemote(): SavedRemote | null {
+  const raw = localStorage.getItem(REMOTE_KEY);
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw) as SavedRemote;
+    return parsed.url && parsed.token ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+export function saveRemote(url: string, token: string) {
+  const trimmed = url.trim().replace(/\/+$/, "");
+  localStorage.setItem(REMOTE_KEY, JSON.stringify({ url: trimmed, token: token.trim() }));
+  connection = null;
+}
+
+/** Forget the saved host and fall back to the server this machine runs. */
+export function useLocalServer() {
+  localStorage.removeItem(REMOTE_KEY);
+  connection = null;
+}
+
+function labelFor(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Where the work runs. A saved host wins, because that is the one the person
+ * chose; otherwise the Tauri shell's own server answers, and a browser dev build
+ * falls back to the port and token pasted from a connection file.
+ */
 export async function connect(): Promise<Connection> {
   if (connection) return connection;
+
+  const saved = savedRemote();
+  if (saved) {
+    connection = {
+      url: saved.url,
+      token: saved.token,
+      dataDir: "",
+      label: labelFor(saved.url),
+    };
+    return connection;
+  }
+
   const bridge = (window as unknown as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   if (bridge) {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -139,30 +197,50 @@ export async function connect(): Promise<Connection> {
     connection = info;
     return info;
   }
+
+  const url = localStorage.getItem("hulahoop.url") ?? "";
   const port = Number(localStorage.getItem("hulahoop.port") ?? 0);
   const token = localStorage.getItem("hulahoop.token") ?? "";
-  if (!port || !token) {
+  if ((!url && !port) || !token) {
     throw new Error(
-      "No running server. Start the app (or `just dev`) and reload: the browser build reads the port and token from the connection file.",
+      "No server yet. Start one on any machine and connect to it: `hulahoop-server --listen 0.0.0.0 --port 5123` prints the token with --print-connection.",
     );
   }
-  connection = { port, token, dataDir: "" };
+  const base = url || `http://127.0.0.1:${port}`;
+  connection = { url: base, token, dataDir: "", label: labelFor(base) };
   return connection;
 }
 
-export function rememberConnection(port: number, token: string) {
-  localStorage.setItem("hulahoop.port", String(port));
+export function rememberConnection(url: string, token: string) {
+  localStorage.setItem("hulahoop.url", url.replace(/\/+$/, ""));
+  localStorage.setItem("hulahoop.port", String(Number(new URL(url).port || 0)));
   localStorage.setItem("hulahoop.token", token);
+}
+
+/** One cheap query, so a wrong host or token fails at the connect screen. */
+export async function probe(url: string, token: string): Promise<void> {
+  const response = await fetch(`${url.replace(/\/+$/, "")}/graphql`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ query: "{ workspaces { id name } }" }),
+  });
+  if (!response.ok) {
+    throw new Error(`the server answered ${response.status}`);
+  }
+  const payload = await response.json();
+  if (payload.errors?.length) {
+    throw new Error(payload.errors.map((e: { message: string }) => e.message).join("\n"));
+  }
 }
 
 export class GqlError extends Error {}
 
 export async function gql<T>(query: string, variables?: Record<string, unknown>): Promise<T> {
-  const { port, token } = await connect();
+  const { url, token } = await connect();
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/graphql`, {
+    const response = await fetch(`${url}/graphql`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
       body: JSON.stringify({ query, variables }),

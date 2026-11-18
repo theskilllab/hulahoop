@@ -25,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(default_data_dir);
     let mut port: u16 = 0;
+    let mut listen: std::net::IpAddr = std::net::IpAddr::from([127, 0, 0, 1]);
     let mut print_connection = false;
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,6 +44,14 @@ async fn main() -> anyhow::Result<()> {
                     .context("--port needs a number")?
                     .parse()
                     .context("--port must be a number")?;
+            }
+            "--listen" => {
+                index += 1;
+                listen = args
+                    .get(index)
+                    .context("--listen needs an address")?
+                    .parse()
+                    .context("--listen takes an IP address; 127.0.0.1 keeps it loopback-only")?;
             }
             "--print-connection" => print_connection = true,
             other => anyhow::bail!("unknown argument {other}"),
@@ -74,14 +83,16 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::cors::CorsLayer::very_permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
-    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], port)))
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from((listen, port)))
         .await
         .context("binding the server port")?;
     let address = listener.local_addr()?;
 
     let connection_path = hulahoop_core::contract::connection_file(&data_dir);
     let connection = serde_json::json!({
+        "listen": listen.to_string(),
         "port": address.port(),
+        "url": format!("http://{}:{}", advertise_host(listen), address.port()),
         "token": token,
         "pid": std::process::id(),
         "data_dir": data_dir.display().to_string(),
@@ -118,6 +129,17 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("serving HTTP")?;
     Ok(())
+}
+
+/// The host a client should dial: loopback when the server listens everywhere,
+/// otherwise the address it was told to bind. A runner on the same machine reads
+/// this file, and the desktop only uses the same value for its local mode.
+fn advertise_host(listen: std::net::IpAddr) -> std::net::IpAddr {
+    if listen.is_unspecified() {
+        std::net::IpAddr::from([127, 0, 0, 1])
+    } else {
+        listen
+    }
 }
 
 fn default_data_dir() -> std::path::PathBuf {

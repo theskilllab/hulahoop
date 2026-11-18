@@ -15,9 +15,10 @@ struct Shell {
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Connection {
-    port: u16,
+    url: String,
     token: String,
     data_dir: String,
+    label: String,
 }
 
 #[tauri::command]
@@ -28,10 +29,15 @@ fn connection() -> Result<Connection, String> {
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|error| format!("cannot parse connection.json: {error}"))?;
+    let port = value["port"].as_u64().unwrap_or_default();
     Ok(Connection {
-        port: value["port"].as_u64().unwrap_or_default() as u16,
+        url: value["url"]
+            .as_str()
+            .map(|url| url.to_string())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{port}")),
         token: value["token"].as_str().unwrap_or_default().to_string(),
         data_dir: value["data_dir"].as_str().unwrap_or_default().to_string(),
+        label: "this machine".to_string(),
     })
 }
 

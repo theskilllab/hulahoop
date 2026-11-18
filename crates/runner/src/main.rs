@@ -9,6 +9,56 @@ mod vcs;
 use anyhow::Context;
 use std::time::Duration;
 
+/// Where the work comes from: `--server`/`--token` (or `HULAHOOP_SERVER`,
+/// `HULAHOOP_TOKEN`) point the runner at a host that already runs the server;
+/// without them it reads the `connection.json` a local server wrote.
+fn resolve_connection(
+    mut data_dir: std::path::PathBuf,
+) -> anyhow::Result<(client::Connection, std::path::PathBuf)> {
+    let mut server = std::env::var("HULAHOOP_SERVER").ok();
+    let mut token = std::env::var("HULAHOOP_TOKEN").ok();
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--server" => {
+                index += 1;
+                server = Some(
+                    args.get(index)
+                        .context("--server needs a URL, like http://host:51234")?
+                        .clone(),
+                );
+            }
+            "--token" => {
+                index += 1;
+                token = Some(
+                    args.get(index)
+                        .context("--token needs the server's token")?
+                        .clone(),
+                );
+            }
+            "--data-dir" => {
+                index += 1;
+                data_dir =
+                    std::path::PathBuf::from(args.get(index).context("--data-dir needs a path")?);
+            }
+            other => anyhow::bail!("unknown argument {other}"),
+        }
+        index += 1;
+    }
+
+    let connection = match (server, token) {
+        (Some(server), Some(token)) => {
+            client::Connection::remote(&server, &token, data_dir.clone())
+        }
+        (Some(_), None) => anyhow::bail!("--server needs --token (or HULAHOOP_TOKEN)"),
+        _ => client::Connection::load(&data_dir)?,
+    };
+    let data_dir = connection.data_dir.clone();
+    Ok((connection, data_dir))
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -39,16 +89,16 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&direnv_data)?;
     std::env::set_var("XDG_DATA_HOME", &direnv_data);
 
-    let connection = client::Connection::load(&data_dir)?;
-    let data_dir = connection.data_dir.clone();
+    let (connection, data_dir) = resolve_connection(data_dir)?;
     let client = client::Client::new(&connection)?;
-    let executor = exec::Executor::new(client, data_dir);
+    let executor = exec::Executor::new(client, data_dir.clone());
     let runner_id = std::env::var("HULAHOOP_RUNNER_ID")
         .unwrap_or_else(|_| format!("runner-{}", std::process::id()));
 
     tracing::info!(
         runner_id,
-        port = connection.port,
+        server = %connection.base,
+        data_dir = %data_dir.display(),
         "runner watching for work"
     );
     let mut idle = Duration::from_millis(250);

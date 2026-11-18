@@ -12,12 +12,23 @@ pub struct Client {
 
 #[derive(Clone)]
 pub struct Connection {
-    pub port: u16,
+    /// Where the server listens, scheme included: `http://10.0.0.4:51234`.
+    pub base: String,
     pub token: String,
     pub data_dir: PathBuf,
 }
 
 impl Connection {
+    /// A runner that does not share a directory with the server: the host runs
+    /// the server, so the runner needs an address and a token, nothing else.
+    pub fn remote(server: &str, token: &str, data_dir: PathBuf) -> Self {
+        Connection {
+            base: server.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            data_dir,
+        }
+    }
+
     pub fn load(data_dir: &std::path::Path) -> Result<Self> {
         let path = hulahoop_core::contract::connection_file(data_dir);
         let bytes = std::fs::read(&path).with_context(|| {
@@ -27,10 +38,15 @@ impl Connection {
             )
         })?;
         let value: Value = serde_json::from_slice(&bytes)?;
+        let port = value["port"]
+            .as_u64()
+            .context("connection.json has no port")? as u16;
+        let base = value["url"]
+            .as_str()
+            .map(|url| url.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| format!("http://127.0.0.1:{port}"));
         Ok(Connection {
-            port: value["port"]
-                .as_u64()
-                .context("connection.json has no port")? as u16,
+            base,
             token: value["token"]
                 .as_str()
                 .context("connection.json has no token")?
@@ -46,7 +62,7 @@ impl Connection {
 impl Client {
     pub fn new(connection: &Connection) -> Result<Self> {
         Ok(Client {
-            base: format!("http://127.0.0.1:{}", connection.port),
+            base: connection.base.clone(),
             token: connection.token.clone(),
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
