@@ -11,6 +11,38 @@ use hulahoop_core::junit;
 use hulahoop_core::{AgentRole, IssueEvent, IssueStatus, ReplayKind, RunFlag, RunStatus};
 use uuid::Uuid;
 
+/// Future-tense intent: true of a product goal, and true of nothing a test can read.
+const GOAL_PHRASES: &[&str] = &[
+    "be able to",
+    "as a user",
+    "as an user",
+    "i want",
+    "should work",
+    "works well",
+];
+
+/// Behaviour a test can assert. Verb list first because that is how people write it,
+/// then the shapes that carry a readable value: a number, a code span, an arrow, a path.
+const OBSERVABLE_VERBS: &[&str] = &[
+    "returns", "shows", "rejects", "accepts", "creates", "stores", "writes", "reads", "equals",
+    "is ", "contains", "appears", "lists", "requires", "refuses", "fails", "succeeds", "displays",
+    "records", "sets ", "sends", "responds", "keeps ",
+];
+
+fn names_observable(trimmed: &str, lowered: &str) -> bool {
+    trimmed.chars().any(|c| c.is_ascii_digit())
+        || OBSERVABLE_VERBS.iter().any(|verb| lowered.contains(verb))
+        || trimmed.contains('`')
+        || trimmed.contains("->")
+        || trimmed.contains('\u{2192}')
+        || trimmed.split_whitespace().any(|word| {
+            word.starts_with('/') && word.len() > 2
+                || word.contains("()")
+                || word.contains("==")
+                || word.contains(": ")
+        })
+}
+
 pub struct Engine {
     pub db: Db,
 }
@@ -124,13 +156,15 @@ impl Engine {
                     index + 1
                 );
             }
-            if !trimmed.chars().any(|c| c.is_ascii_digit())
-                && !trimmed.contains("returns")
-                && !trimmed.contains("shows")
-                && !trimmed.contains("rejects")
-            {
+            if GOAL_PHRASES.iter().any(|goal| lowered.contains(goal)) {
                 bail!(
-                    "criterion {} states a goal rather than an observable result: {trimmed:?}. Phrase it as `<behavior> when <condition>`, so a test can assert it.",
+                    "criterion {} states a goal rather than an observable result: {trimmed:?}. Name what a test can read back, for example `the connections query lists github after the app is created`.",
+                    index + 1
+                );
+            }
+            if !names_observable(trimmed, &lowered) {
+                bail!(
+                    "criterion {} names a goal without an observable result: {trimmed:?}. A test has to be able to assert something concrete — a value, a stored row, a response, a rendered list. Write it as `<behavior> when <condition>`, such as `the commit author is hulahoop-test-author when the implementer commits`.",
                     index + 1
                 );
             }
@@ -1535,4 +1569,51 @@ pub fn prompt_hash() -> String {
         all.push_str(prompt_for(role));
     }
     sha256_hex(all.as_bytes())
+}
+
+#[cfg(test)]
+mod criterion_tests {
+    use super::*;
+
+    fn verdict(line: &str) -> String {
+        Engine::validate_criteria(&[line.to_string()])
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_goal_is_refused_with_a_sentence_that_teaches() {
+        assert!(verdict("As a user, I will be able to create a Github app")
+            .contains("states a goal rather than an observable result"));
+        assert!(
+            verdict("The app will use that information to do the commits")
+                .contains("names a goal without an observable result")
+        );
+    }
+
+    #[test]
+    fn behaviour_plus_condition_is_accepted() {
+        assert!(
+            verdict("the commit author is hulahoop-test-author when the implementer commits")
+                .is_empty()
+        );
+        assert!(verdict("GET /connections lists github after the app is created").is_empty());
+        assert!(verdict("`connections` contains one row after the app is created").is_empty());
+        assert!(verdict("the token is stored encrypted when the app is created").is_empty());
+    }
+
+    #[test]
+    fn the_four_real_criteria_are_each_explained() {
+        for line in [
+            "As a user, I will be able to create a Github app and then the app will store the information in the server / database / vault.",
+            "The app will use that information to do the commits on.",
+            "Each agents who commits will have their own names in the commit username so that I can identify who commits what easily.",
+            "In the UI, I will be able to see a list of my connections (which are available — e.g GitHub) and which ones I am already connected to.",
+        ] {
+            let said = verdict(line);
+            assert!(!said.is_empty(), "should be refused: {line}");
+            assert!(said.contains("criterion 1"), "names the line: {said}");
+        }
+    }
 }
