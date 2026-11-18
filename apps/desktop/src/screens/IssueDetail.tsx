@@ -105,6 +105,11 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
                 Freeze suite
               </button>
             )}
+            {(!current || (current.status !== "running" && current.status !== "queued" && current.status !== "succeeded")) && (
+              <button className="ghost" disabled={busy !== null} onClick={() => startRun("test_author")}>
+                Write the tests again
+              </button>
+            )}
           </>
         )}
         {issue.status === "tests_ready" && (
