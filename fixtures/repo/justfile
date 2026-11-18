@@ -1,0 +1,25 @@
+# Hulahoop repo contract.
+#
+# `just test` must always run the whole suite. It is the only source of truth
+# for red/green, and per-test selection stays out of the contract.
+# `just setup` is the only recipe allowed to need the network.
+# The suite writes a JUnit report to `.hulahoop/junit.xml`; the runner copies it
+# and the gate parses it.
+
+setup:
+    @echo "fixture: nothing to provision"
+
+test:
+    #!/usr/bin/env sh
+    set -eu
+    mkdir -p .hulahoop
+    rm -f .hulahoop/junit.xml
+    python3 -m pytest -q --junitxml=.hulahoop/junit.xml tests
+
+fmt-check:
+    @echo "fixture: no formatter configured"
+
+lint:
+    @echo "fixture: no linter configured"
+
+ci: test

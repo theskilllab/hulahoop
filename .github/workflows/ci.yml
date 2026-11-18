@@ -1,0 +1,38 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/magic-nix-cache-action@main
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.29.1
+      - name: ci
+        run: nix develop --command just ci
+      # The loop itself: the fake adapter, the real state machine, a throwaway repo.
+      - name: end-to-end loop
+        run: nix develop --command bash tests/e2e/loop.sh
+      # The desktop shell is a separate Cargo build; compiling it here means a shell
+      # bug fails on every push instead of on the next release tag.
+      - name: desktop shell compiles
+        if: matrix.os == 'ubuntu-latest'
+        run: nix develop --command just shell-check
+      - name: junit
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-${{ matrix.os }}
+          path: .hulahoop/junit.xml
+          if-no-files-found: ignore

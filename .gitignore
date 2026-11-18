@@ -1,0 +1,9 @@
+/target
+.hulahoop
+.hulahoop-dev
+apps/desktop/dist
+apps/desktop/node_modules
+apps/desktop/src-tauri/target
+apps/desktop/src-tauri/binaries/hulahoop-*
+.DS_Store
+.direnv
