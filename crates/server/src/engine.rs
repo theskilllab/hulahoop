@@ -1605,10 +1605,7 @@ mod criterion_tests {
     fn a_goal_is_refused_by_name() {
         assert!(verdict("As a user, I will be able to create a Github app")
             .contains("states a goal rather than an observable result"));
-        assert!(
-            verdict("In the UI, I will be able to see a list of my connections").is_empty()
-                == false
-        );
+        assert!(!verdict("In the UI, I will be able to see a list of my connections").is_empty());
     }
 
     #[test]
