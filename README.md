@@ -1271,6 +1271,12 @@ Reviewer uses `pi` on a machine without a Claude Code login and `claude_code` on
 with it (`HULAHOOP_REVIEWER_ADAPTER=claude_code`); the two adapters are the same code
 path, only the argv differs.
 
+The app needs macOS 14 (Sonoma) or newer. The Rust toolchain in the flake builds its
+standard library with a 14.0 deployment target, so linking against 12.0 prints
+`was built for newer macOS version (14.0) than being linked (12.0)` and would promise
+APIs macOS 12 does not have; `tauri.conf.json` pins `minimumSystemVersion` to the same
+value rather than shipping that mismatch.
+
 ### Where the implementation differs from the spec
 
 The spec is the contract; these are the deliberate deviations, each because the code

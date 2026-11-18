@@ -68,4 +68,4 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Unsigned build: right-click the app, choose Open, then confirm. On Apple silicon, arm64 requires at least an ad-hoc signature, which this build carries." artifacts/**/*.dmg
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --notes "Requires macOS 14 (Sonoma) or newer on Apple silicon. Unsigned build: right-click the app, choose Open, then confirm — arm64 requires at least an ad-hoc signature, which this build carries." artifacts/**/*.dmg
