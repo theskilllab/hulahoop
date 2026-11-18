@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { gql, type Agent, type Project, type Repo } from "../api";
 
 const ROLES = ["test_author", "implementer", "reviewer"] as const;
+const ADAPTERS = ["pi", "claude_code", "fake"] as const;
 
 interface Binding {
   role: string;
@@ -49,6 +50,23 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.id]);
+
+  /** A new harness or model invalidates its probe, so ask for a fresh one. */
+  async function saveAgent(id: string, adapter: string, model: string) {
+    await action("agent", async () => {
+      await gql(`mutation ($id: UUID!, $adapter: String!, $model: String!) { updateAgent(id: $id, adapter: $adapter, model: $model) { id } }`, {
+        id,
+        adapter,
+        model,
+      });
+      if (repo) {
+        await gql(`mutation ($agentId: UUID!, $repoId: UUID!) { runPreflight(agentId: $agentId, repoId: $repoId) }`, {
+          agentId: id,
+          repoId: repo.id,
+        });
+      }
+    });
+  }
 
   async function action(label: string, work: () => Promise<unknown>) {
     setBusy(label);
@@ -118,9 +136,28 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
             <li key={agent.id}>
               <div>
                 <strong>{agent.name}</strong>
-                <p className="dim small">
-                  {agent.adapter} · {agent.model}
-                </p>
+                <div className="agent-edit">
+                  <select
+                    value={agent.adapter}
+                    disabled={busy !== null}
+                    onChange={(e) => void saveAgent(agent.id, e.target.value, agent.model)}
+                  >
+                    {ADAPTERS.map((adapter) => (
+                      <option key={adapter} value={adapter}>
+                        {adapter}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    defaultValue={agent.model}
+                    key={`${agent.id}-${agent.model}`}
+                    placeholder="model"
+                    onBlur={(e) => {
+                      const model = e.target.value.trim();
+                      if (model !== agent.model) void saveAgent(agent.id, agent.adapter, model);
+                    }}
+                  />
+                </div>
               </div>
               <div className="probe">
                 {probe ? (

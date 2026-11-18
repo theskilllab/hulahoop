@@ -378,6 +378,12 @@ impl Mutation {
                 .await?;
             }
         }
+        // A changed adapter or model makes the old probe meaningless: it answered a
+        // question about a command line that no longer exists.
+        sqlx::query("delete from agent_preflight where agent_id = ?")
+            .bind(id)
+            .execute(&engine.db.pool)
+            .await?;
         Ok(sqlx::query_as("select * from agents where id = ?")
             .bind(id)
             .fetch_one(&engine.db.pool)

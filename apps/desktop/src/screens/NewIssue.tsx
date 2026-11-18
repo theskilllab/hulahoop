@@ -1,20 +1,20 @@
 import { useState } from "react";
-import { gql, loadWorkspace } from "../api";
+import { gql } from "../api";
 
 interface Props {
   projectId: string;
-  hasRepo: boolean;
+  /** The repo the issue will be tested against; null when the project has none. */
+  repoId: string | null;
   onAddRepo: (path: string) => Promise<void>;
   onCreated: (id: string) => Promise<void> | void;
   onCancel: () => void;
 }
 
-export default function NewIssue({ projectId, hasRepo, onAddRepo, onCreated, onCancel }: Props) {
+export default function NewIssue({ projectId, repoId, onAddRepo, onCreated, onCancel }: Props) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [criteria, setCriteria] = useState("");
   const [repoPath, setRepoPath] = useState("");
-  const [repoId, setRepoId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -22,9 +22,9 @@ export default function NewIssue({ projectId, hasRepo, onAddRepo, onCreated, onC
     setBusy(true);
     setError(null);
     try {
+      // The parent reloads the workspace, so the repo arrives as a prop and this
+      // form turns into the issue form on the next render.
       await onAddRepo(repoPath.trim());
-      const loaded = await loadWorkspace();
-      setRepoId(loaded.project?.repos[0]?.id ?? null);
       setRepoPath("");
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
@@ -55,7 +55,7 @@ export default function NewIssue({ projectId, hasRepo, onAddRepo, onCreated, onC
     }
   }
 
-  if (!hasRepo || !repoId) {
+  if (!repoId) {
     return (
       <section className="detail narrow">
         <h1>Add a repository</h1>

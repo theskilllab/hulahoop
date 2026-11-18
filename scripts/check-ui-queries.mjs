@@ -17,7 +17,9 @@ import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-const DOCUMENT = /gql<[^>]*>\(\s*`([^`]*)`/g;
+// `gql<T>(` and the untyped `gql(` both carry documents; the second form was how
+// the settings screen escaped this check the first time.
+const DOCUMENT = /gql(?:<[^>]*>)?\(\s*`([^`]*)`/g;
 // Documents are assembled from constants (`${ISSUE_FIELDS}`), so the literals have to
 // be substituted before the text is valid GraphQL. Harvest first, then expand.
 const CONSTANT = /const\s+([A-Za-z_$][\w$]*)\s*=\s*`([^`]*)`/g;

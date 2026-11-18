@@ -761,3 +761,26 @@ button.link {
   text-decoration: underline;
   text-underline-offset: 2px;
 }
+
+/* Editing an agent in place: the harness and the model are a pair, so they sit on
+   one line under the name rather than behind a dialog. */
+.agent-edit {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.35rem;
+}
+
+.agent-edit select,
+.agent-edit input {
+  padding: 0.25rem 0.4rem;
+  font-size: 0.75rem;
+  background: var(--ink-2);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.agent-edit input {
+  width: 13rem;
+  font-family: var(--mono);
+}

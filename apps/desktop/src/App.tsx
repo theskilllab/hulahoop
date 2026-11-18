@@ -197,7 +197,7 @@ export default function App() {
         {view.name === "new" && project && (
           <NewIssue
             projectId={project.id}
-            hasRepo={Boolean(project.repos.length)}
+            repoId={project.repos[0]?.id ?? null}
             onAddRepo={createRepo}
             onCreated={async (id) => {
               await refresh();
