@@ -454,6 +454,14 @@ impl Engine {
             .ok_or_else(|| anyhow!("run {id} not found"))
     }
 
+    pub async fn replay(&self, id: Uuid) -> Result<Replay> {
+        sqlx::query_as::<_, Replay>("select * from replays where id = ?")
+            .bind(id)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .ok_or_else(|| anyhow!("replay {id} not found"))
+    }
+
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<Run> {
         let run = self.run(run_id).await?;
         if !run.status_enum().is_live() {
@@ -1166,6 +1174,35 @@ impl Engine {
                 .await?;
         }
         Ok(())
+    }
+
+    /// Runs the base replay again for the current candidate suite.
+    ///
+    /// The proof is the report, and the report can be missing for reasons the agent
+    /// had nothing to do with: a `just test` that only copied its JUnit file after a
+    /// green run left the base replay with nothing to read. The candidate tests still
+    /// exist on their bookmark, so asking again costs one suite run and no model call.
+    pub async fn retry_base_replay(&self, issue_id: Uuid) -> Result<Replay> {
+        let issue = self.issue(issue_id).await?;
+        let live = self.live_run_on_issue(issue_id).await?;
+        if live.is_some() {
+            bail!("an agent is still working on this issue; wait for it to finish");
+        }
+        let candidate = sqlx::query_as::<_, Run>(
+            "select * from runs where issue_id = ? and candidate_bookmark is not null
+             order by created_at desc limit 1",
+        )
+        .bind(issue_id)
+        .fetch_optional(&self.db.pool)
+        .await?
+        .ok_or_else(|| anyhow!("no authoring run has produced a candidate suite yet: the base replay has nothing to replay"))?;
+        if crate::db::json_list(&candidate.changed_paths).is_empty() {
+            bail!("the authoring run changed no files, so there is no suite to replay. Write the tests first");
+        }
+        let id = self
+            .queue_replay(issue, ReplayKind::Base, None, None, Some(&candidate))
+            .await?;
+        self.replay(id).await
     }
 
     pub async fn queue_replay(

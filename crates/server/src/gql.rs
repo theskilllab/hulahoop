@@ -699,6 +699,18 @@ impl Mutation {
             .await?)
     }
 
+    /// The base replay reads a report the suite produced. When the report is missing
+    /// for a reason of the harness (a `just test` that only wrote its JUnit file after a
+    /// green run), asking again costs one suite run and no model call.
+    async fn retry_base_replay(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+    ) -> async_graphql::Result<Replay> {
+        let engine = engine(ctx);
+        Ok(engine.retry_base_replay(issue_id).await?)
+    }
+
     async fn clear_run_cap(
         &self,
         ctx: &Context<'_>,

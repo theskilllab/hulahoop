@@ -12,11 +12,19 @@ setup:
     pnpm --prefix apps/desktop install --frozen-lockfile
 
 # Run the whole suite and write the machine-readable verdict.
+# The JUnit report is the verdict every gate reads, so it has to exist after a red run
+# too. A red suite is the wanted outcome of the base replay, and a recipe that copies the
+# report only after a green run leaves that replay with no evidence to read.
 test:
+    #!/usr/bin/env bash
+    set -uo pipefail
     mkdir -p .hulahoop target/nextest/ci
-    cargo nextest run --workspace --profile ci
-    cargo test --workspace --doc
-    cp target/nextest/ci/junit.xml .hulahoop/junit.xml
+    suite=0
+    cargo nextest run --workspace --profile ci || suite=$?
+    docs=0
+    cargo test --workspace --doc || docs=$?
+    cp -f target/nextest/ci/junit.xml .hulahoop/junit.xml
+    exit $(( suite != 0 ? suite : docs ))
 
 # Check formatting without changing files.
 fmt-check:

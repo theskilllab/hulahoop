@@ -105,6 +105,19 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
                 Freeze suite
               </button>
             )}
+            {issue.replays?.some((replay) => replay.kind === "base" && replay.status === "failed") && (
+              <button
+                className="ghost"
+                disabled={busy !== null}
+                onClick={() =>
+                  run("replay", `mutation ($id: UUID!) { retryBaseReplay(issueId: $id) { id status } }`, {
+                    id: issue.id,
+                  })
+                }
+              >
+                Run the base replay again
+              </button>
+            )}
             {(!current || (current.status !== "running" && current.status !== "queued" && current.status !== "succeeded")) && (
               <button className="ghost" disabled={busy !== null} onClick={() => startRun("test_author")}>
                 Write the tests again
