@@ -1,0 +1,33 @@
+# A macOS runner that is never acquired comes back as `cancelled` with every step
+# green, and nothing inside the job can restart it. This watches for that outcome
+# and re-queues the failed jobs, three attempts deep, so a release needs no human.
+name: release recover
+
+on:
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+
+permissions:
+  actions: write
+
+jobs:
+  retry:
+    if: >-
+      github.event.workflow_run.conclusion == 'cancelled' ||
+      github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - name: re-queue the jobs that did not finish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -eu
+          if [ "$ATTEMPT" -ge 3 ]; then
+            echo "attempt $ATTEMPT already; leaving it for a human" 
+            exit 0
+          fi
+          gh run rerun "$RUN_ID" --failed || gh run rerun "$RUN_ID"
+          echo "re-queued $RUN_ID (attempt $ATTEMPT)"
