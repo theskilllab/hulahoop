@@ -60,15 +60,19 @@ impl Db {
         let now = chrono::Utc::now().to_rfc3339();
         let user_id = uuid::Uuid::now_v7();
         let workspace_id = uuid::Uuid::now_v7();
+        // `Local` gives `LOC`, so an issue filed with no project reads `LOC-3`
+        // rather than `WS-3`. The name is the input; the prefix follows it.
+        let prefix: String = "Local".chars().take(3).collect::<String>().to_uppercase();
         sqlx::query("insert into users (id, name, email, created_at) values (?, 'you', null, ?)")
             .bind(user_id)
             .bind(&now)
             .execute(&self.pool)
             .await?;
         sqlx::query(
-            "insert into workspaces (id, name, slug, created_at) values (?, 'Local', 'local', ?)",
+            "insert into workspaces (id, name, slug, default_prefix, created_at) values (?, 'Local', 'local', ?, ?)",
         )
         .bind(workspace_id)
+        .bind(&prefix)
         .bind(&now)
         .execute(&self.pool)
         .await?;

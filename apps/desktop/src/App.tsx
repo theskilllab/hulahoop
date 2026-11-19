@@ -16,6 +16,7 @@ import {
   type Project,
   type Workspace,
 } from "./api";
+import { WORKSPACE_KEY } from "./api";
 import Artifacts from "./screens/Artifacts";
 import Board from "./screens/Board";
 import Connect from "./screens/Connect";
@@ -37,6 +38,7 @@ export default function App() {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
@@ -65,15 +67,28 @@ export default function App() {
     }
   }, [workspace]);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (preferred?: string | null) => {
     const info = await connect();
     setConnection(info);
-    const loaded = await loadWorkspace();
+    const remembered = preferred ?? localStorage.getItem(WORKSPACE_KEY);
+    const loaded = await loadWorkspace(remembered);
+    setWorkspaces(loaded.workspaces);
     setWorkspace(loaded.workspace);
+    localStorage.setItem(WORKSPACE_KEY, loaded.workspace.id);
     setProjects(loaded.projects);
     setAgents(loaded.agents);
     setError(null);
   }, []);
+
+  /** A different workspace means different projects, issues and shelves. */
+  const switchWorkspace = useCallback(
+    async (id: string) => {
+      localStorage.setItem(WORKSPACE_KEY, id);
+      await load(id);
+      setView({ name: "board" });
+    },
+    [load],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -176,6 +191,16 @@ export default function App() {
           <span className="mark" aria-hidden="true" />
           hulahoop
         </div>
+        <label className="project-pick">
+          <span>workspace</span>
+          <select value={workspace.id} onChange={(event) => void switchWorkspace(event.target.value)}>
+            {workspaces.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.name} · {entry.defaultPrefix}
+              </option>
+            ))}
+          </select>
+        </label>
         <label className="project-pick">
           <span>project</span>
           <select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}>
@@ -300,6 +325,8 @@ export default function App() {
         {view.name === "settings" && (
           <Settings
             workspace={workspace}
+            workspaces={workspaces}
+            onSwitchWorkspace={switchWorkspace}
             projects={projects}
             active={project}
             agents={agents}

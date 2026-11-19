@@ -140,8 +140,16 @@ export interface Project {
 export interface Workspace {
   id: string;
   name: string;
+  slug: string;
   /** What an issue with no project is called by. */
   defaultPrefix: string;
+}
+
+export interface WorkspaceMember {
+  userId: string;
+  name: string;
+  email: string | null;
+  role: string;
 }
 
 export interface Milestone {
@@ -177,6 +185,9 @@ interface SavedRemote {
 }
 
 /** A server saved from the connect screen; work runs wherever it listens. */
+/** Where the chosen workspace is remembered between reloads. */
+export const WORKSPACE_KEY = "hulahoop.workspace";
+
 export function savedRemote(): SavedRemote | null {
   const raw = localStorage.getItem(REMOTE_KEY);
   if (!raw) return null;
@@ -424,11 +435,23 @@ export async function loadIssue(id: string): Promise<Issue> {
   return data.issue;
 }
 
-export async function loadWorkspace(): Promise<{ workspace: Workspace; projects: Project[]; agents: Agent[] }> {
+export interface WorkspaceSnapshot {
+  workspaces: Workspace[];
+  workspace: Workspace;
+  projects: Project[];
+  agents: Agent[];
+}
+
+/**
+ * Workspaces are the top of the tree, and a server can hold more than one. The
+ * chosen id is remembered, so a reload lands where the last one left off.
+ */
+export async function loadWorkspace(workspaceId?: string | null): Promise<WorkspaceSnapshot> {
   const data = await gql<{ workspaces: Workspace[] }>(
-    `{ workspaces { id name defaultPrefix } }`,
+    `{ workspaces { id name slug defaultPrefix } }`,
   );
-  const workspace = data.workspaces[0];
+  const workspace =
+    data.workspaces.find((entry) => entry.id === workspaceId) ?? data.workspaces[0];
   if (!workspace) throw new Error("the server has no workspace yet");
   const projects = await gql<{ projects: Project[] }>(
     `query ($id: UUID!) { projects(workspaceId: $id) { id name prefix repos { id name path vcs baseBookmark contractVersion fetchedAt } } }`,
@@ -438,7 +461,50 @@ export async function loadWorkspace(): Promise<{ workspace: Workspace; projects:
     `query ($id: UUID!) { agents(workspaceId: $id) { id name adapter model } }`,
     { id: workspace.id },
   );
-  return { workspace, projects: projects.projects, agents: agents.agents };
+  return {
+    workspaces: data.workspaces,
+    workspace,
+    projects: projects.projects,
+    agents: agents.agents,
+  };
+}
+
+export async function createWorkspace(name: string, prefix?: string): Promise<Workspace> {
+  const data = await gql<{ createWorkspace: Workspace }>(
+    `mutation ($name: String!, $prefix: String) { createWorkspace(name: $name, prefix: $prefix) { id name slug defaultPrefix } }`,
+    { name, prefix: prefix?.trim() ? prefix.trim() : null },
+  );
+  return data.createWorkspace;
+}
+
+export async function updateWorkspace(
+  id: string,
+  name?: string,
+  defaultPrefix?: string,
+): Promise<Workspace> {
+  const data = await gql<{ updateWorkspace: Workspace }>(
+    `mutation ($id: UUID!, $name: String, $defaultPrefix: String) {
+       updateWorkspace(id: $id, name: $name, defaultPrefix: $defaultPrefix) { id name slug defaultPrefix }
+     }`,
+    { id, name: name ?? null, defaultPrefix: defaultPrefix ?? null },
+  );
+  return data.updateWorkspace;
+}
+
+export async function renameProject(id: string, name: string): Promise<Project> {
+  const data = await gql<{ renameProject: Project }>(
+    `mutation ($id: UUID!, $name: String!) { renameProject(id: $id, name: $name) { id name prefix } }`,
+    { id, name },
+  );
+  return data.renameProject;
+}
+
+export async function loadWorkspaceMembers(workspaceId: string): Promise<WorkspaceMember[]> {
+  const data = await gql<{ workspaceMembers: WorkspaceMember[] }>(
+    `query ($id: UUID!) { workspaceMembers(workspaceId: $id) { userId name email role } }`,
+    { id: workspaceId },
+  );
+  return data.workspaceMembers;
 }
 
 export async function loadWorkspaceIssues(workspaceId: string): Promise<Issue[]> {

@@ -11,6 +11,167 @@ use anyhow::{anyhow, bail, Context, Result};
 use uuid::Uuid;
 
 impl Engine {
+    // ---- workspaces ----------------------------------------------------------
+
+    /// A workspace is the top of the tree: projects live in it, and an issue that
+    /// belongs to no project is still filed here, keyed by the workspace prefix.
+    pub async fn create_workspace(&self, name: &str, prefix: Option<&str>) -> Result<Workspace> {
+        let name = name.trim().to_string();
+        if name.len() < 2 {
+            bail!("a workspace needs a name");
+        }
+        let prefix = match prefix.map(str::trim).filter(|raw| !raw.is_empty()) {
+            Some(raw) => Self::normalise_prefix(raw)?,
+            None => Self::derive_prefix(&name),
+        };
+        let slug = self.unique_slug(&name).await?;
+        let id = Uuid::now_v7();
+        let now = crate::db::now_rfc3339();
+        sqlx::query(
+            "insert into workspaces (id, name, slug, default_prefix, created_at) values (?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(&slug)
+        .bind(&prefix)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        if let Ok(user) = self.db.local_user_id().await {
+            sqlx::query("insert or ignore into workspace_members (workspace_id, user_id, role) values (?, ?, 'owner')")
+                .bind(id)
+                .bind(user)
+                .execute(&self.db.pool)
+                .await?;
+        }
+        self.workspace(id).await
+    }
+
+    /// `local`, then `local-2`, `local-3`. The slug is what a URL or a log line can
+    /// carry, so it stays readable and unique.
+    async fn unique_slug(&self, name: &str) -> Result<String> {
+        let base: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let base = base.trim_matches('-').to_string();
+        let base = if base.is_empty() {
+            "workspace".to_string()
+        } else {
+            base
+        };
+        for attempt in 0..50 {
+            let candidate = if attempt == 0 {
+                base.clone()
+            } else {
+                format!("{base}-{}", attempt + 1)
+            };
+            let taken: Option<(String,)> =
+                sqlx::query_as("select id from workspaces where slug = ?")
+                    .bind(&candidate)
+                    .fetch_optional(&self.db.pool)
+                    .await?;
+            if taken.is_none() {
+                return Ok(candidate);
+            }
+        }
+        bail!("could not find a free slug for {name}")
+    }
+
+    pub async fn workspace(&self, id: Uuid) -> Result<Workspace> {
+        sqlx::query_as::<_, Workspace>("select * from workspaces where id = ?")
+            .bind(id)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .ok_or_else(|| anyhow!("workspace {id} not found"))
+    }
+
+    pub async fn update_workspace(
+        &self,
+        id: Uuid,
+        name: Option<String>,
+        default_prefix: Option<String>,
+    ) -> Result<Workspace> {
+        let workspace = self.workspace(id).await?;
+        let name = match name
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(value) if value.len() >= 2 => value,
+            Some(_) => bail!("a workspace needs a name"),
+            None => workspace.name.clone(),
+        };
+        let prefix = match default_prefix
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty())
+        {
+            Some(raw) => Self::normalise_prefix(&raw)?,
+            None => workspace.default_prefix.clone(),
+        };
+        // A project in this workspace must not already use the new workspace prefix,
+        // or two different sets of issues would share one key space.
+        let clash: Option<(String,)> =
+            sqlx::query_as("select name from projects where workspace_id = ? and prefix = ?")
+                .bind(id)
+                .bind(&prefix)
+                .fetch_optional(&self.db.pool)
+                .await?;
+        if let Some((project,)) = clash {
+            bail!("the project {project} already uses {prefix}; pick another workspace prefix");
+        }
+        sqlx::query("update workspaces set name = ?, default_prefix = ? where id = ?")
+            .bind(&name)
+            .bind(&prefix)
+            .bind(id)
+            .execute(&self.db.pool)
+            .await?;
+        if prefix != workspace.default_prefix {
+            sqlx::query(
+                "update issues set issue_key = ? || '-' || number where workspace_id = ? and project_id is null",
+            )
+            .bind(&prefix)
+            .bind(id)
+            .execute(&self.db.pool)
+            .await?;
+        }
+        self.workspace(id).await
+    }
+
+    /// `(user id, name, email, role)` — a workspace is shared or it is not, but the
+    /// list of people is what makes that visible.
+    pub async fn workspace_members(&self, workspace_id: Uuid) -> Result<Vec<WorkspaceMember>> {
+        Ok(sqlx::query_as::<_, WorkspaceMember>(
+            "select m.user_id, u.name, u.email, m.role from workspace_members m join users u on u.id = m.user_id where m.workspace_id = ? order by u.name",
+        )
+        .bind(workspace_id)
+        .fetch_all(&self.db.pool)
+        .await?)
+    }
+
+    pub async fn rename_project(&self, id: Uuid, name: &str) -> Result<Project> {
+        let name = name.trim();
+        if name.len() < 2 {
+            bail!("a project needs a name");
+        }
+        sqlx::query("update projects set name = ? where id = ?")
+            .bind(name)
+            .bind(id)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(
+            sqlx::query_as::<_, Project>("select * from projects where id = ?")
+                .bind(id)
+                .fetch_one(&self.db.pool)
+                .await?,
+        )
+    }
+
     // ---- projects, milestones, artifacts -------------------------------------
 
     /// `BAL`, not `bal` and not `BAL-15`. Two to five characters, letters and
@@ -26,6 +187,21 @@ impl Engine {
             bail!("a prefix is two to five letters or digits, like BAL or ATL");
         }
         Ok(cleaned)
+    }
+
+    /// The prefix a name suggests: `Local` becomes `LOC`, `Bali` becomes `BAL`.
+    /// Used when nobody typed one, so a workspace or project is never keyless.
+    pub fn derive_prefix(name: &str) -> String {
+        let letters: String = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_uppercase();
+        match letters.len() {
+            0 => "WS".into(),
+            1..=3 => letters,
+            _ => letters[..3].to_string(),
+        }
     }
 
     pub async fn set_project_prefix(&self, project_id: Uuid, prefix: &str) -> Result<Project> {
@@ -45,6 +221,17 @@ impl Engine {
         .await?;
         if taken.is_some() {
             bail!("the prefix {prefix} is already used by another project in this workspace");
+        }
+        // Workspace-level issues carry the workspace prefix, so a project claiming
+        // it would mint keys that collide with theirs.
+        let workspace: Workspace = sqlx::query_as("select * from workspaces where id = ?")
+            .bind(project.workspace_id)
+            .fetch_one(&self.db.pool)
+            .await?;
+        if workspace.default_prefix == prefix {
+            bail!(
+                "{prefix} is the workspace prefix, used by issues filed with no project. Pick another one."
+            );
         }
         sqlx::query("update projects set prefix = ? where id = ?")
             .bind(&prefix)
@@ -79,7 +266,7 @@ impl Engine {
                     .await?;
                 match project.prefix {
                     Some(prefix) => prefix,
-                    None => Self::normalise_prefix(&project.name).unwrap_or_else(|_| "PRJ".into()),
+                    None => Self::derive_prefix(&project.name),
                 }
             }
             None => {

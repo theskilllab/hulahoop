@@ -1,5 +1,16 @@
 import { useEffect, useState } from "react";
-import { gql, type Agent, type Project, type Repo, type Workspace } from "../api";
+import {
+  createWorkspace,
+  gql,
+  loadWorkspaceMembers,
+  renameProject,
+  updateWorkspace,
+  type Agent,
+  type Project,
+  type Repo,
+  type Workspace,
+  type WorkspaceMember,
+} from "../api";
 
 const ROLES = ["test_author", "implementer", "reviewer"] as const;
 const ADAPTERS = ["pi", "claude_code", "fake"] as const;
@@ -19,16 +30,20 @@ interface Preflight {
 
 export default function Settings({
   workspace,
+  workspaces,
   projects,
   active,
   agents,
   onChanged,
+  onSwitchWorkspace,
 }: {
   workspace: Workspace;
+  workspaces: Workspace[];
   projects: Project[];
   active: Project | null;
   agents: Agent[];
   onChanged: () => Promise<void>;
+  onSwitchWorkspace: (id: string) => Promise<void>;
 }) {
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [preflight, setPreflight] = useState<Preflight[]>([]);
@@ -39,9 +54,71 @@ export default function Settings({
   const [newProject, setNewProject] = useState("");
   const [newPrefix, setNewPrefix] = useState("");
   const [repoPath, setRepoPath] = useState("");
+  const [wsName, setWsName] = useState(workspace.name);
+  const [wsPrefix, setWsPrefix] = useState(workspace.defaultPrefix);
+  const [members, setMembers] = useState<WorkspaceMember[]>([]);
+  const [newWorkspace, setNewWorkspace] = useState("");
+  const [newWorkspacePrefix, setNewWorkspacePrefix] = useState("");
+  const [projectName, setProjectName] = useState("");
 
   const project = projects.find((entry) => entry.id === chosen) ?? active ?? projects[0] ?? null;
   const repo: Repo | undefined = project?.repos[0];
+
+  useEffect(() => {
+    setWsName(workspace.name);
+    setWsPrefix(workspace.defaultPrefix);
+    void loadWorkspaceMembers(workspace.id).then(setMembers).catch(() => setMembers([]));
+  }, [workspace.id, workspace.name, workspace.defaultPrefix]);
+
+  useEffect(() => {
+    setProjectName(project?.name ?? "");
+    setPrefix(project?.prefix ?? "");
+  }, [project?.id, project?.name, project?.prefix]);
+
+  async function saveWorkspace(name: string, prefix: string) {
+    setBusy("workspace");
+    setError(null);
+    try {
+      await updateWorkspace(workspace.id, name.trim(), prefix.trim());
+      await onChanged();
+    } catch (cause) {
+      setError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function addWorkspace() {
+    setBusy("new-workspace");
+    setError(null);
+    try {
+      const created = await createWorkspace(
+        newWorkspace.trim(),
+        newWorkspacePrefix.trim() || undefined,
+      );
+      setNewWorkspace("");
+      setNewWorkspacePrefix("");
+      await onSwitchWorkspace(created.id);
+    } catch (cause) {
+      setError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function saveProjectName() {
+    if (!project) return;
+    setBusy("project-name");
+    setError(null);
+    try {
+      await renameProject(project.id, projectName.trim());
+      await onChanged();
+    } catch (cause) {
+      setError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setBusy(null);
+    }
+  }
 
   async function loadBindings() {
     if (!project) return;
@@ -106,6 +183,71 @@ export default function Settings({
   return (
     <section className="detail">
       <h1>Settings</h1>
+
+      <div className="settings-block">
+        <div className="row spread">
+          <strong>{workspace.name}</strong>
+          <span className="dim small">{workspace.slug} · workspace</span>
+        </div>
+        <p className="dim small">
+          Issues filed with no project are keyed by this prefix — {workspace.defaultPrefix}-1, {workspace.defaultPrefix}-2.
+          Projects in this workspace must use a different one.
+        </p>
+        <div className="grid-2">
+          <label>
+            <span>name</span>
+            <input value={wsName} onChange={(event) => setWsName(event.target.value)} />
+          </label>
+          <label>
+            <span>issue prefix (2–5)</span>
+            <input
+              value={wsPrefix}
+              maxLength={5}
+              onChange={(event) => setWsPrefix(event.target.value.toUpperCase())}
+            />
+          </label>
+        </div>
+        <div className="row">
+          <button
+            className="primary"
+            disabled={busy === "workspace"}
+            onClick={() => void saveWorkspace(wsName, wsPrefix)}
+          >
+            Save workspace
+          </button>
+          <span className="dim small">
+            {members.length === 0
+              ? "one member"
+              : members.map((member) => `${member.name} (${member.role})`).join(", ")}
+          </span>
+        </div>
+        <div className="row">
+          <input
+            placeholder="new workspace name"
+            value={newWorkspace}
+            onChange={(event) => setNewWorkspace(event.target.value)}
+          />
+          <input
+            placeholder="prefix"
+            value={newWorkspacePrefix}
+            maxLength={5}
+            onChange={(event) => setNewWorkspacePrefix(event.target.value.toUpperCase())}
+          />
+          <button
+            className="ghost"
+            disabled={busy === "new-workspace" || newWorkspace.trim().length < 2}
+            onClick={() => void addWorkspace()}
+          >
+            Add workspace
+          </button>
+        </div>
+        {workspaces.length > 1 && (
+          <p className="dim small">
+            {workspaces.length} workspaces on this server:{" "}
+            {workspaces.map((entry) => entry.name).join(", ")}.
+          </p>
+        )}
+      </div>
       {error && <p className="error">{error}</p>}
 
       <h2 className="section">Projects</h2>
@@ -124,6 +266,17 @@ export default function Settings({
           </select>
           {project && (
             <>
+              <input
+                className="narrow-input"
+                value={projectName}
+                placeholder={project.name}
+                onChange={(event) => setProjectName(event.target.value)}
+                onBlur={() => {
+                  if (projectName.trim() && projectName.trim() !== project.name) {
+                    void saveProjectName();
+                  }
+                }}
+              />
               <input
                 className="narrow-input"
                 value={prefix}

@@ -1446,7 +1446,7 @@ its project.
 | --- | --- | --- |
 | project | a unit of work with a prefix (`BAL`, `ATL`) | `projects`, `projects.prefix` unique per workspace |
 | issue key | `BAL-15`: prefix and number, stored, not computed on read | `issues.issue_key`, `issues.number` |
-| projectless issue | planning that has no project yet, named by the workspace prefix | `issues.project_id` null, `workspaces.default_prefix` (default `WS`) |
+| projectless issue | planning that has no project yet, named by the workspace prefix | `issues.project_id` null, `workspaces.default_prefix` (`LOC` for a workspace named `Local`) |
 | milestone | a name, a date and a body for a body of work | `milestones`, `issues.milestone_id` |
 | artifact | bytes plus an index row; optionally filed under a milestone | `artifacts` table, `$DATA/artifacts/<id>/<filename>` on disk |
 
@@ -1468,6 +1468,27 @@ The screen side: a project picker in the rail (with `all projects`), keys on eve
 board card and issue title, `Milestones` and `Artifacts` screens, a milestone selector
 on an issue, and a repository list per project in Settings — several repositories may
 hang off one project, and the first is the one a run clones.
+
+### Workspaces
+
+A workspace is the root of the tree: projects, milestones, artifacts and issues all
+carry its id, and a server can hold several.
+
+- **An issue with no project is still filed somewhere.** It belongs to the workspace
+  and is keyed by the workspace prefix, which is derived from the name — a workspace
+  called `Local` files `LOC-1`, `LOC-2` — and is editable in Settings. That is the key
+  for work that spans every project in the workspace.
+- **Prefixes are per workspace and non-overlapping.** A project prefix must be unique
+  inside the workspace and must not equal the workspace prefix, or two sets of issues
+  would share one key space; both directions are refused with the reason.
+- **Changing a prefix rewrites the keys that already exist**, for the project
+  (`setProjectPrefix`) and for the workspace (`updateWorkspace`). The key is what
+  people quote in a commit message, so it is stored and rewritten rather than
+  recomputed later.
+- **The rail carries a workspace switcher** once a server has more than one, and
+  Settings creates them: name plus an optional prefix, defaulting from the name
+  (`Bali` → `BAL`). Switching reloads projects, issues, milestones and artifacts, and
+  the choice is remembered between reloads.
 
 ### Where the implementation differs from the spec
 

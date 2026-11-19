@@ -225,6 +225,12 @@ has 134 "artifacts/<id>/<filename>" "artifacts live on disk under their id"
 has 135 "GET /artifacts/<id>" "artifact downloads are authenticated"
 
 echo "---"
+# ---- workspaces and prefixes ----------------------------------------------
+has 136 "LOC-1" "the workspace prefix is derived from the name"
+has 137 "must not equal the workspace prefix" "a project may not take the workspace prefix"
+has 138 "Changing a prefix rewrites the keys that already exist" "renaming a prefix rewrites keys"
+has 139 "workspace switcher" "the rail switches workspaces"
+
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
 
@@ -233,3 +239,4 @@ has 132 "issues.issue_key" "the key is stored, not derived"
 has 133 "Milestones" "a milestone screen exists"
 has 134 "artifacts/<id>/<filename>" "artifacts live on disk under their id"
 has 135 "GET /artifacts/<id>" "artifact downloads are authenticated"
+

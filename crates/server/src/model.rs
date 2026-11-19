@@ -71,6 +71,16 @@ pub struct ProjectAgent {
     pub role: String,
 }
 
+/// A person on a workspace, joined with their row in `users` so the UI can name
+/// them. Local mode has exactly one.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct WorkspaceMember {
+    pub user_id: Uuid,
+    pub name: String,
+    pub email: Option<String>,
+    pub role: String,
+}
+
 // `complex` lets the resolvers in `gql.rs` add the nested reads to this object.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
 #[graphql(complex)]

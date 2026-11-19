@@ -28,6 +28,17 @@ pub struct Query;
 
 #[Object]
 impl Query {
+    async fn workspace_members(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<WorkspaceMember>> {
+        engine(ctx)
+            .workspace_members(workspace_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
     async fn workspaces(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Workspace>> {
         Ok(
             sqlx::query_as::<_, Workspace>("select * from workspaces order by created_at")
@@ -275,6 +286,45 @@ pub struct Mutation;
 
 #[Object]
 impl Mutation {
+    async fn create_workspace(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+        prefix: Option<String>,
+    ) -> async_graphql::Result<Workspace> {
+        engine(ctx)
+            .create_workspace(&name, prefix.as_deref())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Renaming a workspace or changing its prefix also rewrites the keys of the
+    /// issues filed with no project, because the prefix is part of the key.
+    async fn update_workspace(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        name: Option<String>,
+        default_prefix: Option<String>,
+    ) -> async_graphql::Result<Workspace> {
+        engine(ctx)
+            .update_workspace(id, name, default_prefix)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    async fn rename_project(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        name: String,
+    ) -> async_graphql::Result<Project> {
+        engine(ctx)
+            .rename_project(id, &name)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
     async fn create_project(
         &self,
         ctx: &Context<'_>,
@@ -289,7 +339,7 @@ impl Mutation {
         let prefix = match prefix {
             Some(raw) => Engine::normalise_prefix(&raw)
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?,
-            None => Engine::normalise_prefix(&name).unwrap_or_else(|_| "PRJ".to_string()),
+            None => Engine::derive_prefix(&name),
         };
         let taken: Option<(String,)> =
             sqlx::query_as("select id from projects where workspace_id = ? and prefix = ?")
