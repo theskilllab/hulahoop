@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use hulahoop_core::runspec::{
     CheckoutInput, CriterionInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
 };
-use hulahoop_core::{contract, junit};
+use hulahoop_core::{contract, junit, AgentRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -409,6 +409,14 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         None
     };
 
+    // Committing is the app's act, so the implementer is the role that gets the
+    // app's token. The test author and the reviewer write tests and read a diff;
+    // neither pushes as the user, so neither is handed a credential it cannot use.
+    let github_token = match run.role_enum() {
+        AgentRole::Implementer => engine.github_token().await?,
+        AgentRole::TestAuthor | AgentRole::Reviewer => None,
+    };
+
     let replays: Vec<Replay> =
         sqlx::query_as("select * from replays where issue_id = ? order by created_at desc limit 4")
             .bind(issue.id)
@@ -488,6 +496,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "base_revision": run.base_revision,
         "tests_bookmark": issue.tests_bookmark,
         "frozen_paths": issue.frozen_path_list(),
+        "github_token": github_token,
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
         "caller_role": "run",

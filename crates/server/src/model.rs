@@ -264,3 +264,25 @@ pub struct RunnerJob {
     pub finished_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
+
+/// What the connections screen shows. The credentials themselves never leave the
+/// server, so the object carries the two facts a user can act on: which provider
+/// this is, and whether the stored credential still works.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject)]
+pub struct Connection {
+    pub provider: String,
+    pub connected: bool,
+    /// When the stored app was last written, so a stale key is visible.
+    pub connected_at: Option<DateTime<Utc>>,
+}
+
+/// The stored row: the credentials as vault ciphertext, never as plaintext.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ConnectionRow {
+    pub id: Uuid,
+    pub provider: String,
+    pub app_id_ciphertext: String,
+    pub private_key_ciphertext: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}

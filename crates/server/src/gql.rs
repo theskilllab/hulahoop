@@ -36,6 +36,12 @@ impl Query {
         )
     }
 
+    /// Every provider the loop can act as, with whether the stored credential
+    /// still works. This is the connections screen's one read.
+    async fn connections(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Connection>> {
+        Ok(engine(ctx).connections().await?)
+    }
+
     async fn projects(
         &self,
         ctx: &Context<'_>,
@@ -240,6 +246,17 @@ impl Mutation {
             .bind(id)
             .fetch_one(&engine(ctx).db.pool)
             .await?)
+    }
+
+    /// Store a GitHub app so the loop can commit as it. Replaceable: pasting a
+    /// new key is the fix for an app whose key can no longer sign.
+    async fn create_github_app(
+        &self,
+        ctx: &Context<'_>,
+        app_id: String,
+        private_key: String,
+    ) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx).set_github_app(&app_id, &private_key).await?)
     }
 
     async fn add_repo(

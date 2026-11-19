@@ -139,6 +139,25 @@ impl AgentRole {
         AgentRole::Implementer,
         AgentRole::Reviewer,
     ];
+
+    /// The author name a commit made by this role carries. One name per role is
+    /// what makes "who wrote this" answerable from `jj log` alone, and the
+    /// `.invalid` domain keeps the address obviously non-routable.
+    pub fn commit_name(self) -> &'static str {
+        match self {
+            AgentRole::TestAuthor => "hulahoop-test-author",
+            AgentRole::Implementer => "hulahoop-implementer",
+            AgentRole::Reviewer => "hulahoop-reviewer",
+        }
+    }
+
+    pub fn commit_email(self) -> &'static str {
+        match self {
+            AgentRole::TestAuthor => "hulahoop-test-author@hulahoop.invalid",
+            AgentRole::Implementer => "hulahoop-implementer@hulahoop.invalid",
+            AgentRole::Reviewer => "hulahoop-reviewer@hulahoop.invalid",
+        }
+    }
 }
 
 string_enum!(Adapter {

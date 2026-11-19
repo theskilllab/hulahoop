@@ -2,6 +2,7 @@
 //! state machine and the gate live in one place.
 
 use crate::db::{json_list, kill_process_group, sha256_hex, Db};
+use crate::github::StoredApp;
 use crate::model::*;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -205,6 +206,116 @@ impl Engine {
             }
         }
         Ok(())
+    }
+
+    // ----------------------------------------------------------- connections
+
+    /// The providers this loop knows how to act as. Listing them even when no
+    /// app is stored is what lets the screen show "available" and "connected"
+    /// as two different answers.
+    pub const PROVIDERS: [&'static str; 1] = [crate::github::PROVIDER];
+
+    fn vault(&self) -> Result<crate::vault::Vault> {
+        crate::vault::Vault::open(&self.db.data_dir)
+    }
+
+    async fn connection_row(&self, provider: &str) -> Result<Option<ConnectionRow>> {
+        Ok(
+            sqlx::query_as::<_, ConnectionRow>("select * from connections where provider = ?")
+                .bind(provider)
+                .fetch_optional(&self.db.pool)
+                .await?,
+        )
+    }
+
+    /// The stored app's credentials, or `None` when nothing is stored or the
+    /// vault cannot open what is stored. An unreadable credential is a
+    /// connection that needs re-creating, not an error that hides the list.
+    async fn stored_app(&self, provider: &str) -> Result<Option<StoredApp>> {
+        let Some(row) = self.connection_row(provider).await? else {
+            return Ok(None);
+        };
+        let vault = self.vault()?;
+        let (Ok(app_id), Ok(private_key)) = (
+            vault.open_string(&row.app_id_ciphertext),
+            vault.open_string(&row.private_key_ciphertext),
+        ) else {
+            return Ok(None);
+        };
+        Ok(Some(StoredApp {
+            app_id,
+            private_key,
+            updated_at: row.updated_at,
+        }))
+    }
+
+    /// Whether a stored key can still sign is the only honest definition of
+    /// "connected": an app whose key is broken cannot act, and GitHub would
+    /// reject the token it tried to mint.
+    pub async fn connections(&self) -> Result<Vec<Connection>> {
+        let mut connections = Vec::with_capacity(Self::PROVIDERS.len());
+        for provider in Self::PROVIDERS {
+            let stored = self.stored_app(provider).await?;
+            connections.push(Connection {
+                provider: provider.to_string(),
+                connected: stored
+                    .as_ref()
+                    .is_some_and(|app| crate::github::can_sign(&app.private_key)),
+                connected_at: stored.map(|app| app.updated_at),
+            });
+        }
+        Ok(connections)
+    }
+
+    /// Store (or replace) a GitHub app. The key is sealed before it reaches the
+    /// database, and the app id with it: both identify the account the loop can
+    /// act as, so neither belongs in a page a backup would copy in the clear.
+    pub async fn set_github_app(&self, app_id: &str, private_key: &str) -> Result<Connection> {
+        let app_id = app_id.trim();
+        let private_key = private_key.trim();
+        if app_id.is_empty() {
+            bail!("a github app needs an app id; GitHub shows it next to the app name");
+        }
+        if private_key.is_empty() {
+            bail!("a github app needs its private key; GitHub generates the .pem once");
+        }
+        let vault = self.vault()?;
+        let now = crate::db::now_rfc3339();
+        sqlx::query(
+            "insert into connections (id, provider, app_id_ciphertext, private_key_ciphertext, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?)
+             on conflict(provider) do update set
+                 app_id_ciphertext = excluded.app_id_ciphertext,
+                 private_key_ciphertext = excluded.private_key_ciphertext,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(Uuid::now_v7())
+        .bind(crate::github::PROVIDER)
+        .bind(vault.seal_string(app_id)?)
+        .bind(vault.seal_string(private_key)?)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        let stored = self.connection_row(crate::github::PROVIDER).await?;
+        Ok(Connection {
+            provider: crate::github::PROVIDER.to_string(),
+            connected: crate::github::can_sign(private_key),
+            connected_at: stored.map(|row| row.updated_at),
+        })
+    }
+
+    /// The token a run acts as the app with. `None` when no app is stored or the
+    /// stored key cannot sign, because handing out a token nobody can verify is
+    /// worse than handing out nothing.
+    pub async fn github_token(&self) -> Result<Option<String>> {
+        let Some(app) = self.stored_app(crate::github::PROVIDER).await? else {
+            return Ok(None);
+        };
+        if !crate::github::can_sign(&app.private_key) {
+            return Ok(None);
+        }
+        crate::github::mint_token(&app.app_id, &app.private_key).map(Some)
     }
 
     // ------------------------------------------------------------------ runs

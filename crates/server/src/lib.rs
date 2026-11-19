@@ -4,8 +4,10 @@
 pub mod api;
 pub mod db;
 pub mod engine;
+pub mod github;
 pub mod gql;
 pub mod model;
+pub mod vault;
 
 use anyhow::Context;
 use std::net::SocketAddr;

@@ -178,6 +178,11 @@ impl Executor {
                 .ok();
         }
 
+        // The role owns the commit, whichever agent produced it: the working
+        // copy is rewritten to the role's identity before the bookmark names it,
+        // so `jj log` answers "who wrote this" without the runner's config.
+        let _ = vcs.set_working_copy_author(&checkout, role.commit_name(), role.commit_email());
+
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
         let changed_paths = vcs.changed_paths(&checkout, &base).unwrap_or_default();
         let commit = vcs.working_copy_revision(&checkout).unwrap_or_default();
@@ -803,6 +808,21 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
         if let Ok(value) = std::env::var(key) {
             env.push((key.into(), value));
         }
+    }
+    // The commit this role produces has to say who wrote it. jj reads its
+    // identity from the environment, so the agent commits under the role's name
+    // even where the runner's own identity is the machine's.
+    if let Some(role) = AgentRole::parse(role) {
+        env.push(("JJ_USER".into(), role.commit_name().into()));
+        env.push(("JJ_EMAIL".into(), role.commit_email().into()));
+    }
+    // A token minted for the stored app; absent when there is no app, because a
+    // variable holding an empty credential is worse than one that is not set.
+    if let Some(token) = spec["github_token"]
+        .as_str()
+        .filter(|token| !token.is_empty())
+    {
+        env.push(("GITHUB_TOKEN".into(), token.to_string()));
     }
     Ok(env)
 }

@@ -16,7 +16,7 @@ rand = "0.9"
 reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
+sha2 = { workspace = true, features = ["oid"] }
 sqlx = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
@@ -27,4 +27,6 @@ uuid = { workspace = true }
 hex = "0.4"
 libc = { workspace = true }
 futures = "0.3"
+ring = "0.17"
+rsa = "0.9"
 tokio-stream = "0.1"

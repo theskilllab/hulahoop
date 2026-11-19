@@ -124,6 +124,27 @@ impl Vcs {
     /// The bookmark for a working copy inside a checkout. `@` means "the working
     /// copy of the directory I am run in", so this has to run there: resolving `@`
     /// in the repo root would bookmark the user's own tree.
+    /// Give the working-copy commit an author. A commit inherits the identity of
+    /// whoever created it, so a checkout made by the runner would otherwise
+    /// credit every agent's work to the machine.
+    pub fn set_working_copy_author(&self, checkout: &Path, name: &str, email: &str) -> Result<()> {
+        let output = Command::new("jj")
+            .args(["metaedit", "--update-author"])
+            .current_dir(checkout)
+            .env("JJ_USER", name)
+            .env("JJ_EMAIL", email)
+            .output()
+            .with_context(|| format!("running jj metaedit in {}", checkout.display()))?;
+        if !output.status.success() {
+            bail!(
+                "jj metaedit --update-author failed in {}: {}",
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
+    }
+
     pub fn set_bookmark_here(&self, checkout: &Path, name: &str) -> Result<String> {
         let output = self.run(
             checkout,
