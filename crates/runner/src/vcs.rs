@@ -254,18 +254,24 @@ impl Vcs {
         Ok(())
     }
 
-    /// Landing: move the approved head onto the refreshed base. jj moves the
-    /// bookmark with the commit it rewrites, so the same name now points at the
-    /// rebased commit.
-    pub fn rebase_bookmark(&self, checkout: &Path, bookmark: &str, dest: &str) -> Result<String> {
+    /// Move a revision **and its descendants** onto `dest`.
+    ///
+    /// Rebasing a bookmark that sits on the last commit of a chain moves only that
+    /// commit; the landing preview needs the suite commit beneath the implementation
+    /// to travel too, so this takes a revision rather than a bookmarked head.
+    pub fn rebase_chain(&self, checkout: &Path, source: &str, dest: &str) -> Result<()> {
+        let source = self.resolve(source)?;
         let dest = self.resolve(dest)?;
-        self.run(checkout, "jj", &["rebase", "-s", bookmark, "-d", &dest])?;
-        let moved = self.run(
-            checkout,
-            "jj",
-            &["log", "-r", bookmark, "--no-graph", "-T", "commit_id"],
-        )?;
-        Ok(moved.trim().to_string())
+        self.run(checkout, "jj", &["rebase", "-s", &source, "-d", &dest])?;
+        Ok(())
+    }
+
+    /// Put the checkout's working copy on `revision`, so the files the suite runs
+    /// against are the files of that commit.
+    pub fn edit(&self, checkout: &Path, revision: &str) -> Result<()> {
+        let revision = self.resolve(revision)?;
+        self.run(checkout, "jj", &["edit", &revision])?;
+        Ok(())
     }
 
     /// True when the approved head is contained in the merged revision.

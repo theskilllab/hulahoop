@@ -323,16 +323,34 @@ impl Executor {
                     .as_str()
                     .context("landing replay without a landing bookmark")?
                     .to_string();
+                let head_bookmark = spec["head_bookmark"]
+                    .as_str()
+                    .context("landing replay without a head bookmark")?
+                    .to_string();
+                let candidate_bookmark = spec["candidate_bookmark"]
+                    .as_str()
+                    .context("landing replay without the suite it was approved from")?
+                    .to_string();
                 let base = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
-                // Rebase the approved head onto the refreshed base. jj carries the
-                // bookmark with the rewritten commit.
-                vcs.set_bookmark(&landing_bookmark, &approved_head)?;
-                vcs.add_workspace(&checkout, &landing_bookmark)?;
-                vcs.rebase_bookmark(&checkout, &landing_bookmark, &base)?;
+                // The suite is a commit of its own beneath the implementation, so
+                // rebasing the head alone lands the implementation **without** the
+                // tests: the preview then runs the base suite and proves nothing.
+                // Move the whole chain, then put the run's bookmarks back so the
+                // approved revision stays the one the human approved.
+                let tests_before = vcs.resolve(&candidate_bookmark)?;
+                let head_before = vcs.resolve(&head_bookmark)?;
+                vcs.add_workspace(&checkout, &base)?;
+                vcs.rebase_chain(&checkout, &tests_before, &base)?;
+                // jj resolves an abandoned commit id to the commit that replaced it,
+                // so the landed revision is the rewritten approved head.
+                let landed = vcs.resolve(&approved_head)?;
+                vcs.set_bookmark(&landing_bookmark, &landed)?;
+                vcs.set_bookmark(&head_bookmark, &head_before)?;
+                vcs.set_bookmark(&candidate_bookmark, &tests_before)?;
+                vcs.edit(&checkout, &landed)?;
                 (landing_bookmark.clone(), None, Vec::new())
             }
         };
-
         if kind != ReplayKind::Landing {
             vcs.add_workspace(&checkout, &revision)?;
         }
