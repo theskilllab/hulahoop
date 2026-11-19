@@ -647,14 +647,37 @@ impl Engine {
 
     pub async fn unfreeze_suite(&self, issue_id: Uuid, reason: &str) -> Result<Issue> {
         let issue = self.issue(issue_id).await?;
-        if issue.status_enum() != IssueStatus::TestsReady
-            && issue.status_enum() != IssueStatus::InReview
+        // Frozen is the condition, not the status: the human can learn the criteria
+        // were wrong at any point before the merge.
+        if issue.tests_bookmark.is_none()
+            || matches!(
+                issue.status_enum(),
+                IssueStatus::Backlog
+                    | IssueStatus::Ready
+                    | IssueStatus::Done
+                    | IssueStatus::Cancelled
+            )
         {
             bail!(
-                "only a frozen suite can be thawed (issue is {})",
-                issue.status_enum()
+                "there is no frozen suite to thaw (issue is {}, tests bookmark {})",
+                issue.status_enum(),
+                if issue.tests_bookmark.is_some() {
+                    "set"
+                } else {
+                    "empty"
+                }
             );
         }
+        // Refuse before touching anything: the transition is the part that can
+        // fail, and a refused one used to leave the issue with no suite at all.
+        hulahoop_core::next(issue.status_enum(), &IssueEvent::StartTestAuthor).with_context(
+            || {
+                format!(
+                    "an issue in `{}` cannot thaw its suite",
+                    issue.status_enum()
+                )
+            },
+        )?;
         let body = format!("Suite thawed: {reason}");
         self.comment(
             issue_id,

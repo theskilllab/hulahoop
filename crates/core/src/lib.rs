@@ -249,6 +249,10 @@ pub fn next(from: IssueStatus, event: &IssueEvent) -> Result<IssueStatus, Transi
         (S::InProgress, E::ImplementerCompleted) => S::InReview,
         (S::InProgress, E::ImplementerFailed) => S::InProgress,
         (S::InProgress, E::StartTestAuthor) => S::TestsInProgress,
+        // A thaw is the human saying the criteria were wrong, and that decision has
+        // to be possible while an implementation already exists.
+        (S::InReview, E::StartTestAuthor) => S::TestsInProgress,
+        (S::Merging, E::StartTestAuthor) => S::TestsInProgress,
         (S::InReview, E::StartReviewer) => S::InReview,
         (S::InReview, E::ReviewerApproved) => S::InReview,
         (S::InReview, E::ReviewerChangesRequested) => S::InProgress,
@@ -357,6 +361,22 @@ mod tests {
                 IssueStatus::InProgress
             );
             assert_eq!(resume_to(Some(status)), Some(status));
+        }
+    }
+
+    #[test]
+    fn thaw_is_possible_while_an_implementation_exists() {
+        for from in [
+            IssueStatus::TestsReady,
+            IssueStatus::InProgress,
+            IssueStatus::InReview,
+            IssueStatus::Merging,
+        ] {
+            assert_eq!(
+                next(from, &IssueEvent::StartTestAuthor).unwrap(),
+                IssueStatus::TestsInProgress,
+                "a thaw from {from} has to reach the authoring state"
+            );
         }
     }
 

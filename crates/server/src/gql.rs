@@ -495,15 +495,10 @@ impl Mutation {
     ) -> async_graphql::Result<Issue> {
         let engine = engine(ctx);
         let issue = engine.issue(id).await?;
-        if matches!(
-            issue.status_enum(),
-            hulahoop_core::IssueStatus::TestsReady
-                | hulahoop_core::IssueStatus::InProgress
-                | hulahoop_core::IssueStatus::InReview
-                | hulahoop_core::IssueStatus::Merging
-                | hulahoop_core::IssueStatus::Done
-        ) && criteria.is_some()
-        {
+        // A frozen suite is the bookmark, not the status: an issue can sit in
+        // `in_progress` with its suite already thawed, and then its criteria are
+        // editable again.
+        if issue.tests_bookmark.is_some() && criteria.is_some() {
             return Err(async_graphql::Error::new(
                 "criteria cannot change while the suite is frozen: thaw it first, so the tests keep proving the criteria they were written for",
             ));
