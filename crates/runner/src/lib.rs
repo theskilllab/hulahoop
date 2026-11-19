@@ -88,6 +88,11 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let runner_id = std::env::var("HULAHOOP_RUNNER_ID")
         .unwrap_or_else(|_| format!("runner-{}", std::process::id()));
 
+    let pruned = exec::prune_workspace(&data_dir);
+    if pruned > 0 {
+        tracing::info!(pruned, "removed checkouts a killed runner left behind");
+    }
+
     tracing::info!(
         runner_id,
         server = %connection.base,

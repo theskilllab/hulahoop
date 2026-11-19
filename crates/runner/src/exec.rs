@@ -58,6 +58,16 @@ impl Executor {
         let spec = &envelope["spec"];
         let run_id = run["id"].as_str().context("run has no id")?.to_string();
         let result = self.execute_run(&run_id, spec).await;
+        // A local checkout is a copy of the repository, and a copy per run
+        // compounds: one project, ten issues, four attempts, three roles. It is
+        // deleted the moment the run is over; the artifacts it produced live
+        // under runs/<id>/ and are what anyone reads afterwards.
+        if spec["runner_mode"].as_str() == Some("local") {
+            let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
+            if let Some(run_dir) = checkout.parent() {
+                let _ = std::fs::remove_dir_all(run_dir);
+            }
+        }
         if let Err(error) = &result {
             tracing::error!(%error, run_id, "run failed to execute");
             let _ = self
@@ -91,7 +101,7 @@ impl Executor {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        let base = if base_revision.is_empty() {
+        let mut base = if base_revision.is_empty() {
             base_bookmark.clone()
         } else {
             base_revision
@@ -105,9 +115,24 @@ impl Executor {
             .as_i64()
             .unwrap_or(hulahoop_core::AGENT_WALL_CLOCK_MINUTES);
 
-        let vcs = Vcs::detect(&repo_path)?;
-        vcs.ensure_vcs()?;
-        vcs.add_workspace(&checkout, &base)?;
+        let local = spec["runner_mode"].as_str() == Some("local");
+        if local {
+            let url = spec["clone_url"]
+                .as_str()
+                .filter(|url| !url.is_empty())
+                .unwrap_or(hulahoop_core::contract::DEFAULT_CLONE_URL);
+            // The clone may know the base under a different name (`@origin`), and
+            // every diff the run reports is taken against what it actually started
+            // from — otherwise a resolvable base still yields an empty diff.
+            base = prepare_clone(&checkout, url, &base)?;
+        } else {
+            let vcs = Vcs::detect(&repo_path)?;
+            vcs.ensure_vcs()?;
+            vcs.add_workspace(&checkout, &base)?;
+        }
+        // A clone is its own repository; a workspace shares the one at repo_path.
+        // Everything after this point asks the checkout, which is right either way.
+        let vcs = Vcs::detect(&checkout)?;
         ensure_envrc(&checkout)?;
 
         self.client
@@ -216,15 +241,27 @@ impl Executor {
 
         // The bookmark the server will resolve later. It is created here because
         // only the checkout knows the commit id.
-        let _ = match role {
+        let published: Vec<String> = match role {
             AgentRole::TestAuthor => {
-                vcs.set_bookmark_here(&checkout, &format!("tests/{issue_id}/cand/{run_id}"))
+                let name = format!("tests/{issue_id}/cand/{run_id}");
+                let _ = vcs.set_bookmark_here(&checkout, &name);
+                vec![name]
             }
             AgentRole::Implementer => {
-                vcs.set_bookmark_here(&checkout, &format!("issue/{issue_id}/head/{attempt}"))
+                let name = format!("issue/{issue_id}/head/{attempt}");
+                let _ = vcs.set_bookmark_here(&checkout, &name);
+                vec![name]
             }
-            AgentRole::Reviewer => Ok(commit.clone()),
+            AgentRole::Reviewer => Vec::new(),
         };
+        // A clone is deleted when the run ends, and the replay that has to prove the
+        // work reads the loop's own repository: the bookmark travels back before the
+        // checkout disappears.
+        if local && !published.is_empty() {
+            if let Err(error) = vcs.publish_to(&checkout, &repo_path, &published) {
+                tracing::warn!(%error, "could not publish the run's bookmarks to the host repository");
+            }
+        }
 
         let status = if outcome.timed_out {
             "timed_out"
@@ -267,7 +304,9 @@ impl Executor {
 
         // The checkout is removed on success; a failure keeps it so the human can
         // look at the mess a cancel or a crash left behind... for one attempt.
-        if status == "succeeded" {
+        // A workspace has to be forgotten or the repository accumulates them; a clone
+        // is a directory, and `run_run` deletes the whole run directory.
+        if status == "succeeded" && !local {
             let _ = vcs.remove_workspace(&checkout);
         }
         Ok(())
@@ -939,6 +978,34 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
             env.push((key.into(), value));
         }
     }
+    // A connector the user pasted wins over the machine's own login: the run acts
+    // as the credential it was given, not as whoever started the runner. Files land
+    // in the scratch home, so a subscription is used by a run and never by the host.
+    if let Some(credential) = spec.get("credential") {
+        for entry in credential["env"].as_array().into_iter().flatten() {
+            let (Some(name), Some(value)) = (
+                entry.get(0).and_then(|v| v.as_str()),
+                entry.get(1).and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            env.push((name.to_string(), value.to_string()));
+        }
+        for entry in credential["files"].as_array().into_iter().flatten() {
+            let (Some(relative), Some(contents)) = (
+                entry.get(0).and_then(|v| v.as_str()),
+                entry.get(1).and_then(|v| v.as_str()),
+            ) else {
+                continue;
+            };
+            let path = home.join(relative);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_private_file(&path, contents)
+                .with_context(|| format!("writing {relative} into the run's home"))?;
+        }
+    }
     // The commit this role produces has to say who wrote it. jj reads its
     // identity from the environment, so the agent commits under the role's name
     // even where the runner's own identity is the machine's.
@@ -964,6 +1031,134 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
         env.push(("GITHUB_TOKEN".into(), token.to_string()));
     }
     Ok(env)
+}
+
+/// A credentials file the CLI will read. Owner-only, because the directory is
+/// shared with the next run and a mode that drifts is a leak nobody notices.
+fn write_private_file(path: &Path, contents: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(contents.as_bytes())?;
+    Ok(())
+}
+
+/// Remove workspace directories that no run can still be using.
+///
+/// A runner that is killed mid-run leaves its clone behind, and nothing else knows
+/// the directory is garbage. Six hours is longer than any wall clock the loop
+/// allows, so a directory older than that belongs to no live run.
+pub fn prune_workspace(data_dir: &Path) -> usize {
+    const STALE_AFTER_SECS: u64 = 6 * 60 * 60;
+    let root = data_dir.join("workspace");
+    let mut pruned = 0;
+    let Ok(projects) = std::fs::read_dir(&root) else {
+        return 0;
+    };
+    for project in projects.flatten() {
+        let Ok(issues) = std::fs::read_dir(project.path()) else {
+            continue;
+        };
+        for issue in issues.flatten() {
+            let Ok(runs) = std::fs::read_dir(issue.path()) else {
+                continue;
+            };
+            for run in runs.flatten() {
+                let stale = run
+                    .metadata()
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|modified| modified.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > STALE_AFTER_SECS);
+                if stale && std::fs::remove_dir_all(run.path()).is_ok() {
+                    pruned += 1;
+                }
+            }
+        }
+    }
+    pruned
+}
+
+/// Produce the checkout a local runner works in: a fresh clone of the repository,
+/// parked on the revision the server accepted the run against.
+///
+/// The base revision has to exist in the clone. It does not when the base was never
+/// pushed, and the honest answer then is to say so instead of quietly branching
+/// from the branch head and blaming the agent for the difference.
+fn prepare_clone(checkout: &Path, url: &str, base: &str) -> Result<String> {
+    if checkout.exists() {
+        std::fs::remove_dir_all(checkout)
+            .with_context(|| format!("clearing a stale clone at {}", checkout.display()))?;
+    }
+    if let Some(parent) = checkout.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let clone = std::process::Command::new("jj")
+        .args(["git", "clone", "--colocate", url])
+        .arg(checkout)
+        .output()
+        .context("running jj git clone")?;
+    if !clone.status.success() {
+        bail!(
+            "cloning {url} failed: {}",
+            String::from_utf8_lossy(&clone.stderr).trim()
+        );
+    }
+    // The base comes from the host repository, where the bookmark is local. In a
+    // clone the same bookmark is `<name>@origin`, and the commit id is the same on
+    // both sides. Trying `jj new` per candidate is the check and the action in one
+    // step; falling back to the branch head silently would branch the run from the
+    // wrong revision and blame the agent for commits it never wrote.
+    // A fresh clone knows about the default branch and little else: the loop's own
+    // bookmarks arrive on the next fetch, and a run that starts before they do
+    // branches from the wrong revision. One fetch here costs a second and removes
+    // the whole class of "the clone does not hold the base".
+    let fetched = std::process::Command::new("jj")
+        .args(["git", "fetch"])
+        .current_dir(checkout)
+        .output();
+    if let Ok(output) = &fetched {
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+            "fetched the loop's bookmarks into the clone"
+        );
+    }
+    let listed = std::process::Command::new("jj")
+        .args(["bookmark", "list", "--all-remotes"])
+        .current_dir(checkout)
+        .output();
+    if let Ok(output) = &listed {
+        tracing::info!(bookmarks = %String::from_utf8_lossy(&output.stdout).trim(), "clone bookmarks");
+    }
+
+    let mut landed_on = None;
+    for candidate in [
+        base.to_string(),
+        format!("{base}@origin"),
+        "main@origin".to_string(),
+    ] {
+        let checkout_new = std::process::Command::new("jj")
+            .args(["new", &candidate])
+            .current_dir(checkout)
+            .output()
+            .context("moving the clone onto the base revision")?;
+        if checkout_new.status.success() {
+            landed_on = Some(candidate);
+            break;
+        }
+    }
+    let Some(target) = landed_on else {
+        bail!("the clone holds neither {base} nor main@origin, so there is nothing to start from");
+    };
+    if target != base {
+        tracing::warn!(base, target = %target, "the clone does not hold the base under its own name");
+    }
+    Ok(target)
 }
 
 /// The dev shell decides what `just`, the compiler, and the test runner are; the

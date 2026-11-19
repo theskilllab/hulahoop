@@ -281,6 +281,8 @@ pub struct RunnerJob {
 #[derive(Debug, Clone, serde::Serialize, SimpleObject)]
 pub struct Connection {
     pub provider: String,
+    /// `github_app`, `api_key` or `subscription` — what the stored secret is.
+    pub kind: String,
     pub connected: bool,
     /// The app id the stored key belongs to, once that key can sign. Two apps on
     /// one machine are otherwise indistinguishable, so this is the name the
@@ -289,18 +291,23 @@ pub struct Connection {
     /// GitHub's slug for the app, learned from `GET /app` when the key is stored.
     /// `None` until that call succeeds, or when no app is stored.
     pub slug: Option<String>,
-    /// When the stored app was last written, so a stale key is visible.
+    /// What the screen shows beside the provider: an app id, an account name, or
+    /// the kind of secret. Never the secret itself.
+    pub label: Option<String>,
+    /// When the stored secret was last written, so a stale one is visible.
     pub connected_at: Option<DateTime<Utc>>,
 }
 
 /// The stored row: the credentials as vault ciphertext, never as plaintext.
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct ConnectionRow {
+pub struct ConnectorRow {
     pub id: Uuid,
     pub provider: String,
-    pub app_id_ciphertext: String,
-    pub private_key_ciphertext: String,
-    pub slug: Option<String>,
+    pub kind: String,
+    /// Sealed JSON. The fields inside are sealed one by one, so opening a connector
+    /// never requires opening all of it: the app id is public, the key is not.
+    pub secret_ciphertext: String,
+    pub label: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

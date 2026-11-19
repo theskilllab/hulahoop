@@ -259,10 +259,47 @@ impl Mutation {
         Ok(engine(ctx).set_github_app(&app_id, &private_key).await?)
     }
 
-    /// Forget the app. Commits go back to the human's identity until a new key is
-    /// pasted, which is the only honest thing to do when a key is compromised.
+    /// Forget the GitHub app specifically. Kept beside `disconnectConnection`
+    /// because it predates the general form and a stored app is the one case where
+    /// "disconnect" also changes how commits are authored.
     async fn disconnect_github_app(&self, ctx: &Context<'_>) -> async_graphql::Result<Connection> {
-        Ok(engine(ctx).clear_github_app().await?)
+        Ok(engine(ctx)
+            .clear_connection(crate::github::PROVIDER)
+            .await?)
+    }
+
+    /// Store an API key for an agent CLI. One mutation for every provider, because
+    /// the screen renders one row per provider and the difference is the payload.
+    async fn set_agent_key(
+        &self,
+        ctx: &Context<'_>,
+        provider: String,
+        key: String,
+    ) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx).set_agent_key(&provider, &key).await?)
+    }
+
+    /// Store the credentials file a CLI wrote when it logged in.
+    async fn set_agent_subscription(
+        &self,
+        ctx: &Context<'_>,
+        provider: String,
+        contents: String,
+    ) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx)
+            .set_agent_subscription(&provider, &contents)
+            .await?)
+    }
+
+    /// Forget a credential. Commits go back to the human's identity and a run falls
+    /// back to whatever the machine has, which is the only honest thing to do when
+    /// a secret is compromised.
+    async fn disconnect_connection(
+        &self,
+        ctx: &Context<'_>,
+        provider: String,
+    ) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx).clear_connection(&provider).await?)
     }
 
     async fn add_repo(

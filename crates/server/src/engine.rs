@@ -1,8 +1,10 @@
 //! Business rules: every mutation and every runner callback lands here, so the
 //! state machine and the gate live in one place.
 
+use crate::connectors::Credential;
 use crate::db::{json_list, kill_process_group, sha256_hex, Db};
 use crate::github::StoredApp;
+use crate::model::ConnectorRow;
 use crate::model::*;
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -208,93 +210,179 @@ impl Engine {
         Ok(())
     }
 
-    // ----------------------------------------------------------- connections
+    // ----------------------------------------------------------- connectors
 
-    /// The providers this loop knows how to act as. Listing them even when no
-    /// app is stored is what lets the screen show "available" and "connected"
-    /// as two different answers.
-    pub const PROVIDERS: [&'static str; 1] = [crate::github::PROVIDER];
+    /// Every provider the screen offers, stored or not. "Available" and
+    /// "connected" are two different answers, and only a complete list shows both.
+    pub const PROVIDERS: [&'static str; 4] = crate::connectors::ALL;
 
     fn vault(&self) -> Result<crate::vault::Vault> {
         crate::vault::Vault::open(&self.db.data_dir)
     }
 
-    async fn connection_row(&self, provider: &str) -> Result<Option<ConnectionRow>> {
+    async fn connector_row(&self, provider: &str) -> Result<Option<ConnectorRow>> {
         Ok(
-            sqlx::query_as::<_, ConnectionRow>("select * from connections where provider = ?")
+            sqlx::query_as::<_, ConnectorRow>("select * from connectors where provider = ?")
                 .bind(provider)
                 .fetch_optional(&self.db.pool)
                 .await?,
         )
     }
 
+    /// One field out of the stored payload. Each field is sealed on its own, so
+    /// reading the app id never requires opening the private key.
+    fn open_field(vault: &crate::vault::Vault, payload: &str, field: &str) -> Option<String> {
+        let map: serde_json::Value = serde_json::from_str(payload).ok()?;
+        vault.open_string(map.get(field)?.as_str()?).ok()
+    }
+
+    fn sealed_payload(fields: &[(&str, String)]) -> String {
+        let mut map = serde_json::Map::new();
+        for (name, value) in fields {
+            map.insert(
+                (*name).to_string(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+        serde_json::Value::Object(map).to_string()
+    }
+
     /// The stored app's credentials, or `None` when nothing is stored or the
-    /// vault cannot open what is stored. An unreadable credential is a
-    /// connection that needs re-creating, not an error that hides the list.
+    /// vault cannot open what is stored. An unreadable credential is a reason to
+    /// refuse work, not a reason to guess.
     async fn stored_app(&self, provider: &str) -> Result<Option<StoredApp>> {
-        let Some(row) = self.connection_row(provider).await? else {
+        let Some(row) = self.connector_row(provider).await? else {
             return Ok(None);
         };
         let vault = self.vault()?;
-        let (Ok(app_id), Ok(private_key)) = (
-            vault.open_string(&row.app_id_ciphertext),
-            vault.open_string(&row.private_key_ciphertext),
+        let (Some(app_id), Some(private_key)) = (
+            Self::open_field(&vault, &row.secret_ciphertext, "app_id"),
+            Self::open_field(&vault, &row.secret_ciphertext, "private_key"),
         ) else {
             return Ok(None);
         };
         Ok(Some(StoredApp {
             app_id,
             private_key,
-            slug: row.slug,
+            slug: row.label,
             updated_at: row.updated_at,
         }))
     }
 
-    /// Whether a stored key can still sign is the only honest definition of
-    /// "connected": an app whose key is broken cannot act, and GitHub would
-    /// reject the token it tried to mint.
+    /// What a run of this adapter authenticates with: a key in the environment, or
+    /// the credentials file the CLI wrote, copied into the run's scratch home.
+    pub async fn agent_credential(&self, adapter: hulahoop_core::Adapter) -> Result<Credential> {
+        let Some(provider) = crate::connectors::for_adapter(adapter) else {
+            return Ok(Credential::default());
+        };
+        let Some(row) = self.connector_row(provider).await? else {
+            return Ok(Credential::default());
+        };
+        let vault = self.vault()?;
+        let mut credential = Credential::default();
+        if let Some(secret) = Self::open_field(&vault, &row.secret_ciphertext, "secret") {
+            if let Some(name) = crate::connectors::api_key_env(provider) {
+                credential.env.push((name.to_string(), secret));
+            }
+        }
+        if let Some(contents) = Self::open_field(&vault, &row.secret_ciphertext, "contents") {
+            if let Some(path) = crate::connectors::credentials_file(provider) {
+                credential.files.push((path.to_string(), contents));
+            }
+        }
+        Ok(credential)
+    }
+
+    /// Whether a stored secret can still act is the only honest definition of
+    /// "connected": an app whose key cannot sign is not the app it claims to be,
+    /// and a key the CLI would reject is not a login.
     pub async fn connections(&self) -> Result<Vec<Connection>> {
         let mut connections = Vec::with_capacity(Self::PROVIDERS.len());
         for provider in Self::PROVIDERS {
-            let stored = self.stored_app(provider).await?;
-            let connected = stored
-                .as_ref()
-                .is_some_and(|app| crate::github::can_sign(&app.private_key));
+            let row = self.connector_row(provider).await?;
+            let vault = self.vault()?;
+            let (connected, app_id, slug, label) = match &row {
+                None => (false, None, None, None),
+                Some(row) => {
+                    let app_id = Self::open_field(&vault, &row.secret_ciphertext, "app_id");
+                    let private_key =
+                        Self::open_field(&vault, &row.secret_ciphertext, "private_key");
+                    // Sealed and openable is what every provider can prove locally;
+                    // a github app has one more answer, whether the key parses.
+                    let openable = app_id.is_some()
+                        || private_key.is_some()
+                        || Self::open_field(&vault, &row.secret_ciphertext, "secret").is_some()
+                        || Self::open_field(&vault, &row.secret_ciphertext, "contents").is_some();
+                    let signs = private_key.as_deref().is_none_or(crate::github::can_sign);
+                    (
+                        openable && signs,
+                        if openable { app_id } else { None },
+                        if openable { row.label.clone() } else { None },
+                        row.label.clone(),
+                    )
+                }
+            };
             connections.push(Connection {
                 provider: provider.to_string(),
+                kind: row.as_ref().map(|row| row.kind.clone()).unwrap_or_default(),
                 connected,
-                // The app id names the stored app only while its key can act: a
-                // key that cannot sign is not the app it claims to be.
-                app_id: if connected {
-                    stored.as_ref().map(|app| app.app_id.clone())
-                } else {
-                    None
-                },
-                slug: if connected {
-                    stored.as_ref().and_then(|app| app.slug.clone())
-                } else {
-                    None
-                },
-                connected_at: stored.map(|app| app.updated_at),
+                app_id,
+                slug,
+                label,
+                connected_at: row.map(|row| row.updated_at),
             });
         }
         Ok(connections)
     }
 
-    /// Forget the stored app. The loop stops committing as it, so the next attempt
-    /// goes back to the human's identity until an app is pasted again.
-    pub async fn clear_github_app(&self) -> Result<Connection> {
-        sqlx::query("delete from connections where provider = ?")
-            .bind(crate::github::PROVIDER)
+    /// Forget a stored credential. The loop stops acting as that provider, so the
+    /// next attempt goes back to what the machine has until one is stored again.
+    pub async fn clear_connection(&self, provider: &str) -> Result<Connection> {
+        if !Self::PROVIDERS.contains(&provider) {
+            bail!("unknown provider `{provider}`");
+        }
+        sqlx::query("delete from connectors where provider = ?")
+            .bind(provider)
             .execute(&self.db.pool)
             .await?;
         Ok(Connection {
-            provider: crate::github::PROVIDER.to_string(),
+            provider: provider.to_string(),
+            kind: String::new(),
             connected: false,
             app_id: None,
             slug: None,
+            label: None,
             connected_at: None,
         })
+    }
+
+    async fn write_connector(
+        &self,
+        provider: &str,
+        kind: &str,
+        payload: &str,
+        label: Option<&str>,
+    ) -> Result<()> {
+        let now = crate::db::now_rfc3339();
+        sqlx::query(
+            "insert into connectors (id, provider, kind, secret_ciphertext, label, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?)
+             on conflict(provider) do update set
+                 kind = excluded.kind,
+                 secret_ciphertext = excluded.secret_ciphertext,
+                 label = excluded.label,
+                 updated_at = excluded.updated_at",
+        )
+        .bind(Uuid::now_v7())
+        .bind(provider)
+        .bind(kind)
+        .bind(payload)
+        .bind(label)
+        .bind(&now)
+        .bind(&now)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
     }
 
     /// Store (or replace) a GitHub app. The key is sealed before it reaches the
@@ -310,68 +398,111 @@ impl Engine {
             bail!("a github app needs its private key; GitHub generates the .pem once");
         }
         let vault = self.vault()?;
-        let now = crate::db::now_rfc3339();
-        sqlx::query(
-            "insert into connections (id, provider, app_id_ciphertext, private_key_ciphertext, created_at, updated_at)
-             values (?, ?, ?, ?, ?, ?)
-             on conflict(provider) do update set
-                 app_id_ciphertext = excluded.app_id_ciphertext,
-                 private_key_ciphertext = excluded.private_key_ciphertext,
-                 updated_at = excluded.updated_at",
+        let payload = Self::sealed_payload(&[
+            ("app_id", vault.seal_string(app_id)?),
+            ("private_key", vault.seal_string(private_key)?),
+        ]);
+        self.write_connector(
+            crate::github::PROVIDER,
+            crate::connectors::KIND_GITHUB_APP,
+            &payload,
+            None,
         )
-        .bind(Uuid::now_v7())
-        .bind(crate::github::PROVIDER)
-        .bind(vault.seal_string(app_id)?)
-        .bind(vault.seal_string(private_key)?)
-        .bind(&now)
-        .bind(&now)
-        .execute(&self.db.pool)
         .await?;
-        // Asking GitHub for the app's own record is the only way to learn the slug,
-        // and it is a better answer to "connected" than whether the key parses. A
-        // machine with no network keeps the app: the local check still decides
-        // `connected`, and the slug is learned on the first successful call.
-        if crate::github::can_sign(private_key) {
-            if let Ok(jwt) = crate::github::mint_token(app_id, private_key) {
-                let http = reqwest::Client::builder()
-                    .timeout(std::time::Duration::from_secs(15))
-                    .build()?;
-                match crate::github::fetch_slug(&http, &jwt).await {
-                    Ok(slug) => {
-                        sqlx::query("update connections set slug = ? where provider = ?")
-                            .bind(&slug)
-                            .bind(crate::github::PROVIDER)
-                            .execute(&self.db.pool)
-                            .await?;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "github did not name the app; the slug stays unknown");
-                    }
-                }
-            }
-        }
-        let stored = self.connection_row(crate::github::PROVIDER).await?;
-        let connected = crate::github::can_sign(private_key);
-        Ok(Connection {
-            provider: crate::github::PROVIDER.to_string(),
-            connected,
-            app_id: if connected {
-                Some(app_id.to_string())
-            } else {
-                None
-            },
-            slug: if connected {
-                stored.as_ref().and_then(|row| row.slug.clone())
-            } else {
-                None
-            },
-            connected_at: stored.map(|row| row.updated_at),
-        })
+        self.refresh_slug(app_id, private_key).await;
+        self.connection(crate::github::PROVIDER).await
     }
 
-    /// The app id and slug a commit's author address is built from, when both are
-    /// known. `None` for either means the commit keeps the role's own address and
-    /// GitHub shows it unattributed.
+    /// Store an API key for an agent CLI. The key is sealed like every other
+    /// secret, and the adapter it belongs to decides where it goes.
+    pub async fn set_agent_key(&self, provider: &str, key: &str) -> Result<Connection> {
+        let key = key.trim();
+        if key.is_empty() {
+            bail!("a key is required; the CLI uses it as {provider} credentials");
+        }
+        if crate::connectors::api_key_env(provider).is_none() {
+            bail!("`{provider}` takes a subscription file, not an API key");
+        }
+        let vault = self.vault()?;
+        let payload = Self::sealed_payload(&[("secret", vault.seal_string(key)?)]);
+        self.write_connector(
+            provider,
+            crate::connectors::KIND_API_KEY,
+            &payload,
+            Some("api key"),
+        )
+        .await?;
+        self.connection(provider).await
+    }
+
+    /// Store the credentials file a CLI wrote when it logged in. The contents are
+    /// copied into every run's scratch home, so a subscription is used by a run and
+    /// never by the host.
+    pub async fn set_agent_subscription(
+        &self,
+        provider: &str,
+        contents: &str,
+    ) -> Result<Connection> {
+        let contents = contents.trim();
+        if !contents.starts_with('{') {
+            bail!("paste the contents of the credentials file, which is JSON starting with `{{`");
+        }
+        let Some(path) = crate::connectors::credentials_file(provider) else {
+            bail!("`{provider}` does not take a subscription file");
+        };
+        let vault = self.vault()?;
+        let payload = Self::sealed_payload(&[("contents", vault.seal_string(contents)?)]);
+        self.write_connector(
+            provider,
+            crate::connectors::KIND_SUBSCRIPTION,
+            &payload,
+            Some(path),
+        )
+        .await?;
+        self.connection(provider).await
+    }
+
+    /// One provider as the screen sees it.
+    pub async fn connection(&self, provider: &str) -> Result<Connection> {
+        let all = self.connections().await?;
+        all.into_iter()
+            .find(|connection| connection.provider == provider)
+            .ok_or_else(|| anyhow!("unknown provider `{provider}`"))
+    }
+
+    /// Ask GitHub which app this key belongs to and remember the slug. Best
+    /// effort: no network keeps the app, and the slug is learned on a later call.
+    async fn refresh_slug(&self, app_id: &str, private_key: &str) {
+        if !crate::github::can_sign(private_key) {
+            return;
+        }
+        let Ok(jwt) = crate::github::mint_token(app_id, private_key) else {
+            return;
+        };
+        let Ok(http) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+        else {
+            return;
+        };
+        match crate::github::fetch_slug(&http, &jwt).await {
+            Ok(slug) => {
+                if let Err(error) =
+                    sqlx::query("update connectors set label = ? where provider = ?")
+                        .bind(&slug)
+                        .bind(crate::github::PROVIDER)
+                        .execute(&self.db.pool)
+                        .await
+                {
+                    tracing::warn!(%error, "could not remember the app slug");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "github did not name the app; the slug stays unknown");
+            }
+        }
+    }
+
     pub async fn commit_identity(&self) -> Result<(Option<String>, Option<String>)> {
         let Some(app) = self.stored_app(crate::github::PROVIDER).await? else {
             return Ok((None, None));
@@ -379,13 +510,7 @@ impl Engine {
         if !crate::github::can_sign(&app.private_key) {
             return Ok((None, None));
         }
-        let slug: Option<String> =
-            sqlx::query_scalar("select slug from connections where provider = ?")
-                .bind(crate::github::PROVIDER)
-                .fetch_optional(&self.db.pool)
-                .await?
-                .flatten();
-        Ok((Some(app.app_id), slug))
+        Ok((Some(app.app_id.clone()), app.slug.clone()))
     }
 
     /// The token a run acts as the app with. `None` when no app is stored or the

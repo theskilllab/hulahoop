@@ -131,6 +131,15 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
       <h2 className="section">GitHub</h2>
       <GithubConnector onChanged={onChanged} onError={setError} />
 
+      <h2 className="section">Agent credentials</h2>
+      <p className="dim small">
+        A subscription is the credentials file the CLI wrote when you logged in on this machine; an API key is the
+        alternative. Either way the run gets its own copy in a scratch home, so your login is never touched.
+      </p>
+      {AGENT_CONNECTORS.map((connector) => (
+        <AgentConnector key={connector.provider} {...connector} onChanged={onChanged} onError={setError} />
+      ))}
+
       <h2 className="section">Agents</h2>
       <ul className="agents">
         {agents.map((agent) => {
@@ -231,11 +240,25 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
 
 interface StoredConnection {
   provider: string;
+  kind: string;
   connected: boolean;
   appId: string | null;
   slug: string | null;
+  label: string | null;
   connectedAt: string | null;
 }
+
+/** The agent connectors, in the order the screen shows them. */
+const AGENT_CONNECTORS: { provider: string; title: string; file: string; keyHint: string }[] = [
+  {
+    provider: "claude_code",
+    title: "Claude Code subscription",
+    file: ".claude/.credentials.json",
+    keyHint: "sk-ant-…",
+  },
+  { provider: "codex", title: "Codex subscription", file: ".codex/auth.json", keyHint: "sk-…" },
+  { provider: "pi", title: "Pi subscription", file: ".pi/agent/auth.json", keyHint: "provider key" },
+];
 
 /**
  * The GitHub App is what lets the loop commit as itself instead of as you. Two
@@ -243,6 +266,136 @@ interface StoredConnection {
  * cannot sign. The second one is why the panel reports a reason rather than a
  * tick.
  */
+/**
+ * One agent connector: a subscription file or an API key, stored sealed, copied
+ * into each run's scratch home. Pasted values are never shown again, so the two
+ * fields start empty and the stored state is what the row reports.
+ */
+function AgentConnector({
+  provider,
+  title,
+  file,
+  keyHint,
+  onChanged,
+  onError,
+}: {
+  provider: string;
+  title: string;
+  file: string;
+  keyHint: string;
+  onChanged: () => Promise<void>;
+  onError: (message: string | null) => void;
+}) {
+  const [stored, setStored] = useState<StoredConnection | null>(null);
+  const [contents, setContents] = useState("");
+  const [key, setKey] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function load() {
+    const data = await gql<{ connections: StoredConnection[] }>(
+      `query { connections { provider kind connected label connectedAt } }`,
+    );
+    setStored(data.connections.find((connection) => connection.provider === provider) ?? null);
+  }
+
+  useEffect(() => {
+    void load();
+  }, [provider]);
+
+  async function run(label: string, work: () => Promise<unknown>) {
+    setBusy(label);
+    onError(null);
+    try {
+      await work();
+      setContents("");
+      setKey("");
+      await load();
+      await onChanged();
+    } catch (failure) {
+      onError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const when = stored?.connectedAt ? `stored ${new Date(stored.connectedAt).toLocaleString()}` : "";
+
+  return (
+    <div className="settings-block">
+      <div className="row spread">
+        <strong>{title}</strong>
+        {stored ? (
+          <span className={stored.connected ? "ok small" : "bad small"}>
+            {stored.connected ? `connected · ${stored.kind.replace("_", " ")}` : "stored, unusable"}
+          </span>
+        ) : (
+          <span className="dim small">not stored</span>
+        )}
+      </div>
+      <p className="dim small">
+        {stored?.label ? `${stored.label} · ${when}` : `paste ${file} or an api key · ${when}`}
+      </p>
+      <label>
+        Subscription file ({file})
+        <textarea
+          rows={3}
+          value={contents}
+          placeholder='{"claudeAiOauth":{"accessToken":"…"}}'
+          onChange={(event) => setContents(event.target.value)}
+        />
+      </label>
+      <label>
+        API key
+        <input value={key} placeholder={keyHint} onChange={(event) => setKey(event.target.value)} />
+      </label>
+      <div className="row">
+        <button
+          disabled={busy !== null || contents.trim().length < 2}
+          onClick={() =>
+            run("subscription", () =>
+              gql(
+                `mutation ($provider: String!, $contents: String!) { setAgentSubscription(provider: $provider, contents: $contents) { provider connected } }`,
+                { provider, contents },
+              ),
+            )
+          }
+        >
+          Save subscription
+        </button>
+        <button
+          disabled={busy !== null || key.trim().length < 4}
+          onClick={() =>
+            run("key", () =>
+              gql(
+                `mutation ($provider: String!, $key: String!) { setAgentKey(provider: $provider, key: $key) { provider connected } }`,
+                { provider, key },
+              ),
+            )
+          }
+        >
+          Save key
+        </button>
+        {stored && (
+          <button
+            className="ghost"
+            disabled={busy !== null}
+            onClick={() =>
+              run("disconnect", () =>
+                gql(
+                  `mutation ($provider: String!) { disconnectConnection(provider: $provider) { provider connected } }`,
+                  { provider },
+                ),
+              )
+            }
+          >
+            Disconnect
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function GithubConnector({ onChanged, onError }: { onChanged: () => Promise<void>; onError: (message: string | null) => void }) {
   const [stored, setStored] = useState<StoredConnection | null>(null);
   const [appId, setAppId] = useState("");
@@ -339,7 +492,7 @@ function GithubConnector({ onChanged, onError }: { onChanged: () => Promise<void
             disabled={busy !== null}
             onClick={() => {
               setPrivateKey("");
-              void run("disconnect", () => gql(`mutation { disconnectGithubApp { connected } }`));
+              void run("disconnect", () => gql(`mutation { disconnectConnection(provider: "github") { connected } }`));
             }}
           >
             Disconnect

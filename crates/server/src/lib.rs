@@ -2,6 +2,7 @@
 //! runner, and the single writer for the SQLite database.
 
 pub mod api;
+pub mod connectors;
 pub mod db;
 pub mod engine;
 pub mod github;

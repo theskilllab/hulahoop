@@ -173,6 +173,36 @@ impl Vcs {
         Ok(())
     }
 
+    /// Copy the bookmarks a run created back into the repository the loop keeps,
+    /// so a clone can be deleted without deleting the evidence.
+    ///
+    /// A local checkout is its own repository: the commit exists there and nowhere
+    /// else, and the replay that has to prove it reads the loop's repository. Pushing
+    /// to that path over git is cheaper and more honest than teaching replays to
+    /// clone, and it needs no network credential.
+    pub fn publish_to(&self, checkout: &Path, target: &Path, bookmarks: &[String]) -> Result<()> {
+        if bookmarks.is_empty() {
+            return Ok(());
+        }
+        let remote = "hulahoop-host";
+        let target = target.to_string_lossy().to_string();
+        // Adding a remote twice is not an error worth surfacing: the second run of a
+        // checkout that was reused would hit it.
+        let _ = self.run(checkout, "jj", &["git", "remote", "add", remote, &target]);
+        for name in bookmarks {
+            self.run(
+                checkout,
+                "jj",
+                &["git", "push", "--remote", remote, "--bookmark", name],
+            )?;
+        }
+        // jj imports external git refs lazily. Without this, the server resolves the
+        // bookmark a moment later and finds nothing, records an empty base revision,
+        // and the next run branches from the branch head instead of the suite.
+        self.run(std::path::Path::new(&target), "jj", &["git", "import"])?;
+        Ok(())
+    }
+
     pub fn set_bookmark_here(&self, checkout: &Path, name: &str) -> Result<String> {
         let output = self.run(
             checkout,

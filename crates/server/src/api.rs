@@ -10,7 +10,7 @@ use axum::{Json, Router};
 use hulahoop_core::runspec::{
     CheckoutInput, CriterionInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
 };
-use hulahoop_core::{contract, junit, AgentRole};
+use hulahoop_core::{junit, AgentRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -20,6 +20,66 @@ pub struct ApiState {
     pub engine: Arc<Engine>,
     pub token: String,
     pub runner_id_default: String,
+}
+
+/// What a local runner clones. The stored remote wins; the constant is the floor
+/// so a repository attached before remotes were read still has somewhere to come
+/// from.
+fn clone_url(repo: &Repo) -> String {
+    if let Some(remote) = &repo.remote_url {
+        return remote.clone();
+    }
+    // No remote, but the repository is on this machine: cloning the path is honest
+    // and needs no network. The constant is for the case the path does not exist
+    // here, which is exactly when the runner is on another host.
+    if std::path::Path::new(&repo.path).exists() {
+        return repo.path.clone();
+    }
+    hulahoop_core::contract::DEFAULT_CLONE_URL.to_string()
+}
+
+/// Runs either borrow the repository at its path or produce a checkout of their
+/// own. Single decision point, because a runner that mixes the two is a runner
+/// that leaves half a clone behind.
+fn runner_mode() -> &'static str {
+    match std::env::var("HULAHOOP_RUNNER_MODE").as_deref() {
+        Ok("local") => "local",
+        _ => "workspace",
+    }
+}
+
+/// Replays read the loop's own bookmarks (`tests/<issue>/…`), which never leave the
+/// host repository, so they always run in the borrowed one.
+fn replay_checkout(
+    data_dir: &std::path::Path,
+    project: &uuid::Uuid,
+    issue: &uuid::Uuid,
+    owner: &uuid::Uuid,
+) -> std::path::PathBuf {
+    hulahoop_core::contract::checkout_dir(data_dir, &project.to_string(), issue, &owner.to_string())
+}
+
+fn checkout_for(
+    data_dir: &std::path::Path,
+    project: &uuid::Uuid,
+    issue: &uuid::Uuid,
+    owner: &uuid::Uuid,
+) -> std::path::PathBuf {
+    if runner_mode() == "local" {
+        hulahoop_core::contract::workspace_checkout_dir(
+            data_dir,
+            &project.to_string(),
+            issue,
+            owner,
+        )
+    } else {
+        hulahoop_core::contract::checkout_dir(
+            data_dir,
+            &project.to_string(),
+            issue,
+            &owner.to_string(),
+        )
+    }
 }
 
 pub fn router(state: Arc<ApiState>) -> Router {
@@ -349,12 +409,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         .fetch_one(&engine.db.pool)
         .await?;
 
-    let checkout_path = contract::checkout_dir(
-        &engine.db.data_dir,
-        &project.id.to_string(),
-        &issue.id,
-        &run.id.to_string(),
-    );
+    let checkout_path = checkout_for(&engine.db.data_dir, &project.id, &issue.id, &run.id);
 
     // The parent run carries the review body the next attempt has to answer.
     let parent = match run.parent_run_id {
@@ -412,6 +467,17 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     // Committing is the app's act, so the implementer is the role that gets the
     // app's token. The test author and the reviewer write tests and read a diff;
     // neither pushes as the user, so neither is handed a credential it cannot use.
+    // Every role gets the adapter's own credential: an agent that cannot log in
+    // produces nothing, whatever it was asked to do.
+    let credential = {
+        let adapter =
+            hulahoop_core::Adapter::parse(&agent.adapter).unwrap_or(hulahoop_core::Adapter::Pi);
+        let credential = engine.agent_credential(adapter).await?;
+        serde_json::json!({
+            "env": credential.env,
+            "files": credential.files,
+        })
+    };
     let github_token = match run.role_enum() {
         AgentRole::Implementer => engine.github_token().await?,
         AgentRole::TestAuthor | AgentRole::Reviewer => None,
@@ -492,13 +558,21 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "vcs": repo.vcs,
         "repo_id": repo.id,
         "checkout_path": checkout_path,
+        "runner_mode": runner_mode(),
+        "clone_url": clone_url(&repo),
         "base_bookmark": run.base_bookmark,
         "base_revision": run.base_revision,
         "tests_bookmark": issue.tests_bookmark,
         "frozen_paths": issue.frozen_path_list(),
         "github_token": github_token,
+        // What this adapter authenticates with: a key in the environment or the
+        // credentials file the CLI wrote. Empty when nothing is stored, so the run
+        // falls back to whatever the machine's own login gives it.
+        "credential": credential,
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
+        // The connector, opened server-side, travels only on this authenticated
+        // channel: the runner needs it to act, the desktop never sees it.
         "caller_role": "run",
         // The address GitHub rewrites into a link to the bot user needs both
         // halves; either missing means the commit keeps the role address.
@@ -520,12 +594,7 @@ async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<V
         .bind(issue.project_id)
         .fetch_one(&engine.db.pool)
         .await?;
-    let checkout_path = contract::checkout_dir(
-        &engine.db.data_dir,
-        &project.id.to_string(),
-        &issue.id,
-        &replay.id.to_string(),
-    );
+    let checkout_path = replay_checkout(&engine.db.data_dir, &project.id, &issue.id, &replay.id);
 
     // A landing replay runs on the freshly fetched base after a rebase; the base
     // and head replays run on the revision they were queued for.

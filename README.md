@@ -1361,6 +1361,79 @@ first time an app really opens a socket to the LAN — an entry can only appear 
 that first attempt, so a request that never shows up means the app is running from a
 translocated path such as `~/Downloads`, or a VPN is handling the traffic first.
 
+### Connectors
+
+The loop acts on your behalf in two different ways, and both are connectors: a GitHub
+app pushes commits and opens pull requests as a bot user, and an agent CLI logs in as
+your subscription.
+
+| provider | kind | what is stored | what a run gets |
+| --- | --- | --- | --- |
+| `github` | `github_app` | app id + private key | `GITHUB_TOKEN`, the bot commit identity, the pull request |
+| `claude_code` | `subscription` or `api_key` | `.claude/.credentials.json` or `ANTHROPIC_API_KEY` | a copy of that file in the run's scratch home, or the variable |
+| `codex` | `subscription` or `api_key` | `.codex/auth.json` or `OPENAI_API_KEY` | the same |
+| `pi` | `subscription` or `api_key` | `.pi/agent/auth.json` or `PI_API_KEY` | the same |
+
+Every payload is sealed with the vault key before it touches the database, field by
+field: reading the app id never requires opening the private key. Settings shows one row
+per provider with its state — *connected*, *stored, unusable*, *not stored* — and never
+echoes a secret back. *Connected* means the stored secret can still act: a GitHub key
+that does not parse is reported as exactly that, because a key that cannot sign is not
+the app it claims to be.
+
+A run gets the connector for **its own adapter**, in the spec, over the authenticated
+internal channel. The desktop never sees a secret; the agent sees only what its own CLI
+needs, in a scratch home it does not share with the next run.
+
+The order is deliberate: a GitHub app first, because attribution and pull requests are
+how the loop's work reaches a human for review; agent subscriptions second, because a
+CLI that cannot log in produces nothing at all.
+
+### A runner that makes its own checkout
+
+The default runner borrows the repository at its path: `jj workspace add` inside your
+own clone, which is fast and leaves nothing behind beyond a workspace name. That only
+works when the runner and the repository are on the same machine.
+
+`HULAHOOP_RUNNER_MODE=local` changes the contract. The server hands the runner a
+`clone_url` (the repository's `origin`, or `https://github.com/theskilllab/hulahoop.git`
+when no remote is stored) and a checkout path under the data directory's `workspace/`
+tree:
+
+```
+$DATA/workspace/<project>/<issue>/<run>/checkout
+```
+
+Four levels, because the numbers multiply: a project holds issues, an issue holds
+attempts, an attempt holds one run per role. One project with ten issues and four
+attempts is 120 clones; the run directory is the unit of deletion, so a cleanup can
+never take a neighbour with it.
+
+The runner clones (`jj git clone --colocate`), parks the working copy on the revision
+the server accepted, runs setup, the agent, and the replay there, and deletes the whole
+`<run>` directory when the run is over. Artifacts live under `$DATA/runs/<run-id>/` and
+are untouched by that deletion, which is what anyone reads afterwards. A runner that is
+killed mid-run leaves its clone; at startup the runner removes workspace directories
+older than six hours, which is longer than any wall clock the loop allows.
+
+Three things make this work rather than mostly work. The runner pushes the bookmarks a
+run created (`tests/<issue>/cand/<run>`, `issue/<id>/head/<attempt>`) back into the host
+repository and forces `jj git import` there, because a clone is deleted when the run
+ends and the replay that has to prove the work reads the host's bookmarks. The clone
+gets one `jj git fetch` before the run starts, because a fresh clone knows the default
+branch and little else. And the base is tried as a local bookmark, then as
+`<name>@origin`, and only then as `main@origin` — the revision the run actually landed
+on is the revision every diff is taken against, so a resolvable base never yields an
+empty diff.
+
+The honest limits: a clone contains only what was pushed, so the base has to exist
+upstream (for our own repository, that means `main` and the loop's bookmarks); and
+replays still run in the borrowed repository, because they read the bookmarks the loop
+keeps there.
+
+`tests/e2e/loop.sh` runs the whole loop in either mode; `HULAHOOP_RUNNER_MODE=local`
+takes the clone path on every CI run that sets it.
+
 ### Where the implementation differs from the spec
 
 The spec is the contract; these are the deliberate deviations, each because the code

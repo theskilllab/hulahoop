@@ -195,6 +195,31 @@ pub fn checkout_dir(data_dir: &Path, project: &str, issue: &uuid::Uuid, owner: &
         .join(owner)
 }
 
+/// Where a run works when the checkout has to be produced rather than borrowed.
+///
+/// The tree is `workspace/<project>/<issue>/<run>/checkout`, because the numbers
+/// multiply: a project holds issues, an issue holds attempts, an attempt holds one
+/// run per role, and every level has to be findable a year later. Deletion is by
+/// the run directory, so nothing above it can be caught by accident.
+pub fn workspace_checkout_dir(
+    data_dir: &Path,
+    project: &str,
+    issue: &uuid::Uuid,
+    run: &uuid::Uuid,
+) -> PathBuf {
+    data_dir
+        .join("workspace")
+        .join(project)
+        .join(issue.to_string())
+        .join(run.to_string())
+        .join("checkout")
+}
+
+/// The repository a local runner clones from when the repo has no remote of its
+/// own. One constant while there is one project; it becomes a column the day a
+/// second project exists.
+pub const DEFAULT_CLONE_URL: &str = "https://github.com/theskilllab/hulahoop.git";
+
 pub fn run_artifact_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
     data_dir.join("runs").join(run_id.to_string())
 }
@@ -218,6 +243,31 @@ pub fn database_file(data_dir: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_workspace_checkout_is_findable_by_project_issue_and_run() {
+        let project = uuid::Uuid::nil();
+        let issue = uuid::Uuid::now_v7();
+        let run = uuid::Uuid::now_v7();
+        let path = workspace_checkout_dir(
+            std::path::Path::new("/data"),
+            &project.to_string(),
+            &issue,
+            &run,
+        );
+        assert!(path.ends_with("checkout"));
+        let text = path.to_string_lossy();
+        assert!(text.contains(&project.to_string()));
+        assert!(text.contains(&issue.to_string()));
+        assert!(text.contains(&run.to_string()));
+        // The run directory is what a cleanup deletes, so nothing above it can be
+        // caught by a parent-relative removal.
+        assert_eq!(
+            path.parent()
+                .map(|dir| dir.file_name().unwrap().to_string_lossy().to_string()),
+            Some(run.to_string())
+        );
+    }
 
     #[test]
     fn frozen_tests_win_over_the_contract() {
