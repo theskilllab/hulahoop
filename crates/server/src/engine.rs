@@ -1478,9 +1478,13 @@ impl Engine {
             .await?;
         }
 
+        // Everything below keys on the judged status: a suite that ran without the
+        // frozen tests is a failure even though the runner reported success, and it
+        // has to have the same consequences as any other red replay.
+        let status = judged.0;
         match replay.kind.as_str() {
             "head" => {
-                if payload.status == "succeeded" && report.is_green() {
+                if status == "succeeded" && report.is_green() {
                     sqlx::query(
                         "update issues set current_run_id = ?, updated_at = ? where id = ?",
                     )
@@ -1527,7 +1531,7 @@ impl Engine {
                 }
             }
             "landing" => {
-                if payload.status == "succeeded" && report.is_green() {
+                if status == "succeeded" && report.is_green() {
                     // Green here means the rebased tree passes; the human still
                     // merges, and `recordMerge` verifies the commit afterwards.
                 } else {
