@@ -145,6 +145,39 @@ impl Executor {
             )
             .await?;
 
+        // Frozen means frozen: a formatter run over the whole workspace rewrites the
+        // suite the implementer is not allowed to touch, and that should not throw
+        // away an hour of real work. Restoring first also means a deliberate edit to
+        // a test has no effect, which is the rule the gate is protecting.
+        let frozen: Vec<String> = spec["frozen_paths"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // A Test Author is the one role that writes tests, so it is exempt.
+        let mut restored = Vec::new();
+        let before = if role == AgentRole::TestAuthor {
+            Vec::new()
+        } else {
+            vcs.changed_paths(&checkout, &base).unwrap_or_default()
+        };
+        for path in &frozen {
+            if before.contains(path) {
+                vcs.restore_from(&checkout, &base, std::slice::from_ref(path))?;
+                restored.push(path.clone());
+            }
+        }
+        if !restored.is_empty() {
+            self.client
+                .event(run_id, "frozen_restored", json!({ "paths": restored }))
+                .await
+                .ok();
+        }
+
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
         let changed_paths = vcs.changed_paths(&checkout, &base).unwrap_or_default();
         let commit = vcs.working_copy_revision(&checkout).unwrap_or_default();

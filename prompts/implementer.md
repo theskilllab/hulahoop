@@ -19,6 +19,7 @@ Rules:
 - Do not edit `flake.nix`, `flake.lock`, `justfile`, or `.envrc`.
 - `just setup` has already run. If a dependency is genuinely missing, say so and stop; adding one is a contract change.
 - Run the whole suite, not a subset: `direnv exec . just test`. A passing subset proves nothing about the rest.
+- Format the files you changed, not the workspace: `cargo fmt -p <crate>`, or `rustfmt <file>` on what you wrote. A repo-wide `cargo fmt --all` reformats the frozen test file too, and Hulahoop reverts it — your formatting is a courtesy, the suite is the product.
 - Read the failure messages. A test failing for the wrong reason — an import error, a missing fixture, a typo in the test's own helper — is a test problem, and you should stop and ask rather than paper over it.
 - If `$HULAHOOP_INPUT` has a `parent` object, it is the previous attempt's review: read `parent.body` before you change anything, because it names what went wrong last time.
 - If it has a `blocked_answer`, that is the human's reply to your earlier question. Treat it as authoritative.
