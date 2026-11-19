@@ -84,6 +84,18 @@ impl Executor {
         let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
         std::fs::create_dir_all(&artifact_dir)?;
         let base_bookmark = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
+        // The server resolved the bookmark when it accepted the run. Using the name
+        // again here would branch from wherever the bookmark has since moved, and the
+        // diff would then blame the agent for commits it never wrote.
+        let base_revision = spec["base_revision"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let base = if base_revision.is_empty() {
+            base_bookmark.clone()
+        } else {
+            base_revision
+        };
         let issue_id = spec["issue_id"].as_str().unwrap_or_default().to_string();
         let attempt = spec["attempt"].as_i64().unwrap_or(0);
         let model = spec["model"].as_str().unwrap_or_default().to_string();
@@ -95,14 +107,14 @@ impl Executor {
 
         let vcs = Vcs::detect(&repo_path)?;
         vcs.ensure_vcs()?;
-        vcs.add_workspace(&checkout, &base_bookmark)?;
+        vcs.add_workspace(&checkout, &base)?;
         ensure_envrc(&checkout)?;
 
         self.client
             .event(
                 run_id,
                 "checkout",
-                json!({ "path": checkout, "base": base_bookmark }),
+                json!({ "path": checkout, "base": base, "bookmark": base_bookmark }),
             )
             .await
             .ok();
@@ -133,10 +145,8 @@ impl Executor {
             )
             .await?;
 
-        let diff = vcs.diff_from(&checkout, &base_bookmark).unwrap_or_default();
-        let changed_paths = vcs
-            .changed_paths(&checkout, &base_bookmark)
-            .unwrap_or_default();
+        let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
+        let changed_paths = vcs.changed_paths(&checkout, &base).unwrap_or_default();
         let commit = vcs.working_copy_revision(&checkout).unwrap_or_default();
 
         // The bookmark the server will resolve later. It is created here because
