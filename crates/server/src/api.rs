@@ -525,7 +525,9 @@ async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<V
 
     // A landing replay runs on the freshly fetched base after a rebase; the base
     // and head replays run on the revision they were queued for.
-    let head_bookmark = match replay.run_id {
+    // A landing replay carries the run it was approved from as its candidate, and
+    // that run is the one holding the head bookmark, so fall back to it.
+    let head_bookmark = match replay.run_id.or(replay.candidate_run_id) {
         Some(run_id) => {
             let run: Option<Run> = sqlx::query_as("select * from runs where id = ?")
                 .bind(run_id)
