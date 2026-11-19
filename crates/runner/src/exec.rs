@@ -327,8 +327,12 @@ impl Executor {
                     .as_str()
                     .context("landing replay without a head bookmark")?
                     .to_string();
+                // The suite commit is where the chain starts, and it is the same
+                // bookmark the freeze recorded: the landing replay has no candidate
+                // run of its own.
                 let candidate_bookmark = spec["candidate_bookmark"]
                     .as_str()
+                    .or_else(|| spec["tests_bookmark"].as_str())
                     .context("landing replay without the suite it was approved from")?
                     .to_string();
                 let base = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
