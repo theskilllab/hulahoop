@@ -245,6 +245,7 @@ impl Engine {
         Ok(Some(StoredApp {
             app_id,
             private_key,
+            slug: row.slug,
             updated_at: row.updated_at,
         }))
     }
@@ -256,11 +257,24 @@ impl Engine {
         let mut connections = Vec::with_capacity(Self::PROVIDERS.len());
         for provider in Self::PROVIDERS {
             let stored = self.stored_app(provider).await?;
+            let connected = stored
+                .as_ref()
+                .is_some_and(|app| crate::github::can_sign(&app.private_key));
             connections.push(Connection {
                 provider: provider.to_string(),
-                connected: stored
-                    .as_ref()
-                    .is_some_and(|app| crate::github::can_sign(&app.private_key)),
+                connected,
+                // The app id names the stored app only while its key can act: a
+                // key that cannot sign is not the app it claims to be.
+                app_id: if connected {
+                    stored.as_ref().map(|app| app.app_id.clone())
+                } else {
+                    None
+                },
+                slug: if connected {
+                    stored.as_ref().and_then(|app| app.slug.clone())
+                } else {
+                    None
+                },
                 connected_at: stored.map(|app| app.updated_at),
             });
         }
@@ -277,6 +291,8 @@ impl Engine {
         Ok(Connection {
             provider: crate::github::PROVIDER.to_string(),
             connected: false,
+            app_id: None,
+            slug: None,
             connected_at: None,
         })
     }
@@ -335,9 +351,20 @@ impl Engine {
             }
         }
         let stored = self.connection_row(crate::github::PROVIDER).await?;
+        let connected = crate::github::can_sign(private_key);
         Ok(Connection {
             provider: crate::github::PROVIDER.to_string(),
-            connected: crate::github::can_sign(private_key),
+            connected,
+            app_id: if connected {
+                Some(app_id.to_string())
+            } else {
+                None
+            },
+            slug: if connected {
+                stored.as_ref().and_then(|row| row.slug.clone())
+            } else {
+                None
+            },
             connected_at: stored.map(|row| row.updated_at),
         })
     }

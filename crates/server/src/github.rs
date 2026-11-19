@@ -17,11 +17,13 @@ use sha2::Sha256;
 pub const PROVIDER: &str = "github";
 
 /// The stored app with its credentials decrypted for the moment they are used.
-/// It never leaves this module's callers: the screen sees `provider` and
-/// `connected`, the runner sees a minted token.
+/// It never leaves this module's callers: the screen sees `provider`, `app_id`,
+/// and `connected`, the runner sees a minted token.
 pub struct StoredApp {
     pub app_id: String,
     pub private_key: String,
+    /// GitHub's slug for the app, once `GET /app` has named it.
+    pub slug: Option<String>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 

@@ -232,6 +232,8 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
 interface StoredConnection {
   provider: string;
   connected: boolean;
+  appId: string | null;
+  slug: string | null;
   connectedAt: string | null;
 }
 
@@ -249,7 +251,7 @@ function GithubConnector({ onChanged, onError }: { onChanged: () => Promise<void
 
   async function load() {
     const data = await gql<{ connections: StoredConnection[] }>(
-      `query { connections { provider connected connectedAt } }`,
+      `query { connections { provider connected appId slug connectedAt } }`,
     );
     setStored(data.connections.find((connection) => connection.provider === "github") ?? null);
   }
@@ -274,6 +276,8 @@ function GithubConnector({ onChanged, onError }: { onChanged: () => Promise<void
 
   const ready = appId.trim().length > 0 && privateKey.trim().length > 0;
 
+  const appName = stored?.slug ? `${stored.slug} (${stored.appId ?? "unknown id"})` : stored?.appId;
+
   return (
     <div className="settings-block">
       {stored ? (
@@ -281,6 +285,7 @@ function GithubConnector({ onChanged, onError }: { onChanged: () => Promise<void
           {stored.connected ? (
             <>
               <strong>connected</strong>{" "}
+              {appName ? <strong>{appName}</strong> : null}{" "}
               <span className="dim small">
                 the loop commits as its own app identity, and the key can sign
                 {stored.connectedAt ? ` · stored ${new Date(stored.connectedAt).toLocaleString()}` : ""}

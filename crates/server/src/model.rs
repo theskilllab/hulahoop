@@ -276,12 +276,19 @@ pub struct RunnerJob {
 }
 
 /// What the connections screen shows. The credentials themselves never leave the
-/// server, so the object carries the two facts a user can act on: which provider
-/// this is, and whether the stored credential still works.
+/// server, so the object carries the facts a user can act on: which provider
+/// this is, whether the stored credential still works, and which app it names.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject)]
 pub struct Connection {
     pub provider: String,
     pub connected: bool,
+    /// The app id the stored key belongs to, once that key can sign. Two apps on
+    /// one machine are otherwise indistinguishable, so this is the name the
+    /// screen shows. `None` when no app is stored or its key cannot act.
+    pub app_id: Option<String>,
+    /// GitHub's slug for the app, learned from `GET /app` when the key is stored.
+    /// `None` until that call succeeds, or when no app is stored.
+    pub slug: Option<String>,
     /// When the stored app was last written, so a stale key is visible.
     pub connected_at: Option<DateTime<Utc>>,
 }
@@ -293,6 +300,7 @@ pub struct ConnectionRow {
     pub provider: String,
     pub app_id_ciphertext: String,
     pub private_key_ciphertext: String,
+    pub slug: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
