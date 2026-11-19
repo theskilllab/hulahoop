@@ -896,7 +896,7 @@ impl Engine {
                 issue.repo_id,
                 Some(issue_id),
                 "bookmark",
-                serde_json::json!({ "from": bookmark, "to": archive }),
+                serde_json::json!({ "name": archive, "from": bookmark }),
             )
             .await?;
         }
@@ -996,13 +996,15 @@ impl Engine {
         let artifact_dir = contract::replay_artifact_dir(&self.db.data_dir, &replay_id);
         std::fs::create_dir_all(&artifact_dir)?;
         sqlx::query(
-            "insert into replays (id, issue_id, repo_id, run_id, approval_id, kind, attempt, revision,
-                tests_bookmark, status, artifact_dir, created_at)
-             values (?, ?, ?, null, ?, 'landing', ?, ?, ?, 'queued', ?, ?)",
+            "insert into replays (id, issue_id, repo_id, run_id, candidate_run_id, approval_id, kind,
+                attempt, revision, tests_bookmark, status, artifact_dir, created_at)
+             values (?, ?, ?, ?, ?, ?, 'landing', ?, ?, ?, 'queued', ?, ?)",
         )
         .bind(replay_id)
         .bind(issue_id)
         .bind(issue.repo_id)
+        .bind(run_id)
+        .bind(run_id)
         .bind(approval_id)
         .bind(issue.attempt)
         .bind(reviewed_head)
@@ -1620,7 +1622,11 @@ impl Engine {
                     // Green here means the rebased tree passes. The pull request is
                     // the human's next move, so it is opened now and the merge is
                     // still theirs to make.
-                    if let Some(run_id) = replay.run_id.or(replay.candidate_run_id) {
+                    if let Some(run_id) = replay
+                        .run_id
+                        .or(replay.candidate_run_id)
+                        .or(issue.current_run_id)
+                    {
                         self.queue_job(
                             issue.repo_id,
                             Some(issue.id),

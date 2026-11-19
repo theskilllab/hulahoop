@@ -607,10 +607,23 @@ async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<V
 }
 
 async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Value> {
-    let repo: Repo = sqlx::query_as("select * from repos where id = ?")
+    let mut repo: Repo = sqlx::query_as("select * from repos where id = ?")
         .bind(job.repo_id)
         .fetch_one(&engine.db.pool)
         .await?;
+    // A repository attached before the column existed has no remote, and a pull
+    // request job cannot work without one. Reading it now costs a subprocess and
+    // saves a migration that would have to guess.
+    if repo.remote_url.is_none() {
+        if let Some(remote) = crate::vcs_remote(std::path::Path::new(&repo.path)) {
+            sqlx::query("update repos set remote_url = ? where id = ?")
+                .bind(&remote)
+                .bind(repo.id)
+                .execute(&engine.db.pool)
+                .await?;
+            repo.remote_url = Some(remote);
+        }
+    }
     let checkout_path = engine
         .db
         .data_dir

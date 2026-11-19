@@ -197,6 +197,17 @@ impl Executor {
                     author_name
                 )
             })?;
+        // A commit with no message cannot be pushed and reads as noise in `jj log`.
+        // The role says who, the issue says what.
+        if role != AgentRole::Reviewer {
+            let prefix = match role {
+                AgentRole::TestAuthor => "tests",
+                _ => "implement",
+            };
+            let title = spec["issue"]["title"].as_str().unwrap_or("the issue");
+            vcs.describe_here(&checkout, &format!("{prefix}: {title}"))
+                .with_context(|| format!("describing the {prefix} commit"))?;
+        }
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();

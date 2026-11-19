@@ -147,6 +147,14 @@ impl Vcs {
         Ok((name, email))
     }
 
+    /// Give the working-copy commit a message. jj refuses to push a commit that
+    /// has none, and `jj log` is unreadable without it, so a run names its own.
+    pub fn describe_here(&self, checkout: &Path, message: &str) -> Result<()> {
+        let output = self.run(checkout, "jj", &["describe", "-m", message])?;
+        let _ = output;
+        Ok(())
+    }
+
     pub fn set_working_copy_author(&self, checkout: &Path, name: &str, email: &str) -> Result<()> {
         let output = Command::new("jj")
             .args(["metaedit", "--update-author"])

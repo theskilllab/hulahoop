@@ -307,7 +307,7 @@ export const ISSUE_FIELDS = `
   comments { id authorType body pinned createdAt }
   replays { id kind status failedTests createdAt }
   approval { id headRevision diffSha landingBookmark flags createdAt }
-  currentRun { id role status attempt }
+  currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error startedAt finishedAt }
 `;
 
 export async function loadBoard(projectId: string): Promise<Issue[]> {

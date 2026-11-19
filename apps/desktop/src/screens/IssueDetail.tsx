@@ -257,9 +257,9 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
           <p className="dim">
             head {current.headRevision?.slice(0, 12)} · diff {current.diffSha?.slice(0, 12)}
           </p>
-          {current.flags.length > 0 ? (
+          {(current.flags ?? []).length > 0 ? (
             <ul className="flags">
-              {current.flags.map((flag) => (
+              {(current.flags ?? []).map((flag) => (
                 <li key={flag}>
                   <label>
                     <input
@@ -283,7 +283,7 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
             </button>
             <button
               className="primary"
-              disabled={busy !== null || ackFlags.length !== current.flags.length}
+              disabled={busy !== null || ackFlags.length !== (current.flags?.length ?? 0)}
               onClick={async () => {
                 await run(
                   "approve",
