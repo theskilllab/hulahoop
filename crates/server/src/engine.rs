@@ -400,7 +400,11 @@ impl Engine {
         .bind(role.as_str())
         .bind(attempt)
         .bind(&base_bookmark)
-        .bind(&repo.base_revision)
+        // The base is a revision expression, not a frozen hash: an implementer run
+        // has to start on the frozen suite's bookmark, and resolving it here would
+        // mean a second process to ask jj. Storing the bookmark keeps the run on
+        // the suite the gate proved red, even after another attempt moves it.
+        .bind(&base_bookmark)
         .bind(&prompt_revision)
         .bind(artifact_dir.display().to_string())
         .bind(crate::db::now_rfc3339())
@@ -1303,6 +1307,19 @@ impl Engine {
 
         // What the colour of the suite means depends on the kind of replay: red is
         // the proof for a base replay, green is the proof for a head or landing one.
+        // A green suite without the frozen tests is the failure this product exists
+        // to catch: it proves the build, not the criteria.
+        let criteria = self.criteria(issue.id).await?;
+        let tokens: Vec<String> = criteria
+            .iter()
+            .map(|criterion| format!("ac{}", criterion.position))
+            .collect();
+        let frozen_tests_ran = report.cases.iter().any(|case| {
+            tokens
+                .iter()
+                .any(|token| hulahoop_core::junit::contains_token(&case.name, token))
+        });
+
         let judged = match replay.kind.as_str() {
             "base" if payload.status == "succeeded" => {
                 if report.is_green() {
@@ -1316,6 +1333,10 @@ impl Engine {
                     ("failed", "the base replay produced no test results at all")
                 }
             }
+            "head" | "landing" if payload.status == "succeeded" && !frozen_tests_ran => (
+                "failed",
+                "the report has no test named after a criterion, so the frozen suite never ran at this revision",
+            ),
             "head" | "landing" if payload.status == "succeeded" => {
                 if report.is_green() {
                     ("succeeded", "")
