@@ -93,26 +93,32 @@ impl Query {
     async fn issues(
         &self,
         ctx: &Context<'_>,
-        project_id: Uuid,
+        workspace_id: Uuid,
+        project_id: Option<Uuid>,
         status: Option<String>,
     ) -> async_graphql::Result<Vec<Issue>> {
-        let rows = match status {
-            Some(status) => sqlx::query_as::<_, Issue>(
-                "select * from issues where project_id = ? and status = ? order by created_at desc",
-            )
-            .bind(project_id)
-            .bind(status)
-            .fetch_all(&engine(ctx).db.pool)
-            .await?,
-            None => {
+        let engine = engine(ctx);
+        let mut rows: Vec<Issue> = match project_id {
+            Some(project) => {
                 sqlx::query_as::<_, Issue>(
                     "select * from issues where project_id = ? order by created_at desc",
                 )
-                .bind(project_id)
-                .fetch_all(&engine(ctx).db.pool)
+                .bind(project)
+                .fetch_all(&engine.db.pool)
+                .await?
+            }
+            None => {
+                sqlx::query_as::<_, Issue>(
+                    "select * from issues where workspace_id = ? order by created_at desc",
+                )
+                .bind(workspace_id)
+                .fetch_all(&engine.db.pool)
                 .await?
             }
         };
+        if let Some(status) = status {
+            rows.retain(|issue| issue.status == status);
+        }
         Ok(rows)
     }
 
@@ -180,6 +186,49 @@ impl Query {
         .await?)
     }
 
+    async fn milestones(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<Milestone>> {
+        Ok(engine(ctx).milestones(workspace_id).await?)
+    }
+
+    async fn milestone(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+    ) -> async_graphql::Result<Option<Milestone>> {
+        Ok(
+            sqlx::query_as::<_, Milestone>("select * from milestones where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
+    async fn artifacts(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        milestone_id: Option<Uuid>,
+    ) -> async_graphql::Result<Vec<Artifact>> {
+        Ok(engine(ctx).artifacts(workspace_id, milestone_id).await?)
+    }
+
+    async fn artifact(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+    ) -> async_graphql::Result<Option<Artifact>> {
+        Ok(
+            sqlx::query_as::<_, Artifact>("select * from artifacts where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
     async fn preflight(
         &self,
         ctx: &Context<'_>,
@@ -231,21 +280,138 @@ impl Mutation {
         ctx: &Context<'_>,
         workspace_id: Uuid,
         name: String,
+        prefix: Option<String>,
     ) -> async_graphql::Result<Project> {
+        let engine = engine(ctx);
         let id = Uuid::now_v7();
+        // The prefix is what an issue is called by, so it is a decision made when
+        // the project is made — with the project's own name as the first guess.
+        let prefix = match prefix {
+            Some(raw) => Engine::normalise_prefix(&raw)
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?,
+            None => Engine::normalise_prefix(&name).unwrap_or_else(|_| "PRJ".to_string()),
+        };
+        let taken: Option<(String,)> =
+            sqlx::query_as("select id from projects where workspace_id = ? and prefix = ?")
+                .bind(workspace_id)
+                .bind(&prefix)
+                .fetch_optional(&engine.db.pool)
+                .await?;
+        if taken.is_some() {
+            return Err(async_graphql::Error::new(format!(
+                "the prefix {prefix} is already used by another project in this workspace"
+            )));
+        }
         sqlx::query(
-            "insert into projects (id, workspace_id, name, created_at) values (?, ?, ?, ?)",
+            "insert into projects (id, workspace_id, name, prefix, created_at) values (?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
         .bind(&name)
+        .bind(&prefix)
         .bind(crate::db::now_rfc3339())
-        .execute(&engine(ctx).db.pool)
+        .execute(&engine.db.pool)
         .await?;
         Ok(sqlx::query_as("select * from projects where id = ?")
             .bind(id)
-            .fetch_one(&engine(ctx).db.pool)
+            .fetch_one(&engine.db.pool)
             .await?)
+    }
+
+    async fn set_project_prefix(
+        &self,
+        ctx: &Context<'_>,
+        project_id: Uuid,
+        prefix: String,
+    ) -> async_graphql::Result<Project> {
+        Ok(engine(ctx).set_project_prefix(project_id, &prefix).await?)
+    }
+
+    async fn create_milestone(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        project_id: Option<Uuid>,
+        title: String,
+        body: Option<String>,
+        target_date: Option<String>,
+    ) -> async_graphql::Result<Milestone> {
+        Ok(engine(ctx)
+            .create_milestone(
+                workspace_id,
+                project_id,
+                title,
+                body.unwrap_or_default(),
+                target_date,
+            )
+            .await?)
+    }
+
+    async fn update_milestone(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        title: Option<String>,
+        body: Option<String>,
+        status: Option<String>,
+        target_date: Option<String>,
+    ) -> async_graphql::Result<Milestone> {
+        Ok(engine(ctx)
+            .update_milestone(id, title, body, status, target_date)
+            .await?)
+    }
+
+    async fn set_issue_milestone(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        milestone_id: Option<Uuid>,
+    ) -> async_graphql::Result<Issue> {
+        Ok(engine(ctx)
+            .set_issue_milestone(issue_id, milestone_id)
+            .await?)
+    }
+
+    /// Files arrive base64-encoded so the mutation stays one JSON body; the server
+    /// writes the bytes and keeps the row as the index.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_artifact(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        project_id: Option<Uuid>,
+        milestone_id: Option<Uuid>,
+        title: Option<String>,
+        kind: Option<String>,
+        filename: String,
+        mime: Option<String>,
+        content_base64: String,
+    ) -> async_graphql::Result<Artifact> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content_base64.trim())
+            .map_err(|e| async_graphql::Error::new(format!("the file is not valid base64: {e}")))?;
+        if bytes.len() as u64 > hulahoop_core::ARTIFACT_LIMIT_BYTES {
+            return Err(async_graphql::Error::new(
+                "that file is larger than the artifact limit (500 MB)",
+            ));
+        }
+        Ok(engine(ctx)
+            .store_artifact(
+                workspace_id,
+                project_id,
+                milestone_id,
+                title.unwrap_or_default(),
+                kind,
+                filename,
+                mime,
+                &bytes,
+            )
+            .await?)
+    }
+
+    async fn delete_artifact(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).delete_artifact(id).await?)
     }
 
     /// Store a GitHub app so the loop can commit as it. Replaceable: pasting a
@@ -510,8 +676,11 @@ impl Mutation {
     async fn create_issue(
         &self,
         ctx: &Context<'_>,
-        project_id: Uuid,
-        repo_id: Uuid,
+        // Optional: a project or a repository already names the workspace, and the
+        // older callers predate the field.
+        workspace_id: Option<Uuid>,
+        project_id: Option<Uuid>,
+        repo_id: Option<Uuid>,
         title: String,
         body: String,
         priority: Option<String>,
@@ -520,15 +689,82 @@ impl Mutation {
         let engine = engine(ctx);
         Engine::validate_criteria(&criteria)
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        // A repository always exists, because a run has to know where to work: the
+        // caller may name one, a project with a single repository supplies it, and
+        // otherwise the workspace's first repository is the honest default.
+        let repo_id = match repo_id {
+            Some(id) => id,
+            None => {
+                let row: Option<(Uuid,)> = match project_id {
+                    Some(project) => {
+                        sqlx::query_as(
+                            "select id from repos where project_id = ? order by created_at limit 1",
+                        )
+                        .bind(project)
+                        .fetch_optional(&engine.db.pool)
+                        .await?
+                    }
+                    None => {
+                        let workspace: Option<(Uuid,)> = sqlx::query_as(
+                            "select r.id from repos r join projects p on p.id = r.project_id where p.workspace_id = ? order by r.created_at limit 1",
+                        )
+                        .bind(workspace_id)
+                        .fetch_optional(&engine.db.pool)
+                        .await?;
+                        workspace
+                    }
+                };
+                row.map(|(id,)| id)
+                    .ok_or_else(|| {
+                        async_graphql::Error::new(
+                            "no repository is attached yet, and a run needs one. Add a repository on the project first.",
+                        )
+                    })?
+            }
+        };
+        let workspace_id = match workspace_id {
+            Some(id) => id,
+            None => {
+                let derived: Option<(Uuid,)> = match project_id {
+                    Some(project) => {
+                        sqlx::query_as("select workspace_id from projects where id = ?")
+                            .bind(project)
+                            .fetch_optional(&engine.db.pool)
+                            .await?
+                    }
+                    None => {
+                        sqlx::query_as(
+                            "select p.workspace_id from repos r join projects p on p.id = r.project_id where r.id = ?",
+                        )
+                        .bind(repo_id)
+                        .fetch_optional(&engine.db.pool)
+                        .await?
+                    }
+                };
+                match derived.map(|(id,)| id) {
+                    Some(id) => id,
+                    None => return Err(async_graphql::Error::new(
+                        "the issue needs a workspace: pass workspaceId, or file it under a project",
+                    )),
+                }
+            }
+        };
+        let (number, issue_key) = engine
+            .next_issue_key(workspace_id, project_id)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         let id = Uuid::now_v7();
         let now = crate::db::now_rfc3339();
         sqlx::query(
-            "insert into issues (id, project_id, repo_id, title, body, status, priority, created_at, updated_at)
-             values (?, ?, ?, ?, ?, 'backlog', ?, ?, ?)",
+            "insert into issues (id, workspace_id, project_id, repo_id, number, issue_key, title, body, status, priority, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?)",
         )
         .bind(id)
+        .bind(workspace_id)
         .bind(project_id)
         .bind(repo_id)
+        .bind(number)
+        .bind(&issue_key)
         .bind(&title)
         .bind(&body)
         .bind(priority.unwrap_or_else(|| "medium".into()))
@@ -810,6 +1046,32 @@ impl Project {
 
 #[ComplexObject]
 impl Issue {
+    /// The milestone this issue was filed under, if any.
+    async fn milestone(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Milestone>> {
+        let Some(id) = self.milestone_id else {
+            return Ok(None);
+        };
+        Ok(
+            sqlx::query_as::<_, Milestone>("select * from milestones where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
+    /// The project's prefix, so a screen can show `BAL` without a second query.
+    async fn project_prefix(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<String>> {
+        let Some(id) = self.project_id else {
+            return Ok(None);
+        };
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("select prefix from projects where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?;
+        Ok(row.and_then(|(prefix,)| prefix))
+    }
+
     async fn criteria(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Criterion>> {
         Ok(engine(ctx).criteria(self.id).await?)
     }

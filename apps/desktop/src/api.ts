@@ -82,6 +82,12 @@ export interface Approval {
 
 export interface Issue {
   id: string;
+  /** `BAL-15`: the project's prefix and the number inside it. */
+  key: string;
+  number: number;
+  projectId: string | null;
+  projectPrefix: string | null;
+  milestoneId: string | null;
   title: string;
   body: string;
   status: IssueStatus;
@@ -126,12 +132,39 @@ export interface ProjectAgent {
 export interface Project {
   id: string;
   name: string;
+  /** `BAL` in `BAL-15`. Null until somebody decides one. */
+  prefix: string | null;
   repos: Repo[];
 }
 
 export interface Workspace {
   id: string;
   name: string;
+  /** What an issue with no project is called by. */
+  defaultPrefix: string;
+}
+
+export interface Milestone {
+  id: string;
+  projectId: string | null;
+  title: string;
+  body: string;
+  status: string;
+  targetDate: string | null;
+  createdAt: string;
+}
+
+export interface Artifact {
+  id: string;
+  projectId: string | null;
+  milestoneId: string | null;
+  title: string;
+  kind: string;
+  filename: string;
+  mime: string;
+  size: number;
+  sha256: string;
+  createdAt: string;
 }
 
 let connection: Connection | null = null;
@@ -300,7 +333,8 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
 }
 
 export const ISSUE_FIELDS = `
-  id title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
+  id key number projectId projectPrefix milestoneId
+  title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
   criteria { position text testName }
   runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
@@ -310,12 +344,79 @@ export const ISSUE_FIELDS = `
   currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error startedAt finishedAt }
 `;
 
-export async function loadBoard(projectId: string): Promise<Issue[]> {
+export async function loadBoard(workspaceId: string): Promise<Issue[]> {
   const data = await gql<{ issues: Issue[] }>(
-    `query ($projectId: UUID!) { issues(projectId: $projectId) { ${ISSUE_FIELDS} } }`,
-    { projectId },
+    `query ($workspaceId: UUID!) { issues(workspaceId: $workspaceId) { ${ISSUE_FIELDS} } }`,
+    { workspaceId },
   );
   return data.issues;
+}
+
+export const MILESTONE_FIELDS = `id projectId title body status targetDate createdAt`;
+
+export async function loadMilestones(workspaceId: string): Promise<Milestone[]> {
+  const data = await gql<{ milestones: Milestone[] }>(
+    `query ($workspaceId: UUID!) { milestones(workspaceId: $workspaceId) { ${MILESTONE_FIELDS} } }`,
+    { workspaceId },
+  );
+  return data.milestones;
+}
+
+export const ARTIFACT_FIELDS = `id projectId milestoneId title kind filename mime size sha256 createdAt`;
+
+export async function loadArtifacts(workspaceId: string): Promise<Artifact[]> {
+  const data = await gql<{ artifacts: Artifact[] }>(
+    `query ($workspaceId: UUID!) { artifacts(workspaceId: $workspaceId) { ${ARTIFACT_FIELDS} } }`,
+    { workspaceId },
+  );
+  return data.artifacts;
+}
+
+/** Upload a file: base64 in the mutation body, bytes on the server's disk. */
+export async function uploadArtifact(input: {
+  workspaceId: string;
+  projectId: string | null;
+  milestoneId: string | null;
+  title: string;
+  file: File;
+}): Promise<Artifact> {
+  const buffer = new Uint8Array(await input.file.arrayBuffer());
+  let binary = "";
+  const chunk = 0x8000;
+  for (let index = 0; index < buffer.length; index += chunk) {
+    binary += String.fromCharCode(...buffer.subarray(index, index + chunk));
+  }
+  const data = await gql<{ createArtifact: Artifact }>(
+    `mutation ($workspaceId: UUID!, $projectId: UUID, $milestoneId: UUID, $title: String, $filename: String!, $mime: String, $contentBase64: String!) {
+      createArtifact(workspaceId: $workspaceId, projectId: $projectId, milestoneId: $milestoneId, title: $title, filename: $filename, mime: $mime, contentBase64: $contentBase64) { ${ARTIFACT_FIELDS} }
+    }`,
+    {
+      workspaceId: input.workspaceId,
+      projectId: input.projectId,
+      milestoneId: input.milestoneId,
+      title: input.title,
+      filename: input.file.name,
+      mime: input.file.type || null,
+      contentBase64: btoa(binary),
+    },
+  );
+  return data.createArtifact;
+}
+
+/** Fetch the bytes with the bearer token, then hand them to the browser to save. */
+export async function downloadArtifact(artifact: Artifact): Promise<void> {
+  const current = await connect();
+  const response = await fetch(`${current.url}/artifacts/${artifact.id}`, {
+    headers: { authorization: `Bearer ${current.token}` },
+  });
+  if (!response.ok) throw new Error(`the server answered ${response.status} for ${artifact.filename}`);
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = artifact.filename;
+  link.click();
+  URL.revokeObjectURL(url);
 }
 
 export async function loadIssue(id: string): Promise<Issue> {
@@ -323,27 +424,23 @@ export async function loadIssue(id: string): Promise<Issue> {
   return data.issue;
 }
 
-export async function loadWorkspace(): Promise<{ workspace: Workspace; project: Project | null; agents: Agent[] }> {
-  const data = await gql<{ workspaces: Workspace[] }>(`{ workspaces { id name } }`);
+export async function loadWorkspace(): Promise<{ workspace: Workspace; projects: Project[]; agents: Agent[] }> {
+  const data = await gql<{ workspaces: Workspace[] }>(
+    `{ workspaces { id name defaultPrefix } }`,
+  );
   const workspace = data.workspaces[0];
   if (!workspace) throw new Error("the server has no workspace yet");
   const projects = await gql<{ projects: Project[] }>(
-    `query ($id: UUID!) { projects(workspaceId: $id) { id name repos { id name path vcs baseBookmark contractVersion fetchedAt } } }`,
+    `query ($id: UUID!) { projects(workspaceId: $id) { id name prefix repos { id name path vcs baseBookmark contractVersion fetchedAt } } }`,
     { id: workspace.id },
   );
   const agents = await gql<{ agents: Agent[] }>(
     `query ($id: UUID!) { agents(workspaceId: $id) { id name adapter model } }`,
     { id: workspace.id },
   );
-  return { workspace, project: projects.projects[0] ?? null, agents: agents.agents };
+  return { workspace, projects: projects.projects, agents: agents.agents };
 }
 
 export async function loadWorkspaceIssues(workspaceId: string): Promise<Issue[]> {
-  const data = await gql<{ projects: Project[] }>(
-    `query ($id: UUID!) { projects(workspaceId: $id) { id name repos { id name path vcs baseBookmark contractVersion fetchedAt } } }`,
-    { id: workspaceId },
-  );
-  const project = data.projects[0];
-  if (!project) return [];
-  return loadBoard(project.id);
+  return loadBoard(workspaceId);
 }

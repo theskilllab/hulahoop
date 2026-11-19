@@ -568,6 +568,13 @@ impl Engine {
         parent_run_id: Option<Uuid>,
     ) -> Result<Run> {
         let issue = self.issue(issue_id).await?;
+        // A run needs somewhere to work and a project to borrow role bindings from.
+        // An issue without a project is planning, and planning is not running.
+        let project_id = issue.project_id.ok_or_else(|| {
+            anyhow!(
+                "this issue belongs to no project, so it has no agent roles to run. Move it into a project first."
+            )
+        })?;
         let repo: Repo = sqlx::query_as("select * from repos where id = ?")
             .bind(issue.repo_id)
             .fetch_one(&self.db.pool)
@@ -575,7 +582,7 @@ impl Engine {
 
         let agent_id = match agent_id {
             Some(id) => {
-                let bound = self.agent_role_binding(issue.project_id, role).await?;
+                let bound = self.agent_role_binding(project_id, role).await?;
                 if bound != Some(id) {
                     let bound_name = match bound {
                         Some(other) => other.to_string(),
@@ -589,7 +596,7 @@ impl Engine {
                 id
             }
             None => self
-                .agent_role_binding(issue.project_id, role)
+                .agent_role_binding(project_id, role)
                 .await?
                 .ok_or_else(|| {
                     anyhow!(

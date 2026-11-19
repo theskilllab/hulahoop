@@ -10,6 +10,8 @@ pub struct Workspace {
     pub id: Uuid,
     pub name: String,
     pub slug: String,
+    /// What an issue is called when it belongs to no project.
+    pub default_prefix: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -20,6 +22,8 @@ pub struct Project {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
+    /// `BAL` in `BAL-15`. Unique per workspace, uppercase.
+    pub prefix: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -72,8 +76,16 @@ pub struct ProjectAgent {
 #[graphql(complex)]
 pub struct Issue {
     pub id: Uuid,
-    pub project_id: Uuid,
+    pub workspace_id: Uuid,
+    /// Null when the issue is planning work that belongs to no project yet.
+    pub project_id: Option<Uuid>,
     pub repo_id: Uuid,
+    pub milestone_id: Option<Uuid>,
+    /// The number inside its project (or workspace, when it has no project).
+    pub number: i64,
+    /// `BAL-15`. Stored, not derived, so a renamed prefix is a deliberate rewrite.
+    #[graphql(name = "key")]
+    pub issue_key: String,
     pub title: String,
     pub body: String,
     pub status: String,
@@ -310,4 +322,33 @@ pub struct ConnectorRow {
     pub label: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct Milestone {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub title: String,
+    pub body: String,
+    pub status: String,
+    pub target_date: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct Artifact {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub project_id: Option<Uuid>,
+    pub milestone_id: Option<Uuid>,
+    pub title: String,
+    /// `document`, `image`, `archive`, `link` — a label, never a rule.
+    pub kind: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
+    pub created_at: DateTime<Utc>,
 }

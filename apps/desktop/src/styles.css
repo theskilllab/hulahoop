@@ -9,6 +9,10 @@
   --loop-dim: #2f6f4d;
   --warn: #f2b357;
   --bad: #ef6a6a;
+  --panel: var(--ink-2);
+  --panel-2: var(--ink-3);
+  --dim: var(--paper-dim);
+  --red: var(--bad);
   --mono: "SF Mono", "Iosevka Term", ui-monospace, monospace;
   --sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
@@ -792,4 +796,128 @@ button.link {
   font-size: 0.65rem;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+/* Project prefixes, milestones and the shelf. */
+code.key {
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  color: var(--loop);
+  letter-spacing: 0.02em;
+}
+
+.project-pick {
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.6rem 1rem 0.2rem;
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--dim);
+}
+
+.milestone-pick {
+  margin-left: auto;
+  max-width: 14rem;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: baseline;
+  gap: 1rem;
+  flex-wrap: wrap;
+}
+
+.sheet .panel {
+  margin-top: 1rem;
+}
+
+.milestone.closed {
+  opacity: 0.65;
+}
+
+.milestone header h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.members {
+  list-style: none;
+  padding: 0;
+  margin: 0.6rem 0;
+  display: grid;
+  gap: 0.3rem;
+}
+
+.members li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.86rem;
+}
+
+.attach {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.chip {
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.15rem 0.6rem;
+  font-size: 0.75rem;
+  font-family: var(--mono);
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 1rem;
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: 0.45rem 0.6rem;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.86rem;
+  vertical-align: top;
+}
+
+.table th {
+  color: var(--dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.68rem;
+}
+
+.repos {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 0.5rem;
+}
+
+.narrow-input {
+  max-width: 7rem;
+  text-transform: uppercase;
+}
+
+button.link.danger {
+  color: var(--red);
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.75rem 1rem;
+}
+
+.grid-2 .wide {
+  grid-column: 1 / -1;
 }

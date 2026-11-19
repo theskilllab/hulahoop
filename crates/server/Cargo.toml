@@ -6,6 +6,7 @@ license.workspace = true
 
 
 [dependencies]
+base64 = "0.22"
 anyhow = { workspace = true }
 async-graphql = { workspace = true }
 async-graphql-axum = { workspace = true }

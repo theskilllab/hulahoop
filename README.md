@@ -422,6 +422,9 @@ $DATA/replays/<replay-id>/
 
 The server writes every file here; the runner posts the bytes. One writer keeps the log and the JUnit reports consistent with `runs.status`, and the reviewer reads the same files the gate read. A replay is its own row and its own directory, so red at base, green at head, and the landing replay stay distinguishable.
 
+The project, milestone and artifact tables are described under
+[Projects, milestones and artifacts](#projects-milestones-and-artifacts).
+
 ### Run states
 
 ```text
@@ -1434,6 +1437,38 @@ keeps there.
 `tests/e2e/loop.sh` runs the whole loop in either mode; `HULAHOOP_RUNNER_MODE=local`
 takes the clone path on every CI run that sets it.
 
+### Projects, milestones and artifacts
+
+A workspace holds projects, a project holds repositories, and every issue is named by
+its project.
+
+| thing | what it is | where it lives |
+| --- | --- | --- |
+| project | a unit of work with a prefix (`BAL`, `ATL`) | `projects`, `projects.prefix` unique per workspace |
+| issue key | `BAL-15`: prefix and number, stored, not computed on read | `issues.issue_key`, `issues.number` |
+| projectless issue | planning that has no project yet, named by the workspace prefix | `issues.project_id` null, `workspaces.default_prefix` (default `WS`) |
+| milestone | a name, a date and a body for a body of work | `milestones`, `issues.milestone_id` |
+| artifact | bytes plus an index row; optionally filed under a milestone | `artifacts` table, `$DATA/artifacts/<id>/<filename>` on disk |
+
+Three deliberate rules:
+
+1. **An issue key is stored.** Renaming a project's prefix rewrites its issues' keys
+   (`setProjectPrefix`), because a key is what people quote in a commit message and a
+   ticket; recomputing it on read would silently rewrite history.
+2. **A run needs a project.** Agent roles are bound per project, so `startRun` refuses
+   an issue that belongs to none ("this issue belongs to no project, so it has no agent
+   roles to run"). Filing an issue without a project is planning; running it is not.
+3. **An artifact is a file with an index row, and a download is authenticated.** The
+   mutation takes base64 (`createArtifact`), the server writes
+   `$DATA/artifacts/<id>/<filename>` and stores size, sha256, mime and kind; the
+   desktop downloads through `GET /artifacts/<id>` with its bearer token, so no
+   artifact is ever reachable without the token.
+
+The screen side: a project picker in the rail (with `all projects`), keys on every
+board card and issue title, `Milestones` and `Artifacts` screens, a milestone selector
+on an issue, and a repository list per project in Settings — several repositories may
+hang off one project, and the first is the one a run clones.
+
 ### Where the implementation differs from the spec
 
 The spec is the contract; these are the deliberate deviations, each because the code
@@ -1465,7 +1500,11 @@ above when the loop has run for a while.
    boundary; the login stays usable.
 8. **`runs.agent.jsonl` is written by the runner** while it streams, because the
    review screen needs the transcript and the server only sees events.
-9. **The desktop connects to a URL, not a port.** The first build wired the app to
+9. **The runner takes the repository from the project**, not from a constant. A
+   project may hold several repositories; the issue records which one it is tested
+   against (`issues.repo_id`), and the clone URL comes from that repository's remote or
+   its path, never from a hardcoded default.
+10. **The desktop connects to a URL, not a port.** The first build wired the app to
    `http://127.0.0.1:<port>`; the server now advertises a `url`, the shell passes it
    through, and a saved host in `localStorage` wins over the bundled one. Without that
    the app could only ever be a single-machine tool.

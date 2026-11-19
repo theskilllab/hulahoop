@@ -218,6 +218,18 @@ has 74 'suite_seq: increments per authored suite'
 # 75 the git provider does not ship in M0
 has 75 'The git worktree provider ships in M1'
 
+has 131 "BAL-15" "an issue key names its project prefix"
+has 132 "issues.issue_key" "the key is stored, not derived"
+has 133 "Milestones" "a milestone screen exists"
+has 134 "artifacts/<id>/<filename>" "artifacts live on disk under their id"
+has 135 "GET /artifacts/<id>" "artifact downloads are authenticated"
+
 echo "---"
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
+
+
+has 132 "issues.issue_key" "the key is stored, not derived"
+has 133 "Milestones" "a milestone screen exists"
+has 134 "artifacts/<id>/<filename>" "artifacts live on disk under their id"
+has 135 "GET /artifacts/<id>" "artifact downloads are authenticated"

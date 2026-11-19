@@ -143,10 +143,10 @@ if [[ "$green" != "3" ]]; then
   exit 1
 fi
 
-issue=$(gql 'mutation ($projectId: UUID!, $repoId: UUID!, $title: String!, $body: String!, $criteria: [String!]!) {
-               createIssue(projectId: $projectId, repoId: $repoId, title: $title, body: $body, criteria: $criteria) { id status }
+issue=$(gql 'mutation ($workspaceId: UUID!, $projectId: UUID!, $repoId: UUID!, $title: String!, $body: String!, $criteria: [String!]!) {
+               createIssue(workspaceId: $workspaceId, projectId: $projectId, repoId: $repoId, title: $title, body: $body, criteria: $criteria) { id status }
              }' \
-  "{\"projectId\":\"$project\",\"repoId\":\"$repo\",\"title\":\"subtract two numbers\",\"body\":\"add a subtract function\",\"criteria\":[\"subtract(5, 3) returns 2\"]}" | jq -r '.data.createIssue.id')
+  "{\"workspaceId\":\"$workspace\",\"projectId\":\"$project\",\"repoId\":\"$repo\",\"title\":\"subtract two numbers\",\"body\":\"add a subtract function\",\"criteria\":[\"subtract(5, 3) returns 2\"]}" | jq -r '.data.createIssue.id // .errors')
 echo "issue $issue"
 
 gql 'mutation ($issueId: UUID!) { approveCriteria(issueId: $issueId) { status } }' "{\"issueId\":\"$issue\"}" | jq -c '.data.approveCriteria // .errors'

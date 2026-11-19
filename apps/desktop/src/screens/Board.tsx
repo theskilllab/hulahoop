@@ -57,7 +57,9 @@ export default function Board({
               </h2>
               {items.map((issue) => (
                 <button className="card" key={issue.id} onClick={() => onOpen(issue.id)}>
-                  <span className="title">{issue.title}</span>
+                  <span className="title">
+                    <code className="key">{issue.key}</code> {issue.title}
+                  </span>
                   <span className="meta">
                     <StatusPill status={issue.status} />
                     <span className="dim">

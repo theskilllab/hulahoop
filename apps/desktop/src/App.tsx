@@ -1,29 +1,64 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { connect, gql, loadWorkspace, loadWorkspaceIssues, savedRemote, useLocalServer, type Agent, type Connection, type Issue, type Project, type Workspace } from "./api";
+import {
+  connect,
+  gql,
+  loadArtifacts,
+  loadMilestones,
+  loadWorkspace,
+  loadWorkspaceIssues,
+  savedRemote,
+  useLocalServer,
+  type Agent,
+  type Artifact,
+  type Connection,
+  type Issue,
+  type Milestone,
+  type Project,
+  type Workspace,
+} from "./api";
+import Artifacts from "./screens/Artifacts";
 import Board from "./screens/Board";
 import Connect from "./screens/Connect";
 import IssueDetail from "./screens/IssueDetail";
+import Milestones from "./screens/Milestones";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
 
-type View = { name: "board" } | { name: "issue"; id: string } | { name: "new" } | { name: "settings" } | { name: "connect" };
+type View =
+  | { name: "board" }
+  | { name: "issue"; id: string }
+  | { name: "new" }
+  | { name: "milestones" }
+  | { name: "artifacts" }
+  | { name: "settings" }
+  | { name: "connect" };
 
 export default function App() {
   const [connection, setConnection] = useState<Connection | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
-  const [project, setProject] = useState<Project | null>(null);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
+  const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [view, setView] = useState<View>({ name: "board" });
   const [connected, setConnected] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  /** `all` shows every project's issues, including the ones filed under none. */
+  const [projectFilter, setProjectFilter] = useState<string | "all">("all");
 
   const refresh = useCallback(async () => {
     if (!workspace) return;
     try {
-      const next = await loadWorkspaceIssues(workspace.id);
-      setIssues(next);
+      const [nextIssues, nextMilestones, nextArtifacts] = await Promise.all([
+        loadWorkspaceIssues(workspace.id),
+        loadMilestones(workspace.id),
+        loadArtifacts(workspace.id),
+      ]);
+      setIssues(nextIssues);
+      setMilestones(nextMilestones);
+      setArtifacts(nextArtifacts);
       setError(null);
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
@@ -35,7 +70,7 @@ export default function App() {
     setConnection(info);
     const loaded = await loadWorkspace();
     setWorkspace(loaded.workspace);
-    setProject(loaded.project);
+    setProjects(loaded.projects);
     setAgents(loaded.agents);
     setError(null);
   }, []);
@@ -63,21 +98,36 @@ export default function App() {
     return () => clearInterval(timer);
   }, [refresh]);
 
+  const reload = useCallback(async () => {
+    const loaded = await loadWorkspace();
+    setWorkspace(loaded.workspace);
+    setProjects(loaded.projects);
+    setAgents(loaded.agents);
+  }, []);
+
+  const shown = useMemo(
+    () => (projectFilter === "all" ? issues : issues.filter((issue) => issue.projectId === projectFilter)),
+    [issues, projectFilter],
+  );
   const openIssue = issues.find((issue) => view.name === "issue" && issue.id === view.id) ?? null;
   const counts = useMemo(() => {
     const map = new Map<string, number>();
-    for (const issue of issues) map.set(issue.status, (map.get(issue.status) ?? 0) + 1);
+    for (const issue of shown) map.set(issue.status, (map.get(issue.status) ?? 0) + 1);
     return map;
-  }, [issues]);
+  }, [shown]);
+  const project = useMemo(
+    () => projects.find((entry) => entry.id === projectFilter) ?? projects[0] ?? null,
+    [projects, projectFilter],
+  );
 
-  async function createRepo(path: string) {
-    if (!project) return;
+  async function createRepo(path: string, projectId: string | null) {
+    const target = projects.find((entry) => entry.id === projectId) ?? project;
+    if (!target) return;
     await gql(
       `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id name } }`,
-      { projectId: project.id, name: path.split("/").filter(Boolean).pop() ?? "repo", path },
+      { projectId: target.id, name: path.split("/").filter(Boolean).pop() ?? "repo", path },
     );
-    const loaded = await loadWorkspace();
-    setProject(loaded.project);
+    await reload();
     setNotice("Repository added. Preflight the agents from Settings before starting work.");
   }
 
@@ -126,12 +176,29 @@ export default function App() {
           <span className="mark" aria-hidden="true" />
           hulahoop
         </div>
+        <label className="project-pick">
+          <span>project</span>
+          <select value={projectFilter} onChange={(event) => setProjectFilter(event.target.value)}>
+            <option value="all">all projects</option>
+            {projects.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name}
+              </option>
+            ))}
+          </select>
+        </label>
         <nav>
           <button className={view.name === "board" ? "active" : ""} onClick={() => setView({ name: "board" })}>
-            Board <span className="tally">{issues.filter((i) => i.status !== "done" && i.status !== "cancelled").length}</span>
+            Board <span className="tally">{shown.filter((i) => i.status !== "done" && i.status !== "cancelled").length}</span>
           </button>
           <button className={view.name === "new" ? "active" : ""} onClick={() => setView({ name: "new" })}>
             New issue
+          </button>
+          <button className={view.name === "milestones" ? "active" : ""} onClick={() => setView({ name: "milestones" })}>
+            Milestones <span className="tally">{milestones.filter((m) => m.status === "open").length}</span>
+          </button>
+          <button className={view.name === "artifacts" ? "active" : ""} onClick={() => setView({ name: "artifacts" })}>
+            Artifacts <span className="tally">{artifacts.length}</span>
           </button>
           <button className={view.name === "settings" ? "active" : ""} onClick={() => setView({ name: "settings" })}>
             Settings
@@ -152,7 +219,7 @@ export default function App() {
           </div>
         </dl>
         <footer>
-          <p>{project ? project.name : "no project"}</p>
+          <p>{project ? project.name : `${workspace.defaultPrefix} (no project)`}</p>
           <p className="dim">{project?.repos[0]?.vcs ?? "no repo"} · v{project?.repos[0]?.contractVersion ?? "?"}</p>
           <p className="dim">
             {connection?.label ?? "no server"}
@@ -184,20 +251,25 @@ export default function App() {
         )}
         {view.name === "board" && (
           <Board
-            issues={issues}
+            issues={shown}
             onOpen={(id) => setView({ name: "issue", id })}
             onNew={() => setView({ name: "new" })}
             hasRepo={Boolean(project?.repos.length)}
           />
         )}
         {view.name === "issue" && openIssue && (
-          <IssueDetail issue={openIssue} onBack={() => setView({ name: "board" })} onChanged={refresh} />
+          <IssueDetail
+            issue={openIssue}
+            milestones={milestones}
+            onBack={() => setView({ name: "board" })}
+            onChanged={refresh}
+          />
         )}
         {view.name === "issue" && !openIssue && <p className="hint">loading issue…</p>}
-        {view.name === "new" && project && (
+        {view.name === "new" && (
           <NewIssue
-            projectId={project.id}
-            repoId={project.repos[0]?.id ?? null}
+            workspaceId={workspace.id}
+            projects={projects}
             onAddRepo={createRepo}
             onCreated={async (id) => {
               await refresh();
@@ -206,12 +278,35 @@ export default function App() {
             onCancel={() => setView({ name: "board" })}
           />
         )}
-        {view.name === "settings" && project && (
-          <Settings project={project} agents={agents} onChanged={async () => {
-            const loaded = await loadWorkspace();
-            setProject(loaded.project);
-            setAgents(loaded.agents);
-          }} />
+        {view.name === "milestones" && (
+          <Milestones
+            workspaceId={workspace.id}
+            projects={projects}
+            milestones={milestones}
+            issues={issues}
+            artifacts={artifacts}
+            onChanged={refresh}
+          />
+        )}
+        {view.name === "artifacts" && (
+          <Artifacts
+            workspaceId={workspace.id}
+            projects={projects}
+            milestones={milestones}
+            artifacts={artifacts}
+            onChanged={refresh}
+          />
+        )}
+        {view.name === "settings" && (
+          <Settings
+            workspace={workspace}
+            projects={projects}
+            active={project}
+            agents={agents}
+            onChanged={async () => {
+              await reload();
+            }}
+          />
         )}
       </main>
     </div>

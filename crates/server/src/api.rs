@@ -3,8 +3,9 @@
 
 use crate::engine::{prompt_for, Engine};
 use crate::model::*;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use hulahoop_core::runspec::{
@@ -30,12 +31,13 @@ fn clone_url(repo: &Repo) -> String {
         return remote.clone();
     }
     // No remote, but the repository is on this machine: cloning the path is honest
-    // and needs no network. The constant is for the case the path does not exist
-    // here, which is exactly when the runner is on another host.
+    // and needs no network. A runner on another host cannot use a path, and there is
+    // nothing else to fall back to — the project's repository is the only source.
     if std::path::Path::new(&repo.path).exists() {
         return repo.path.clone();
     }
-    hulahoop_core::contract::DEFAULT_CLONE_URL.to_string()
+    let _ = hulahoop_core::contract::DEFAULT_CLONE_URL;
+    repo.path.clone()
 }
 
 /// Runs either borrow the repository at its path or produce a checkout of their
@@ -95,6 +97,9 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/internal/jobs/{id}/complete", post(complete_job))
         .route("/internal/repos/{id}/lock", post(lock_repo))
         .route("/internal/repos/{id}/unlock", post(unlock_repo))
+        // The desktop fetches artifact bytes with its bearer token, so a download is
+        // an authenticated read rather than a public URL.
+        .route("/artifacts/{id}", axum::routing::get(artifact_bytes))
         .with_state(state)
 }
 
@@ -772,4 +777,59 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         "caller_role": "job",
         "pull_request": pull_request,
     }))
+}
+
+/// The bytes behind an artifact row. The token travels in the query string because
+/// a browser download cannot set a header, and the file is served as an attachment.
+async fn artifact_bytes(
+    State(state): State<Arc<ApiState>>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+    headers: HeaderMap,
+) -> Response {
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::to_string)
+        .or_else(|| params.get("token").cloned())
+        .unwrap_or_default();
+    if authorize(&state, &{
+        let mut map = HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {presented}")) {
+            map.insert(header::AUTHORIZATION, value);
+        }
+        map
+    })
+    .is_err()
+    {
+        return (StatusCode::UNAUTHORIZED, "the token is missing or wrong").into_response();
+    }
+    let Ok(artifact) = state.engine.artifact(id).await else {
+        return (StatusCode::NOT_FOUND, "no such artifact").into_response();
+    };
+    let path = state.engine.artifact_path(&artifact);
+    let Ok(bytes) = std::fs::read(&path) else {
+        return (
+            StatusCode::GONE,
+            format!("{} is registered but its file is gone", artifact.filename),
+        )
+            .into_response();
+    };
+    let mut response = bytes.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_TYPE,
+        artifact
+            .mime
+            .parse()
+            .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+    );
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "attachment; filename=\"{}\"",
+        artifact.filename.replace('"', "")
+    )) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+    response
 }

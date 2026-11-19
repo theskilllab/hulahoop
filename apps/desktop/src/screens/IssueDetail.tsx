@@ -1,8 +1,10 @@
 import { useState } from "react";
-import { gql, type Issue } from "../api";
+import { gql, type Issue, type Milestone } from "../api";
 import { StatusPill } from "./Board";
 
 interface Props {
+  /** The milestones this workspace knows about, so an issue can be filed under one. */
+  milestones: Milestone[];
   issue: Issue;
   onBack: () => void;
   onChanged: () => Promise<void> | void;
@@ -14,7 +16,7 @@ const ROLE_LABEL: Record<string, string> = {
   reviewer: "Reviewer",
 };
 
-export default function IssueDetail({ issue, onBack, onChanged }: Props) {
+export default function IssueDetail({ milestones, issue, onBack, onChanged }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
@@ -59,12 +61,31 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
           ← board
         </button>
         <div className="titles">
-          <h1>{issue.title}</h1>
+          <h1>
+            <code className="key">{issue.key}</code> {issue.title}
+          </h1>
           <div className="meta">
             <StatusPill status={issue.status} />
             <span className="dim">
               attempt {issue.attempt} · {issue.runCount} runs · {issue.criteria.length} criteria
             </span>
+            <select
+              className="milestone-pick"
+              value={issue.milestoneId ?? ""}
+              onChange={(event) =>
+                void run("milestone", `mutation ($issueId: UUID!, $milestoneId: UUID) { setIssueMilestone(issueId: $issueId, milestoneId: $milestoneId) { id } }`, {
+                  issueId: issue.id,
+                  milestoneId: event.target.value || null,
+                })
+              }
+            >
+              <option value="">no milestone</option>
+              {milestones.map((milestone) => (
+                <option key={milestone.id} value={milestone.id}>
+                  {milestone.title}
+                </option>
+              ))}
+            </select>
           </div>
         </div>
       </header>

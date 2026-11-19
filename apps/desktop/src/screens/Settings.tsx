@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { gql, type Agent, type Project, type Repo } from "../api";
+import { gql, type Agent, type Project, type Repo, type Workspace } from "../api";
 
 const ROLES = ["test_author", "implementer", "reviewer"] as const;
 const ADAPTERS = ["pi", "claude_code", "fake"] as const;
@@ -17,15 +17,34 @@ interface Preflight {
   checkedAt: string;
 }
 
-export default function Settings({ project, agents, onChanged }: { project: Project; agents: Agent[]; onChanged: () => Promise<void> }) {
+export default function Settings({
+  workspace,
+  projects,
+  active,
+  agents,
+  onChanged,
+}: {
+  workspace: Workspace;
+  projects: Project[];
+  active: Project | null;
+  agents: Agent[];
+  onChanged: () => Promise<void>;
+}) {
   const [bindings, setBindings] = useState<Record<string, string>>({});
   const [preflight, setPreflight] = useState<Preflight[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
+  const [chosen, setChosen] = useState<string>(active?.id ?? "");
+  const [prefix, setPrefix] = useState<string>(active?.prefix ?? "");
+  const [newProject, setNewProject] = useState("");
+  const [newPrefix, setNewPrefix] = useState("");
+  const [repoPath, setRepoPath] = useState("");
 
-  const repo: Repo | undefined = project.repos[0];
+  const project = projects.find((entry) => entry.id === chosen) ?? active ?? projects[0] ?? null;
+  const repo: Repo | undefined = project?.repos[0];
 
   async function loadBindings() {
+    if (!project) return;
     const data = await gql<{ projectAgents: Binding[] }>(
       `query ($id: UUID!) { projectAgents(projectId: $id) { role agentId } }`,
       { id: project.id },
@@ -36,6 +55,7 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
   }
 
   async function loadPreflight() {
+    if (!project) return;
     const data = await gql<{ preflight: Preflight[] }>(
       `query ($id: UUID!) { preflight(projectId: $id) { agentId repoId ok detail checkedAt } }`,
       { id: project.id },
@@ -49,7 +69,7 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
     const timer = setInterval(() => void loadPreflight(), 4000);
     return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project.id]);
+  }, [project?.id]);
 
   /** A new harness or model invalidates its probe, so ask for a fresh one. */
   async function saveAgent(id: string, adapter: string, model: string) {
@@ -87,6 +107,119 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
     <section className="detail">
       <h1>Settings</h1>
       {error && <p className="error">{error}</p>}
+
+      <h2 className="section">Projects</h2>
+      <p className="dim small">
+        A project carries the prefix its issues are named by — {workspace.defaultPrefix} is the workspace's own, for issues
+        with no project. Several repositories may hang off one project; the first is the one a run clones.
+      </p>
+      <div className="settings-block">
+        <div className="row">
+          <select value={chosen} onChange={(event) => setChosen(event.target.value)}>
+            {projects.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name}
+              </option>
+            ))}
+          </select>
+          {project && (
+            <>
+              <input
+                className="narrow-input"
+                value={prefix}
+                placeholder={project.prefix ?? "PREFIX"}
+                onChange={(event) => setPrefix(event.target.value)}
+              />
+              <button
+                disabled={busy !== null || prefix.trim().length < 2}
+                onClick={() =>
+                  action("prefix", () =>
+                    gql(`mutation ($id: UUID!, $prefix: String!) { setProjectPrefix(projectId: $id, prefix: $prefix) { id prefix } }`, {
+                      id: project.id,
+                      prefix: prefix.trim(),
+                    }),
+                  )
+                }
+              >
+                Set prefix
+              </button>
+            </>
+          )}
+        </div>
+        <div className="row">
+          <input value={newProject} onChange={(event) => setNewProject(event.target.value)} placeholder="new project name" />
+          <input
+            className="narrow-input"
+            value={newPrefix}
+            onChange={(event) => setNewPrefix(event.target.value)}
+            placeholder="BAL"
+          />
+          <button
+            disabled={busy !== null || newProject.trim().length < 2}
+            onClick={() =>
+              action("project", async () => {
+                await gql(
+                  `mutation ($workspaceId: UUID!, $name: String!, $prefix: String) { createProject(workspaceId: $workspaceId, name: $name, prefix: $prefix) { id } }`,
+                  {
+                    workspaceId: workspace.id,
+                    name: newProject.trim(),
+                    prefix: newPrefix.trim() || null,
+                  },
+                );
+                setNewProject("");
+                setNewPrefix("");
+              })
+            }
+          >
+            Create project
+          </button>
+        </div>
+      </div>
+
+      <h2 className="section">Repositories</h2>
+      {project ? (
+        <div className="settings-block">
+          <ul className="repos">
+            {project.repos.map((entry) => (
+              <li key={entry.id}>
+                <strong>{entry.name}</strong> <span className="dim">{entry.path}</span>
+                <div className="dim small">
+                  {entry.vcs} · contract v{entry.contractVersion} · base {entry.baseBookmark} · fetched{" "}
+                  {entry.fetchedAt ? new Date(entry.fetchedAt).toLocaleString() : "never"}
+                </div>
+              </li>
+            ))}
+            {project.repos.length === 0 && <li className="dim">No repository attached yet.</li>}
+          </ul>
+          <div className="row">
+            <input
+              value={repoPath}
+              onChange={(event) => setRepoPath(event.target.value)}
+              placeholder="/absolute/path/to/another/repo"
+            />
+            <button
+              disabled={busy !== null || repoPath.trim().length < 2}
+              onClick={() =>
+                action("repo", async () => {
+                  await gql(
+                    `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id } }`,
+                    {
+                      projectId: project.id,
+                      name: repoPath.trim().split("/").filter(Boolean).pop() ?? "repo",
+                      path: repoPath.trim(),
+                    },
+                  );
+                  setRepoPath("");
+                })
+              }
+            >
+              Add repository
+            </button>
+          </div>
+        </div>
+      ) : (
+        <p className="dim">Create a project first.</p>
+      )}
 
       <h2 className="section">Repository</h2>
       {repo ? (
@@ -200,6 +333,7 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
       </ul>
 
       <h2 className="section">Roles</h2>
+      {!project && <p className="dim">Create a project before binding roles.</p>}
       <p className="dim small">
         A Test Author and an Implementer on the same model family are weaker than they look: the tests and the code share the same
         blind spots.
@@ -217,7 +351,7 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
                   gql(
                     `mutation ($projectId: UUID!, $bindings: [RoleBinding!]!) { setProjectAgents(projectId: $projectId, bindings: $bindings) { role } }`,
                     {
-                      projectId: project.id,
+                      projectId: project!.id,
                       bindings: ROLES.filter((r) => next[r]).map((r) => ({ role: r, agentId: next[r] })),
                     },
                   ),
