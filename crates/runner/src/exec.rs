@@ -183,11 +183,18 @@ impl Executor {
         // so `jj log` answers "who wrote this" without the runner's config. A
         // failure here is fatal on purpose: a machine-authored commit that carries
         // the human's name is worse than a failed run, because nothing shows it.
-        vcs.set_working_copy_author(&checkout, role.commit_name(), role.commit_email())
+        // The address decides whether GitHub links the commit to the app's bot
+        // user, so it is built from the app id and slug when both are known.
+        let author_name = role.app_commit_name(spec["commit_app_slug"].as_str());
+        let author_email = role.app_commit_email(
+            spec["commit_app_id"].as_str(),
+            spec["commit_app_slug"].as_str(),
+        );
+        vcs.set_working_copy_author(&checkout, &author_name, &author_email)
             .with_context(|| {
                 format!(
-                    "the loop could not take ownership of the commit as {}; refusing to                      produce a commit under somebody else's name",
-                    role.commit_name()
+                    "the loop could not take ownership of the commit as {}; refusing to produce a commit under somebody else's name",
+                    author_name
                 )
             })?;
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
@@ -925,8 +932,17 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     // identity from the environment, so the agent commits under the role's name
     // even where the runner's own identity is the machine's.
     if let Some(role) = AgentRole::parse(role) {
-        env.push(("JJ_USER".into(), role.commit_name().into()));
-        env.push(("JJ_EMAIL".into(), role.commit_email().into()));
+        env.push((
+            "JJ_USER".into(),
+            role.app_commit_name(spec["commit_app_slug"].as_str()),
+        ));
+        env.push((
+            "JJ_EMAIL".into(),
+            role.app_commit_email(
+                spec["commit_app_id"].as_str(),
+                spec["commit_app_slug"].as_str(),
+            ),
+        ));
     }
     // A token minted for the stored app; absent when there is no app, because a
     // variable holding an empty credential is worse than one that is not set.

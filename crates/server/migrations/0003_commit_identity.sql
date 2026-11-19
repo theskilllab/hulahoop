@@ -11,3 +11,8 @@ alter table runs add column pr_branch text;
 
 -- Where the repo lives on GitHub, so a pull request job needs no discovery step.
 alter table repos add column remote_url text;
+
+-- The app's own slug, read from `GET /app` when the key is stored. The commit
+-- email needs it: GitHub links a commit to the bot user only for
+-- `<app id>+<slug>[bot]@users.noreply.github.com`.
+alter table connections add column slug text;

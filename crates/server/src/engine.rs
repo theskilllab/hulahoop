@@ -311,12 +311,54 @@ impl Engine {
         .bind(&now)
         .execute(&self.db.pool)
         .await?;
+        // Asking GitHub for the app's own record is the only way to learn the slug,
+        // and it is a better answer to "connected" than whether the key parses. A
+        // machine with no network keeps the app: the local check still decides
+        // `connected`, and the slug is learned on the first successful call.
+        if crate::github::can_sign(private_key) {
+            if let Ok(jwt) = crate::github::mint_token(app_id, private_key) {
+                let http = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(15))
+                    .build()?;
+                match crate::github::fetch_slug(&http, &jwt).await {
+                    Ok(slug) => {
+                        sqlx::query("update connections set slug = ? where provider = ?")
+                            .bind(&slug)
+                            .bind(crate::github::PROVIDER)
+                            .execute(&self.db.pool)
+                            .await?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "github did not name the app; the slug stays unknown");
+                    }
+                }
+            }
+        }
         let stored = self.connection_row(crate::github::PROVIDER).await?;
         Ok(Connection {
             provider: crate::github::PROVIDER.to_string(),
             connected: crate::github::can_sign(private_key),
             connected_at: stored.map(|row| row.updated_at),
         })
+    }
+
+    /// The app id and slug a commit's author address is built from, when both are
+    /// known. `None` for either means the commit keeps the role's own address and
+    /// GitHub shows it unattributed.
+    pub async fn commit_identity(&self) -> Result<(Option<String>, Option<String>)> {
+        let Some(app) = self.stored_app(crate::github::PROVIDER).await? else {
+            return Ok((None, None));
+        };
+        if !crate::github::can_sign(&app.private_key) {
+            return Ok((None, None));
+        }
+        let slug: Option<String> =
+            sqlx::query_scalar("select slug from connections where provider = ?")
+                .bind(crate::github::PROVIDER)
+                .fetch_optional(&self.db.pool)
+                .await?
+                .flatten();
+        Ok((Some(app.app_id), slug))
     }
 
     /// The token a run acts as the app with. `None` when no app is stored or the

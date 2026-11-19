@@ -80,6 +80,33 @@ pub fn mint_token(app_id: &str, private_key: &str) -> Result<String> {
     ))
 }
 
+/// The app's own record, which is how the slug behind the bot login is learned.
+///
+/// Asking GitHub beats deriving it from the name: the slug is what the name became
+/// after collisions, and only the slug makes a commit show up as `<slug>[bot]`.
+pub async fn fetch_slug(http: &reqwest::Client, jwt: &str) -> Result<String> {
+    let response = http
+        .get("https://api.github.com/app")
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .context("asking github which app this key belongs to")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github did not accept the app id and key together ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    body["slug"]
+        .as_str()
+        .map(str::to_string)
+        .context("the app response carried no slug")
+}
+
 /// base64url without padding, which is what a JWT segment is.
 fn base64url(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

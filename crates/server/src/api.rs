@@ -500,6 +500,10 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
         "caller_role": "run",
+        // The address GitHub rewrites into a link to the bot user needs both
+        // halves; either missing means the commit keeps the role address.
+        "commit_app_id": engine.commit_identity().await?.0,
+        "commit_app_slug": engine.commit_identity().await?.1,
         "timeout_minutes": hulahoop_core::AGENT_WALL_CLOCK_MINUTES,
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
         "prompt_revision": run.prompt_revision,

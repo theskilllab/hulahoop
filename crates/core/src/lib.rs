@@ -158,6 +158,45 @@ impl AgentRole {
             AgentRole::Reviewer => "hulahoop-reviewer@hulahoop.invalid",
         }
     }
+
+    /// The role's half of a name, so one app can still write as three roles.
+    pub fn name_suffix(self) -> &'static str {
+        match self {
+            AgentRole::TestAuthor => "test-author",
+            AgentRole::Implementer => "implementer",
+            AgentRole::Reviewer => "reviewer",
+        }
+    }
+
+    /// The author name, prefixed with the app's slug when there is one.
+    ///
+    /// Nothing here is a constant the user has to edit: rename the app, paste the
+    /// new key, and the commits name themselves after it.
+    pub fn app_commit_name(self, slug: Option<&str>) -> String {
+        match slug.map(str::trim).filter(|slug| !slug.is_empty()) {
+            Some(slug) => format!("{slug}-{}", self.name_suffix()),
+            None => self.commit_name().to_string(),
+        }
+    }
+
+    /// The address GitHub rewrites into a link to the app's bot user.
+    ///
+    /// The form is `<app id>+<slug>[bot]@users.noreply.github.com`; with any other
+    /// address the commit shows up unattributed, which reads as if a human wrote
+    /// it. Without both halves there is nothing honest to build, so the role's own
+    /// non-routable address stands in and the panel says so.
+    pub fn app_commit_email(self, app_id: Option<&str>, slug: Option<&str>) -> String {
+        match (app_id, slug) {
+            (Some(app_id), Some(slug)) if !app_id.trim().is_empty() && !slug.trim().is_empty() => {
+                format!(
+                    "{}+{}[bot]@users.noreply.github.com",
+                    app_id.trim(),
+                    slug.trim()
+                )
+            }
+            _ => self.commit_email().to_string(),
+        }
+    }
 }
 
 string_enum!(Adapter {
@@ -437,5 +476,59 @@ mod tests {
         ] {
             assert_eq!(IssueStatus::parse(status.as_str()), Some(status));
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::AgentRole;
+
+    #[test]
+    fn an_app_address_is_the_one_github_links_to_the_bot() {
+        assert_eq!(
+            AgentRole::Implementer.app_commit_email(Some("123456"), Some("hulahoop-dev")),
+            "123456+hulahoop-dev[bot]@users.noreply.github.com"
+        );
+    }
+
+    #[test]
+    fn without_both_halves_the_role_address_stands() {
+        for (app_id, slug) in [
+            (None, None),
+            (Some("123456"), None),
+            (None, Some("hulahoop-dev")),
+        ] {
+            let email = AgentRole::TestAuthor.app_commit_email(app_id, slug);
+            assert_eq!(email, "hulahoop-test-author@hulahoop.invalid");
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_name_tests {
+    use super::AgentRole;
+
+    #[test]
+    fn the_name_follows_the_app_slug() {
+        assert_eq!(
+            AgentRole::Implementer.app_commit_name(Some("hulahoop-dev")),
+            "hulahoop-dev-implementer"
+        );
+        assert_eq!(
+            AgentRole::TestAuthor.app_commit_name(Some("acme-loop")),
+            "acme-loop-test-author"
+        );
+    }
+
+    #[test]
+    fn without_an_app_the_loop_keeps_its_own_name() {
+        assert_eq!(
+            AgentRole::TestAuthor.app_commit_name(None),
+            "hulahoop-test-author"
+        );
+        assert_eq!(
+            AgentRole::Implementer.app_commit_name(Some("  ")),
+            "hulahoop-implementer"
+        );
     }
 }
