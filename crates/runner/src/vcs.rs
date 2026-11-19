@@ -127,6 +127,26 @@ impl Vcs {
     /// Give the working-copy commit an author. A commit inherits the identity of
     /// whoever created it, so a checkout made by the runner would otherwise
     /// credit every agent's work to the machine.
+    /// The identity on the checkout's working-copy commit, as `jj` reports it.
+    pub fn working_copy_author(&self, checkout: &Path) -> Result<(String, String)> {
+        let output = self.run(
+            checkout,
+            "jj",
+            &[
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "author.name() ++ \"\\n\" ++ author.email()",
+            ],
+        )?;
+        let mut lines = output.lines();
+        let name = lines.next().unwrap_or_default().trim().to_string();
+        let email = lines.next().unwrap_or_default().trim().to_string();
+        Ok((name, email))
+    }
+
     pub fn set_working_copy_author(&self, checkout: &Path, name: &str, email: &str) -> Result<()> {
         let output = Command::new("jj")
             .args(["metaedit", "--update-author"])

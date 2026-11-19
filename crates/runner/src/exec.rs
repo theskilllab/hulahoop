@@ -3,7 +3,7 @@
 use crate::adapter;
 use crate::client::Client;
 use crate::vcs::{Kind, Vcs};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use hulahoop_core::{contract, Adapter, AgentRole, ReplayKind};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
@@ -180,8 +180,17 @@ impl Executor {
 
         // The role owns the commit, whichever agent produced it: the working
         // copy is rewritten to the role's identity before the bookmark names it,
-        // so `jj log` answers "who wrote this" without the runner's config.
-        let _ = vcs.set_working_copy_author(&checkout, role.commit_name(), role.commit_email());
+        // so `jj log` answers "who wrote this" without the runner's config. A
+        // failure here is fatal on purpose: a machine-authored commit that carries
+        // the human's name is worse than a failed run, because nothing shows it.
+        vcs.set_working_copy_author(&checkout, role.commit_name(), role.commit_email())
+            .with_context(|| {
+                format!(
+                    "the loop could not take ownership of the commit as {}; refusing to                      produce a commit under somebody else's name",
+                    role.commit_name()
+                )
+            })?;
+        let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
         let changed_paths = vcs.changed_paths(&checkout, &base).unwrap_or_default();
@@ -223,6 +232,8 @@ impl Executor {
                     "verdict": outcome.verdict,
                     "body": outcome.final_text,
                     "artifact_limit_hit": artifact_limit_hit,
+                    "commit_name": commit_name,
+                    "commit_email": commit_email,
                     "transcript": outcome
                         .lines
                         .iter()
@@ -416,6 +427,7 @@ impl Executor {
             "preflight" => self.job_preflight(&repo_path, spec).await,
             "merge_verify" => self.job_merge_verify(&repo_path, spec).await,
             "bookmark" => self.job_bookmark(&repo_path, spec).await,
+            "open_pr" => self.job_open_pr(&repo_path, spec).await,
             other => Err(anyhow!("unknown job kind {other}")),
         };
 
@@ -528,6 +540,84 @@ impl Executor {
         let vcs = Vcs::detect(repo_path)?;
         let contained = vcs.contains(merge_revision, landing)?;
         Ok(json!({ "merge_revision": merge_revision, "ancestry_ok": contained }))
+    }
+
+    /// Push the approved commit and open the pull request a human reviews.
+    ///
+    /// The push is the runner's job, not the agent's: an agent runs with the
+    /// network blocked, and a commit that was approved is the only thing that
+    /// should ever reach the remote.
+    async fn job_open_pr(&self, repo_path: &Path, spec: &Value) -> Result<Value> {
+        let pull = &spec["pull_request"];
+        let run_id = pull["run_id"]
+            .as_str()
+            .context("a pull request job needs the run it is for")?
+            .to_string();
+        let remote = spec["remote_url"]
+            .as_str()
+            .context("this repository has no origin remote, so there is nothing to open a pull request against")?;
+        let (owner, name) = github_remote(remote)?;
+        let jwt = pull["app_token"].as_str().context(
+            "no GitHub app is stored, or its key cannot sign, so the loop cannot push as itself",
+        )?;
+        let head = pull["head_revision"]
+            .as_str()
+            .context("the run has no head revision to push")?;
+        let branch = pull["branch"]
+            .as_str()
+            .context("the pull request job has no branch name")?
+            .to_string();
+        let base = spec["base_bookmark"].as_str().unwrap_or("main");
+
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
+        let installation = installation_token(&http, jwt, &owner, &name).await?;
+        push_commit(repo_path, &installation, &owner, &name, head, &branch)?;
+
+        let criteria = pull["criteria"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .enumerate()
+                    .map(|(index, text)| format!("{}. {text}", index + 1))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let review = pull["review"].as_str().unwrap_or("");
+        let body = format!(
+            "{}\n\n---\n\n**Acceptance criteria**\n\n{}\n\n**The suite was red before the change and green after it.**\n\n**Reviewer verdict**\n\n{}\n\n_Opened by Hulahoop. The loop wrote the tests first, froze them, then implemented against them._\n",
+            pull["body"].as_str().unwrap_or(""),
+            criteria,
+            review
+        );
+        let title = pull["title"]
+            .as_str()
+            .map(|title| format!("{title} (hulahoop)"))
+            .unwrap_or_else(|| format!("hulahoop: {branch}"));
+        let (pr_url, pr_number) = open_pull_request(
+            &http,
+            PullRequest {
+                token: &installation,
+                owner: &owner,
+                repo: &name,
+                branch: &branch,
+                base,
+                title: &title,
+                body: &body,
+            },
+        )
+        .await?;
+
+        Ok(json!({
+            "run_id": run_id,
+            "pr_url": pr_url,
+            "pr_number": pr_number,
+            "pr_branch": branch,
+        }))
     }
 
     async fn job_bookmark(&self, repo_path: &Path, span: &Value) -> Result<Value> {
@@ -1166,4 +1256,192 @@ fn dir_size(path: &Path) -> u64 {
 #[allow(dead_code)]
 fn is_git(kind: &Kind) -> bool {
     matches!(kind, Kind::Git)
+}
+
+/// `git@github.com:owner/repo.git` and `https://github.com/owner/repo` name the
+/// same repository; the API needs the two halves and refuses anything else.
+fn github_remote(remote: &str) -> Result<(String, String)> {
+    let trimmed = remote.trim().trim_end_matches(".git").trim_end_matches('/');
+    let path = trimmed
+        .strip_prefix("git@github.com:")
+        .or_else(|| trimmed.strip_prefix("https://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))
+        .context("pull requests are opened on github.com, and this remote is somewhere else")?;
+    let mut parts = path.split('/');
+    let owner = parts
+        .next()
+        .filter(|owner| !owner.is_empty())
+        .context("the remote names no owner")?;
+    let name = parts
+        .next()
+        .filter(|name| !name.is_empty())
+        .context("the remote names no repository")?;
+    Ok((owner.to_string(), name.to_string()))
+}
+
+/// The app JWT names the app; the installation token is what can push and open a
+/// pull request for one particular repository.
+async fn installation_token(
+    http: &reqwest::Client,
+    jwt: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<String> {
+    let response = http
+        .get(format!(
+            "https://api.github.com/repos/{owner}/{repo}/installation"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .context("asking github which installation covers this repository")?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github would not name the installation for {owner}/{repo} ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    let installation = body["id"]
+        .as_i64()
+        .context("the installation response had no id")?;
+    let response = http
+        .post(format!(
+            "https://api.github.com/app/installations/{installation}/access_tokens"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(jwt)
+        .json(&json!({}))
+        .send()
+        .await
+        .context("minting an installation token")?;
+    let status = response.status();
+    let body: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github refused an installation token ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    body["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("github minted no installation token")
+}
+
+/// Push one commit to a new branch. The token travels in the environment rather
+/// than the command line, so it is not in `ps` while the push runs.
+fn push_commit(
+    repo_path: &Path,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    head: &str,
+    branch: &str,
+) -> Result<()> {
+    use base64::Engine as _;
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    let output = Command::new("git")
+        .args([
+            "push",
+            &format!("https://github.com/{owner}/{repo}.git"),
+            &format!("{head}:refs/heads/{branch}"),
+        ])
+        .current_dir(repo_path)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
+        .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {auth}"))
+        .output()
+        .context("running git push")?;
+    if !output.status.success() {
+        bail!(
+            "git could not push {branch}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+struct PullRequest<'a> {
+    token: &'a str,
+    owner: &'a str,
+    repo: &'a str,
+    branch: &'a str,
+    base: &'a str,
+    title: &'a str,
+    body: &'a str,
+}
+
+async fn open_pull_request(http: &reqwest::Client, pull: PullRequest<'_>) -> Result<(String, i64)> {
+    let PullRequest {
+        token,
+        owner,
+        repo,
+        branch,
+        base,
+        title,
+        body,
+    } = pull;
+    let response = http
+        .post(format!("https://api.github.com/repos/{owner}/{repo}/pulls"))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(token)
+        .json(&json!({
+            "title": title,
+            "head": branch,
+            "base": base,
+            "body": body,
+        }))
+        .send()
+        .await
+        .context("opening the pull request")?;
+    let status = response.status();
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github refused the pull request ({status}): {}",
+            answer["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    let url = answer["html_url"]
+        .as_str()
+        .context("the pull request response had no url")?
+        .to_string();
+    let number = answer["number"].as_i64().unwrap_or_default();
+    Ok((url, number))
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::github_remote;
+
+    #[test]
+    fn a_github_remote_names_its_owner_and_repository() {
+        for remote in [
+            "git@github.com:theskilllab/hulahoop.git",
+            "https://github.com/theskilllab/hulahoop",
+            "https://github.com/theskilllab/hulahoop.git",
+            "ssh://git@github.com/theskilllab/hulahoop.git",
+        ] {
+            let (owner, name) = github_remote(remote).expect(remote);
+            assert_eq!(owner, "theskilllab", "{remote}");
+            assert_eq!(name, "hulahoop", "{remote}");
+        }
+    }
+
+    #[test]
+    fn a_remote_somewhere_else_is_refused_by_name() {
+        let error = github_remote("https://gitlab.com/theskilllab/hulahoop.git")
+            .expect_err("gitlab is not github");
+        assert!(
+            error.to_string().contains("somewhere else"),
+            "unhelpful: {error}"
+        );
+    }
 }

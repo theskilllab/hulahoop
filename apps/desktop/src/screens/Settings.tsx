@@ -128,6 +128,9 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
         <p className="dim">No repository attached yet.</p>
       )}
 
+      <h2 className="section">GitHub</h2>
+      <GithubConnector onChanged={onChanged} onError={setError} />
+
       <h2 className="section">Agents</h2>
       <ul className="agents">
         {agents.map((agent) => {
@@ -223,5 +226,121 @@ export default function Settings({ project, agents, onChanged }: { project: Proj
         ))}
       </div>
     </section>
+  );
+}
+
+interface StoredConnection {
+  provider: string;
+  connected: boolean;
+  connectedAt: string | null;
+}
+
+/**
+ * The GitHub App is what lets the loop commit as itself instead of as you. Two
+ * states matter and they are different: nothing stored, and something stored that
+ * cannot sign. The second one is why the panel reports a reason rather than a
+ * tick.
+ */
+function GithubConnector({ onChanged, onError }: { onChanged: () => Promise<void>; onError: (message: string | null) => void }) {
+  const [stored, setStored] = useState<StoredConnection | null>(null);
+  const [appId, setAppId] = useState("");
+  const [privateKey, setPrivateKey] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function load() {
+    const data = await gql<{ connections: StoredConnection[] }>(
+      `query { connections { provider connected connectedAt } }`,
+    );
+    setStored(data.connections.find((connection) => connection.provider === "github") ?? null);
+  }
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  async function run(label: string, work: () => Promise<unknown>) {
+    setBusy(label);
+    onError(null);
+    try {
+      await work();
+      await load();
+      await onChanged();
+    } catch (failure) {
+      onError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  const ready = appId.trim().length > 0 && privateKey.trim().length > 0;
+
+  return (
+    <div className="settings-block">
+      {stored ? (
+        <p>
+          {stored.connected ? (
+            <>
+              <strong>connected</strong>{" "}
+              <span className="dim small">
+                the loop commits as its own app identity, and the key can sign
+                {stored.connectedAt ? ` · stored ${new Date(stored.connectedAt).toLocaleString()}` : ""}
+              </span>
+            </>
+          ) : (
+            <>
+              <strong className="error">not connected</strong>{" "}
+              <span className="dim small">
+                a key is stored and it cannot sign, so the loop would fall back to your own name. Paste the .pem again.
+              </span>
+            </>
+          )}
+        </p>
+      ) : (
+        <p className="dim">
+          No GitHub app yet. Create one under GitHub → Settings → Developer settings → GitHub Apps, give it contents and pull
+          request write access, then paste its id and its .pem here.
+        </p>
+      )}
+
+      <label>
+        App id
+        <input value={appId} placeholder="123456" onChange={(event) => setAppId(event.target.value)} />
+      </label>
+      <label>
+        Private key (.pem)
+        <textarea
+          rows={4}
+          value={privateKey}
+          placeholder="-----BEGIN RSA PRIVATE KEY-----"
+          onChange={(event) => setPrivateKey(event.target.value)}
+        />
+      </label>
+      <div className="row">
+        <button
+          disabled={busy !== null || !ready}
+          onClick={() =>
+            run("connect", () =>
+              gql(
+                `mutation ($appId: String!, $privateKey: String!) { createGithubApp(appId: $appId, privateKey: $privateKey) { provider connected } }`,
+                { appId: appId.trim(), privateKey },
+              ),
+            )
+          }
+        >
+          {stored ? "Replace the key" : "Connect"}
+        </button>
+        {stored && (
+          <button
+            disabled={busy !== null}
+            onClick={() => {
+              setPrivateKey("");
+              void run("disconnect", () => gql(`mutation { disconnectGithubApp { connected } }`));
+            }}
+          >
+            Disconnect
+          </button>
+        )}
+      </div>
+    </div>
   );
 }

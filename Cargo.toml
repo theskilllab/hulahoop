@@ -19,6 +19,7 @@ repository = "https://github.com/theskilllab/hulahoop"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 async-graphql = { version = "7", features = ["chrono", "uuid"] }
 async-graphql-axum = "7"
 axum = "0.8"

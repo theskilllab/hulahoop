@@ -259,6 +259,12 @@ impl Mutation {
         Ok(engine(ctx).set_github_app(&app_id, &private_key).await?)
     }
 
+    /// Forget the app. Commits go back to the human's identity until a new key is
+    /// pasted, which is the only honest thing to do when a key is compromised.
+    async fn disconnect_github_app(&self, ctx: &Context<'_>) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx).clear_github_app().await?)
+    }
+
     async fn add_repo(
         &self,
         ctx: &Context<'_>,
@@ -282,14 +288,18 @@ impl Mutation {
                 "git".to_string()
             }
         });
+        // The origin remote is what a pull request job pushes to. Reading it now
+        // means the job never has to guess which repository the checkout belongs to.
+        let remote_url = crate::vcs_remote(root);
         sqlx::query(
-            "insert into repos (id, project_id, name, path, vcs, base_bookmark, contract, contract_version, created_at)
-             values (?, ?, ?, ?, ?, 'main', 'nix+just', ?, ?)",
+            "insert into repos (id, project_id, name, path, remote_url, vcs, base_bookmark, contract, contract_version, created_at)
+             values (?, ?, ?, ?, ?, ?, 'main', 'nix+just', ?, ?)",
         )
         .bind(id)
         .bind(project_id)
         .bind(&name)
         .bind(&path)
+        .bind(&remote_url)
         .bind(&vcs)
         .bind(hulahoop_core::CONTRACT_VERSION)
         .bind(crate::db::now_rfc3339())

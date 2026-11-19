@@ -613,17 +613,77 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         .join("checkouts")
         .join("jobs")
         .join(job.id.to_string());
+    let payload: Value = serde_json::from_str(&job.payload).unwrap_or(Value::Null);
+
+    // A pull request needs the story a reviewer reads: what the issue asked for,
+    // what the suite proves, and what the reviewer said, plus the app token that
+    // lets the push and the API call be made as the app.
+    let pull_request = if job.kind == "open_pr" {
+        let run_id = payload
+            .get("run_id")
+            .and_then(|v| v.as_str())
+            .and_then(|id| Uuid::parse_str(id).ok());
+        match run_id {
+            Some(run_id) => {
+                let run: Option<Run> = sqlx::query_as("select * from runs where id = ?")
+                    .bind(run_id)
+                    .fetch_optional(&engine.db.pool)
+                    .await?;
+                let issue: Option<crate::model::Issue> = match run.as_ref() {
+                    Some(run) => {
+                        sqlx::query_as("select * from issues where id = ?")
+                            .bind(run.issue_id)
+                            .fetch_optional(&engine.db.pool)
+                            .await?
+                    }
+                    None => None,
+                };
+                let criteria = match issue.as_ref() {
+                    Some(issue) => engine.criteria(issue.id).await?,
+                    None => Vec::new(),
+                };
+                let review: Option<String> = match run.as_ref() {
+                    Some(run) => {
+                        sqlx::query_scalar::<_, String>(
+                            "select body from reviews where reviewed_run_id = ? order by created_at desc limit 1",
+                        )
+                        .bind(run.id)
+                        .fetch_optional(&engine.db.pool)
+                        .await?
+                    }
+                    None => None,
+                };
+                Some(json!({
+                    "run_id": run_id,
+                    "head_revision": run.as_ref().and_then(|r| r.head_revision.clone()),
+                    "attempt": run.as_ref().map(|r| r.attempt),
+                    "branch": run.as_ref().map(|r| format!("hulahoop/issue-{}-attempt-{}", r.issue_id, r.attempt)),
+                    "title": issue.as_ref().map(|i| i.title.clone()),
+                    "body": issue.as_ref().map(|i| i.body.clone()),
+                    "criteria": criteria.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+                    "review": review,
+                    "app_token": engine.github_token().await?,
+                }))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
     Ok(json!({
         "job_id": job.id,
         "kind": job.kind,
-        "payload": serde_json::from_str::<Value>(&job.payload).unwrap_or(Value::Null),
+        "payload": payload,
         "repo_path": repo.path,
         "repo_id": repo.id,
         "vcs": repo.vcs,
+        "remote_url": repo.remote_url,
         "checkout_path": checkout_path,
         "artifact_dir": engine.db.data_dir.join("jobs").join(job.id.to_string()),
         "data_dir": engine.db.data_dir,
         "base_bookmark": repo.base_bookmark,
         "caller_role": "job",
+        "pull_request": pull_request,
     }))
 }

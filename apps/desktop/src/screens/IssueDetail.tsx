@@ -346,7 +346,16 @@ function RunSummary({
   onToggleDiff,
 }: {
   issue: Issue;
-  run: { id: string; status: string; flags: string[]; error: string | null };
+  run: {
+    id: string;
+    status: string;
+    flags: string[];
+    error: string | null;
+    commitName?: string | null;
+    commitEmail?: string | null;
+    prUrl?: string | null;
+    prNumber?: number | null;
+  };
   showDiff: boolean;
   onToggleDiff: () => void;
 }) {
@@ -365,6 +374,21 @@ function RunSummary({
   return (
     <div className="running">
       {run.error && <p className="error">{run.error}</p>}
+      {run.commitName && (
+        <p className="dim small">
+          committed as <span className="mono">{run.commitName}</span>
+          {run.commitEmail ? ` <${run.commitEmail}>` : ""}
+        </p>
+      )}
+      {run.prUrl && (
+        <p className="dim small">
+          pull request{" "}
+          <a href={run.prUrl} target="_blank" rel="noreferrer">
+            #{run.prNumber ?? "?"}
+          </a>{" "}
+          is open for review
+        </p>
+      )}
       <div className="row">
         <button className="ghost" onClick={() => void load()}>
           {log ? "Reload log" : "Show log"}

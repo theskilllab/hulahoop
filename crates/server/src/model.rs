@@ -29,6 +29,8 @@ pub struct Repo {
     pub project_id: Uuid,
     pub name: String,
     pub path: String,
+    /// The `origin` remote, when the repo has one. A pull request needs it.
+    pub remote_url: Option<String>,
     pub vcs: String,
     pub base_revision: Option<String>,
     pub base_bookmark: String,
@@ -163,6 +165,14 @@ pub struct Run {
     pub artifact_dir: String,
     /// The hash `approveIssue` compares, so the desktop can show what was reviewed.
     pub diff_sha: Option<String>,
+    /// The identity the commit carries. `None` means the run never produced one,
+    /// or produced it before the loop could name itself.
+    pub commit_name: Option<String>,
+    pub commit_email: Option<String>,
+    /// Where the loop opened a pull request for this run, when it did.
+    pub pr_url: Option<String>,
+    pub pr_number: Option<i64>,
+    pub pr_branch: Option<String>,
     #[graphql(skip)]
     pub flags: String,
     pub status: String,

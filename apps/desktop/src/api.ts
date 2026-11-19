@@ -37,6 +37,10 @@ export interface Run {
   headBookmark: string | null;
   headRevision: string | null;
   diffSha: string | null;
+  commitName: string | null;
+  commitEmail: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
@@ -298,7 +302,7 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
 export const ISSUE_FIELDS = `
   id title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
   criteria { position text testName }
-  runs { id role status attempt adapter flags headBookmark headRevision diffSha error startedAt finishedAt }
+  runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments { id authorType body pinned createdAt }
   replays { id kind status failedTests createdAt }

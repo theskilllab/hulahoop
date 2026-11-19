@@ -267,6 +267,20 @@ impl Engine {
         Ok(connections)
     }
 
+    /// Forget the stored app. The loop stops committing as it, so the next attempt
+    /// goes back to the human's identity until an app is pasted again.
+    pub async fn clear_github_app(&self) -> Result<Connection> {
+        sqlx::query("delete from connections where provider = ?")
+            .bind(crate::github::PROVIDER)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(Connection {
+            provider: crate::github::PROVIDER.to_string(),
+            connected: false,
+            connected_at: None,
+        })
+    }
+
     /// Store (or replace) a GitHub app. The key is sealed before it reaches the
     /// database, and the app id with it: both identify the account the loop can
     /// act as, so neither belongs in a page a backup would copy in the clear.
@@ -1198,7 +1212,7 @@ impl Engine {
         sqlx::query(
             "update runs set status = ?, exit_code = ?, error = ?, diff_sha = ?, flags = ?,
                 changed_paths = ?, head_revision = coalesce(?, head_revision),
-                finished_at = ? where id = ?",
+                commit_name = ?, commit_email = ?, finished_at = ? where id = ?",
         )
         .bind(final_status.as_str())
         .bind(payload.exit_code)
@@ -1207,6 +1221,8 @@ impl Engine {
         .bind(&flags_json)
         .bind(serde_json::to_string(&changed_paths)?)
         .bind(&payload.commit)
+        .bind(&payload.commit_name)
+        .bind(&payload.commit_email)
         .bind(&finished)
         .bind(run_id)
         .execute(&self.db.pool)
@@ -1532,8 +1548,18 @@ impl Engine {
             }
             "landing" => {
                 if status == "succeeded" && report.is_green() {
-                    // Green here means the rebased tree passes; the human still
-                    // merges, and `recordMerge` verifies the commit afterwards.
+                    // Green here means the rebased tree passes. The pull request is
+                    // the human's next move, so it is opened now and the merge is
+                    // still theirs to make.
+                    if let Some(run_id) = replay.run_id.or(replay.candidate_run_id) {
+                        self.queue_job(
+                            issue.repo_id,
+                            Some(issue.id),
+                            "open_pr",
+                            serde_json::json!({ "run_id": run_id }),
+                        )
+                        .await?;
+                    }
                 } else {
                     let failing = report.failed_names();
                     let body = format!(
@@ -1641,6 +1667,44 @@ impl Engine {
                             false,
                         )
                         .await?;
+                    }
+                }
+            }
+            "open_pr" => {
+                let run_id = payload
+                    .get("run_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|id| Uuid::parse_str(id).ok());
+                let url = payload.get("pr_url").and_then(|v| v.as_str());
+                match (run_id, url) {
+                    (Some(run_id), Some(url)) if !url.is_empty() => {
+                        sqlx::query(
+                            "update runs set pr_url = ?, pr_number = ?, pr_branch = ? where id = ?",
+                        )
+                        .bind(url)
+                        .bind(payload.get("pr_number").and_then(|v| v.as_i64()))
+                        .bind(payload.get("pr_branch").and_then(|v| v.as_str()))
+                        .bind(run_id)
+                        .execute(&self.db.pool)
+                        .await?;
+                    }
+                    _ => {
+                        let reason = payload
+                            .get("error")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("it reported no pull request");
+                        if let Some(issue_id) = job.issue_id {
+                            self.comment(
+                                issue_id,
+                                hulahoop_core::AuthorType::Server,
+                                None,
+                                &format!(
+                                    "The pull request could not be opened: {reason}. The approval still stands, so the merge is yours to make by hand."
+                                ),
+                                false,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }
@@ -1788,6 +1852,12 @@ pub struct RunCompletion {
     /// saying "it exited".
     #[serde(default)]
     pub transcript: Option<String>,
+    /// Who the runner wrote into the commit. Reported so a run that fell back to
+    /// the human's identity is visible instead of inferred.
+    #[serde(default)]
+    pub commit_name: Option<String>,
+    #[serde(default)]
+    pub commit_email: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -1844,6 +1914,8 @@ mod adapter_failure_tests {
             body: String::new(),
             artifact_limit_hit: false,
             transcript: Some(transcript.to_string()),
+            commit_name: None,
+            commit_email: None,
         }
     }
 
