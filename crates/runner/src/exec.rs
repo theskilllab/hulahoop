@@ -89,7 +89,7 @@ impl Executor {
             .ok_or_else(|| anyhow!("unknown role in spec"))?;
         let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
-        let repo_path = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default());
+        let repo_path = host_repository(spec)?;
         let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
         let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
         std::fs::create_dir_all(&artifact_dir)?;
@@ -338,7 +338,7 @@ impl Executor {
     async fn execute_replay(&self, replay_id: &str, spec: &Value) -> Result<()> {
         let kind = ReplayKind::parse(spec["kind"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown replay kind"))?;
-        let repo_path = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default());
+        let repo_path = host_repository(spec)?;
         let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
         let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
         std::fs::create_dir_all(&artifact_dir)?;
@@ -477,7 +477,7 @@ impl Executor {
         let spec = &envelope["spec"];
         let job_id = job["id"].as_str().context("job has no id")?.to_string();
         let kind = spec["kind"].as_str().unwrap_or_default().to_string();
-        let repo_path = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default());
+        let repo_path = host_repository(spec)?;
 
         let result = match kind.as_str() {
             "fetch" => self.job_fetch(&repo_path, spec).await,
@@ -1090,6 +1090,88 @@ pub fn prune_workspace(data_dir: &Path) -> usize {
 /// The base revision has to exist in the clone. It does not when the base was never
 /// pushed, and the honest answer then is to say so instead of quietly branching
 /// from the branch head and blaming the agent for the difference.
+/// Environment that makes git and jj send the token, without it ever appearing in
+/// `ps` or in a stored remote URL.
+fn git_auth(token: &str) -> Vec<(&'static str, String)> {
+    use base64::Engine as _;
+    let auth = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
+    vec![
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
+        ("GIT_CONFIG_COUNT", "1".to_string()),
+        (
+            "GIT_CONFIG_KEY_0",
+            "http.https://github.com/.extraheader".to_string(),
+        ),
+        ("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {auth}")),
+    ]
+}
+
+/// The host repository a run borrows from. A repository attached by its remote has
+/// no checkout on this machine, so the server gives it a mirror path it owns; the
+/// first run clones into it, later runs fetch. Cloning here keeps the loop out of
+/// any working copy the user is using, and lets a private repository work without
+/// the token ever being written to disk.
+fn host_repository(spec: &Value) -> Result<PathBuf> {
+    let raw = spec["repo_path"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if raw.is_empty() {
+        bail!(
+            "this repository has neither a checkout nor a remote, so a run has nothing to work from. Attach it by path or by its GitHub remote in Settings."
+        );
+    }
+    let path = PathBuf::from(&raw);
+    if !spec["repo_mirror"].as_bool().unwrap_or(false) {
+        return Ok(path);
+    }
+    let url = spec["clone_url"].as_str().unwrap_or_default().to_string();
+    if url.is_empty() {
+        bail!("the mirror has no clone url, so the run cannot fetch the repository");
+    }
+    let token = spec["clone_token"].as_str().map(str::to_string);
+    if path.join(".git").exists() || path.join(".jj").exists() {
+        let mut command = Command::new("jj");
+        command.args(["git", "fetch"]).current_dir(&path);
+        if let Some(token) = &token {
+            command.envs(git_auth(token));
+        }
+        let output = command
+            .output()
+            .context("running jj git fetch in the mirror")?;
+        if !output.status.success() {
+            bail!(
+                "fetching the mirror at {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        return Ok(path);
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut command = Command::new("jj");
+    command
+        .args(["git", "clone", "--colocate", &url])
+        .arg(&path);
+    if let Some(token) = &token {
+        command.envs(git_auth(token));
+    }
+    let output = command
+        .output()
+        .context("running jj git clone for the mirror")?;
+    if !output.status.success() {
+        bail!(
+            "cloning {url} into the mirror at {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(path)
+}
+
 fn prepare_clone(checkout: &Path, url: &str, base: &str) -> Result<String> {
     if checkout.exists() {
         std::fs::remove_dir_all(checkout)
@@ -1565,8 +1647,6 @@ fn push_commit(
     head: &str,
     branch: &str,
 ) -> Result<()> {
-    use base64::Engine as _;
-    let auth = base64::engine::general_purpose::STANDARD.encode(format!("x-access-token:{token}"));
     let output = Command::new("git")
         .args([
             "push",
@@ -1574,10 +1654,7 @@ fn push_commit(
             &format!("{head}:refs/heads/{branch}"),
         ])
         .current_dir(repo_path)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_CONFIG_COUNT", "1")
-        .env("GIT_CONFIG_KEY_0", "http.https://github.com/.extraheader")
-        .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {auth}"))
+        .envs(git_auth(token))
         .output()
         .context("running git push")?;
     if !output.status.success() {

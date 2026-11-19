@@ -11,6 +11,25 @@ use anyhow::{anyhow, bail, Context, Result};
 use uuid::Uuid;
 
 impl Engine {
+    // ---- github -------------------------------------------------------------
+
+    /// The repositories this app's installation can reach. Read over the app JWT,
+    /// because an installation token is already narrowed to one repository.
+    pub async fn github_repositories(&self) -> Result<Vec<crate::github::GithubRepo>> {
+        let app = self
+            .stored_app(crate::github::PROVIDER)
+            .await?
+            .ok_or_else(|| {
+                // Two very different situations reach this line, and the user's fix
+                // differs: paste a key, or replace a key whose vault will not open.
+                anyhow!(
+                    "no usable GitHub app is stored. Paste the app id and its private key in Settings (replacing any stored value), install the app on the repositories you want, then try again."
+                )
+            })?;
+        let jwt = crate::github::mint_token(&app.app_id, &app.private_key)?;
+        crate::github::list_repositories(&reqwest::Client::new(), &jwt).await
+    }
+
     // ---- workspaces ----------------------------------------------------------
 
     /// A workspace is the top of the tree: projects live in it, and an issue that

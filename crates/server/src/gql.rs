@@ -28,6 +28,17 @@ pub struct Query;
 
 #[Object]
 impl Query {
+    /// What the GitHub app can reach. Empty until an app is stored and installed.
+    async fn github_repos(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<crate::github::GithubRepo>> {
+        engine(ctx)
+            .github_repositories()
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
     async fn workspace_members(
         &self,
         ctx: &Context<'_>,
@@ -518,32 +529,58 @@ impl Mutation {
         Ok(engine(ctx).clear_connection(&provider).await?)
     }
 
+    /// Attach a repository either from a checkout on this machine or from the
+    /// GitHub app's listing. A remote-only repository is cloned by a local runner;
+    /// a checkout is used in place, which is what a workspace runner does.
     async fn add_repo(
         &self,
         ctx: &Context<'_>,
         project_id: Uuid,
         name: String,
-        path: String,
+        path: Option<String>,
+        remote_url: Option<String>,
         vcs: Option<String>,
     ) -> async_graphql::Result<Repo> {
         let engine = engine(ctx);
-        let root = std::path::Path::new(&path);
-        // Structural contract check before anything is stored: a repo without
-        // flake.nix and a justfile cannot run the loop at all.
-        hulahoop_core::contract::check_files(root)
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let path = path
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty());
+        let remote_url = remote_url
+            .map(|value| value.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if path.is_none() && remote_url.is_none() {
+            return Err(async_graphql::Error::new(
+                "attach a repository by path or by its GitHub remote; one of them is required",
+            ));
+        }
+        // Structural contract check before anything is stored when there is a
+        // checkout to look at: a repo without flake.nix and a justfile cannot run
+        // the loop at all. A remote-only repository is checked by the first clone.
+        if let Some(checkout) = &path {
+            hulahoop_core::contract::check_files(std::path::Path::new(checkout))
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        }
 
         let id = Uuid::now_v7();
         let vcs = vcs.unwrap_or_else(|| {
-            if root.join(".jj").exists() {
+            // A mirror is always cloned with jj (`jj git clone --colocate`), so a
+            // repository attached by its remote is jj before it exists on disk.
+            let checkout_is_jj = path
+                .as_ref()
+                .map(|checkout| std::path::Path::new(checkout).join(".jj").exists())
+                .unwrap_or(false);
+            if path.is_none() || checkout_is_jj {
                 "jj".to_string()
             } else {
                 "git".to_string()
             }
         });
-        // The origin remote is what a pull request job pushes to. Reading it now
-        // means the job never has to guess which repository the checkout belongs to.
-        let remote_url = crate::vcs_remote(root);
+        // The origin remote is what a pull request job pushes to and what a local
+        // runner clones. Reading it from the checkout means nobody has to guess.
+        let remote_url = match (&path, remote_url) {
+            (Some(checkout), None) => crate::vcs_remote(std::path::Path::new(checkout)),
+            (_, given) => given,
+        };
         sqlx::query(
             "insert into repos (id, project_id, name, path, remote_url, vcs, base_bookmark, contract, contract_version, created_at)
              values (?, ?, ?, ?, ?, ?, 'main', 'nix+just', ?, ?)",

@@ -32,7 +32,9 @@ pub struct Repo {
     pub id: Uuid,
     pub project_id: Uuid,
     pub name: String,
-    pub path: String,
+    /// A checkout on this machine. Null when the repository was attached from the
+    /// GitHub listing and only a runner that clones can use it.
+    pub path: Option<String>,
     /// The `origin` remote, when the repo has one. A pull request needs it.
     pub remote_url: Option<String>,
     pub vcs: String,

@@ -109,7 +109,9 @@ export interface Issue {
 export interface Repo {
   id: string;
   name: string;
-  path: string;
+  /** Null when the repository was attached by its remote and lives in a mirror. */
+  path: string | null;
+  remoteUrl: string | null;
   vcs: string;
   baseBookmark: string;
   contractVersion: string;
@@ -497,6 +499,37 @@ export async function renameProject(id: string, name: string): Promise<Project> 
     { id, name },
   );
   return data.renameProject;
+}
+
+export interface GithubRepo {
+  fullName: string;
+  name: string;
+  owner: string;
+  private: boolean;
+  archived: boolean;
+  defaultBranch: string;
+  cloneUrl: string;
+}
+
+/// Every repository the installed GitHub app can reach. Reads the stored app key,
+/// mints the app JWT on the server, and never exposes a token to the browser.
+export async function loadGithubRepos(): Promise<GithubRepo[]> {
+  const data = await gql<{ githubRepos: GithubRepo[] }>(
+    `query { githubRepos { fullName name owner private archived defaultBranch cloneUrl } }`,
+  );
+  return data.githubRepos;
+}
+
+/// Attach a repository the app can reach. It has no checkout on this machine, so
+/// the runner clones into a mirror it owns on the first run.
+export async function attachGithubRepo(projectId: string, repo: GithubRepo): Promise<string> {
+  const data = await gql<{ addRepo: { id: string } }>(
+    `mutation ($projectId: UUID!, $name: String!, $remoteUrl: String!) {
+       addRepo(projectId: $projectId, name: $name, remoteUrl: $remoteUrl) { id }
+     }`,
+    { projectId, name: repo.name, remoteUrl: repo.cloneUrl },
+  );
+  return data.addRepo.id;
 }
 
 export async function loadWorkspaceMembers(workspaceId: string): Promise<WorkspaceMember[]> {

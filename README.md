@@ -1469,6 +1469,25 @@ board card and issue title, `Milestones` and `Artifacts` screens, a milestone se
 on an issue, and a repository list per project in Settings — several repositories may
 hang off one project, and the first is the one a run clones.
 
+### Attaching a repository from GitHub
+
+Settings lists every repository the installed GitHub app can reach, so a project can
+be attached to a repository that has no checkout on this machine.
+
+- **Listing needs `Metadata: Read`**, which every GitHub App has whether it asks or
+  not. `Metadata` is enough to see names, owners and clone URLs; `Contents: Write` is
+  what the loop already needs for pushing. `Checks: Read` and `Actions: Read` are
+  display features for a later screen and stay optional.
+- **The list goes through an installation token.** An app JWT can read the app and its
+  installations; the repository list hangs off each installation, so the server lists
+  installations first and then their repositories, one token at a time. An app with no
+  installation gets a sentence saying so rather than an empty list.
+- **A repository attached by its remote has no checkout, and that is fine.** The server
+  gives it a mirror path it owns (`$DATA/mirrors/<repo-id>`), the first run clones into
+  it with a token minted for that one repository, later runs fetch, and the loop never
+  works inside a checkout the user is using. `repos.path` is null in that case, which
+  the screen shows as "mirror, cloned on the first run".
+
 ### Workspaces
 
 A workspace is the root of the tree: projects, milestones, artifacts and issues all

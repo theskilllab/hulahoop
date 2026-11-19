@@ -1,11 +1,14 @@
 import { useEffect, useState } from "react";
 import {
+  attachGithubRepo,
   createWorkspace,
   gql,
+  loadGithubRepos,
   loadWorkspaceMembers,
   renameProject,
   updateWorkspace,
   type Agent,
+  type GithubRepo,
   type Project,
   type Repo,
   type Workspace,
@@ -54,6 +57,9 @@ export default function Settings({
   const [newProject, setNewProject] = useState("");
   const [newPrefix, setNewPrefix] = useState("");
   const [repoPath, setRepoPath] = useState("");
+  const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
+  const [githubChoice, setGithubChoice] = useState("");
+  const [githubError, setGithubError] = useState<string | null>(null);
   const [wsName, setWsName] = useState(workspace.name);
   const [wsPrefix, setWsPrefix] = useState(workspace.defaultPrefix);
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
@@ -63,6 +69,15 @@ export default function Settings({
 
   const project = projects.find((entry) => entry.id === chosen) ?? active ?? projects[0] ?? null;
   const repo: Repo | undefined = project?.repos[0];
+
+  useEffect(() => {
+    loadGithubRepos()
+      .then(setGithubRepos)
+      .catch((cause: Error) => {
+        setGithubRepos([]);
+        setGithubError(cause.message);
+      });
+  }, []);
 
   useEffect(() => {
     setWsName(workspace.name);
@@ -335,7 +350,9 @@ export default function Settings({
           <ul className="repos">
             {project.repos.map((entry) => (
               <li key={entry.id}>
-                <strong>{entry.name}</strong> <span className="dim">{entry.path}</span>
+                <strong>{entry.name}</strong>{" "}
+                <span className="dim">{entry.path ?? "mirror, cloned on the first run"}</span>
+                {entry.remoteUrl && <div className="dim small">{entry.remoteUrl}</div>}
                 <div className="dim small">
                   {entry.vcs} · contract v{entry.contractVersion} · base {entry.baseBookmark} · fetched{" "}
                   {entry.fetchedAt ? new Date(entry.fetchedAt).toLocaleString() : "never"}
@@ -344,6 +361,44 @@ export default function Settings({
             ))}
             {project.repos.length === 0 && <li className="dim">No repository attached yet.</li>}
           </ul>
+          {githubRepos.length > 0 && (
+            <div className="row">
+              <select
+                value={githubChoice}
+                onChange={(event) => setGithubChoice(event.target.value)}
+              >
+                <option value="">pick a repository the app can reach…</option>
+                {githubRepos
+                  .filter(
+                    (entry) =>
+                      !project.repos.some((attached) => attached.remoteUrl === entry.cloneUrl),
+                  )
+                  .map((entry) => (
+                    <option key={entry.cloneUrl} value={entry.cloneUrl}>
+                      {entry.fullName}
+                      {entry.private ? " (private)" : ""}
+                      {entry.archived ? " (archived)" : ""}
+                    </option>
+                  ))}
+              </select>
+              <button
+                disabled={busy !== null || githubChoice === ""}
+                onClick={() =>
+                  action("github-repo", async () => {
+                    const chosen = githubRepos.find((entry) => entry.cloneUrl === githubChoice);
+                    if (!chosen) {
+                      return;
+                    }
+                    await attachGithubRepo(project.id, chosen);
+                    setGithubChoice("");
+                  })
+                }
+              >
+                Attach from GitHub
+              </button>
+            </div>
+          )}
+          {githubError && <p className="dim small">{githubError}</p>}
           <div className="row">
             <input
               value={repoPath}

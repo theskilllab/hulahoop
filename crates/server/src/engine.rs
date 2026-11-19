@@ -232,8 +232,27 @@ impl Engine {
     /// One field out of the stored payload. Each field is sealed on its own, so
     /// reading the app id never requires opening the private key.
     fn open_field(vault: &crate::vault::Vault, payload: &str, field: &str) -> Option<String> {
-        let map: serde_json::Value = serde_json::from_str(payload).ok()?;
-        vault.open_string(map.get(field)?.as_str()?).ok()
+        let sealed = Self::payload_field(payload, field)?;
+        vault.open_string(&sealed).ok()
+    }
+
+    /// One sealed field out of a stored payload. Payloads written before the envelope
+    /// was JSON look like `{"app_id":v1:…,"private_key":v1:…}`, with the ciphertexts
+    /// unquoted; a GitHub app stored then is still worth reading, and asking the user
+    /// to paste a working key again because of a formatting change is a bad trade.
+    fn payload_field(payload: &str, field: &str) -> Option<String> {
+        if let Ok(map) = serde_json::from_str::<serde_json::Value>(payload) {
+            return map.get(field)?.as_str().map(str::to_string);
+        }
+        let head = format!("\"{field}\":");
+        let start = payload.find(&head)? + head.len();
+        let rest = &payload[start..];
+        let end = rest.find([',', '}']).unwrap_or(rest.len());
+        let value = rest[..end].trim().trim_matches('"');
+        if value.is_empty() {
+            return None;
+        }
+        Some(value.to_string())
     }
 
     fn sealed_payload(fields: &[(&str, String)]) -> String {
@@ -250,7 +269,7 @@ impl Engine {
     /// The stored app's credentials, or `None` when nothing is stored or the
     /// vault cannot open what is stored. An unreadable credential is a reason to
     /// refuse work, not a reason to guess.
-    async fn stored_app(&self, provider: &str) -> Result<Option<StoredApp>> {
+    pub(crate) async fn stored_app(&self, provider: &str) -> Result<Option<StoredApp>> {
         let Some(row) = self.connector_row(provider).await? else {
             return Ok(None);
         };

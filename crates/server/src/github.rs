@@ -109,6 +109,221 @@ pub async fn fetch_slug(http: &reqwest::Client, jwt: &str) -> Result<String> {
         .context("the app response carried no slug")
 }
 
+/// A repository the installed app can reach, as GitHub describes it. Enough to
+/// attach it to a project without a local checkout.
+#[derive(Debug, Clone, serde::Serialize, async_graphql::SimpleObject)]
+pub struct GithubRepo {
+    pub full_name: String,
+    pub name: String,
+    pub owner: String,
+    pub private: bool,
+    pub archived: bool,
+    pub default_branch: String,
+    pub clone_url: String,
+}
+
+/// Everything the installation can reach, in one listing.
+///
+/// `GET /installation/repositories` needs the app JWT: the installation token is
+/// already narrowed to one repository, so it cannot answer this question. The
+/// endpoint needs `Metadata: read`, which every app has whether it asks or not.
+pub async fn list_repositories(http: &reqwest::Client, jwt: &str) -> Result<Vec<GithubRepo>> {
+    // A JWT can read the app, its installations and nothing else: the repository
+    // list hangs off an installation token. So: installations, then their repos.
+    let installations = installation_ids(http, jwt).await?;
+    if installations.is_empty() {
+        bail!(
+            "the GitHub app is not installed anywhere yet, so it can reach no repositories. Install it on the account or organisation that holds them (Settings → GitHub Apps → Install)."
+        );
+    }
+    let mut out: Vec<GithubRepo> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for installation in installations {
+        let token = installation_token_by_id(http, jwt, installation).await?;
+        for page in 1..=20 {
+            let response = http
+                .get("https://api.github.com/installation/repositories")
+                .query(&[("per_page", "100"), ("page", &page.to_string())])
+                .header("accept", "application/vnd.github+json")
+                .header("user-agent", "hulahoop")
+                .bearer_auth(&token)
+                .send()
+                .await
+                .context("asking github which repositories the installation can reach")?;
+            let status = response.status();
+            let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+            if !status.is_success() {
+                bail!(
+                    "github would not list the installation's repositories ({status}): {}",
+                    body["message"].as_str().unwrap_or("no reason given")
+                );
+            }
+            let batch = body["repositories"].as_array().cloned().unwrap_or_default();
+            let count = batch.len();
+            for entry in batch {
+                let full_name = entry["full_name"].as_str().unwrap_or_default().to_string();
+                if full_name.is_empty() || !seen.insert(full_name.clone()) {
+                    continue;
+                }
+                out.push(GithubRepo {
+                    full_name,
+                    name: entry["name"].as_str().unwrap_or_default().to_string(),
+                    owner: entry["owner"]["login"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    private: entry["private"].as_bool().unwrap_or(false),
+                    archived: entry["archived"].as_bool().unwrap_or(false),
+                    default_branch: entry["default_branch"]
+                        .as_str()
+                        .unwrap_or("main")
+                        .to_string(),
+                    clone_url: entry["clone_url"].as_str().unwrap_or_default().to_string(),
+                });
+            }
+            if count < 100 {
+                break;
+            }
+        }
+    }
+    out.sort_by(|a, b| a.full_name.cmp(&b.full_name));
+    Ok(out)
+}
+
+/// The installations this app has. One per account or organisation it was installed
+/// on, which is why a repository list has to be assembled from several tokens.
+pub async fn installation_ids(http: &reqwest::Client, jwt: &str) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for page in 1..=10 {
+        let response = http
+            .get("https://api.github.com/app/installations")
+            .query(&[("per_page", "100"), ("page", &page.to_string())])
+            .header("accept", "application/vnd.github+json")
+            .header("user-agent", "hulahoop")
+            .bearer_auth(jwt)
+            .send()
+            .await
+            .context("asking github where this app is installed")?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            bail!(
+                "github would not list the app's installations ({status}): {}",
+                body["message"].as_str().unwrap_or("no reason given")
+            );
+        }
+        let batch = body.as_array().cloned().unwrap_or_default();
+        let count = batch.len();
+        for entry in batch {
+            if let Some(id) = entry["id"].as_i64() {
+                ids.push(id);
+            }
+        }
+        if count < 100 {
+            break;
+        }
+    }
+    Ok(ids)
+}
+
+pub async fn installation_token_by_id(
+    http: &reqwest::Client,
+    jwt: &str,
+    installation: i64,
+) -> Result<String> {
+    let response = http
+        .post(format!(
+            "https://api.github.com/app/installations/{installation}/access_tokens"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .context("minting an installation token")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github would not mint a token for installation {installation} ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    body["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("the token response carried no token")
+}
+
+/// `owner/repo` out of a remote URL, so a run can ask for a token scoped to it.
+pub fn split_remote(remote: &str) -> Option<(String, String)> {
+    let trimmed = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = trimmed
+        .strip_prefix("git@github.com:")
+        .or_else(|| trimmed.strip_prefix("https://github.com/"))
+        .or_else(|| trimmed.strip_prefix("ssh://git@github.com/"))?;
+    let mut parts = path.splitn(2, '/');
+    let owner = parts.next()?.to_string();
+    let name = parts.next()?.to_string();
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((owner, name))
+}
+
+/// A token that can clone and push one repository. Narrowed on purpose: a token
+/// that reaches every repository the app was installed on is a token worth leaking.
+pub async fn installation_token(
+    http: &reqwest::Client,
+    jwt: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<String> {
+    let response = http
+        .get(format!(
+            "https://api.github.com/repos/{owner}/{repo}/installation"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .context("asking github for the installation that covers this repository")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github has no installation covering {owner}/{repo} ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    let installation = body["id"]
+        .as_i64()
+        .context("the installation response carried no id")?;
+    let response = http
+        .post(format!(
+            "https://api.github.com/app/installations/{installation}/access_tokens"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(jwt)
+        .send()
+        .await
+        .context("minting an installation token")?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github would not mint a token for {owner}/{repo} ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    body["token"]
+        .as_str()
+        .map(str::to_string)
+        .context("the token response carried no token")
+}
+
 /// base64url without padding, which is what a JWT segment is.
 fn base64url(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

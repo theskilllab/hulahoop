@@ -26,18 +26,59 @@ pub struct ApiState {
 /// What a local runner clones. The stored remote wins; the constant is the floor
 /// so a repository attached before remotes were read still has somewhere to come
 /// from.
-fn clone_url(repo: &Repo) -> String {
-    if let Some(remote) = &repo.remote_url {
-        return remote.clone();
+fn clone_url(repo: &Repo) -> Option<String> {
+    if let Some(remote) = repo.remote_url.as_deref() {
+        return Some(remote.to_string());
     }
-    // No remote, but the repository is on this machine: cloning the path is honest
-    // and needs no network. A runner on another host cannot use a path, and there is
-    // nothing else to fall back to — the project's repository is the only source.
-    if std::path::Path::new(&repo.path).exists() {
-        return repo.path.clone();
+    // With no remote, the checkout on this machine is the source: cloning a path
+    // needs no network and produces the same history. A repository attached from
+    // GitHub has the remote and no path; one attached by path may have neither.
+    repo.path
+        .as_deref()
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
+/// Where a run finds the repository it works from. A repository attached by path
+/// borrows that checkout; one attached by its remote gets a mirror the runner owns,
+/// so the loop never works inside a checkout the user is using. The mirror also
+/// keeps a private clone possible: the server mints a token scoped to that one
+/// repository and hands it to the runner.
+fn host_path(repo: &Repo, data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    if let Some(path) = repo
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    {
+        return Some(std::path::PathBuf::from(path));
     }
-    let _ = hulahoop_core::contract::DEFAULT_CLONE_URL;
-    repo.path.clone()
+    repo.remote_url
+        .as_ref()
+        .map(|_| data_dir.join("mirrors").join(repo.id.to_string()))
+}
+
+fn is_mirror(repo: &Repo) -> bool {
+    !repo
+        .path
+        .as_deref()
+        .map(str::trim)
+        .map(|path| !path.is_empty())
+        .unwrap_or(false)
+        && repo.remote_url.is_some()
+}
+
+async fn clone_token(engine: &Engine, repo: &Repo) -> Option<String> {
+    let (owner, name) = crate::github::split_remote(repo.remote_url.as_deref()?)?;
+    let app = engine
+        .stored_app(crate::github::PROVIDER)
+        .await
+        .ok()
+        .flatten()?;
+    let jwt = crate::github::mint_token(&app.app_id, &app.private_key).ok()?;
+    crate::github::installation_token(&reqwest::Client::new(), &jwt, &owner, &name)
+        .await
+        .ok()
 }
 
 /// Runs either borrow the repository at its path or produce a checkout of their
@@ -528,7 +569,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             .collect(),
         repo: hulahoop_core::runspec::RepoInput {
             name: repo.name.clone(),
-            path: std::path::PathBuf::from(&repo.path),
+            path: repo.path.as_ref().map(std::path::PathBuf::from),
             base_bookmark: repo.base_bookmark.clone(),
             tests_bookmark: issue.tests_bookmark.clone(),
         },
@@ -559,7 +600,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "prompt": prompt_for(run.role_enum()),
         "prompt_path": prompt_path,
         "input_path": input_path,
-        "repo_path": repo.path,
+        "repo_path": host_path(&repo, &engine.db.data_dir),
+        "repo_mirror": is_mirror(&repo),
+        "clone_token": clone_token(engine, &repo).await,
         "vcs": repo.vcs,
         "repo_id": repo.id,
         "checkout_path": checkout_path,
@@ -659,7 +702,9 @@ async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<V
         "issue_id": issue.id,
         "attempt": replay.attempt,
         "kind": replay.kind,
-        "repo_path": repo.path,
+        "repo_path": host_path(&repo, &engine.db.data_dir),
+        "repo_mirror": is_mirror(&repo),
+        "clone_token": clone_token(engine, &repo).await,
         "repo_id": repo.id,
         "vcs": repo.vcs,
         "checkout_path": checkout_path,
@@ -689,7 +734,11 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
     // request job cannot work without one. Reading it now costs a subprocess and
     // saves a migration that would have to guess.
     if repo.remote_url.is_none() {
-        if let Some(remote) = crate::vcs_remote(std::path::Path::new(&repo.path)) {
+        let found = repo
+            .path
+            .as_deref()
+            .and_then(|path| crate::vcs_remote(std::path::Path::new(path)));
+        if let Some(remote) = found {
             sqlx::query("update repos set remote_url = ? where id = ?")
                 .bind(&remote)
                 .bind(repo.id)
@@ -766,7 +815,9 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         "job_id": job.id,
         "kind": job.kind,
         "payload": payload,
-        "repo_path": repo.path,
+        "repo_path": host_path(&repo, &engine.db.data_dir),
+        "repo_mirror": is_mirror(&repo),
+        "clone_token": clone_token(engine, &repo).await,
         "repo_id": repo.id,
         "vcs": repo.vcs,
         "remote_url": repo.remote_url,

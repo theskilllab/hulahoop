@@ -231,6 +231,11 @@ has 137 "must not equal the workspace prefix" "a project may not take the worksp
 has 138 "Changing a prefix rewrites the keys that already exist" "renaming a prefix rewrites keys"
 has 139 "workspace switcher" "the rail switches workspaces"
 
+# ---- repositories from GitHub ---------------------------------------------
+has 140 "Attaching a repository from GitHub" "the GitHub repository list is documented"
+has 141 "Metadata: Read" "listing needs metadata read"
+has 142 "mirror, cloned on the first run" "a remote-only repository is a mirror"
+
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]
 

@@ -44,7 +44,9 @@ pub struct CriterionInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoInput {
     pub name: String,
-    pub path: PathBuf,
+    /// Absent when the repository was attached by its remote and never checked out
+    /// on this machine; a runner then clones instead of borrowing.
+    pub path: Option<PathBuf>,
     pub base_bookmark: String,
     pub tests_bookmark: Option<String>,
 }
@@ -162,7 +164,7 @@ mod tests {
             }],
             repo: RepoInput {
                 name: "fixture".into(),
-                path: "/tmp/fixture".into(),
+                path: Some("/tmp/fixture".into()),
                 base_bookmark: "main".into(),
                 tests_bookmark: Some("tests/abc".into()),
             },
