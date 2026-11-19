@@ -509,9 +509,12 @@ impl Fixture {
         files
             .into_iter()
             .filter_map(|file| {
-                std::fs::read(&file)
-                    .ok()
-                    .map(|bytes| (file.display().to_string(), String::from_utf8_lossy(&bytes).into_owned()))
+                std::fs::read(&file).ok().map(|bytes| {
+                    (
+                        file.display().to_string(),
+                        String::from_utf8_lossy(&bytes).into_owned(),
+                    )
+                })
             })
             .collect()
     }
@@ -615,9 +618,12 @@ async fn ac3_the_minted_github_token_verifies_against_the_app_key() {
         let mut files = Vec::new();
         collect_files(&fixture.data, &mut files);
         artifacts.extend(files.into_iter().filter_map(|file| {
-            std::fs::read(&file)
-                .ok()
-                .map(|bytes| (file.display().to_string(), String::from_utf8_lossy(&bytes).into_owned()))
+            std::fs::read(&file).ok().map(|bytes| {
+                (
+                    file.display().to_string(),
+                    String::from_utf8_lossy(&bytes).into_owned(),
+                )
+            })
         }));
     }
     let tokens: Vec<(String, String)> = artifacts
@@ -725,7 +731,10 @@ fn jwt_tokens(text: &str) -> Vec<String> {
         candidate.clear();
     };
     for character in text.chars() {
-        if character.is_ascii_alphanumeric() || character == '-' || character == '_' || character == '.'
+        if character.is_ascii_alphanumeric()
+            || character == '-'
+            || character == '_'
+            || character == '.'
         {
             current.push(character);
         } else {
@@ -776,7 +785,11 @@ fn verify_rsa_signature(token: &str, private_key: &str, work: &Path) -> Result<(
         "RS256" => "sha256",
         "RS384" => "sha384",
         "RS512" => "sha512",
-        other => return Err(format!("`{other}` is not an RSA signature over the app key")),
+        other => {
+            return Err(format!(
+                "`{other}` is not an RSA signature over the app key"
+            ))
+        }
     };
     let signature = base64url_decode(parts[2])?;
 
