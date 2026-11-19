@@ -25,6 +25,11 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
   const [mergeRevision, setMergeRevision] = useState("");
 
   const current = issue.currentRun ?? issue.runs[issue.runs.length - 1] ?? null;
+  // A verdict judges one run. Without this filter a reworked attempt showed the
+  // objection it was written to answer, and hid the button that asks again.
+  const verdictOfCurrentRun = current
+    ? issue.reviews.filter((r) => r.reviewedRunId === current.id).slice(-1)[0]
+    : undefined;
 
   async function run<T>(label: string, query: string, variables: Record<string, unknown>): Promise<T | null> {
     setBusy(label);
@@ -149,16 +154,16 @@ export default function IssueDetail({ issue, onBack, onChanged }: Props) {
         {issue.status === "in_review" && current && (
           <>
             <RunSummary issue={issue} run={current} onToggleDiff={() => setShowDiff(!showDiff)} showDiff={showDiff} />
-            {issue.reviews.length === 0 && (
+            {!verdictOfCurrentRun && (
               <button className="primary" disabled={busy !== null} onClick={() => startRun("reviewer")}>
                 Ask the Reviewer
               </button>
             )}
-            {issue.reviews.length > 0 && (
+            {verdictOfCurrentRun && (
               <>
-                <h3>Reviewer verdict: {issue.reviews[issue.reviews.length - 1].verdict}</h3>
-                <pre className="review-body">{issue.reviews[issue.reviews.length - 1].body}</pre>
-                {issue.reviews[issue.reviews.length - 1].verdict === "approved" && (
+                <h3>Reviewer verdict: {verdictOfCurrentRun.verdict}</h3>
+                <pre className="review-body">{verdictOfCurrentRun.body}</pre>
+                {verdictOfCurrentRun.verdict === "approved" && (
                   <button className="primary" onClick={() => setApproving(true)}>
                     Approve…
                   </button>
