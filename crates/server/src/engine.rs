@@ -529,7 +529,18 @@ impl Engine {
         if !crate::github::can_sign(&app.private_key) {
             return Ok((None, None));
         }
-        Ok((Some(app.app_id.clone()), app.slug.clone()))
+        let slug = match app.slug.clone() {
+            Some(slug) => Some(slug),
+            // A stored app can predate the slug, and the slug is what makes the
+            // commit address a GitHub bot instead of an unlinked string.
+            None => {
+                self.refresh_slug(&app.app_id, &app.private_key).await;
+                self.stored_app(crate::github::PROVIDER)
+                    .await?
+                    .and_then(|app| app.slug)
+            }
+        };
+        Ok((Some(app.app_id.clone()), slug))
     }
 
     /// The token a run acts as the app with. `None` when no app is stored or the

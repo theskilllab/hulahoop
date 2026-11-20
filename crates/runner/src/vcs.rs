@@ -149,9 +149,31 @@ impl Vcs {
 
     /// Give the working-copy commit a message. jj refuses to push a commit that
     /// has none, and `jj log` is unreadable without it, so a run names its own.
-    pub fn describe_here(&self, checkout: &Path, message: &str) -> Result<()> {
-        let output = self.run(checkout, "jj", &["describe", "-m", message])?;
-        let _ = output;
+    /// The same as `describe_here`, but the rewrite is
+    /// recorded under the bot that owns the run. jj stamps the committer from the
+    /// configured user on every rewrite, so describing a commit without this puts
+    /// the developer back on it as committer.
+    pub fn describe_as(
+        &self,
+        checkout: &Path,
+        message: &str,
+        name: &str,
+        email: &str,
+    ) -> Result<()> {
+        let output = Command::new("jj")
+            .args(["describe", "-m", message])
+            .current_dir(checkout)
+            .env("JJ_USER", name)
+            .env("JJ_EMAIL", email)
+            .output()
+            .context("running jj describe")?;
+        if !output.status.success() {
+            bail!(
+                "jj describe failed in {}: {}",
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 

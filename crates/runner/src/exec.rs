@@ -230,8 +230,13 @@ impl Executor {
                 _ => "implement",
             };
             let title = spec["issue"]["title"].as_str().unwrap_or("the issue");
-            vcs.describe_here(&checkout, &format!("{prefix}: {title}"))
-                .with_context(|| format!("describing the {prefix} commit"))?;
+            vcs.describe_as(
+                &checkout,
+                &format!("{prefix}: {title}"),
+                &author_name,
+                &author_email,
+            )
+            .with_context(|| format!("describing the {prefix} commit"))?;
         }
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
