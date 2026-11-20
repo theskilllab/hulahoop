@@ -1024,6 +1024,7 @@ impl Mutation {
         Ok(engine(ctx).unfreeze_suite(issue_id, &reason).await?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn approve_issue(
         &self,
         ctx: &Context<'_>,
@@ -1032,13 +1033,22 @@ impl Mutation {
         reviewed_head: String,
         diff_sha: String,
         acknowledge_flags: Vec<String>,
+        // Why you are approving a run the Reviewer did not approve.
+        override_reason: Option<String>,
     ) -> async_graphql::Result<Issue> {
         let flags: Vec<RunFlag> = acknowledge_flags
             .iter()
             .filter_map(|f| RunFlag::parse(f))
             .collect();
         Ok(engine(ctx)
-            .approve_issue(issue_id, run_id, &reviewed_head, &diff_sha, flags)
+            .approve_issue(
+                issue_id,
+                run_id,
+                &reviewed_head,
+                &diff_sha,
+                flags,
+                override_reason.as_deref(),
+            )
             .await?)
     }
 

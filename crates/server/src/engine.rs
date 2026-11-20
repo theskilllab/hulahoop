@@ -1097,6 +1097,7 @@ impl Engine {
         reviewed_head: &str,
         diff_sha: &str,
         acknowledge_flags: Vec<RunFlag>,
+        override_reason: Option<&str>,
     ) -> Result<Issue> {
         let issue = self.issue(issue_id).await?;
         if issue.current_run_id != Some(run_id) {
@@ -1121,14 +1122,45 @@ impl Engine {
             );
         }
 
-        let review: Option<Review> = sqlx::query_as(
-            "select * from reviews where reviewed_run_id = ? and verdict = 'approved' order by created_at desc limit 1",
+        let latest: Option<Review> = sqlx::query_as(
+            "select * from reviews where reviewed_run_id = ? order by created_at desc limit 1",
         )
         .bind(run_id)
         .fetch_optional(&self.db.pool)
         .await?;
-        if review.is_none() {
-            bail!("the Reviewer has not approved run {run_id} yet. An approval without a verdict skips the review gate.");
+        let approved = latest.as_ref().map(|review| review.verdict.as_str()) == Some("approved");
+        if !approved {
+            // The reviewer advises, the human decides: an approval over a review
+            // that asked for changes is allowed, but only with a written reason,
+            // and the reason is recorded next to the approval.
+            let reason = override_reason.unwrap_or_default().trim();
+            if reason.chars().count() < 15 {
+                bail!(
+                    "the Reviewer has not approved run {run_id} yet. Approving over a review that asked for changes needs a reason of at least fifteen characters, so the record says why."
+                );
+            }
+            let now = crate::db::now_rfc3339();
+            sqlx::query(
+                "insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(issue_id)
+            .bind(run_id)
+            .bind::<Option<Uuid>>(None)
+            .bind("approved")
+            .bind(format!("Overridden by the human: {reason}"))
+            .bind(&now)
+            .bind(&now)
+            .execute(&self.db.pool)
+            .await?;
+            self.comment(
+                issue_id,
+                hulahoop_core::AuthorType::Human,
+                None,
+                &format!("Approving over the Reviewer's objection: {reason}"),
+                false,
+            )
+            .await?;
         }
 
         let flags = run.flags_enum();

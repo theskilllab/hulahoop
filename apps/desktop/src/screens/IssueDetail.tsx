@@ -22,6 +22,7 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
   const [showDiff, setShowDiff] = useState(false);
   const [approving, setApproving] = useState(false);
   const [ackFlags, setAckFlags] = useState<string[]>([]);
+  const [overrideReason, setOverrideReason] = useState("");
   const [answer, setAnswer] = useState("");
   const [reason, setReason] = useState("");
   const [mergeRevision, setMergeRevision] = useState("");
@@ -340,20 +341,46 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
           ) : (
             <p>No flags on this run.</p>
           )}
+          {verdictOfCurrentRun?.verdict !== "approved" && (
+            <>
+              <p className="dim">
+                {verdictOfCurrentRun
+                  ? `The Reviewer asked for changes. Approving anyway is your call, and it needs a reason on the record.`
+                  : `No Reviewer has judged this run yet. Approving anyway needs a reason on the record.`}
+              </p>
+              <textarea
+                placeholder="Why this lands without the Reviewer's approval"
+                value={overrideReason}
+                onChange={(event) => setOverrideReason(event.target.value)}
+                rows={3}
+              />
+            </>
+          )}
           <div className="row">
             <button className="ghost" onClick={() => setApproving(false)}>
               Cancel
             </button>
             <button
               className="primary"
-              disabled={busy !== null || ackFlags.length !== (current.flags?.length ?? 0)}
+              disabled={
+                busy !== null ||
+                ackFlags.length !== (current.flags?.length ?? 0) ||
+                (verdictOfCurrentRun?.verdict !== "approved" && overrideReason.trim().length < 15)
+              }
               onClick={async () => {
                 await run(
                   "approve",
-                  `mutation ($issueId: UUID!, $runId: UUID!, $head: String!, $sha: String!, $flags: [String!]!) {
-                     approveIssue(issueId: $issueId, runId: $runId, reviewedHead: $head, diffSha: $sha, acknowledgeFlags: $flags) { id }
+                  `mutation ($issueId: UUID!, $runId: UUID!, $head: String!, $sha: String!, $flags: [String!]!, $reason: String) {
+                     approveIssue(issueId: $issueId, runId: $runId, reviewedHead: $head, diffSha: $sha, acknowledgeFlags: $flags, overrideReason: $reason) { id }
                    }`,
-                  { issueId: issue.id, runId: current.id, head: current.headRevision ?? "", sha: current.diffSha ?? "", flags: ackFlags },
+                  {
+                    issueId: issue.id,
+                    runId: current.id,
+                    head: current.headRevision ?? "",
+                    sha: current.diffSha ?? "",
+                    flags: ackFlags,
+                    reason: overrideReason.trim() === "" ? null : overrideReason.trim(),
+                  },
                 );
                 setApproving(false);
               }}
