@@ -65,7 +65,9 @@ pub fn totals(stream: &str) -> (i64, i64) {
 }
 
 fn usage_of(value: &Value) -> Option<Usage> {
-    let usage = value.get("usage")?;
+    // An explicit null (or a non-object) is an adapter saying nothing, so the
+    // message keeps the last snapshot it reported instead of reading as zero.
+    let usage = value.get("usage").filter(|usage| usage.is_object())?;
     Some(Usage {
         input: usage.get("input").and_then(Value::as_i64).unwrap_or(0),
         output: usage.get("output").and_then(Value::as_i64).unwrap_or(0),
@@ -107,6 +109,17 @@ mod tests {
         let stream = r#"{"type":"message_end","message":{"role":"assistant"}}"#;
         assert_eq!(totals(stream), (0, 0));
         assert_eq!(totals(""), (0, 0));
+    }
+
+    #[test]
+    fn a_null_usage_at_the_end_keeps_the_last_snapshot() {
+        let stream = [
+            r#"{"type":"message_start","message":{"role":"assistant"}}"#,
+            r#"{"type":"message_update","usage":{"input":70,"output":14}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","usage":null}}"#,
+        ]
+        .join("\n");
+        assert_eq!(totals(&stream), (70, 14));
     }
 
     #[test]

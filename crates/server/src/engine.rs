@@ -1384,12 +1384,15 @@ impl Engine {
 
         // The transcript the run already wrote holds the whole stream, which is
         // where the adapter reports usage. A runner that could only send the tail
-        // gets the same treatment from that tail.
-        let stream = std::fs::read_to_string(artifact_dir.join("agent.jsonl"))
-            .ok()
-            .or_else(|| payload.transcript.clone())
-            .unwrap_or_default();
-        let (tokens_in, tokens_out) = hulahoop_core::usage::totals(&stream);
+        // gets the same treatment from that tail; an agent.jsonl the runner opened
+        // but never filled falls back to the tail as well.
+        let written = std::fs::read_to_string(artifact_dir.join("agent.jsonl")).unwrap_or_default();
+        let stream = if written.trim().is_empty() {
+            payload.transcript.as_deref().unwrap_or_default()
+        } else {
+            written.as_str()
+        };
+        let (tokens_in, tokens_out) = hulahoop_core::usage::totals(stream);
 
         let mut flags = summary.flags.clone();
         if payload.artifact_limit_hit {
