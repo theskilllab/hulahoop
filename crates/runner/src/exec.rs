@@ -242,7 +242,20 @@ impl Executor {
         // fails `fmt-check` in CI and no agent may touch the frozen file to fix it.
         // The loop formats what it is about to freeze.
         if role != AgentRole::Reviewer {
-            self.format_tree(&checkout, &artifact_dir);
+            let frozen: Vec<String> = spec["frozen_paths"]
+                .as_array()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let tests_bookmark = spec["tests_bookmark"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            self.format_tree(&checkout, &artifact_dir, &frozen, &tests_bookmark);
         }
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
@@ -774,7 +787,13 @@ impl Executor {
 
     /// `just fmt` when the repository declares it, so the tree the loop records is
     /// the tree the house rules would accept.
-    fn format_tree(&self, checkout: &Path, artifact_dir: &Path) {
+    fn format_tree(
+        &self,
+        checkout: &Path,
+        artifact_dir: &Path,
+        frozen: &[String],
+        tests_bookmark: &str,
+    ) {
         if std::fs::create_dir_all(artifact_dir).is_err() {
             return;
         }
@@ -797,6 +816,18 @@ impl Executor {
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             Some(&log),
         );
+        // A formatter will happily rewrite a frozen test, and the tree has to stay
+        // byte-identical to the suite the gate recorded, so those paths come back
+        // from the suite afterwards.
+        if frozen.is_empty() || tests_bookmark.trim().is_empty() {
+            return;
+        }
+        let mut argv: Vec<&str> = vec!["restore", "--from", tests_bookmark, "--"];
+        argv.extend(frozen.iter().map(String::as_str));
+        let _ = Command::new("jj")
+            .args(&argv)
+            .current_dir(checkout)
+            .output();
     }
 
     /// The recipes a repository declares beyond the suite, run at the same revision
