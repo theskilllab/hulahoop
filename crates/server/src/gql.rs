@@ -4,7 +4,7 @@
 use async_graphql::{
     ComplexObject, Context, EmptySubscription, InputObject, Object, Schema, SimpleObject,
 };
-use hulahoop_core::{AgentRole, RunFlag};
+use hulahoop_core::AgentRole;
 use uuid::Uuid;
 
 use crate::engine::Engine;
@@ -167,19 +167,6 @@ impl Query {
             .bind(id)
             .fetch_optional(&engine(ctx).db.pool)
             .await?)
-    }
-
-    async fn replays(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-    ) -> async_graphql::Result<Vec<Replay>> {
-        Ok(sqlx::query_as::<_, Replay>(
-            "select * from replays where issue_id = ? order by created_at desc",
-        )
-        .bind(issue_id)
-        .fetch_all(&engine(ctx).db.pool)
-        .await?)
     }
 
     async fn reviews(
@@ -934,8 +921,41 @@ impl Mutation {
         let texts: Vec<String> = criteria.iter().map(|c| c.text.clone()).collect();
         Engine::validate_criteria(&texts).map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(engine
-            .transition(issue_id, hulahoop_core::IssueEvent::ApproveCriteria)
+            .transition(issue_id, hulahoop_core::IssueEvent::Plan)
             .await?)
+    }
+
+    /// The pull request merged, which is what closes a task.
+    async fn merge_issue(&self, ctx: &Context<'_>, issue_id: Uuid) -> async_graphql::Result<Issue> {
+        Ok(engine(ctx)
+            .transition(issue_id, hulahoop_core::IssueEvent::Merge)
+            .await?)
+    }
+
+    /// Back to To do, for work that is queued again after a merge or an abandon.
+    async fn reopen_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+    ) -> async_graphql::Result<Issue> {
+        Ok(engine(ctx)
+            .transition(issue_id, hulahoop_core::IssueEvent::Reopen)
+            .await?)
+    }
+
+    /// Backlog and To do are the same task on either side of the human's line.
+    async fn plan_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        planned: bool,
+    ) -> async_graphql::Result<Issue> {
+        let event = if planned {
+            hulahoop_core::IssueEvent::Plan
+        } else {
+            hulahoop_core::IssueEvent::Unplan
+        };
+        Ok(engine(ctx).transition(issue_id, event).await?)
     }
 
     async fn add_comment(
@@ -1007,60 +1027,6 @@ impl Mutation {
             .await?)
     }
 
-    async fn freeze_suite(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-    ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).freeze_suite(issue_id).await?)
-    }
-
-    async fn unfreeze_suite(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-        reason: String,
-    ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).unfreeze_suite(issue_id, &reason).await?)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn approve_issue(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-        run_id: Uuid,
-        reviewed_head: String,
-        diff_sha: String,
-        acknowledge_flags: Vec<String>,
-        // Why you are approving a run the Reviewer did not approve.
-        override_reason: Option<String>,
-    ) -> async_graphql::Result<Issue> {
-        let flags: Vec<RunFlag> = acknowledge_flags
-            .iter()
-            .filter_map(|f| RunFlag::parse(f))
-            .collect();
-        Ok(engine(ctx)
-            .approve_issue(
-                issue_id,
-                run_id,
-                &reviewed_head,
-                &diff_sha,
-                flags,
-                override_reason.as_deref(),
-            )
-            .await?)
-    }
-
-    async fn record_merge(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-        merge_revision: String,
-    ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).record_merge(issue_id, &merge_revision).await?)
-    }
-
     async fn resume_issue(
         &self,
         ctx: &Context<'_>,
@@ -1094,18 +1060,6 @@ impl Mutation {
     /// The base replay reads a report the suite produced. When the report is missing
     /// for a reason of the harness (a `just test` that only wrote its JUnit file after a
     /// green run), asking again costs one suite run and no model call.
-    async fn retry_base_replay(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-    ) -> async_graphql::Result<Replay> {
-        let engine = engine(ctx);
-        Ok(engine.retry_base_replay(issue_id).await?)
-    }
-
-    /// Asks GitHub again whether the pull request is ready: the human resolves a
-    /// failing check or a change request over there, and this is how the loop
-    /// learns about it without waiting for a new attempt.
     async fn recheck_pull_request(
         &self,
         ctx: &Context<'_>,
@@ -1192,6 +1146,36 @@ impl Issue {
         )
     }
 
+    /// What the task waits for, read from the agent's question. Shown where a
+    /// person can act on it, so the drawer never just says "blocked".
+    async fn blocked_by(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<String>> {
+        if self.status != "blocked" {
+            return Ok(None);
+        }
+        let Some(comment_id) = self.pinned_comment_id else {
+            return Ok(None);
+        };
+        Ok(
+            sqlx::query_scalar::<_, String>("select body from comments where id = ?")
+                .bind(comment_id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
+    /// The project's name, so a drawer can show where the task lives in one query.
+    async fn project_name(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<String>> {
+        let Some(id) = self.project_id else {
+            return Ok(None);
+        };
+        Ok(
+            sqlx::query_scalar::<_, String>("select name from projects where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
     /// The project's prefix, so a screen can show `BAL` without a second query.
     async fn project_prefix(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<String>> {
         let Some(id) = self.project_id else {
@@ -1218,14 +1202,24 @@ impl Issue {
         .await?)
     }
 
+    /// The run the task is on. A task carries the newest attempt even when no run
+    /// is live, so a screen never has to guess which attempt it is reading.
     async fn current_run(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Run>> {
-        let Some(id) = self.current_run_id else {
-            return Ok(None);
-        };
-        Ok(sqlx::query_as::<_, Run>("select * from runs where id = ?")
-            .bind(id)
-            .fetch_optional(&engine(ctx).db.pool)
-            .await?)
+        if let Some(id) = self.current_run_id {
+            let run: Option<Run> = sqlx::query_as("select * from runs where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?;
+            if run.is_some() {
+                return Ok(run);
+            }
+        }
+        Ok(sqlx::query_as::<_, Run>(
+            "select * from runs where issue_id = ? order by created_at desc limit 1",
+        )
+        .bind(self.id)
+        .fetch_optional(&engine(ctx).db.pool)
+        .await?)
     }
 
     async fn reviews(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Review>> {
@@ -1240,15 +1234,6 @@ impl Issue {
     async fn comments(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Comment>> {
         Ok(sqlx::query_as::<_, Comment>(
             "select * from comments where issue_id = ? order by created_at",
-        )
-        .bind(self.id)
-        .fetch_all(&engine(ctx).db.pool)
-        .await?)
-    }
-
-    async fn replays(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Replay>> {
-        Ok(sqlx::query_as::<_, Replay>(
-            "select * from replays where issue_id = ? order by created_at desc",
         )
         .bind(self.id)
         .fetch_all(&engine(ctx).db.pool)
@@ -1317,17 +1302,21 @@ impl Run {
         Ok(adapter.unwrap_or_else(|| "unknown".to_string()))
     }
 }
-
 #[ComplexObject]
-impl Replay {
-    /// The tests that failed, read from the JUnit report this replay stored. A
-    /// red base replay is the wanted outcome, so this is evidence, not an error.
-    async fn failed_tests(&self) -> async_graphql::Result<Vec<String>> {
-        let path = std::path::Path::new(&self.artifact_dir).join("junit.xml");
-        match hulahoop_core::junit::parse_file(&path) {
-            Ok(report) => Ok(report.failed_names()),
-            Err(_) => Ok(Vec::new()),
+impl Comment {
+    /// Who wrote it: the agent's name, or `you` for a person.
+    async fn author(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
+        if self.author_type == "human" {
+            return Ok("you".to_string());
         }
+        let Some(id) = self.author_id.clone() else {
+            return Ok(self.author_type.clone());
+        };
+        let name: Option<String> = sqlx::query_scalar("select name from agents where id = ?")
+            .bind(id)
+            .fetch_optional(&engine(ctx).db.pool)
+            .await?;
+        Ok(name.unwrap_or_else(|| self.author_type.clone()))
     }
 }
 

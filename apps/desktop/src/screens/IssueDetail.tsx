@@ -3,7 +3,7 @@ import { gql, type Issue, type Milestone } from "../api";
 import { StatusPill } from "./Board";
 
 interface Props {
-  /** The milestones this workspace knows about, so an issue can be filed under one. */
+  /** The milestones this workspace knows about, so a task can be filed under one. */
   milestones: Milestone[];
   issue: Issue;
   onBack: () => void;
@@ -11,28 +11,30 @@ interface Props {
 }
 
 const ROLE_LABEL: Record<string, string> = {
-  test_author: "Test Author",
-  implementer: "Implementer",
+  test_author: "Test author",
+  implementer: "Agent",
   reviewer: "Reviewer",
 };
 
+/**
+ * One task, and the moves it allows.
+ *
+ * The board is the product; this drawer is where a task is read and where the
+ * three moves a person still makes by hand live: out of the backlog, back from
+ * review, and the merge that closes it.
+ */
 export default function IssueDetail({ milestones, issue, onBack, onChanged }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [showDiff, setShowDiff] = useState(false);
-  const [approving, setApproving] = useState(false);
-  const [ackFlags, setAckFlags] = useState<string[]>([]);
-  const [overrideReason, setOverrideReason] = useState("");
   const [answer, setAnswer] = useState("");
-  const [reason, setReason] = useState("");
-  const [mergeRevision, setMergeRevision] = useState("");
+  const [comment, setComment] = useState("");
+  const [openLog, setOpenLog] = useState<string | null>(null);
+  const [log, setLog] = useState<string | null>(null);
 
-  const current = issue.currentRun ?? issue.runs[issue.runs.length - 1] ?? null;
-  // A verdict judges one run. Without this filter a reworked attempt showed the
-  // objection it was written to answer, and hid the button that asks again.
-  const verdictOfCurrentRun = current
-    ? issue.reviews.filter((r) => r.reviewedRunId === current.id).slice(-1)[0]
-    : undefined;
+  const runs = issue.runs ?? [];
+  const current = issue.currentRun ?? runs[runs.length - 1] ?? null;
+  const live = current && (current.status === "running" || current.status === "queued");
+  const verdict = current ? issue.reviews?.filter((r) => r.reviewedRunId === current.id).slice(-1)[0] : undefined;
 
   async function run<T>(label: string, query: string, variables: Record<string, unknown>): Promise<T | null> {
     setBusy(label);
@@ -49,452 +51,285 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
     }
   }
 
-  /** The attempt this issue is on, and the implementer run it followed, if any. */
-  const lastImplementer = [...(issue.runs ?? [])].reverse().find((run) => run.role === "implementer") ?? null;
-  const implementerLive = lastImplementer !== null && (lastImplementer.status === "running" || lastImplementer.status === "queued");
+  /** Every move is a full document, so `just check-ui` can verify each one. */
+  const mutate = (label: string, document: string, variables: Record<string, unknown>) =>
+    run(label, document, variables);
 
-  const startRun = (role: string, parentRunId?: string) =>
-    run(
-      "start",
-      `mutation ($issueId: UUID!, $role: String!, $parentRunId: UUID) { startRun(issueId: $issueId, role: $role, parentRunId: $parentRunId) { id } }`,
-      { issueId: issue.id, role, parentRunId: parentRunId ?? null },
-    );
+  async function showLog(id: string) {
+    if (openLog === id) {
+      setOpenLog(null);
+      return;
+    }
+    setOpenLog(id);
+    setLog(null);
+    const data = await run<{ run: { log: string } }>("log", `query ($id: UUID!) { run(id: $id) { log } }`, { id });
+    setLog(data?.run.log ?? "no transcript was recorded for this run");
+  }
 
   return (
-    <section className="detail">
-      <header className="detail-head">
-        <button className="ghost" onClick={onBack}>
-          ← board
-        </button>
-        <div className="titles">
-          <h1>
-            <code className="key">{issue.key}</code> {issue.title}
-          </h1>
-          <div className="meta">
-            <StatusPill status={issue.status} />
-            <span className="dim">
-              attempt {issue.attempt} · {issue.runCount} runs · {issue.criteria.length} criteria
-            </span>
-            <select
-              className="milestone-pick"
-              value={issue.milestoneId ?? ""}
-              onChange={(event) =>
-                void run("milestone", `mutation ($issueId: UUID!, $milestoneId: UUID) { setIssueMilestone(issueId: $issueId, milestoneId: $milestoneId) { id } }`, {
-                  issueId: issue.id,
-                  milestoneId: event.target.value || null,
-                })
-              }
-            >
-              <option value="">no milestone</option>
-              {milestones.map((milestone) => (
-                <option key={milestone.id} value={milestone.id}>
-                  {milestone.title}
-                </option>
-              ))}
-            </select>
-          </div>
+    <div className="detail">
+      <div className="detail-head">
+        <div className="row">
+          <button className="ghost" onClick={onBack}>
+            ← Board
+          </button>
+          <span className="dim" style={{ marginLeft: "auto" }}>
+            {issue.key}
+          </span>
+          <StatusPill status={issue.status} />
         </div>
-      </header>
+        <h1>{issue.title}</h1>
+        <div className="meta">
+          {issue.projectName ? <span>{issue.projectName}</span> : <span>no project</span>}
+          <span>·</span>
+          <span>attempt {issue.attempt}</span>
+          {issue.prUrl ? (
+            <>
+              <span>·</span>
+              <a className="pr-link" href={issue.prUrl} target="_blank" rel="noreferrer">
+                pull request #{issue.prNumber}
+              </a>
+            </>
+          ) : null}
+        </div>
+      </div>
 
       {error && <p className="error">{error}</p>}
 
-      <ol className="criteria">
-        {issue.criteria.map((criterion) => (
-          <li key={criterion.position} className={criterion.testName ? "proven" : ""}>
-            <span className="ac">ac{criterion.position}</span>
-            <span>{criterion.text}</span>
-            <code>{criterion.testName ?? "no test yet"}</code>
-          </li>
-        ))}
-      </ol>
-
-      {issue.body && <p className="body">{issue.body}</p>}
+      {issue.blockedBy ? (
+        <div className="blocked-box">
+          <strong>Blocked.</strong> {issue.blockedBy}
+        </div>
+      ) : null}
 
       <div className="actions">
         {issue.status === "backlog" && (
           <button
             className="primary"
             disabled={busy !== null}
-            onClick={() => run("ready", `mutation ($id: UUID!) { approveCriteria(issueId: $id) { id } }`, { id: issue.id })}
+            onClick={() =>
+              mutate(
+                "plan",
+                `mutation ($id: UUID!) { planIssue(issueId: $id, planned: true) { id status } }`,
+                { id: issue.id },
+              )
+            }
           >
-            Approve criteria
+            Move to To do
           </button>
         )}
-        {issue.status === "ready" && (
-          <button className="primary" disabled={busy !== null} onClick={() => startRun("test_author")}>
-            Write the tests
+
+        {issue.status === "todo" && !live && (
+          <button
+            className="primary"
+            disabled={busy !== null}
+            onClick={() =>
+              mutate(
+                "start",
+                `mutation ($id: UUID!) { startRun(issueId: $id, role: "implementer") { id status } }`,
+                { id: issue.id },
+              )
+            }
+          >
+            Start an agent now
           </button>
         )}
-        {issue.status === "tests_in_progress" && (
-          <>
-            {current && <RunSummary issue={issue} run={current} onToggleDiff={() => setShowDiff(!showDiff)} showDiff={showDiff} />}
-            {current && current.status === "succeeded" && (
-              <button
-                className="primary"
-                disabled={busy !== null}
-                onClick={() => run("freeze", `mutation ($id: UUID!) { freezeSuite(issueId: $id) { id } }`, { id: issue.id })}
-              >
-                Freeze suite
-              </button>
-            )}
-            {issue.replays?.some((replay) => replay.kind === "base" && replay.status === "failed") && (
-              <button
-                className="ghost"
-                disabled={busy !== null}
-                onClick={() =>
-                  run("replay", `mutation ($id: UUID!) { retryBaseReplay(issueId: $id) { id status } }`, {
-                    id: issue.id,
-                  })
-                }
-              >
-                Run the base replay again
-              </button>
-            )}
-            {(!current || (current.status !== "running" && current.status !== "queued" && current.status !== "succeeded")) && (
-              <button className="ghost" disabled={busy !== null} onClick={() => startRun("test_author")}>
-                Write the tests again
-              </button>
-            )}
-          </>
-        )}
-        {issue.status === "tests_ready" && (
-          <button className="primary" disabled={busy !== null} onClick={() => startRun("implementer")}>
-            Implement
+
+        {live && (
+          <button
+            className="danger"
+            disabled={busy !== null}
+            onClick={() =>
+              mutate(
+                "cancel",
+                `mutation ($runId: UUID!) { cancelRun(runId: $runId) { id status } }`,
+                { runId: current!.id },
+              )
+            }
+          >
+            Cancel the run
           </button>
         )}
-        {issue.status === "in_progress" && (
+
+        {issue.status === "in_review" && (
           <>
-            {current && <RunSummary issue={issue} run={current} onToggleDiff={() => setShowDiff(!showDiff)} showDiff={showDiff} />}
-            {current && (current.status === "running" || current.status === "queued") && (
-              <button
-                className="danger"
-                disabled={busy !== null}
-                onClick={() =>
-                  run("cancel", `mutation ($runId: UUID!) { cancelRun(runId: $runId) { id } }`, { runId: current.id })
-                }
-              >
-                Cancel run
-              </button>
-            )}
-            {issue.prUrl && (
-              <>
-                <a className="pr-link" href={issue.prUrl} target="_blank" rel="noreferrer">
-                  Pull request #{issue.prNumber} — {issue.prUrl}
-                </a>
-                <button
-                  disabled={busy !== null}
-                  onClick={() =>
-                    run(
-                      "recheck",
-                      `mutation ($id: UUID!) { recheckPullRequest(issueId: $id) { id } }`,
-                      { id: issue.id },
-                    )
-                  }
-                >
-                  Check the pull request again
-                </button>
-                <p className="hint">
-                  The issue moves to review when every check on the pull request is green and nobody on the team is
-                  still asking for changes.
-                </p>
-              </>
-            )}
-            {!implementerLive && lastImplementer && (
-              <button
-                className="primary"
-                disabled={busy !== null}
-                onClick={() => startRun("implementer", lastImplementer.id)}
-              >
-                {lastImplementer.status === "failed" ? "Implement again" : "Continue with the review"}
-              </button>
-            )}
-          </>
-        )}
-        {issue.status === "in_review" && current && (
-          <>
-            {issue.prUrl && (
-              <a className="pr-link" href={issue.prUrl} target="_blank" rel="noreferrer">
-                Pull request #{issue.prNumber} — {issue.prUrl}
-              </a>
-            )}
-            <RunSummary issue={issue} run={current} onToggleDiff={() => setShowDiff(!showDiff)} showDiff={showDiff} />
-            {!verdictOfCurrentRun && (
-              <button className="primary" disabled={busy !== null} onClick={() => startRun("reviewer")}>
-                Ask the Reviewer
-              </button>
-            )}
-            {verdictOfCurrentRun && (
-              <>
-                <h3>Reviewer verdict: {verdictOfCurrentRun.verdict}</h3>
-                <pre className="review-body">{verdictOfCurrentRun.body}</pre>
-                {verdictOfCurrentRun.verdict === "approved" && (
-                  <button className="primary" onClick={() => setApproving(true)}>
-                    Approve…
-                  </button>
-                )}
-              </>
-            )}
-          </>
-        )}
-        {issue.status === "merging" && (
-          <div className="merge">
-            <p>
-              The landing replay is green. Merge the approved head in your checkout, then record the merge commit here — Hulahoop
-              verifies its ancestry before closing the issue.
-            </p>
-            <input placeholder="merge commit revision" value={mergeRevision} onChange={(e) => setMergeRevision(e.target.value)} />
             <button
               className="primary"
-              disabled={busy !== null || mergeRevision.trim().length < 4}
+              disabled={busy !== null}
               onClick={() =>
-                run(
-                  "merge",
-                  `mutation ($id: UUID!, $rev: String!) { recordMerge(issueId: $id, mergeRevision: $rev) { id } }`,
-                  { id: issue.id, rev: mergeRevision.trim() },
+              mutate("merge", `mutation ($id: UUID!) { mergeIssue(issueId: $id) { id status } }`, { id: issue.id })
+            }
+            >
+              The pull request merged
+            </button>
+            <button
+              disabled={busy !== null}
+              onClick={() =>
+                mutate(
+                  "changes",
+                  `mutation ($id: UUID!) { requestChanges(issueId: $id) { id status } }`,
+                  { id: issue.id },
                 )
               }
             >
-              Record merge
+              Send it back
             </button>
-          </div>
+          </>
         )}
-        {issue.status === "blocked" && (
-          <div className="blocked-box">
-            <h3>The agent is blocked</h3>
-            <p>{issue.comments.find((c) => c.id === issue.pinnedCommentId)?.body ?? "No question recorded."}</p>
-            <textarea value={answer} onChange={(e) => setAnswer(e.target.value)} placeholder="Answer the question…" rows={3} />
-            <button
-              className="primary"
-              disabled={busy !== null || answer.trim().length === 0}
-              onClick={() =>
-                run("resume", `mutation ($id: UUID!, $answer: String!) { resumeIssue(issueId: $id, answer: $answer) { id } }`, {
-                  id: issue.id,
-                  answer: answer.trim(),
-                })
-              }
-            >
-              Resume
-            </button>
-          </div>
+
+        {issue.status === "done" && (
+          <button
+            disabled={busy !== null}
+            onClick={() =>
+              mutate("reopen", `mutation ($id: UUID!) { reopenIssue(issueId: $id) { id status } }`, { id: issue.id })
+            }
+          >
+            Reopen
+          </button>
         )}
-        {(issue.status === "in_review" || issue.status === "in_progress") && (
-          <details className="secondary">
-            <summary>More</summary>
-            <div className="row">
-              <input placeholder="reason to thaw the suite" value={reason} onChange={(e) => setReason(e.target.value)} />
-              <button
-                disabled={busy !== null || reason.trim().length === 0}
-                onClick={() =>
-                  run(
-                    "thaw",
-                    `mutation ($id: UUID!, $reason: String!) { unfreezeSuite(issueId: $id, reason: $reason) { id } }`,
-                    { id: issue.id, reason: reason.trim() },
-                  )
-                }
-              >
-                Thaw suite
-              </button>
-            </div>
-            <div className="row">
-              <input placeholder="reason to abandon" value={reason} onChange={(e) => setReason(e.target.value)} />
-              <button
-                className="danger"
-                disabled={busy !== null || reason.trim().length === 0}
-                onClick={() =>
-                  run(
-                    "abandon",
-                    `mutation ($id: UUID!, $reason: String!) { abandonIssue(issueId: $id, reason: $reason) { id } }`,
-                    { id: issue.id, reason: reason.trim() },
-                  )
-                }
-              >
-                Abandon issue
-              </button>
-            </div>
-          </details>
-        )}
+
+        <label className="project-pick" style={{ marginLeft: "auto" }}>
+          <span>milestone</span>
+          <select
+            value={issue.milestoneId ?? ""}
+            onChange={(event) =>
+              void run(
+                "milestone",
+                `mutation ($id: UUID!, $milestoneId: UUID) { setIssueMilestone(issueId: $id, milestoneId: $milestoneId) { id } }`,
+                { id: issue.id, milestoneId: event.target.value || null },
+              )
+            }
+          >
+            <option value="">none</option>
+            {milestones.map((entry) => (
+              <option key={entry.id} value={entry.id}>
+                {entry.title}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
-      {approving && current && (
-        <div className="dialog">
-          <h2>Approve the diff you reviewed</h2>
-          <p className="dim">
-            head {current.headRevision?.slice(0, 12)} · diff {current.diffSha?.slice(0, 12)}
-          </p>
-          {(current.flags ?? []).length > 0 ? (
-            <ul className="flags">
-              {(current.flags ?? []).map((flag) => (
-                <li key={flag}>
-                  <label>
-                    <input
-                      type="checkbox"
-                      checked={ackFlags.includes(flag)}
-                      onChange={(e) =>
-                        setAckFlags(e.target.checked ? [...ackFlags, flag] : ackFlags.filter((f) => f !== flag))
-                      }
-                    />
-                    {flag.replaceAll("_", " ").toLowerCase()} — I read this part of the diff.
-                  </label>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            <p>No flags on this run.</p>
-          )}
-          {verdictOfCurrentRun?.verdict !== "approved" && (
-            <>
-              <p className="dim">
-                {verdictOfCurrentRun
-                  ? `The Reviewer asked for changes. Approving anyway is your call, and it needs a reason on the record.`
-                  : `No Reviewer has judged this run yet. Approving anyway needs a reason on the record.`}
-              </p>
-              <textarea
-                placeholder="Why this lands without the Reviewer's approval"
-                value={overrideReason}
-                onChange={(event) => setOverrideReason(event.target.value)}
-                rows={3}
-              />
-            </>
-          )}
-          <div className="row">
-            <button className="ghost" onClick={() => setApproving(false)}>
-              Cancel
-            </button>
-            <button
-              className="primary"
-              disabled={
-                busy !== null ||
-                ackFlags.length !== (current.flags?.length ?? 0) ||
-                (verdictOfCurrentRun?.verdict !== "approved" && overrideReason.trim().length < 15)
-              }
-              onClick={async () => {
-                await run(
-                  "approve",
-                  `mutation ($issueId: UUID!, $runId: UUID!, $head: String!, $sha: String!, $flags: [String!]!, $reason: String) {
-                     approveIssue(issueId: $issueId, runId: $runId, reviewedHead: $head, diffSha: $sha, acknowledgeFlags: $flags, overrideReason: $reason) { id }
-                   }`,
-                  {
-                    issueId: issue.id,
-                    runId: current.id,
-                    head: current.headRevision ?? "",
-                    sha: current.diffSha ?? "",
-                    flags: ackFlags,
-                    reason: overrideReason.trim() === "" ? null : overrideReason.trim(),
-                  },
-                );
-                setApproving(false);
-              }}
-            >
-              Approve this diff
-            </button>
-          </div>
+      {issue.status === "blocked" && (
+        <div className="panel">
+          <h3>Resume</h3>
+          <textarea
+            rows={2}
+            placeholder="what the agent should know before it continues"
+            value={answer}
+            onChange={(event) => setAnswer(event.target.value)}
+          />
+          <button
+            className="primary"
+            disabled={busy !== null || answer.trim().length === 0}
+            onClick={() =>
+              void run(
+                "resume",
+                `mutation ($id: UUID!, $answer: String!) { resumeIssue(issueId: $id, answer: $answer) { id } }`,
+                { id: issue.id, answer },
+              ).then(() => setAnswer(""))
+            }
+          >
+            Resume
+          </button>
         </div>
       )}
 
-      <h3 className="section">Runs</h3>
-      <ul className="runs">
-        {issue.runs.map((runItem) => (
-          <li key={runItem.id}>
-            <span className="role">{ROLE_LABEL[runItem.role] ?? runItem.role}</span>
-            <StatusPill status={runItem.status} />
-            <span className="dim">{runItem.adapter}</span>
-            {(runItem.tokensIn > 0 || runItem.tokensOut > 0) && (
+      {issue.body ? (
+        <div className="section">
+          <h3>Description</h3>
+          <p style={{ whiteSpace: "pre-wrap" }}>{issue.body}</p>
+        </div>
+      ) : null}
+
+      <div className="section">
+        <h3>Acceptance criteria</h3>
+        {(issue.criteria ?? []).length === 0 ? (
+          <p className="dim">No criteria yet. Each line becomes one test the agent has to make pass.</p>
+        ) : (
+          <ul className="criteria">
+            {(issue.criteria ?? []).map((criterion) => (
+              <li key={criterion.id}>
+                <span>
+                  <span className="ac">ac{criterion.position}</span>
+                  {criterion.text}
+                </span>
+                {criterion.testName ? <span className="dim">{criterion.testName}</span> : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      {verdict ? (
+        <div className="section">
+          <h3>
+            Reviewer verdict: <span className={verdict.verdict === "approved" ? "chip ok" : "chip bad"}>{verdict.verdict}</span>
+          </h3>
+          <pre className="review-body">{verdict.body}</pre>
+        </div>
+      ) : null}
+
+      <div className="section">
+        <h3>Runs</h3>
+        {runs.length === 0 ? (
+          <p className="dim">Nothing has run yet.</p>
+        ) : (
+          <ul className="runs">
+            {[...runs].reverse().map((entry) => (
+              <li key={entry.id}>
+                <div className="row">
+                  <span className="role">{ROLE_LABEL[entry.role] ?? entry.role}</span>
+                  <StatusPill status={entry.status} />
+                  <span className="dim">attempt {entry.attempt}</span>
+                  {entry.adapter ? <span className="mark">{entry.adapter}</span> : null}
+                  <span className="dim" style={{ marginLeft: "auto" }}>
+                    {entry.startedAt ? new Date(entry.startedAt).toLocaleString() : ""}
+                  </span>
+                  <button className="link" onClick={() => void showLog(entry.id)}>
+                    {openLog === entry.id ? "hide the transcript" : "transcript"}
+                  </button>
+                </div>
+                {entry.error ? <p className="error">{entry.error}</p> : null}
+                {entry.commitName ? <span className="dim">committed as {entry.commitName}</span> : null}
+                {openLog === entry.id ? <pre className="log">{log ?? "reading…"}</pre> : null}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+
+      <div className="section">
+        <h3>Comments</h3>
+        <ul className="comments">
+          {(issue.comments ?? []).map((entry) => (
+            <li key={entry.id}>
               <span className="dim">
-                {runItem.tokensIn.toLocaleString()} in / {runItem.tokensOut.toLocaleString()} out
+                {entry.author} · {new Date(entry.createdAt).toLocaleString()}
               </span>
-            )}
-            {runItem.flags.length > 0 && <span className="flag">{runItem.flags.join(", ").replaceAll("_", " ").toLowerCase()}</span>}
-            {runItem.error && <span className="error inline">{runItem.error}</span>}
-          </li>
-        ))}
-      </ul>
-
-      <h3 className="section">Replays</h3>
-      <ul className="runs">
-        {issue.replays.map((replay) => (
-          <li key={replay.id}>
-            <span className="role">{replay.kind}</span>
-            <StatusPill status={replay.status} />
-            {replay.failedTests?.length ? <span className="dim">failing: {replay.failedTests.join(", ")}</span> : null}
-          </li>
-        ))}
-      </ul>
-
-      <h3 className="section">Conversation</h3>
-      <ul className="comments">
-        {issue.comments.map((comment) => (
-          <li key={comment.id} className={comment.pinned ? "pinned" : ""}>
-            <span className="who">{comment.authorType}</span>
-            <p>{comment.body}</p>
-          </li>
-        ))}
-        {issue.comments.length === 0 && <li className="dim">nothing said yet</li>}
-      </ul>
-    </section>
-  );
-}
-
-function RunSummary({
-  issue,
-  run,
-  showDiff,
-  onToggleDiff,
-}: {
-  issue: Issue;
-  run: {
-    id: string;
-    status: string;
-    flags: string[];
-    error: string | null;
-    commitName?: string | null;
-    commitEmail?: string | null;
-    prUrl?: string | null;
-    prNumber?: number | null;
-  };
-  showDiff: boolean;
-  onToggleDiff: () => void;
-}) {
-  const [log, setLog] = useState<string | null>(null);
-  const [diff, setDiff] = useState<string | null>(null);
-
-  async function load() {
-    const data = await gql<{ run: { log: string; diff: string } }>(
-      `query ($id: UUID!) { run(id: $id) { log diff } }`,
-      { id: run.id },
-    );
-    setLog(data.run.log);
-    setDiff(data.run.diff);
-  }
-
-  return (
-    <div className="running">
-      {run.error && <p className="error">{run.error}</p>}
-      {run.commitName && (
-        <p className="dim small">
-          committed as <span className="mono">{run.commitName}</span>
-          {run.commitEmail ? ` <${run.commitEmail}>` : ""}
-        </p>
-      )}
-      {run.prUrl && (
-        <p className="dim small">
-          pull request{" "}
-          <a href={run.prUrl} target="_blank" rel="noreferrer">
-            #{run.prNumber ?? "?"}
-          </a>{" "}
-          is open for review
-        </p>
-      )}
-      <div className="row">
-        <button className="ghost" onClick={() => void load()}>
-          {log ? "Reload log" : "Show log"}
-        </button>
-        <button className="ghost" onClick={onToggleDiff}>
-          {showDiff ? "Hide diff" : "Show diff"}
+              <span style={{ whiteSpace: "pre-wrap" }}>{entry.body}</span>
+            </li>
+          ))}
+        </ul>
+        <textarea
+          rows={2}
+          placeholder="a note for whoever picks this up"
+          value={comment}
+          onChange={(event) => setComment(event.target.value)}
+        />
+        <button
+          disabled={busy !== null || comment.trim().length === 0}
+          onClick={() =>
+            void run(
+              "comment",
+              `mutation ($id: UUID!, $body: String!) { addComment(issueId: $id, body: $body) { id } }`,
+              { id: issue.id, body: comment },
+            ).then(() => setComment(""))
+          }
+        >
+          Comment
         </button>
       </div>
-      {log && <pre className="log">{log.split("\n").slice(-120).join("\n")}</pre>}
-      {showDiff && diff && <pre className="log">{diff}</pre>}
-      {showDiff && !diff && <p className="dim">nothing captured yet for {issue.title}</p>}
     </div>
   );
 }

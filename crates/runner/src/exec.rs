@@ -4,7 +4,7 @@ use crate::adapter;
 use crate::client::Client;
 use crate::vcs::{Kind, Vcs};
 use anyhow::{anyhow, bail, Context, Result};
-use hulahoop_core::{contract, Adapter, AgentRole, ReplayKind};
+use hulahoop_core::{contract, Adapter, AgentRole};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -44,10 +44,6 @@ impl Executor {
         }
         if let Some(run) = self.client.claim_run(runner_id).await? {
             self.run_run(run).await?;
-            return Ok(true);
-        }
-        if let Some(replay) = self.client.claim_replay().await? {
-            self.run_replay(replay).await?;
             return Ok(true);
         }
         Ok(false)
@@ -331,173 +327,6 @@ impl Executor {
         Ok(())
     }
 
-    async fn run_replay(&self, envelope: Value) -> Result<()> {
-        let replay = &envelope["replay"];
-        let spec = &envelope["spec"];
-        let replay_id = replay["id"]
-            .as_str()
-            .context("replay has no id")?
-            .to_string();
-        if let Err(error) = self.execute_replay(&replay_id, spec).await {
-            tracing::error!(%error, replay_id, "replay failed to execute");
-            let _ = self
-                .client
-                .complete_replay(
-                    &replay_id,
-                    json!({
-                        "status": "timed_out",
-                        "error": format!("the runner could not execute the replay: {error}"),
-                    }),
-                )
-                .await;
-        }
-        Ok(())
-    }
-
-    async fn execute_replay(&self, replay_id: &str, spec: &Value) -> Result<()> {
-        let kind = ReplayKind::parse(spec["kind"].as_str().unwrap_or_default())
-            .ok_or_else(|| anyhow!("unknown replay kind"))?;
-        let repo_path = host_repository(spec)?;
-        let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
-        let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
-        std::fs::create_dir_all(&artifact_dir)?;
-
-        let vcs = Vcs::detect(&repo_path)?;
-        vcs.ensure_vcs()?;
-
-        // Which revision the suite runs at, and what has to be laid on top of it.
-        let (revision, restore_from, restore_paths) = match kind {
-            ReplayKind::Base => {
-                let revision = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
-                let candidate = spec["candidate_bookmark"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_string();
-                if candidate.is_empty() {
-                    (revision, None, Vec::new())
-                } else {
-                    // What the Test Author wrote, relative to the base it branched
-                    // from. These files are laid on top of the untouched base, so a
-                    // green suite there would mean the tests prove nothing.
-                    // Where the candidate was authored, not where the repo stands now:
-                    // a candidate branched before later commits landed must still lay
-                    // down only its own files.
-                    let base = spec["candidate_base_revision"]
-                        .as_str()
-                        .or_else(|| spec["base_revision"].as_str())
-                        .filter(|value| !value.is_empty())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| revision.clone());
-                    let paths = vcs
-                        .changed_paths_between(&base, &candidate)
-                        .unwrap_or_default();
-                    (revision, Some(candidate), paths)
-                }
-            }
-            ReplayKind::Head => {
-                let head = spec["head_bookmark"]
-                    .as_str()
-                    .context("head replay without a head bookmark")?
-                    .to_string();
-                (head, None, Vec::new())
-            }
-            ReplayKind::Landing => {
-                let approved_head = spec["approval_head_revision"]
-                    .as_str()
-                    .context("landing replay without the approved head")?
-                    .to_string();
-                let landing_bookmark = spec["landing_bookmark"]
-                    .as_str()
-                    .context("landing replay without a landing bookmark")?
-                    .to_string();
-                let head_bookmark = spec["head_bookmark"]
-                    .as_str()
-                    .context("landing replay without a head bookmark")?
-                    .to_string();
-                // The suite commit is where the chain starts, and it is the same
-                // bookmark the freeze recorded: the landing replay has no candidate
-                // run of its own.
-                let candidate_bookmark = spec["candidate_bookmark"]
-                    .as_str()
-                    .or_else(|| spec["tests_bookmark"].as_str())
-                    .context("landing replay without the suite it was approved from")?
-                    .to_string();
-                let base = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
-                // The suite is a commit of its own beneath the implementation, so
-                // rebasing the head alone lands the implementation **without** the
-                // tests: the preview then runs the base suite and proves nothing.
-                // Move the whole chain, then put the run's bookmarks back so the
-                // approved revision stays the one the human approved.
-                let tests_before = vcs.resolve(&candidate_bookmark)?;
-                let head_before = vcs.resolve(&head_bookmark)?;
-                vcs.add_workspace(&checkout, &base)?;
-                vcs.rebase_chain(&checkout, &tests_before, &base)?;
-                // jj resolves an abandoned commit id to the commit that replaced it,
-                // so the landed revision is the rewritten approved head.
-                let landed = vcs.resolve(&approved_head)?;
-                vcs.set_bookmark(&landing_bookmark, &landed)?;
-                vcs.set_bookmark(&head_bookmark, &head_before)?;
-                vcs.set_bookmark(&candidate_bookmark, &tests_before)?;
-                vcs.edit(&checkout, &landed)?;
-                (landing_bookmark.clone(), None, Vec::new())
-            }
-        };
-        if kind != ReplayKind::Landing {
-            vcs.add_workspace(&checkout, &revision)?;
-        }
-        ensure_envrc(&checkout)?;
-        if let Some(from) = restore_from {
-            vcs.restore_from(&checkout, &from, &restore_paths)?;
-        }
-
-        if let Some(failure) = self.run_setup(&checkout, &artifact_dir).await? {
-            self.client
-                .complete_replay(
-                    replay_id,
-                    json!({ "status": "timed_out", "error": failure }),
-                )
-                .await?;
-            return Ok(());
-        }
-
-        let outcome = self.run_suite(&checkout, &artifact_dir, kind).await?;
-        let junit_path = checkout.join(".hulahoop").join("junit.xml");
-        let junit_xml = std::fs::read_to_string(&junit_path).ok();
-        // The house rules run after the suite, at the same revision.
-        let house_rules = if outcome.timed_out {
-            Vec::new()
-        } else {
-            self.run_house_rules(&checkout, &artifact_dir, kind)?
-        };
-
-        // The runner reports whether the suite *ran*, not what its colour means: a
-        // red suite is the wanted outcome for a base replay and the wrong one for a
-        // head replay. The server owns that reading.
-        let status = if outcome.timed_out {
-            "timed_out"
-        } else if junit_xml.is_some() {
-            "succeeded"
-        } else {
-            "failed"
-        };
-
-        self.client
-            .complete_replay(
-                replay_id,
-                json!({
-                    "status": status,
-                    "exit_code": outcome.exit_code,
-                    "error": outcome.error,
-                    "junit_xml": junit_xml,
-                    "house_rules": house_rules,
-                }),
-            )
-            .await?;
-
-        let _ = vcs.remove_workspace(&checkout);
-        Ok(())
-    }
-
     async fn run_job(&self, envelope: Value) -> Result<()> {
         let job = &envelope["job"];
         let spec = &envelope["spec"];
@@ -559,8 +388,17 @@ impl Executor {
         // place the runner may not approve silently, so approval is per repo and
         // idempotent.
         let has_envrc = repo_path.join(".envrc").exists();
+        let direnv_home = self.data_dir.join("direnv");
         if has_envrc {
-            let _ = Command::new("direnv").arg("allow").arg(repo_path).output();
+            // `direnv allow` has to write into the same XDG home the probe will
+            // read, so both get the same environment.
+            std::fs::create_dir_all(&direnv_home).ok();
+            let _ = Command::new("direnv")
+                .arg("allow")
+                .arg(repo_path)
+                .env("XDG_DATA_HOME", &direnv_home)
+                .env("NO_COLOR", "1")
+                .output();
         }
         let command = contract::probe_command(adapter, &model);
         let mut cmd = Command::new(&command[0]);
@@ -576,14 +414,17 @@ impl Executor {
         let home = contract::scratch_home(&self.data_dir, adapter);
         std::fs::create_dir_all(&home)?;
         seed_home(&home);
-        let path =
-            dev_shell_path(repo_path).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
+        let path = if adapter == Adapter::Fake {
+            std::env::var("PATH").unwrap_or_default()
+        } else {
+            dev_shell_path(repo_path).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+        };
         let output = cmd
             .current_dir(repo_path)
             .env_clear()
             .env("PATH", path)
             .env("HOME", &home)
-            .env("XDG_DATA_HOME", self.data_dir.join("direnv"))
+            .env("XDG_DATA_HOME", &direnv_home)
             .env("NO_COLOR", "1")
             .output();
 
@@ -796,29 +637,6 @@ impl Executor {
         Ok(None)
     }
 
-    async fn run_suite(
-        &self,
-        checkout: &Path,
-        artifact_dir: &Path,
-        kind: ReplayKind,
-    ) -> Result<Outcome> {
-        let log = artifact_dir.join("just-test.log");
-        let outcome = run_command(
-            checkout,
-            &["direnv", "exec", ".", "just", "test"],
-            hulahoop_core::REPLAY_WALL_CLOCK_MINUTES,
-            Some(&log),
-        )?;
-        let junit_path = checkout.join(".hulahoop").join("junit.xml");
-        if junit_path.exists() {
-            let _ = std::fs::copy(&junit_path, artifact_dir.join("junit.xml"));
-        }
-        let _ = kind;
-        Ok(outcome)
-    }
-
-    /// `just fmt` when the repository declares it, so the tree the loop records is
-    /// the tree the house rules would accept.
     fn format_tree(
         &self,
         checkout: &Path,
@@ -865,48 +683,6 @@ impl Executor {
     /// The recipes a repository declares beyond the suite, run at the same revision
     /// the suite ran at. The pull request's checks run `just ci`, so a head that
     /// passes the suite and fails `fmt-check` is a head that was never finished.
-    fn run_house_rules(
-        &self,
-        checkout: &Path,
-        artifact_dir: &Path,
-        kind: ReplayKind,
-    ) -> Result<Vec<Value>> {
-        if kind == ReplayKind::Base {
-            return Ok(Vec::new());
-        }
-        let summary = match run_command(
-            checkout,
-            &["direnv", "exec", ".", "just", "--summary"],
-            hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
-            None,
-        ) {
-            Ok(outcome) => outcome.final_text,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let declared: Vec<&str> = summary.split_whitespace().collect();
-        let mut results = Vec::new();
-        for recipe in ["fmt-check", "lint"] {
-            if !declared.contains(&recipe) {
-                continue;
-            }
-            let log = artifact_dir.join(format!("just-{recipe}.log"));
-            let outcome = run_command(
-                checkout,
-                &["direnv", "exec", ".", "just", recipe],
-                hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
-                Some(&log),
-            )?;
-            results.push(json!({
-                "recipe": recipe,
-                "ok": !outcome.timed_out && outcome.exit_code == Some(0),
-                "timed_out": outcome.timed_out,
-                "exit_code": outcome.exit_code,
-            }));
-        }
-        Ok(results)
-    }
-
-    /// Spawn the agent, stream its stdout, and heartbeat while it works.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_and_stream(
         &self,

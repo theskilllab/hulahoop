@@ -1,11 +1,9 @@
+/** The six columns of the board, plus the states a task can leave it through. */
 export type IssueStatus =
   | "backlog"
-  | "ready"
-  | "tests_in_progress"
-  | "tests_ready"
+  | "todo"
   | "in_progress"
   | "in_review"
-  | "merging"
   | "blocked"
   | "done"
   | "cancelled";
@@ -22,6 +20,7 @@ export interface Connection {
 }
 
 export interface Criterion {
+  id: string;
   position: number;
   text: string;
   testName: string | null;
@@ -41,6 +40,9 @@ export interface Run {
   commitEmail: string | null;
   prUrl: string | null;
   prNumber: number | null;
+  /** Set when the task is blocked, naming what it waits for. */
+  blockedBy: string | null;
+  projectName: string | null;
   error: string | null;
   tokensIn: number;
   tokensOut: number;
@@ -59,6 +61,8 @@ export interface Review {
 
 export interface Comment {
   id: string;
+  /** The agent's name, or `you` for a person. */
+  author: string;
   authorType: string;
   body: string;
   pinned: boolean;
@@ -101,11 +105,13 @@ export interface Issue {
   prUrl: string | null;
   prNumber: number | null;
   pinnedCommentId: string | null;
+  /** Set when the task is blocked, naming what it waits for. */
+  blockedBy: string | null;
+  projectName: string | null;
   criteria: Criterion[];
   runs: Run[];
   reviews: Review[];
   comments: Comment[];
-  replays: Replay[];
   approval: Approval | null;
   currentRun: Run | null;
 }
@@ -352,13 +358,11 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
 export const ISSUE_FIELDS = `
   id key number projectId projectPrefix milestoneId
   title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
-  prUrl prNumber
-  criteria { position text testName }
+  blockedBy projectName prUrl prNumber
+  criteria { id position text testName }
   runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
-  comments { id authorType body pinned createdAt }
-  replays { id kind status failedTests createdAt }
-  approval { id headRevision diffSha landingBookmark flags createdAt }
+  comments { id author authorType body pinned createdAt }
   currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 

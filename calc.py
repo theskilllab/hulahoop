@@ -1,0 +1,1 @@
+\n\ndef subtract(a, b):\n    return a - b\n

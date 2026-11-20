@@ -229,7 +229,6 @@ impl Run {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
-#[graphql(complex)]
 pub struct Replay {
     pub id: Uuid,
     pub issue_id: Uuid,
@@ -262,6 +261,7 @@ pub struct Review {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Comment {
     pub id: Uuid,
     pub issue_id: Uuid,

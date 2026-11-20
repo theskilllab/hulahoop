@@ -125,20 +125,6 @@ impl Client {
         Ok(())
     }
 
-    pub async fn claim_replay(&self) -> Result<Option<Value>> {
-        let value = self.post("/internal/replays/claim", json!({})).await?;
-        Ok(if value.is_object() { Some(value) } else { None })
-    }
-
-    pub async fn complete_replay(&self, replay_id: &str, completion: Value) -> Result<()> {
-        self.post(
-            &format!("/internal/replays/{replay_id}/complete"),
-            completion,
-        )
-        .await?;
-        Ok(())
-    }
-
     pub async fn claim_job(&self) -> Result<Option<Value>> {
         let value = self.post("/internal/jobs/claim", json!({})).await?;
         Ok(if value.is_object() { Some(value) } else { None })

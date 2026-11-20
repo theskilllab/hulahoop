@@ -2,16 +2,15 @@
 //! state machine and the gate live in one place.
 
 use crate::connectors::Credential;
-use crate::db::{json_list, kill_process_group, sha256_hex, Db};
+use crate::db::{kill_process_group, sha256_hex, Db};
 use crate::github::StoredApp;
 use crate::model::ConnectorRow;
 use crate::model::*;
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use hulahoop_core::contract;
 use hulahoop_core::diff;
-use hulahoop_core::junit;
-use hulahoop_core::{AgentRole, IssueEvent, IssueStatus, ReplayKind, RunFlag, RunStatus};
+use hulahoop_core::{AgentRole, IssueEvent, IssueStatus, RunFlag, RunStatus};
 use uuid::Uuid;
 
 /// Words that fill a sentence without naming anything. A criterion built only from these
@@ -700,7 +699,11 @@ impl Engine {
         }
 
         let (base_bookmark, attempt) = match role {
-            AgentRole::TestAuthor => (repo.base_bookmark.clone(), issue.attempt),
+            AgentRole::TestAuthor => {
+                bail!(
+                    "there is no separate test-author stage any more. An agent takes the task from To do and does the work, tests included."
+                )
+            }
             AgentRole::Implementer => {
                 let base = match parent_run_id {
                     Some(parent_id) => {
@@ -714,11 +717,7 @@ impl Engine {
                             .clone()
                             .ok_or_else(|| anyhow!("parent run {parent_id} has no head bookmark"))?
                     }
-                    None => issue.tests_bookmark.clone().ok_or_else(|| {
-                        anyhow!(
-                            "the suite is not frozen: freeze it before starting an implementer run"
-                        )
-                    })?,
+                    None => repo.base_bookmark.clone(),
                 };
                 (base, issue.attempt + 1)
             }
@@ -780,19 +779,23 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        // A reviewer does not move the task: it reads what is already in review.
         let event = match role {
-            AgentRole::TestAuthor => IssueEvent::StartTestAuthor,
-            AgentRole::Implementer => IssueEvent::StartImplementer { parent_run_id },
-            AgentRole::Reviewer => IssueEvent::StartReviewer,
+            AgentRole::TestAuthor => IssueEvent::Start,
+            AgentRole::Implementer => IssueEvent::Start,
+            AgentRole::Reviewer => IssueEvent::Start,
         };
-        if let Err(error) = self.transition(issue_id, event.clone()).await {
-            // The run row exists; drop it so a refused transition cannot leave a
-            // queued run the runner would pick up.
-            sqlx::query("delete from runs where id = ?")
-                .bind(run_id)
-                .execute(&self.db.pool)
-                .await?;
-            bail!("{error}");
+        let moves_the_task = role != AgentRole::Reviewer;
+        if moves_the_task {
+            if let Err(error) = self.transition(issue_id, event.clone()).await {
+                // The run row exists; drop it so a refused transition cannot leave a
+                // queued run the runner would pick up.
+                sqlx::query("delete from runs where id = ?")
+                    .bind(run_id)
+                    .execute(&self.db.pool)
+                    .await?;
+                bail!("{error}");
+            }
         }
 
         self.run(run_id).await
@@ -812,14 +815,6 @@ impl Engine {
             .fetch_optional(&self.db.pool)
             .await?
             .ok_or_else(|| anyhow!("run {id} not found"))
-    }
-
-    pub async fn replay(&self, id: Uuid) -> Result<Replay> {
-        sqlx::query_as::<_, Replay>("select * from replays where id = ?")
-            .bind(id)
-            .fetch_optional(&self.db.pool)
-            .await?
-            .ok_or_else(|| anyhow!("replay {id} not found"))
     }
 
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<Run> {
@@ -850,441 +845,6 @@ impl Engine {
     }
 
     // ------------------------------------------------------------------ gate
-
-    pub async fn freeze_suite(&self, issue_id: Uuid) -> Result<Issue> {
-        if let Some(live) = self.live_run_on_issue(issue_id).await? {
-            bail!("a run is active on this issue ({})", live.id);
-        }
-        let authoring: Option<Run> = sqlx::query_as(
-            "select * from runs where issue_id = ? and role = 'test_author' and status = 'succeeded'
-             order by created_at desc limit 1",
-        )
-        .bind(issue_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        let authoring = authoring.ok_or_else(|| {
-            anyhow!("no finished Test Author run on this issue yet: start one, then freeze")
-        })?;
-
-        let replay: Option<Replay> = sqlx::query_as(
-            "select * from replays where candidate_run_id = ? and kind = 'base'
-             order by created_at desc limit 1",
-        )
-        .bind(authoring.id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        let replay = replay.ok_or_else(|| {
-            anyhow!("the base replay for this candidate suite has not finished yet")
-        })?;
-        if !matches!(replay.status.as_str(), "failed" | "succeeded") {
-            bail!(
-                "the base replay is {}, wait for it to finish",
-                replay.status
-            );
-        }
-
-        let report_path = std::path::Path::new(&replay.artifact_dir).join("junit.xml");
-        let report = junit::parse_file(&report_path).with_context(|| {
-            format!(
-                "the base replay wrote no parsable JUnit report at {}",
-                report_path.display()
-            )
-        })?;
-
-        let criteria = self.criteria(issue_id).await?;
-        let mut problems = Vec::new();
-        let mut mapping = Vec::new();
-        for criterion in &criteria {
-            // Only a test that *fails* at the base revision proves anything. An earlier
-            // issue's suite lives in the same repository and carries the same `acN`
-            // names; those tests pass here, and counting them refused every freeze after
-            // the first issue.
-            let named = report.tests_for_criterion(criterion.position);
-            let matches: Vec<&junit::TestCase> =
-                named.iter().copied().filter(|case| case.failed).collect();
-            match matches.len() {
-                0 if !named.is_empty() => problems.push(format!(
-                    "criterion {}: a test carries `ac{}` but passes at the base revision, so it proves nothing: {}",
-                    criterion.position,
-                    criterion.position,
-                    named
-                        .iter()
-                        .map(|case| case.qualified_name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-                1 => {
-                    let case = matches[0];
-                    if case.failed {
-                        mapping.push((criterion.id, case.qualified_name()));
-                    } else {
-                        problems.push(format!(
-                            "criterion {}: `{}` passes at the base revision, so it does not prove the work",
-                            criterion.position,
-                            case.qualified_name()
-                        ));
-                    }
-                }
-                _ => problems.push(format!(
-                    "criterion {}: {} tests carry `ac{}` ({}); one criterion needs exactly one test",
-                    criterion.position,
-                    matches.len(),
-                    criterion.position,
-                    matches
-                        .iter()
-                        .map(|c| c.qualified_name())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )),
-            }
-        }
-
-        // A suite that could not even be collected at base is red for the wrong
-        // reason: the failure belongs to the import, not to a criterion.
-        let uncollected: Vec<String> = report
-            .cases
-            .iter()
-            // pytest names a collection error after the module it failed to import,
-            // with no class: `classname` empty and a dotted name. A real test that
-            // failed carries the criterion token and must not be reported here.
-            .filter(|case| {
-                case.failed
-                    && case.classname.is_none()
-                    && case.name.contains('.')
-                    && !criteria.iter().any(|criterion| {
-                        junit::contains_token(&case.name, &format!("ac{}", criterion.position))
-                    })
-            })
-            .map(|case| case.qualified_name())
-            .collect();
-        for name in uncollected {
-            problems.push(format!(
-                "`{name}` could not be collected at the base revision. Import the API inside the test function, so the failure lands on the test that names its criterion"
-            ));
-        }
-
-        if !problems.is_empty() {
-            let body = format!(
-                "The suite cannot be frozen:\n\n{}\n\nRun the Test Author again after fixing the tests.",
-                problems
-                    .iter()
-                    .map(|p| format!("- {p}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            );
-            self.comment(
-                issue_id,
-                hulahoop_core::AuthorType::Server,
-                None,
-                &body,
-                false,
-            )
-            .await?;
-            self.transition(
-                issue_id,
-                IssueEvent::FreezeRejected {
-                    reason: problems.join("; "),
-                },
-            )
-            .await?;
-            bail!(body);
-        }
-
-        for (criterion_id, test_name) in mapping {
-            sqlx::query("update criteria set test_name = ? where id = ?")
-                .bind(&test_name)
-                .bind(criterion_id)
-                .execute(&self.db.pool)
-                .await?;
-        }
-
-        let frozen_paths = json_list(&authoring.changed_paths);
-        if frozen_paths.is_empty() {
-            bail!("the Test Author changed no files, so there is nothing to freeze");
-        }
-        let tests_bookmark = authoring
-            .candidate_bookmark
-            .clone()
-            .ok_or_else(|| anyhow!("the authoring run recorded no candidate bookmark"))?;
-
-        sqlx::query(
-            "update issues set tests_bookmark = ?, tests_revision = ?, frozen_paths = ?,
-                tests_frozen_at = ?, suite_seq = suite_seq + 1, updated_at = ? where id = ?",
-        )
-        .bind(&tests_bookmark)
-        .bind(&authoring.head_revision)
-        .bind(serde_json::to_string(&frozen_paths)?)
-        .bind(crate::db::now_rfc3339())
-        .bind(crate::db::now_rfc3339())
-        .bind(issue_id)
-        .execute(&self.db.pool)
-        .await?;
-
-        self.transition(issue_id, IssueEvent::FreezeSuite).await
-    }
-
-    pub async fn unfreeze_suite(&self, issue_id: Uuid, reason: &str) -> Result<Issue> {
-        let issue = self.issue(issue_id).await?;
-        // Frozen is the condition, not the status: the human can learn the criteria
-        // were wrong at any point before the merge.
-        if issue.tests_bookmark.is_none()
-            || matches!(
-                issue.status_enum(),
-                IssueStatus::Backlog
-                    | IssueStatus::Ready
-                    | IssueStatus::Done
-                    | IssueStatus::Cancelled
-            )
-        {
-            bail!(
-                "there is no frozen suite to thaw (issue is {}, tests bookmark {})",
-                issue.status_enum(),
-                if issue.tests_bookmark.is_some() {
-                    "set"
-                } else {
-                    "empty"
-                }
-            );
-        }
-        // Refuse before touching anything: the transition is the part that can
-        // fail, and a refused one used to leave the issue with no suite at all.
-        hulahoop_core::next(issue.status_enum(), &IssueEvent::StartTestAuthor).with_context(
-            || {
-                format!(
-                    "an issue in `{}` cannot thaw its suite",
-                    issue.status_enum()
-                )
-            },
-        )?;
-        let body = format!("Suite thawed: {reason}");
-        self.comment(
-            issue_id,
-            hulahoop_core::AuthorType::Human,
-            None,
-            &body,
-            false,
-        )
-        .await?;
-        // The archive keeps the handle the old attempts branched from, numbered by
-        // the suite it replaced, so several thaws in one attempt stay distinct.
-        if let Some(bookmark) = &issue.tests_bookmark {
-            let archive = format!("tests/{}/archive/{}", issue.id, issue.suite_seq);
-            sqlx::query("update runs set status = status where id = id")
-                .execute(&self.db.pool)
-                .await?;
-            self.queue_job(
-                issue.repo_id,
-                Some(issue_id),
-                "bookmark",
-                serde_json::json!({ "name": archive, "from": bookmark }),
-            )
-            .await?;
-        }
-        sqlx::query("update issues set current_run_id = null, tests_bookmark = null, tests_revision = null, frozen_paths = '[]', tests_frozen_at = null, updated_at = ? where id = ?")
-            .bind(crate::db::now_rfc3339())
-            .bind(issue_id)
-            .execute(&self.db.pool)
-            .await?;
-        self.transition(issue_id, IssueEvent::StartTestAuthor).await
-    }
-
-    // -------------------------------------------------------------- approval
-
-    pub async fn approve_issue(
-        &self,
-        issue_id: Uuid,
-        run_id: Uuid,
-        reviewed_head: &str,
-        diff_sha: &str,
-        acknowledge_flags: Vec<RunFlag>,
-        override_reason: Option<&str>,
-    ) -> Result<Issue> {
-        let issue = self.issue(issue_id).await?;
-        if issue.current_run_id != Some(run_id) {
-            bail!(
-                "run {run_id} is not the run this issue is waiting on ({}). Approve the run the review screen shows.",
-                issue
-                    .current_run_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "none".into())
-            );
-        }
-        let run = self.run(run_id).await?;
-        if run.head_revision.as_deref() != Some(reviewed_head) {
-            bail!(
-                "the head moved since you opened the review: run {run_id} is now at {:?}",
-                run.head_revision
-            );
-        }
-        if run.diff_sha.as_deref() != Some(diff_sha) {
-            bail!(
-                "the diff changed since you opened the review; reload the review before approving"
-            );
-        }
-
-        let latest: Option<Review> = sqlx::query_as(
-            "select * from reviews where reviewed_run_id = ? order by created_at desc limit 1",
-        )
-        .bind(run_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        let approved = latest.as_ref().map(|review| review.verdict.as_str()) == Some("approved");
-        if !approved {
-            // The reviewer advises, the human decides: an approval over a review
-            // that asked for changes is allowed, but only with a written reason,
-            // and the reason is recorded next to the approval.
-            let reason = override_reason.unwrap_or_default().trim();
-            if reason.chars().count() < 15 {
-                bail!(
-                    "the Reviewer has not approved run {run_id} yet. Approving over a review that asked for changes needs a reason of at least fifteen characters, so the record says why."
-                );
-            }
-            let now = crate::db::now_rfc3339();
-            sqlx::query(
-                "insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at) values (?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(Uuid::now_v7())
-            .bind(issue_id)
-            .bind(run_id)
-            .bind::<Option<Uuid>>(None)
-            .bind("approved")
-            .bind(format!("Overridden by the human: {reason}"))
-            .bind(&now)
-            .execute(&self.db.pool)
-            .await?;
-            self.comment(
-                issue_id,
-                hulahoop_core::AuthorType::Human,
-                None,
-                &format!("Approving over the Reviewer's objection: {reason}"),
-                false,
-            )
-            .await?;
-        }
-
-        let flags = run.flags_enum();
-        for flag in &flags {
-            if !acknowledge_flags.contains(flag) {
-                bail!(
-                    "this run carries the `{}` flag; acknowledge it to approve",
-                    flag.as_str()
-                );
-            }
-        }
-
-        let approval_id = Uuid::now_v7();
-        let landing_bookmark = format!("landing/{}/{}", issue_id, issue.attempt);
-        let user_id = self.db.local_user_id().await?;
-        sqlx::query(
-            "insert into approvals (id, issue_id, run_id, head_revision, diff_sha, landing_bookmark,
-                acknowledged_flags, approved_by, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(approval_id)
-        .bind(issue_id)
-        .bind(run_id)
-        .bind(reviewed_head)
-        .bind(diff_sha)
-        .bind(&landing_bookmark)
-        .bind(serde_json::to_string(&acknowledge_flags)?)
-        .bind(user_id)
-        .bind(crate::db::now_rfc3339())
-        .execute(&self.db.pool)
-        .await?;
-
-        sqlx::query("update approvals set voided_at = ? where issue_id = ? and id != ? and voided_at is null")
-            .bind(crate::db::now_rfc3339())
-            .bind(issue_id)
-            .bind(approval_id)
-            .execute(&self.db.pool)
-            .await?;
-
-        let repo: Repo = sqlx::query_as("select * from repos where id = ?")
-            .bind(issue.repo_id)
-            .fetch_one(&self.db.pool)
-            .await?;
-
-        let replay_id = Uuid::now_v7();
-        let artifact_dir = contract::replay_artifact_dir(&self.db.data_dir, &replay_id);
-        std::fs::create_dir_all(&artifact_dir)?;
-        sqlx::query(
-            "insert into replays (id, issue_id, repo_id, run_id, candidate_run_id, approval_id, kind,
-                attempt, revision, tests_bookmark, status, artifact_dir, created_at)
-             values (?, ?, ?, ?, ?, ?, 'landing', ?, ?, ?, 'queued', ?, ?)",
-        )
-        .bind(replay_id)
-        .bind(issue_id)
-        .bind(issue.repo_id)
-        .bind(run_id)
-        .bind(run_id)
-        .bind(approval_id)
-        .bind(issue.attempt)
-        .bind(reviewed_head)
-        .bind(issue.tests_bookmark.clone())
-        .bind(artifact_dir.display().to_string())
-        .bind(crate::db::now_rfc3339())
-        .execute(&self.db.pool)
-        .await?;
-
-        let _ = repo;
-        self.transition(issue_id, IssueEvent::ApproveIssue).await
-    }
-
-    pub async fn record_merge(&self, issue_id: Uuid, merge_revision: &str) -> Result<Issue> {
-        let issue = self.issue(issue_id).await?;
-        if issue.status_enum() != IssueStatus::Merging {
-            bail!("the issue is {}, not merging", issue.status_enum());
-        }
-        let approval: Option<Approval> = sqlx::query_as(
-            "select * from approvals where issue_id = ? and voided_at is null order by created_at desc limit 1",
-        )
-        .bind(issue_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        let approval =
-            approval.ok_or_else(|| anyhow!("there is no live approval on this issue"))?;
-
-        let replay: Option<Replay> = sqlx::query_as(
-            "select * from replays where approval_id = ? and kind = 'landing' order by created_at desc limit 1",
-        )
-        .bind(approval.id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        match replay {
-            Some(replay) if replay.status == "succeeded" => {}
-            Some(replay) if replay.status == "failed" => {
-                bail!("the landing replay failed, so this approval cannot be merged")
-            }
-            Some(replay) if replay.status == "timed_out" => {
-                bail!("the landing replay timed out; re-approve to replay it")
-            }
-            Some(_) => bail!("the landing replay has not finished yet"),
-            None => bail!("there is no landing replay for this approval"),
-        }
-
-        // Ancestry is checked in the repo, by the runner, because verifying a
-        // merge commit means walking history. The issue closes when that check
-        // comes back.
-        let landing = approval
-            .landing_bookmark
-            .clone()
-            .ok_or_else(|| anyhow!("the approval has no landing bookmark"))?;
-        self.queue_job(
-            issue.repo_id,
-            Some(issue_id),
-            "merge_verify",
-            serde_json::json!({ "merge_revision": merge_revision, "landing_bookmark": landing }),
-        )
-        .await?;
-        self.comment(
-            issue_id,
-            hulahoop_core::AuthorType::Server,
-            None,
-            &format!("Checking that `{merge_revision}` contains `{landing}`."),
-            false,
-        )
-        .await?;
-        self.issue(issue_id).await
-    }
 
     pub async fn resume_issue(&self, issue_id: Uuid, answer: &str) -> Result<Issue> {
         let issue = self.issue(issue_id).await?;
@@ -1529,45 +1089,38 @@ impl Engine {
         }
 
         match (run.role_enum(), final_status) {
-            (AgentRole::TestAuthor, RunStatus::Succeeded) => {
-                let bookmark = format!("tests/{}/cand/{}", issue.id, run.id);
-                sqlx::query(
-                    "update runs set candidate_bookmark = ?, head_bookmark = ? where id = ?",
-                )
-                .bind(&bookmark)
-                .bind(&bookmark)
-                .bind(run_id)
-                .execute(&self.db.pool)
-                .await?;
-                // The base replay belongs to this candidate suite: freezing reads
-                // it back by the authoring run that produced the tests.
-                self.queue_replay(issue, ReplayKind::Base, Some(&run), None, Some(&run))
-                    .await?;
-                self.transition(run.issue_id, IssueEvent::AuthoringCompleted)
-                    .await?;
-            }
-            (AgentRole::TestAuthor, _) => {
-                self.transition(run.issue_id, IssueEvent::AuthoringFailed)
-                    .await?;
-            }
+            // The agent did the work: its commit becomes the head the pull request
+            // carries, and the task moves to review. The suite it ran is evidence,
+            // not a gate.
             (AgentRole::Implementer, RunStatus::Succeeded) => {
                 let bookmark = format!("issue/{}/head/{}", issue.id, run.attempt);
-                sqlx::query("update runs set head_bookmark = ? where id = ?")
+                // The revision is what the reviewer and the pull request point at,
+                // so it is recorded with the bookmark that names it.
+                sqlx::query("update runs set head_bookmark = ?, head_revision = coalesce(?, head_revision) where id = ?")
                     .bind(&bookmark)
+                    .bind(payload.commit.as_deref())
                     .bind(run_id)
                     .execute(&self.db.pool)
                     .await?;
-                // The head replay decides whether the issue may move: a green
-                // suite at head is what `in_review` means.
-                self.queue_replay(issue, ReplayKind::Head, Some(&run), None, Some(&run))
-                    .await?;
+                self.transition(run.issue_id, IssueEvent::Submit).await?;
+                self.queue_job(
+                    issue.repo_id,
+                    Some(issue.id),
+                    "open_pr",
+                    serde_json::json!({ "run_id": run_id }),
+                )
+                .await?;
             }
             (AgentRole::Implementer, _) => {
-                self.transition(run.issue_id, IssueEvent::ImplementerFailed)
-                    .await?;
+                // A failed attempt leaves the task where it is so the human, or a
+                // retry, decides what happens next.
+                let _ = self.transition(run.issue_id, IssueEvent::CancelRun).await;
             }
             (AgentRole::Reviewer, _) => {
                 self.record_review(&issue, &run, &payload).await?;
+            }
+            (AgentRole::TestAuthor, _) => {
+                let _ = self.transition(run.issue_id, IssueEvent::CancelRun).await;
             }
         }
 
@@ -1616,8 +1169,7 @@ impl Engine {
         }
 
         if verdict == "approved" {
-            self.transition(issue.id, IssueEvent::ReviewerApproved)
-                .await?;
+            // Approval is advice the human reads; it does not move the task.
         } else {
             self.comment(
                 issue.id,
@@ -1627,8 +1179,7 @@ impl Engine {
                 false,
             )
             .await?;
-            self.transition(issue.id, IssueEvent::ReviewerChangesRequested)
-                .await?;
+            let _ = self.transition(issue.id, IssueEvent::RequestChanges).await;
         }
         Ok(())
     }
@@ -1639,312 +1190,6 @@ impl Engine {
     /// had nothing to do with: a `just test` that only copied its JUnit file after a
     /// green run left the base replay with nothing to read. The candidate tests still
     /// exist on their bookmark, so asking again costs one suite run and no model call.
-    pub async fn retry_base_replay(&self, issue_id: Uuid) -> Result<Replay> {
-        let issue = self.issue(issue_id).await?;
-        let live = self.live_run_on_issue(issue_id).await?;
-        if live.is_some() {
-            bail!("an agent is still working on this issue; wait for it to finish");
-        }
-        let candidate = sqlx::query_as::<_, Run>(
-            "select * from runs where issue_id = ? and candidate_bookmark is not null
-             order by created_at desc limit 1",
-        )
-        .bind(issue_id)
-        .fetch_optional(&self.db.pool)
-        .await?
-        .ok_or_else(|| anyhow!("no authoring run has produced a candidate suite yet: the base replay has nothing to replay"))?;
-        if crate::db::json_list(&candidate.changed_paths).is_empty() {
-            bail!("the authoring run changed no files, so there is no suite to replay. Write the tests first");
-        }
-        let id = self
-            .queue_replay(issue, ReplayKind::Base, None, None, Some(&candidate))
-            .await?;
-        self.replay(id).await
-    }
-
-    pub async fn queue_replay(
-        &self,
-        issue: Issue,
-        kind: ReplayKind,
-        run: Option<&Run>,
-        approval_id: Option<Uuid>,
-        candidate: Option<&Run>,
-    ) -> Result<Uuid> {
-        let id = Uuid::now_v7();
-        let artifact_dir = contract::replay_artifact_dir(&self.db.data_dir, &id);
-        std::fs::create_dir_all(&artifact_dir)?;
-        let revision = match kind {
-            ReplayKind::Base => None,
-            ReplayKind::Head => candidate.and_then(|r| r.head_revision.clone()),
-            ReplayKind::Landing => None,
-        };
-        sqlx::query(
-            "insert into replays (id, issue_id, repo_id, run_id, candidate_run_id, approval_id, kind,
-                attempt, revision, tests_bookmark, status, artifact_dir, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
-        )
-        .bind(id)
-        .bind(issue.id)
-        .bind(issue.repo_id)
-        .bind(run.map(|r| r.id))
-        .bind(candidate.map(|r| r.id))
-        .bind(approval_id)
-        .bind(kind.as_str())
-        .bind(issue.attempt)
-        .bind(revision)
-        .bind(issue.tests_bookmark.clone())
-        .bind(artifact_dir.display().to_string())
-        .bind(crate::db::now_rfc3339())
-        .execute(&self.db.pool)
-        .await?;
-        Ok(id)
-    }
-
-    pub async fn complete_replay(&self, replay_id: Uuid, payload: ReplayCompletion) -> Result<()> {
-        let replay: Replay = sqlx::query_as("select * from replays where id = ?")
-            .bind(replay_id)
-            .fetch_optional(&self.db.pool)
-            .await?
-            .ok_or_else(|| anyhow!("replay {replay_id} not found"))?;
-        let issue = self.issue(replay.issue_id).await?;
-
-        if let Some(xml) = &payload.junit_xml {
-            std::fs::create_dir_all(&replay.artifact_dir)?;
-            std::fs::write(
-                std::path::Path::new(&replay.artifact_dir).join("junit.xml"),
-                xml,
-            )?;
-        }
-        let report = payload
-            .junit_xml
-            .as_deref()
-            .map(junit::parse)
-            .unwrap_or_default();
-
-        sqlx::query(
-            "update replays set status = ?, exit_code = ?, error = ?, ancestry_ok = ?,
-                revision = coalesce(?, revision), finished_at = ? where id = ?",
-        )
-        .bind(&payload.status)
-        .bind(payload.exit_code)
-        .bind(&payload.error)
-        .bind(payload.ancestry_ok)
-        .bind(&payload.revision)
-        .bind(crate::db::now_rfc3339())
-        .bind(replay_id)
-        .execute(&self.db.pool)
-        .await?;
-
-        // What the colour of the suite means depends on the kind of replay: red is
-        // the proof for a base replay, green is the proof for a head or landing one.
-        // A green suite without the frozen tests is the failure this product exists
-        // to catch: it proves the build, not the criteria.
-        let criteria = self.criteria(issue.id).await?;
-        let tokens: Vec<String> = criteria
-            .iter()
-            .map(|criterion| format!("ac{}", criterion.position))
-            .collect();
-        let frozen_tests_ran = report.cases.iter().any(|case| {
-            tokens
-                .iter()
-                .any(|token| hulahoop_core::junit::contains_token(&case.name, token))
-        });
-
-        // The house rules the repository declares, run at the same revision as the
-        // suite. Only a head or a landing has to satisfy them: a base replay exists
-        // to prove the suite is red, not that the tree is tidy.
-        let house_reason: Option<String> = if matches!(replay.kind.as_str(), "head" | "landing") {
-            let broken: Vec<String> = payload
-                .house_rules
-                .as_ref()
-                .and_then(|rules| rules.as_array())
-                .map(|rules| {
-                    rules
-                        .iter()
-                        .filter(|rule| rule["ok"].as_bool() == Some(false))
-                        .filter_map(|rule| rule["recipe"].as_str())
-                        .map(|recipe| format!("`just {recipe}`"))
-                        .collect()
-                })
-                .unwrap_or_default();
-            if broken.is_empty() {
-                None
-            } else {
-                Some(format!(
-                    "the house rules fail at this revision: {}",
-                    broken.join(", ")
-                ))
-            }
-        } else {
-            None
-        };
-
-        let judged = match replay.kind.as_str() {
-            "base" if payload.status == "succeeded" => {
-                if report.is_green() {
-                    (
-                        "failed",
-                        "the authored tests pass at the base revision, so they prove nothing",
-                    )
-                } else if report.is_red() {
-                    ("succeeded", "")
-                } else {
-                    ("failed", "the base replay produced no test results at all")
-                }
-            }
-            "head" | "landing" if payload.status == "succeeded" && !frozen_tests_ran => (
-                "failed",
-                "the report has no test named after a criterion, so the frozen suite never ran at this revision",
-            ),
-            "head" | "landing" if payload.status == "succeeded" => {
-                // The suite and the house rules both have to pass: the pull request
-                // runs `just ci`, so a head that only satisfies `just test` arrives
-                // with failing checks.
-                if let Some(reason) = &house_reason {
-                    ("failed", reason.as_str())
-                } else if report.is_green() {
-                    ("succeeded", "")
-                } else {
-                    ("failed", "the suite is red")
-                }
-            }
-            _ => (payload.status.as_str(), ""),
-        };
-        if judged.0 != payload.status {
-            sqlx::query("update replays set status = ? where id = ?")
-                .bind(judged.0)
-                .bind(replay_id)
-                .execute(&self.db.pool)
-                .await?;
-        }
-        if !judged.1.is_empty() {
-            self.comment(
-                issue.id,
-                hulahoop_core::AuthorType::Server,
-                None,
-                &format!(
-                    "The {} replay cannot be trusted: {}.",
-                    replay.kind, judged.1
-                ),
-                false,
-            )
-            .await?;
-        }
-
-        // Everything below keys on the judged status: a suite that ran without the
-        // frozen tests is a failure even though the runner reported success, and it
-        // has to have the same consequences as any other red replay.
-        let status = judged.0;
-        match replay.kind.as_str() {
-            "head" => {
-                if status == "succeeded" && report.is_green() {
-                    sqlx::query(
-                        "update issues set current_run_id = ?, updated_at = ? where id = ?",
-                    )
-                    .bind(replay.run_id)
-                    .bind(crate::db::now_rfc3339())
-                    .bind(issue.id)
-                    .execute(&self.db.pool)
-                    .await?;
-                    // The pull request is what a human is asked to look at, so it
-                    // exists before the asking. The issue does not move to review
-                    // here: a pull request with failing checks is not ready for a
-                    // human, so `watch_checks` owns that transition.
-                    if let Some(run_id) = replay.run_id {
-                        self.queue_job(
-                            issue.repo_id,
-                            Some(issue.id),
-                            "open_pr",
-                            serde_json::json!({ "run_id": run_id }),
-                        )
-                        .await?;
-                    }
-                } else {
-                    let failing = report.failed_names();
-                    let body = if failing.is_empty() {
-                        format!(
-                            "The head replay finished {} and produced no green suite. {}",
-                            payload.status,
-                            payload.error.clone().unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "The head replay is red. Failing tests:\n\n{}",
-                            failing
-                                .iter()
-                                .map(|n| format!("- {n}"))
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        )
-                    };
-                    if let Some(run_id) = replay.run_id {
-                        sqlx::query("update runs set status = 'failed', error = ? where id = ?")
-                            .bind(&body)
-                            .bind(run_id)
-                            .execute(&self.db.pool)
-                            .await?;
-                    }
-                    self.comment(
-                        issue.id,
-                        hulahoop_core::AuthorType::Server,
-                        None,
-                        &body,
-                        false,
-                    )
-                    .await?;
-                }
-            }
-            "landing" => {
-                if status == "succeeded" && report.is_green() {
-                    // Green here means the rebased tree passes. The pull request is
-                    // the human's next move, so it is opened now and the merge is
-                    // still theirs to make.
-                    if let Some(run_id) = replay
-                        .run_id
-                        .or(replay.candidate_run_id)
-                        .or(issue.current_run_id)
-                    {
-                        self.queue_job(
-                            issue.repo_id,
-                            Some(issue.id),
-                            "open_pr",
-                            serde_json::json!({ "run_id": run_id }),
-                        )
-                        .await?;
-                    }
-                } else {
-                    let failing = report.failed_names();
-                    let body = format!(
-                        "The landing replay on the current base turned {}. {}\n\n{}\n\nThe approval was voided.",
-                        payload.status,
-                        payload.error.clone().unwrap_or_default(),
-                        failing
-                            .iter()
-                            .map(|n| format!("- {n}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
-                    sqlx::query("update approvals set voided_at = ? where issue_id = ? and voided_at is null")
-                        .bind(crate::db::now_rfc3339())
-                        .bind(issue.id)
-                        .execute(&self.db.pool)
-                        .await?;
-                    self.comment(
-                        issue.id,
-                        hulahoop_core::AuthorType::Server,
-                        None,
-                        &body,
-                        false,
-                    )
-                    .await?;
-                    self.transition(issue.id, IssueEvent::LandingRed).await?;
-                }
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
     pub async fn complete_job(
         &self,
         job_id: Uuid,
@@ -2004,7 +1249,7 @@ impl Engine {
                                 .execute(&self.db.pool)
                                 .await?;
                         }
-                        self.transition(issue_id, IssueEvent::RecordMerge).await?;
+                        let _ = self.transition(issue_id, IssueEvent::Merge).await;
                     } else {
                         let body = if let Some(reason) =
                             payload.get("error").and_then(|v| v.as_str())
@@ -2111,9 +1356,7 @@ impl Engine {
                             // No pull request means no checks and no team review to
                             // wait for, and a repository without a remote still has to
                             // run the loop.
-                            let _ = self
-                                .transition(issue_id, IssueEvent::ImplementerCompleted)
-                                .await;
+                            // The task is already in review; nothing to move.
                         }
                     }
                 }
@@ -2139,8 +1382,7 @@ impl Engine {
                             false,
                         )
                         .await?;
-                        self.transition(issue_id, IssueEvent::ImplementerCompleted)
-                            .await?;
+                        // The task is already in review; nothing to move.
                     } else {
                         let failing = payload
                             .get("failing")
@@ -2231,30 +1473,6 @@ impl Engine {
             _ => {}
         }
         Ok(())
-    }
-
-    pub async fn claim_replay(&self) -> Result<Option<Replay>> {
-        let candidate: Option<Replay> = sqlx::query_as(
-            "select * from replays where status = 'queued' order by created_at limit 1",
-        )
-        .fetch_optional(&self.db.pool)
-        .await?;
-        let Some(replay) = candidate else {
-            return Ok(None);
-        };
-        let updated =
-            sqlx::query("update replays set status = 'running' where id = ? and status = 'queued'")
-                .bind(replay.id)
-                .execute(&self.db.pool)
-                .await?;
-        if updated.rows_affected() == 0 {
-            return Ok(None);
-        }
-        sqlx::query_as::<_, Replay>("select * from replays where id = ?")
-            .bind(replay.id)
-            .fetch_optional(&self.db.pool)
-            .await
-            .map_err(Into::into)
     }
 
     pub async fn claim_job(&self) -> Result<Option<RunnerJob>> {

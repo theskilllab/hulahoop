@@ -2,13 +2,10 @@ import type { Issue, IssueStatus } from "../api";
 
 const COLUMNS: { status: IssueStatus; label: string }[] = [
   { status: "backlog", label: "Backlog" },
-  { status: "ready", label: "Tests to write" },
-  { status: "tests_in_progress", label: "Authoring" },
-  { status: "tests_ready", label: "Tests frozen" },
-  { status: "in_progress", label: "Implementing" },
-  { status: "in_review", label: "Review" },
-  { status: "merging", label: "Merging" },
+  { status: "todo", label: "To do" },
+  { status: "in_progress", label: "In progress" },
   { status: "blocked", label: "Blocked" },
+  { status: "in_review", label: "In review" },
   { status: "done", label: "Done" },
 ];
 
