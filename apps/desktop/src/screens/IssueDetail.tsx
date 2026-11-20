@@ -329,6 +329,11 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
             <span className="role">{ROLE_LABEL[runItem.role] ?? runItem.role}</span>
             <StatusPill status={runItem.status} />
             <span className="dim">{runItem.adapter}</span>
+            {(runItem.tokensIn > 0 || runItem.tokensOut > 0) && (
+              <span className="dim">
+                {runItem.tokensIn.toLocaleString()} in / {runItem.tokensOut.toLocaleString()} out
+              </span>
+            )}
             {runItem.flags.length > 0 && <span className="flag">{runItem.flags.join(", ").replaceAll("_", " ").toLowerCase()}</span>}
             {runItem.error && <span className="error inline">{runItem.error}</span>}
           </li>

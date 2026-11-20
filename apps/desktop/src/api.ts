@@ -42,6 +42,8 @@ export interface Run {
   prUrl: string | null;
   prNumber: number | null;
   error: string | null;
+  tokensIn: number;
+  tokensOut: number;
   startedAt: string | null;
   finishedAt: string | null;
 }
@@ -349,12 +351,12 @@ export const ISSUE_FIELDS = `
   id key number projectId projectPrefix milestoneId
   title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
   criteria { position text testName }
-  runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error startedAt finishedAt }
+  runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments { id authorType body pinned createdAt }
   replays { id kind status failedTests createdAt }
   approval { id headRevision diffSha landingBookmark flags createdAt }
-  currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error startedAt finishedAt }
+  currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
 export async function loadBoard(workspaceId: string): Promise<Issue[]> {

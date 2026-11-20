@@ -819,8 +819,14 @@ impl Engine {
         if let Some(pgid) = run.pgid {
             kill_process_group(pgid as i32);
         }
-        sqlx::query("update runs set status = 'cancelled', finished_at = ?, error = 'cancelled by a human' where id = ?")
+        // The stream the run already wrote is the only record of what it spent. A
+        // cancelled run reports it instead of reading as a run that spent nothing.
+        let (tokens_in, tokens_out) =
+            spent_tokens(std::path::Path::new(&run.artifact_dir), None).await;
+        sqlx::query("update runs set status = 'cancelled', finished_at = ?, error = 'cancelled by a human', tokens_in = ?, tokens_out = ? where id = ?")
             .bind(crate::db::now_rfc3339())
+            .bind(tokens_in)
+            .bind(tokens_out)
             .bind(run_id)
             .execute(&self.db.pool)
             .await?;
@@ -1381,18 +1387,8 @@ impl Engine {
         let artifact_dir = std::path::Path::new(&run.artifact_dir);
         std::fs::create_dir_all(artifact_dir)?;
         std::fs::write(artifact_dir.join("diff.patch"), &payload.diff)?;
-
-        // The transcript the run already wrote holds the whole stream, which is
-        // where the adapter reports usage. A runner that could only send the tail
-        // gets the same treatment from that tail; an agent.jsonl the runner opened
-        // but never filled falls back to the tail as well.
-        let written = std::fs::read_to_string(artifact_dir.join("agent.jsonl")).unwrap_or_default();
-        let stream = if written.trim().is_empty() {
-            payload.transcript.as_deref().unwrap_or_default()
-        } else {
-            written.as_str()
-        };
-        let (tokens_in, tokens_out) = hulahoop_core::usage::totals(stream);
+        let (tokens_in, tokens_out) =
+            spent_tokens(artifact_dir, payload.transcript.as_deref()).await;
 
         let mut flags = summary.flags.clone();
         if payload.artifact_limit_hit {
@@ -2056,14 +2052,42 @@ impl Engine {
             if let Some(pgid) = run.pgid {
                 kill_process_group(pgid as i32);
             }
-            sqlx::query("update runs set status = 'failed', finished_at = ?, error = 'the runner stopped heartbeating, so the run was declared dead' where id = ?")
+            // A runner that died after streaming its transcript still spent what
+            // the stream says, so the row carries those tokens rather than zero.
+            let (tokens_in, tokens_out) =
+                spent_tokens(std::path::Path::new(&run.artifact_dir), None).await;
+            sqlx::query("update runs set status = 'failed', finished_at = ?, error = 'the runner stopped heartbeating, so the run was declared dead', tokens_in = ?, tokens_out = ? where id = ?")
                 .bind(crate::db::now_rfc3339())
+                .bind(tokens_in)
+                .bind(tokens_out)
                 .bind(run.id)
                 .execute(&self.db.pool)
                 .await?;
         }
         Ok(dead)
     }
+}
+
+/// The tokens a run's adapter reported into its `agent.jsonl`, summed over the
+/// run's finished messages. The transcript the run already wrote holds the whole
+/// stream, so a runner that could only send the tail is still counted from its
+/// file; an `agent.jsonl` the runner opened but never filled falls back to that
+/// tail. Every path that finishes a run reads through here, so a cancelled or
+/// reaped run reports what it spent too.
+async fn spent_tokens(artifact_dir: &std::path::Path, tail: Option<&str>) -> (i64, i64) {
+    let written = tokio::fs::read_to_string(artifact_dir.join("agent.jsonl"))
+        .await
+        .unwrap_or_default();
+    let stream = if written.trim().is_empty() {
+        tail.unwrap_or_default().to_string()
+    } else {
+        written
+    };
+    // The file is capped at the artifact limit, so parsing it is real CPU work and
+    // belongs on the blocking pool rather than on a runtime worker.
+    tokio::task::spawn_blocking(move || hulahoop_core::usage::totals(&stream))
+        .await
+        .unwrap_or((0, 0))
 }
 
 /// The completion payload a runner posts. `diff` is the unified diff the runner
@@ -2136,6 +2160,47 @@ pub fn prompt_hash() -> String {
         all.push_str(prompt_for(role));
     }
     sha256_hex(all.as_bytes())
+}
+
+#[cfg(test)]
+mod spent_tokens_tests {
+    use super::*;
+
+    fn artifact_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("hulahoop-spent-tokens-{tag}-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("create artifact dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_reports_the_usage_in_its_stream() {
+        let dir = artifact_dir("usage");
+        let stream = [
+            r#"{"type":"message_update","usage":{"input":100,"output":10}}"#,
+            r#"{"type":"message_update","usage":{"input":180,"output":30}}"#,
+            r#"{"type":"message_end","message":{"usage":{"input":180,"output":30}}}"#,
+        ]
+        .join("\n");
+        std::fs::write(dir.join("agent.jsonl"), stream).expect("write stream");
+        assert_eq!(spent_tokens(&dir, None).await, (180, 30));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_run_with_no_stream_spent_nothing_recorded() {
+        let dir = artifact_dir("empty");
+        assert_eq!(spent_tokens(&dir, None).await, (0, 0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_runner_that_could_only_send_the_tail_is_counted_from_it() {
+        let dir = artifact_dir("tail");
+        let tail = r#"{"type":"message_end","message":{"usage":{"input":42,"output":7}}}"#;
+        assert_eq!(spent_tokens(&dir, Some(tail)).await, (42, 7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]
