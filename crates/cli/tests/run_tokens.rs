@@ -22,10 +22,8 @@ struct Fixture {
 
 impl Fixture {
     async fn start(tag: &str) -> Fixture {
-        let root = std::env::temp_dir().join(format!(
-            "hulahoop-tokens-{tag}-{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("hulahoop-tokens-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let repo = root.join("repo");
         let data = root.join("data");
@@ -66,9 +64,8 @@ impl Fixture {
             project: String::new(),
             repo_id: String::new(),
         };
-        fixture.workspace = fixture
-            .gql("{ workspaces { id } }", json!({}))
-            .await["workspaces"][0]["id"]
+        fixture.workspace = fixture.gql("{ workspaces { id } }", json!({})).await["workspaces"][0]
+            ["id"]
             .as_str()
             .expect("seeded workspace")
             .to_string();
@@ -107,10 +104,7 @@ impl Fixture {
             .unwrap_or_else(|error| panic!("POST {path} failed: {error}"));
         let status = response.status();
         let text = response.text().await.expect("response body");
-        assert!(
-            status.is_success(),
-            "POST {path} returned {status}: {text}"
-        );
+        assert!(status.is_success(), "POST {path} returned {status}: {text}");
         serde_json::from_str(&text)
             .unwrap_or_else(|error| panic!("POST {path} returned non-json: {error}: {text}"))
     }
@@ -237,8 +231,11 @@ impl Fixture {
             } else {
                 json!({})
             };
-            self.post(&format!("/internal/jobs/{id}/complete"), json!({ "result": result }))
-                .await;
+            self.post(
+                &format!("/internal/jobs/{id}/complete"),
+                json!({ "result": result }),
+            )
+            .await;
         }
         panic!("jobs kept appearing; the server never ran dry");
     }
