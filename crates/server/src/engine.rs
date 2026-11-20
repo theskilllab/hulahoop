@@ -1382,6 +1382,15 @@ impl Engine {
         std::fs::create_dir_all(artifact_dir)?;
         std::fs::write(artifact_dir.join("diff.patch"), &payload.diff)?;
 
+        // The transcript the run already wrote holds the whole stream, which is
+        // where the adapter reports usage. A runner that could only send the tail
+        // gets the same treatment from that tail.
+        let stream = std::fs::read_to_string(artifact_dir.join("agent.jsonl"))
+            .ok()
+            .or_else(|| payload.transcript.clone())
+            .unwrap_or_default();
+        let (tokens_in, tokens_out) = hulahoop_core::usage::totals(&stream);
+
         let mut flags = summary.flags.clone();
         if payload.artifact_limit_hit {
             flags.push(RunFlag::ArtifactLimit);
@@ -1434,7 +1443,8 @@ impl Engine {
         sqlx::query(
             "update runs set status = ?, exit_code = ?, error = ?, diff_sha = ?, flags = ?,
                 changed_paths = ?, head_revision = coalesce(?, head_revision),
-                commit_name = ?, commit_email = ?, finished_at = ? where id = ?",
+                commit_name = ?, commit_email = ?, tokens_in = ?, tokens_out = ?,
+                finished_at = ? where id = ?",
         )
         .bind(final_status.as_str())
         .bind(payload.exit_code)
@@ -1445,6 +1455,8 @@ impl Engine {
         .bind(&payload.commit)
         .bind(&payload.commit_name)
         .bind(&payload.commit_email)
+        .bind(tokens_in)
+        .bind(tokens_out)
         .bind(&finished)
         .bind(run_id)
         .execute(&self.db.pool)

@@ -7,6 +7,7 @@ pub mod contract;
 pub mod diff;
 pub mod junit;
 pub mod runspec;
+pub mod usage;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
