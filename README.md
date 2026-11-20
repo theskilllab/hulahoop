@@ -1394,14 +1394,13 @@ CLI that cannot log in produces nothing at all.
 
 ### A runner that makes its own checkout
 
-The default runner borrows the repository at its path: `jj workspace add` inside your
-own clone, which is fast and leaves nothing behind beyond a workspace name. That only
+The default runner borrows the repository at its path: `jj workspace add` inside your own
+clone, which is fast and leaves nothing behind beyond a workspace name. That only
 works when the runner and the repository are on the same machine.
 
-`HULAHOOP_RUNNER_MODE=local` changes the contract. The server hands the runner a
-`clone_url` (the repository's `origin`, or `https://github.com/theskilllab/hulahoop.git`
-when no remote is stored) and a checkout path under the data directory's `workspace/`
-tree:
+`HULAHOOP_RUNNER_MODE=local` changes the root of the same mechanism. The server hands
+the runner a mirror it owns (`$DATA/mirrors/<repo-id>`, fetched on the first run and
+on every run after) and a checkout path under the data directory's `workspace/` tree:
 
 ```
 $DATA/workspace/<project>/<issue>/<run>/checkout
@@ -1409,33 +1408,47 @@ $DATA/workspace/<project>/<issue>/<run>/checkout
 
 Four levels, because the numbers multiply: a project holds issues, an issue holds
 attempts, an attempt holds one run per role. One project with ten issues and four
-attempts is 120 clones; the run directory is the unit of deletion, so a cleanup can
-never take a neighbour with it.
+attempts is 120 workspaces; the run directory is the unit of deletion, so a cleanup
+can never take a neighbour with it.
 
-The runner clones (`jj git clone --colocate`), parks the working copy on the revision
-the server accepted, runs setup, the agent, and the replay there, and deletes the whole
-`<run>` directory when the run is over. Artifacts live under `$DATA/runs/<run-id>/` and
+The runner adds a workspace (`jj workspace add -r <base> --name run-<run-id>`), runs
+setup, the agent, and the replay there, and deletes the whole `<run>` directory when
+the run is over, forgetting the workspace name first so the mirror does not accumulate
+registrations for paths that are gone. Artifacts live under `$DATA/runs/<run-id>/` and
 are untouched by that deletion, which is what anyone reads afterwards. A runner that is
-killed mid-run leaves its clone; at startup the runner removes workspace directories
-older than six hours, which is longer than any wall clock the loop allows.
+killed mid-run leaves its directory; at startup the runner removes those older than six
+hours, which is longer than any wall clock the loop allows.
 
-Three things make this work rather than mostly work. The runner pushes the bookmarks a
-run created (`tests/<issue>/cand/<run>`, `issue/<id>/head/<attempt>`) back into the host
-repository and forces `jj git import` there, because a clone is deleted when the run
-ends and the replay that has to prove the work reads the host's bookmarks. The clone
-gets one `jj git fetch` before the run starts, because a fresh clone knows the default
-branch and little else. And the base is tried as a local bookmark, then as
-`<name>@origin`, and only then as `main@origin` — the revision the run actually landed
-on is the revision every diff is taken against, so a resolvable base never yields an
-empty diff.
+Why a workspace and not a clone: a workspace costs the working copy and nothing else.
+Measured on a repository with a 50 MB binary — 99 MB of history and files — a clone was
+99 MB and a workspace 48 MB, and the ratio worsens with history, because a clone
+duplicates the object store. No fetch is needed at run time, and there are no bookmarks
+to push back: the run's bookmark (`tests/<issue>/cand/<run>`, `issue/<id>/head/<attempt>`)
+is written in the same repository the replay reads.
 
-The honest limits: a clone contains only what was pushed, so the base has to exist
-upstream (for our own repository, that means `main` and the loop's bookmarks); and
-replays still run in the borrowed repository, because they read the bookmarks the loop
-keeps there.
+The price of sharing is one op log for every workspace, so the repository pins history
+before the first run touches it:
 
-`tests/e2e/loop.sh` runs the whole loop in either mode; `HULAHOOP_RUNNER_MODE=local`
-takes the clone path on every CI run that sets it.
+```toml
+[revset-aliases]
+"immutable_heads()" = "builtin_immutable_heads() | bookmarks() | tags()"
+```
+
+That file is written where `jj config path --repo` says it lives, and from then on every
+revision reachable from a bookmark or a tag is immutable for every workspace: `jj
+describe`, `jj abandon` and `jj rebase` refuse it with `Commit … is immutable`, while the
+run's own in-flight commits stay mutable, because they are not on a bookmark yet. The
+loop itself passes `--ignore-immutable` when it moves an approved head onto a newer base,
+which is the one rewrite that pin is meant to reserve for the runner.
+
+`tests/e2e/loop.sh` runs the whole loop in either mode, and CI runs it with
+`HULAHOOP_RUNNER_MODE=local`, so the workspace path, the mirror and the immutability pin
+are exercised on every push.
+
+The honest limits: immutability fences commit rewriting, so `jj op restore` (which
+rewinds the repository without touching a commit), `jj workspace forget`, and another
+run's not-yet-bookmarked commits remain reachable. The workspace mode inherits that same
+op-log exposure, which is the argument the docker mode answers with a container.
 
 ### Projects, milestones and artifacts
 

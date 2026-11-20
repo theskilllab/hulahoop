@@ -64,6 +64,10 @@ impl Executor {
         // under runs/<id>/ and are what anyone reads afterwards.
         if spec["runner_mode"].as_str() == Some("local") {
             let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
+            let mirror = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default());
+            // The directory goes, the registration goes with it: the mirror is long
+            // lived, and a workspace name for a path that no longer exists is litter.
+            forget_workspace(&mirror, &format!("run-{run_id}"));
             if let Some(run_dir) = checkout.parent() {
                 let _ = std::fs::remove_dir_all(run_dir);
             }
@@ -117,14 +121,10 @@ impl Executor {
 
         let local = spec["runner_mode"].as_str() == Some("local");
         if local {
-            let url = spec["clone_url"]
-                .as_str()
-                .filter(|url| !url.is_empty())
-                .unwrap_or(hulahoop_core::contract::DEFAULT_CLONE_URL);
-            // The clone may know the base under a different name (`@origin`), and
-            // every diff the run reports is taken against what it actually started
-            // from — otherwise a resolvable base still yields an empty diff.
-            base = prepare_clone(&checkout, url, &base)?;
+            // Local mode gives the run its own directory, and shares the mirror's
+            // repository: one object store, one op log, no clone, no fetch, and no
+            // bookmarks to push back afterwards.
+            base = prepare_workspace(&repo_path, &checkout, &base, &format!("run-{run_id}"))?;
         } else {
             let vcs = Vcs::detect(&repo_path)?;
             vcs.ensure_vcs()?;
@@ -254,14 +254,9 @@ impl Executor {
             }
             AgentRole::Reviewer => Vec::new(),
         };
-        // A clone is deleted when the run ends, and the replay that has to prove the
-        // work reads the loop's own repository: the bookmark travels back before the
-        // checkout disappears.
-        if local && !published.is_empty() {
-            if let Err(error) = vcs.publish_to(&checkout, &repo_path, &published) {
-                tracing::warn!(%error, "could not publish the run's bookmarks to the host repository");
-            }
-        }
+        // A workspace shares the loop's repository, so the bookmark set above is
+        // already visible to the replay that has to prove the work; nothing to push.
+        let _ = &published;
 
         let status = if outcome.timed_out {
             "timed_out"
@@ -1172,75 +1167,93 @@ fn host_repository(spec: &Value) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn prepare_clone(checkout: &Path, url: &str, base: &str) -> Result<String> {
+/// Local mode: the run gets its own directory but shares the mirror's repository.
+///
+/// A workspace costs the working copy and nothing else — no second object store,
+/// no fetch, and no bookmarks to push back — which is what keeps a run per attempt
+/// affordable. The price is one shared op log, so the repository pins history:
+/// `immutable_heads` covers everything reachable from a bookmark or a tag, and jj
+/// refuses to rewrite the revision a run started from.
+fn prepare_workspace(root: &Path, checkout: &Path, base: &str, name: &str) -> Result<String> {
+    let vcs = Vcs::detect(root)?;
+    vcs.ensure_vcs()?;
+    ensure_immutability(root)?;
+    forget_workspace(root, name);
     if checkout.exists() {
         std::fs::remove_dir_all(checkout)
-            .with_context(|| format!("clearing a stale clone at {}", checkout.display()))?;
+            .with_context(|| format!("clearing a stale workspace at {}", checkout.display()))?;
     }
     if let Some(parent) = checkout.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let clone = std::process::Command::new("jj")
-        .args(["git", "clone", "--colocate", url])
-        .arg(checkout)
-        .output()
-        .context("running jj git clone")?;
-    if !clone.status.success() {
-        bail!(
-            "cloning {url} failed: {}",
-            String::from_utf8_lossy(&clone.stderr).trim()
-        );
-    }
-    // The base comes from the host repository, where the bookmark is local. In a
-    // clone the same bookmark is `<name>@origin`, and the commit id is the same on
-    // both sides. Trying `jj new` per candidate is the check and the action in one
-    // step; falling back to the branch head silently would branch the run from the
-    // wrong revision and blame the agent for commits it never wrote.
-    // A fresh clone knows about the default branch and little else: the loop's own
-    // bookmarks arrive on the next fetch, and a run that starts before they do
-    // branches from the wrong revision. One fetch here costs a second and removes
-    // the whole class of "the clone does not hold the base".
-    let fetched = std::process::Command::new("jj")
-        .args(["git", "fetch"])
-        .current_dir(checkout)
-        .output();
-    if let Ok(output) = &fetched {
-        tracing::info!(
-            stderr = %String::from_utf8_lossy(&output.stderr).trim(),
-            "fetched the loop's bookmarks into the clone"
-        );
-    }
-    let listed = std::process::Command::new("jj")
-        .args(["bookmark", "list", "--all-remotes"])
-        .current_dir(checkout)
-        .output();
-    if let Ok(output) = &listed {
-        tracing::info!(bookmarks = %String::from_utf8_lossy(&output.stdout).trim(), "clone bookmarks");
-    }
-
-    let mut landed_on = None;
+    let mut refused = Vec::new();
     for candidate in [
         base.to_string(),
         format!("{base}@origin"),
         "main@origin".to_string(),
+        "main".to_string(),
     ] {
-        let checkout_new = std::process::Command::new("jj")
-            .args(["new", &candidate])
-            .current_dir(checkout)
+        let added = std::process::Command::new("jj")
+            .args(["workspace", "add"])
+            .arg(checkout)
+            .args(["--name", name, "-r", &candidate])
+            .current_dir(root)
             .output()
-            .context("moving the clone onto the base revision")?;
-        if checkout_new.status.success() {
-            landed_on = Some(candidate);
-            break;
+            .context("running jj workspace add")?;
+        if added.status.success() {
+            return Ok(candidate);
         }
+        refused.push(format!(
+            "{candidate}: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        ));
     }
-    let Some(target) = landed_on else {
-        bail!("the clone holds neither {base} nor main@origin, so there is nothing to start from");
+    bail!(
+        "the mirror holds no revision to start from ({}). A run cannot start from a revision that does not exist, and starting from the wrong one would blame the agent for changes it never made.",
+        refused.join("; ")
+    )
+}
+
+/// Drops a workspace registration before its directory disappears, so the mirror
+/// does not accumulate names for paths that are gone.
+fn forget_workspace(root: &Path, name: &str) {
+    let _ = std::process::Command::new("jj")
+        .args(["workspace", "forget", name])
+        .current_dir(root)
+        .output();
+}
+
+/// A run may extend history, never rewrite it. Bookmarks carry every revision the
+/// loop has accepted, so the revset below makes them immutable for every workspace
+/// that shares the repository — enforced by jj, with no wrapper in the agent's path.
+fn ensure_immutability(root: &Path) -> Result<()> {
+    // jj 0.47 keeps repo-level config outside the repository, and prints the path
+    // it would read, so ask instead of guessing at `.jj/repo/config.toml`.
+    let printed = std::process::Command::new("jj")
+        .args(["config", "path", "--repo"])
+        .current_dir(root)
+        .output()
+        .context("asking jj where the repository config lives")?;
+    let path = String::from_utf8_lossy(&printed.stdout).trim().to_string();
+    let config = if path.is_empty() {
+        root.join(".jj").join("repo").join("config.toml")
+    } else {
+        PathBuf::from(path)
     };
-    if target != base {
-        tracing::warn!(base, target = %target, "the clone does not hold the base under its own name");
+    if let Some(parent) = config.parent() {
+        std::fs::create_dir_all(parent)?;
     }
-    Ok(target)
+    let existing = std::fs::read_to_string(&config).unwrap_or_default();
+    if existing.contains("immutable_heads()") {
+        return Ok(());
+    }
+    // The alias form is the one jj reads: `revsets.immutable_heads` is accepted as
+    // a plain value and silently ignored, which is worse than no guard at all.
+    let body = format!(
+        "{existing}[revset-aliases]\n# Hulahoop pins history: a run may extend it, never rewrite it.\n\"immutable_heads()\" = \"builtin_immutable_heads() | bookmarks() | tags()\"\n"
+    );
+    std::fs::write(&config, body).with_context(|| format!("writing {}", config.display()))?;
+    Ok(())
 }
 
 /// The dev shell decides what `just`, the compiler, and the test runner are; the
