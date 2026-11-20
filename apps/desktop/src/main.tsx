@@ -2,6 +2,10 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles.css";
+import { applyTheme, watchSystemTheme } from "./theme";
+
+applyTheme();
+watchSystemTheme();
 
 /**
  * A render error used to leave a white window with nothing to read: the screen is
