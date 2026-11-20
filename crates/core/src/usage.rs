@@ -1,10 +1,15 @@
 //! What a run spent, read from the adapter's JSONL stream.
 //!
-//! pi and claude put `usage` on every `message_update`, and the value is
-//! cumulative within one assistant message: the same snapshot repeats on later
-//! updates, so the last update of a message is that message's cost. Summing
-//! every update would roughly double the bill, which is why a message is added
-//! once, when it finishes.
+//! pi puts `usage` on every `message_update`, and the value is cumulative
+//! within one assistant message: the same snapshot repeats on later updates, so
+//! the last update of a message is that message's cost. Summing every update
+//! would roughly double the bill, which is why a message is added once, when it
+//! finishes.
+//!
+//! claude writes one `assistant` record per finished message and puts the
+//! usage on that record's message, so the same rule applies: each record is a
+//! finished message and its own final number. Its usage carries the provider's
+//! snake_case names, which is why the field lookup accepts both spellings.
 
 use serde_json::Value;
 
@@ -21,7 +26,8 @@ struct Usage {
 /// A message contributes its final snapshot: the `message_end` usage when the
 /// adapter writes one, otherwise the last `message_update` seen for it. A
 /// message the stream never finished still spent its last snapshot, so a run
-/// killed mid-answer reports what it used.
+/// killed mid-answer reports what it used. claude's `assistant` records are
+/// finished messages already, so each contributes its own usage once.
 pub fn totals(stream: &str) -> (i64, i64) {
     let mut input = 0i64;
     let mut output = 0i64;
@@ -52,6 +58,15 @@ pub fn totals(stream: &str) -> (i64, i64) {
                 }
                 open = None;
             }
+            // claude's answer to `message_end`: one record per finished message,
+            // usage on the message. There is no `message_update` stream to
+            // defer to, so the record is the message's final value.
+            Some("assistant") => {
+                if let Some(usage) = event.get("message").and_then(usage_of) {
+                    input += usage.input;
+                    output += usage.output;
+                }
+            }
             _ => {}
         }
     }
@@ -69,9 +84,19 @@ fn usage_of(value: &Value) -> Option<Usage> {
     // message keeps the last snapshot it reported instead of reading as zero.
     let usage = value.get("usage").filter(|usage| usage.is_object())?;
     Some(Usage {
-        input: usage.get("input").and_then(Value::as_i64).unwrap_or(0),
-        output: usage.get("output").and_then(Value::as_i64).unwrap_or(0),
+        input: counter(usage, "input", "input_tokens"),
+        output: counter(usage, "output", "output_tokens"),
     })
+}
+
+/// pi names the counters `input`/`output`; claude's provider names them
+/// `input_tokens`/`output_tokens`. A missing counter is zero.
+fn counter(usage: &Value, camel: &str, snake: &str) -> i64 {
+    usage
+        .get(camel)
+        .or_else(|| usage.get(snake))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -120,6 +145,18 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(totals(&stream), (70, 14));
+    }
+
+    #[test]
+    fn claude_records_add_up_with_their_own_counter_names() {
+        let stream = [
+            r#"{"type":"system","subtype":"init","session_id":"fixture"}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":120,"output_tokens":25,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"assistant","message":{"role":"assistant","usage":{"input_tokens":350,"output_tokens":60,"cache_read_input_tokens":0}}}"#,
+            r#"{"type":"result","subtype":"success","usage":{"input_tokens":470,"output_tokens":85}}"#,
+        ]
+        .join("\n");
+        assert_eq!(totals(&stream), (470, 85));
     }
 
     #[test]
