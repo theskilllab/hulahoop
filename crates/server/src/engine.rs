@@ -1947,7 +1947,13 @@ impl Engine {
                         .get("ancestry_ok")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    if ancestry {
+                    // A squash merge carries the landing tree in a new commit, so an
+                    // equal tree is the same proof as a contained revision.
+                    let same_tree = payload
+                        .get("same_tree")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if ancestry || same_tree {
                         let merge_revision = payload
                             .get("merge_revision")
                             .and_then(|v| v.as_str())
@@ -1970,7 +1976,7 @@ impl Engine {
                         self.transition(issue_id, IssueEvent::RecordMerge).await?;
                     } else {
                         let body = format!(
-                            "`{}` does not contain the landing revision `{}`, so the merge was not recorded. Merge the revision the landing replay verified.",
+                            "`{}` neither contains the landing revision `{}` nor has its tree, so the merge was not recorded. Merge the revision the landing replay verified, or squash it to that tree.",
                             payload
                                 .get("merge_revision")
                                 .and_then(|v| v.as_str())

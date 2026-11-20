@@ -624,7 +624,22 @@ impl Executor {
             .context("merge_verify needs the landing bookmark")?;
         let vcs = Vcs::detect(repo_path)?;
         let contained = vcs.contains(merge_revision, landing)?;
-        Ok(json!({ "merge_revision": merge_revision, "ancestry_ok": contained }))
+        // A squash merge does not contain the landing commit: GitHub builds a new
+        // commit with the same tree. That is still the change the replay proved, so
+        // an empty diff between the merge and the landing is evidence too.
+        let same_tree = if contained {
+            false
+        } else {
+            vcs.changed_paths_between(merge_revision, landing)
+                .map(|paths| paths.is_empty())
+                .unwrap_or(false)
+        };
+        Ok(json!({
+            "merge_revision": merge_revision,
+            "landing_bookmark": landing,
+            "ancestry_ok": contained,
+            "same_tree": same_tree,
+        }))
     }
 
     /// Push the approved commit and open the pull request a human reviews.
