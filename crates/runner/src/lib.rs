@@ -61,6 +61,18 @@ fn resolve_connection(
 
 /// Runs the runner loop until it is killed. The caller owns the runtime and the
 /// log filter.
+/// A path is only useful to a child process when it does not depend on where that
+/// child stands: the runner is started from a checkout, and the agent works in
+/// another one.
+fn absolute(path: std::path::PathBuf) -> std::path::PathBuf {
+    if path.is_absolute() {
+        return path;
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(&path))
+        .unwrap_or(path)
+}
+
 pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let data_dir = std::env::var_os("HULAHOOP_DATA")
         .map(std::path::PathBuf::from)
@@ -76,13 +88,17 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
         .context("cannot locate the data directory; set HULAHOOP_DATA")?;
 
     // direnv keeps its allow-list under XDG_DATA_HOME, and every child runs with
-    // a different HOME (the scratch home). Pointing the allow-list at one place
-    // owned by the runner makes `direnv allow` and `direnv exec` agree.
+    // a different HOME (the scratch home) and a different working directory (the
+    // checkout). An absolute path here is what makes `direnv allow` and the agent's
+    // `direnv exec` talk about the same allow-list; a relative one resolves inside
+    // the checkout and every run reports `.envrc is blocked`.
+    let data_dir = absolute(data_dir);
     let direnv_data = data_dir.join("direnv");
     std::fs::create_dir_all(&direnv_data)?;
     std::env::set_var("XDG_DATA_HOME", &direnv_data);
 
     let (connection, data_dir) = resolve_connection(&args, data_dir)?;
+    let data_dir = absolute(data_dir);
     let client = client::Client::new(&connection)?;
     let executor = exec::Executor::new(client, data_dir.clone());
     let runner_id = std::env::var("HULAHOOP_RUNNER_ID")

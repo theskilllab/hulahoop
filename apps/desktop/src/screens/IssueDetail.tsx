@@ -48,11 +48,16 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
     }
   }
 
-  const startRun = (role: string) =>
-    run("start", `mutation ($issueId: UUID!, $role: String!) { startRun(issueId: $issueId, role: $role) { id } }`, {
-      issueId: issue.id,
-      role,
-    });
+  /** The attempt this issue is on, and the implementer run it followed, if any. */
+  const lastImplementer = [...(issue.runs ?? [])].reverse().find((run) => run.role === "implementer") ?? null;
+  const implementerLive = lastImplementer !== null && (lastImplementer.status === "running" || lastImplementer.status === "queued");
+
+  const startRun = (role: string, parentRunId?: string) =>
+    run(
+      "start",
+      `mutation ($issueId: UUID!, $role: String!, $parentRunId: UUID) { startRun(issueId: $issueId, role: $role, parentRunId: $parentRunId) { id } }`,
+      { issueId: issue.id, role, parentRunId: parentRunId ?? null },
+    );
 
   return (
     <section className="detail">
@@ -170,10 +175,47 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
                 Cancel run
               </button>
             )}
+            {issue.prUrl && (
+              <>
+                <a className="pr-link" href={issue.prUrl} target="_blank" rel="noreferrer">
+                  Pull request #{issue.prNumber} — {issue.prUrl}
+                </a>
+                <button
+                  disabled={busy !== null}
+                  onClick={() =>
+                    run(
+                      "recheck",
+                      `mutation ($id: UUID!) { recheckPullRequest(issueId: $id) { id } }`,
+                      { id: issue.id },
+                    )
+                  }
+                >
+                  Check the pull request again
+                </button>
+                <p className="hint">
+                  The issue moves to review when every check on the pull request is green and nobody on the team is
+                  still asking for changes.
+                </p>
+              </>
+            )}
+            {!implementerLive && lastImplementer && (
+              <button
+                className="primary"
+                disabled={busy !== null}
+                onClick={() => startRun("implementer", lastImplementer.id)}
+              >
+                {lastImplementer.status === "failed" ? "Implement again" : "Continue with the review"}
+              </button>
+            )}
           </>
         )}
         {issue.status === "in_review" && current && (
           <>
+            {issue.prUrl && (
+              <a className="pr-link" href={issue.prUrl} target="_blank" rel="noreferrer">
+                Pull request #{issue.prNumber} — {issue.prUrl}
+              </a>
+            )}
             <RunSummary issue={issue} run={current} onToggleDiff={() => setShowDiff(!showDiff)} showDiff={showDiff} />
             {!verdictOfCurrentRun && (
               <button className="primary" disabled={busy !== null} onClick={() => startRun("reviewer")}>

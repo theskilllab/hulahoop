@@ -921,3 +921,22 @@ button.link.danger {
 .grid-2 .wide {
   grid-column: 1 / -1;
 }
+
+/* The review a human is asked for happens on the pull request, so the link sits
+   at the top of the review block rather than in a details panel. */
+.pr-link {
+  display: inline-block;
+  margin: 0 0 0.75rem;
+  padding: 0.4rem 0.7rem;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  color: var(--loop);
+  font-family: var(--mono);
+  font-size: 0.78rem;
+  text-decoration: none;
+  word-break: break-all;
+}
+
+.pr-link:hover {
+  border-color: var(--loop);
+}

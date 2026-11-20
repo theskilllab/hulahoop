@@ -758,7 +758,20 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
     // A pull request needs the story a reviewer reads: what the issue asked for,
     // what the suite proves, and what the reviewer said, plus the app token that
     // lets the push and the API call be made as the app.
-    let pull_request = if job.kind == "open_pr" {
+    let pull_request = if job.kind == "watch_checks" {
+        Some(json!({
+            "number": payload.get("number"),
+            "sha": payload.get("sha"),
+            "app_token": engine.github_token().await?,
+        }))
+    } else if job.kind == "review_pr" {
+        Some(json!({
+            "number": payload.get("number"),
+            "verdict": payload.get("verdict"),
+            "body": payload.get("body"),
+            "app_token": engine.github_token().await?,
+        }))
+    } else if job.kind == "open_pr" {
         let run_id = payload
             .get("run_id")
             .and_then(|v| v.as_str())
@@ -795,9 +808,18 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
                 };
                 Some(json!({
                     "run_id": run_id,
+                    "number": issue.as_ref().and_then(|i| i.pr_number),
+                    "branch": issue
+                        .as_ref()
+                        .and_then(|i| i.pr_branch.clone())
+                        .or_else(|| {
+                            run.as_ref().map(|r| {
+                                format!("hulahoop/issue-{}-attempt-{}", r.issue_id, r.attempt)
+                            })
+                        }),
                     "head_revision": run.as_ref().and_then(|r| r.head_revision.clone()),
                     "attempt": run.as_ref().map(|r| r.attempt),
-                    "branch": run.as_ref().map(|r| format!("hulahoop/issue-{}-attempt-{}", r.issue_id, r.attempt)),
+
                     "title": issue.as_ref().map(|i| i.title.clone()),
                     "body": issue.as_ref().map(|i| i.body.clone()),
                     "criteria": criteria.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),

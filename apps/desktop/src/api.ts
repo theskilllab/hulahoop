@@ -98,6 +98,8 @@ export interface Issue {
   runCount: number;
   testsFrozenAt: string | null;
   mergeRevision: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
   pinnedCommentId: string | null;
   criteria: Criterion[];
   runs: Run[];
@@ -350,6 +352,7 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
 export const ISSUE_FIELDS = `
   id key number projectId projectPrefix milestoneId
   title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
+  prUrl prNumber
   criteria { position text testName }
   runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }

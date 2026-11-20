@@ -1093,6 +1093,42 @@ impl Mutation {
         Ok(engine.retry_base_replay(issue_id).await?)
     }
 
+    /// Asks GitHub again whether the pull request is ready: the human resolves a
+    /// failing check or a change request over there, and this is how the loop
+    /// learns about it without waiting for a new attempt.
+    async fn recheck_pull_request(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+    ) -> async_graphql::Result<Issue> {
+        let engine = engine(ctx);
+        let issue = engine.issue(issue_id).await?;
+        let number = issue
+            .pr_number
+            .ok_or_else(|| async_graphql::Error::new("this issue has no pull request yet"))?;
+        // The revision GitHub has to look at is the head the pull request points
+        // at, which is the current run's head.
+        let sha: Option<String> = match issue.current_run_id {
+            Some(run_id) => sqlx::query_scalar::<_, Option<String>>(
+                "select head_revision from runs where id = ?",
+            )
+            .bind(run_id)
+            .fetch_optional(&engine.db.pool)
+            .await?
+            .flatten(),
+            None => None,
+        };
+        engine
+            .queue_job(
+                issue.repo_id,
+                Some(issue_id),
+                "watch_checks",
+                serde_json::json!({ "number": number, "sha": sha }),
+            )
+            .await?;
+        Ok(engine.issue(issue_id).await?)
+    }
+
     async fn clear_run_cap(
         &self,
         ctx: &Context<'_>,

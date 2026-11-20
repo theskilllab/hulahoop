@@ -439,6 +439,12 @@ impl Executor {
         let outcome = self.run_suite(&checkout, &artifact_dir, kind).await?;
         let junit_path = checkout.join(".hulahoop").join("junit.xml");
         let junit_xml = std::fs::read_to_string(&junit_path).ok();
+        // The house rules run after the suite, at the same revision.
+        let house_rules = if outcome.timed_out {
+            Vec::new()
+        } else {
+            self.run_house_rules(&checkout, &artifact_dir, kind)?
+        };
 
         // The runner reports whether the suite *ran*, not what its colour means: a
         // red suite is the wanted outcome for a base replay and the wrong one for a
@@ -459,6 +465,7 @@ impl Executor {
                     "exit_code": outcome.exit_code,
                     "error": outcome.error,
                     "junit_xml": junit_xml,
+                    "house_rules": house_rules,
                 }),
             )
             .await?;
@@ -480,6 +487,8 @@ impl Executor {
             "merge_verify" => self.job_merge_verify(&repo_path, spec).await,
             "bookmark" => self.job_bookmark(&repo_path, spec).await,
             "open_pr" => self.job_open_pr(&repo_path, spec).await,
+            "review_pr" => job_review_pr(spec).await,
+            "watch_checks" => job_watch_checks(spec).await,
             other => Err(anyhow!("unknown job kind {other}")),
         };
 
@@ -625,7 +634,18 @@ impl Executor {
             .timeout(std::time::Duration::from_secs(30))
             .build()?;
         let installation = installation_token(&http, jwt, &owner, &name).await?;
-        push_commit(repo_path, &installation, &owner, &name, head, &branch)?;
+        // A rework rewrites the head, so the branch is force-updated rather than
+        // rejected; the pull request itself is the same one.
+        let existing = pull["number"].as_i64();
+        push_commit(
+            repo_path,
+            &installation,
+            &owner,
+            &name,
+            head,
+            &branch,
+            existing.is_some(),
+        )?;
 
         let criteria = pull["criteria"]
             .as_array()
@@ -650,6 +670,16 @@ impl Executor {
             .as_str()
             .map(|title| format!("{title} (hulahoop)"))
             .unwrap_or_else(|| format!("hulahoop: {branch}"));
+        if let Some(number) = existing {
+            // The same pull request, with the new head and the story so far.
+            update_pull_request(&http, &installation, &owner, &name, number, &title, &body).await?;
+            return Ok(json!({
+                "run_id": run_id,
+                "pr_url": format!("https://github.com/{owner}/{name}/pull/{number}"),
+                "pr_number": number,
+                "pr_branch": branch,
+            }));
+        }
         let (pr_url, pr_number) = open_pull_request(
             &http,
             PullRequest {
@@ -729,6 +759,50 @@ impl Executor {
         }
         let _ = kind;
         Ok(outcome)
+    }
+
+    /// The recipes a repository declares beyond the suite, run at the same revision
+    /// the suite ran at. The pull request's checks run `just ci`, so a head that
+    /// passes the suite and fails `fmt-check` is a head that was never finished.
+    fn run_house_rules(
+        &self,
+        checkout: &Path,
+        artifact_dir: &Path,
+        kind: ReplayKind,
+    ) -> Result<Vec<Value>> {
+        if kind == ReplayKind::Base {
+            return Ok(Vec::new());
+        }
+        let summary = match run_command(
+            checkout,
+            &["direnv", "exec", ".", "just", "--summary"],
+            hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
+            None,
+        ) {
+            Ok(outcome) => outcome.lines.join("\n"),
+            Err(_) => return Ok(Vec::new()),
+        };
+        let declared: Vec<&str> = summary.split_whitespace().collect();
+        let mut results = Vec::new();
+        for recipe in ["fmt-check", "lint"] {
+            if !declared.contains(&recipe) {
+                continue;
+            }
+            let log = artifact_dir.join(format!("just-{recipe}.log"));
+            let outcome = run_command(
+                checkout,
+                &["direnv", "exec", ".", "just", recipe],
+                hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
+                Some(&log),
+            )?;
+            results.push(json!({
+                "recipe": recipe,
+                "ok": !outcome.timed_out && outcome.exit_code == Some(0),
+                "timed_out": outcome.timed_out,
+                "exit_code": outcome.exit_code,
+            }));
+        }
+        Ok(results)
     }
 
     /// Spawn the agent, stream its stdout, and heartbeat while it works.
@@ -919,6 +993,12 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     let home = contract::scratch_home(data_dir, adapter);
     std::fs::create_dir_all(&home)?;
     seed_home(&home);
+    // Everything the agent is handed has to be absolute: its working directory is
+    // the checkout, so a relative home resolves to nothing and pi reports a missing
+    // API key instead of a missing directory.
+    let home = std::fs::canonicalize(&home).unwrap_or(home);
+    let checkout = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
+    let checkout = checkout.as_path();
 
     let path =
         dev_shell_path(checkout).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default());
@@ -1652,6 +1732,11 @@ async fn installation_token(
 
 /// Push one commit to a new branch. The token travels in the environment rather
 /// than the command line, so it is not in `ps` while the push runs.
+/// How long the runner waits for GitHub's checks before it reports a timeout, and
+/// how often it asks.
+const CHECK_WATCH_SECS: u64 = 45 * 60;
+const CHECK_POLL_SECS: u64 = 20;
+
 fn push_commit(
     repo_path: &Path,
     token: &str,
@@ -1659,12 +1744,18 @@ fn push_commit(
     repo: &str,
     head: &str,
     branch: &str,
+    force: bool,
 ) -> Result<()> {
+    let refspec = if force {
+        format!("+{head}:refs/heads/{branch}")
+    } else {
+        format!("{head}:refs/heads/{branch}")
+    };
     let output = Command::new("git")
         .args([
             "push",
             &format!("https://github.com/{owner}/{repo}.git"),
-            &format!("{head}:refs/heads/{branch}"),
+            &refspec,
         ])
         .current_dir(repo_path)
         .envs(git_auth(token))
@@ -1677,6 +1768,307 @@ fn push_commit(
         );
     }
     Ok(())
+}
+
+/// The pull request already exists, so the change is a body and title refresh.
+#[allow(clippy::too_many_arguments)]
+async fn update_pull_request(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    title: &str,
+    body: &str,
+) -> Result<()> {
+    let response = http
+        .patch(format!(
+            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(token)
+        .json(&json!({ "title": title, "body": body }))
+        .send()
+        .await
+        .context("updating the pull request")?;
+    let status = response.status();
+    if !status.is_success() {
+        let answer: Value = response.json().await.unwrap_or(Value::Null);
+        bail!(
+            "github refused the pull request update ({status}): {}",
+            answer["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    Ok(())
+}
+
+/// Polls the checks GitHub runs on the head, and the reviews the team has left.
+/// Ready means: every check concluded without a failure, and nobody is still
+/// asking for changes.
+async fn job_watch_checks(spec: &Value) -> Result<Value> {
+    let pull = &spec["pull_request"];
+    let number = pull["number"]
+        .as_i64()
+        .context("watching checks needs a pull request number")?;
+    let sha = pull["sha"]
+        .as_str()
+        .filter(|sha| !sha.is_empty())
+        .context("watching checks needs the head revision")?
+        .to_string();
+    let token = pull["app_token"].as_str().context(
+        "no GitHub app is stored, or its key cannot sign, so the loop cannot read the checks",
+    )?;
+    let remote = spec["remote_url"]
+        .as_str()
+        .context("this repository has no origin remote, so there are no checks to read")?;
+    let (owner, name) = github_remote(remote)?;
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let installation = installation_token(&http, token, &owner, &name).await?;
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(CHECK_WATCH_SECS);
+    loop {
+        let checks = http
+            .get(format!(
+                "https://api.github.com/repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100"
+            ))
+            .header("accept", "application/vnd.github+json")
+            .header("user-agent", "hulahoop")
+            .bearer_auth(&installation)
+            .send()
+            .await
+            .context("reading the check runs")?;
+        let status = checks.status();
+        let answer: Value = checks.json().await.unwrap_or(Value::Null);
+        if !status.is_success() {
+            bail!(
+                "github refused the check runs ({status}): {}",
+                answer["message"].as_str().unwrap_or("no reason given")
+            );
+        }
+        let runs = answer["check_runs"].as_array().cloned().unwrap_or_default();
+        let pending = runs
+            .iter()
+            .filter(|check| check["status"].as_str() != Some("completed"))
+            .count();
+        let failing: Vec<String> = runs
+            .iter()
+            .filter(|check| {
+                matches!(
+                    check["conclusion"].as_str(),
+                    Some("failure")
+                        | Some("timed_out")
+                        | Some("cancelled")
+                        | Some("action_required")
+                )
+            })
+            .filter_map(|check| check["name"].as_str().map(str::to_string))
+            .collect();
+        if !failing.is_empty() {
+            return Ok(json!({
+                "sha": sha,
+                "number": number,
+                "conclusion": "failure",
+                "failing": failing,
+                "change_requests": open_change_requests(&http, &installation, &owner, &name, number).await?,
+            }));
+        }
+        if pending == 0 && !runs.is_empty() {
+            let requests =
+                open_change_requests(&http, &installation, &owner, &name, number).await?;
+            if requests.is_empty() {
+                return Ok(json!({
+                    "sha": sha,
+                    "number": number,
+                    "conclusion": "success",
+                    "failing": Vec::<String>::new(),
+                    "change_requests": Vec::<String>::new(),
+                }));
+            }
+            return Ok(json!({
+                "sha": sha,
+                "number": number,
+                "conclusion": "changes requested",
+                "failing": Vec::<String>::new(),
+                "change_requests": requests,
+            }));
+        }
+        if std::time::Instant::now() > deadline {
+            return Ok(json!({
+                "sha": sha,
+                "number": number,
+                "conclusion": "timeout",
+                "failing": Vec::<String>::new(),
+                "change_requests": Vec::<String>::new(),
+                "pending": pending,
+            }));
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(CHECK_POLL_SECS)).await;
+    }
+}
+
+/// The people still asking for changes on the pull request. A resolved thread does
+/// not clear the `CHANGES_REQUESTED` state, so this reads the latest review per
+/// author and counts only those that are still the last word.
+async fn open_change_requests(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<Vec<String>> {
+    let response = http
+        .get(format!(
+            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(token)
+        .send()
+        .await
+        .context("reading the reviews")?;
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    let reviews = answer.as_array().cloned().unwrap_or_default();
+    let mut latest: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for review in &reviews {
+        let author = review["user"]["login"].as_str().unwrap_or("someone");
+        let state = review["state"].as_str().unwrap_or("");
+        if state == "COMMENTED" {
+            continue;
+        }
+        latest.insert(author.to_string(), state.to_string());
+    }
+    Ok(latest
+        .into_iter()
+        .filter(|(_, state)| state == "CHANGES_REQUESTED")
+        .map(|(author, _)| author)
+        .collect())
+}
+
+/// A review the app cannot file on its own pull request still has to be visible,
+/// so it is posted as a comment carrying the same verdict.
+async fn comment_on_pull_request(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+    event: &str,
+    body: &str,
+) -> Result<Value> {
+    let headline = if event == "APPROVE" {
+        "**Reviewer verdict: approved**"
+    } else {
+        "**Reviewer verdict: changes requested**"
+    };
+    let response = http
+        .post(format!(
+            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(token)
+        .json(&json!({ "body": format!("{headline}\n\n{body}") }))
+        .send()
+        .await
+        .context("posting the verdict as a comment")?;
+    let status = response.status();
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github refused the verdict comment ({status}): {}",
+            answer["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    Ok(json!({
+        "number": number,
+        "comment_id": answer["id"].as_i64(),
+        "via": "comment",
+    }))
+}
+
+/// The reviewer's verdict as a GitHub review, so the pull request carries who
+/// approved it instead of appearing approved by nobody.
+async fn job_review_pr(spec: &Value) -> Result<Value> {
+    let pull = &spec["pull_request"];
+    let number = pull["number"]
+        .as_i64()
+        .context("the review needs a pull request number")?;
+    let token = pull["app_token"].as_str().context(
+        "no GitHub app is stored, or its key cannot sign, so the loop cannot review as itself",
+    )?;
+    let remote = spec["remote_url"]
+        .as_str()
+        .context("this repository has no origin remote, so there is no pull request to review")?;
+    let (owner, name) = github_remote(remote)?;
+    let verdict = pull["verdict"].as_str().unwrap_or("changes_requested");
+    let event = if verdict == "approved" {
+        "APPROVE"
+    } else {
+        "REQUEST_CHANGES"
+    };
+    let body = pull["body"].as_str().unwrap_or("");
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+    let installation = installation_token(&http, token, &owner, &name).await?;
+    let response = http
+        .post(format!(
+            "https://api.github.com/repos/{owner}/{name}/pulls/{number}/reviews"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(&installation)
+        .json(&json!({ "event": event, "body": body }))
+        .send()
+        .await
+        .context("posting the review")?;
+    let status = response.status();
+    let answer: Value = response.json().await.unwrap_or(Value::Null);
+    if !status.is_success() {
+        let detail = answer["errors"]
+            .as_array()
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter_map(|error| {
+                        // `errors` is an array of strings for a review refusal and an
+                        // array of objects elsewhere, so accept both shapes.
+                        error
+                            .as_str()
+                            .or_else(|| error["message"].as_str())
+                            .map(str::to_string)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })
+            .filter(|text| !text.is_empty())
+            .or_else(|| answer["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "no reason given".to_string());
+        // GitHub refuses a review on a pull request the same identity opened, and
+        // every branch here is pushed by the one app. The verdict still belongs on
+        // the pull request, so it goes as a comment instead of vanishing.
+        if detail.contains("your own pull request") {
+            return comment_on_pull_request(
+                &http,
+                &installation,
+                &owner,
+                &name,
+                number,
+                event,
+                body,
+            )
+            .await;
+        }
+        bail!("github refused the review ({status}): {detail}");
+    }
+    Ok(json!({
+        "number": number,
+        "review_id": answer["id"].as_i64(),
+        "state": answer["state"].as_str(),
+    }))
 }
 
 struct PullRequest<'a> {

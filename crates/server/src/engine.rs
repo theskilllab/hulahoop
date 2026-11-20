@@ -884,11 +884,23 @@ impl Engine {
         let mut problems = Vec::new();
         let mut mapping = Vec::new();
         for criterion in &criteria {
-            let matches = report.tests_for_criterion(criterion.position);
+            // Only a test that *fails* at the base revision proves anything. An earlier
+            // issue's suite lives in the same repository and carries the same `acN`
+            // names; those tests pass here, and counting them refused every freeze after
+            // the first issue.
+            let named = report.tests_for_criterion(criterion.position);
+            let matches: Vec<&junit::TestCase> =
+                named.iter().copied().filter(|case| case.failed).collect();
             match matches.len() {
-                0 => problems.push(format!(
-                    "criterion {}: no test name carries `ac{}`",
-                    criterion.position, criterion.position
+                0 if !named.is_empty() => problems.push(format!(
+                    "criterion {}: a test carries `ac{}` but passes at the base revision, so it proves nothing: {}",
+                    criterion.position,
+                    criterion.position,
+                    named
+                        .iter()
+                        .map(|case| case.qualified_name())
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 )),
                 1 => {
                     let case = matches[0];
@@ -1545,6 +1557,22 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        // The pull request exists before the review does, so the verdict is posted
+        // where a human reads it, not only inside Hulahoop.
+        if let Some(number) = issue.pr_number {
+            self.queue_job(
+                issue.repo_id,
+                Some(issue.id),
+                "review_pr",
+                serde_json::json!({
+                    "number": number,
+                    "verdict": verdict,
+                    "body": payload.body,
+                }),
+            )
+            .await?;
+        }
+
         if verdict == "approved" {
             self.transition(issue.id, IssueEvent::ReviewerApproved)
                 .await?;
@@ -1680,6 +1708,35 @@ impl Engine {
                 .any(|token| hulahoop_core::junit::contains_token(&case.name, token))
         });
 
+        // The house rules the repository declares, run at the same revision as the
+        // suite. Only a head or a landing has to satisfy them: a base replay exists
+        // to prove the suite is red, not that the tree is tidy.
+        let house_reason: Option<String> = if matches!(replay.kind.as_str(), "head" | "landing") {
+            let broken: Vec<String> = payload
+                .house_rules
+                .as_ref()
+                .and_then(|rules| rules.as_array())
+                .map(|rules| {
+                    rules
+                        .iter()
+                        .filter(|rule| rule["ok"].as_bool() == Some(false))
+                        .filter_map(|rule| rule["recipe"].as_str())
+                        .map(|recipe| format!("`just {recipe}`"))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if broken.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "the house rules fail at this revision: {}",
+                    broken.join(", ")
+                ))
+            }
+        } else {
+            None
+        };
+
         let judged = match replay.kind.as_str() {
             "base" if payload.status == "succeeded" => {
                 if report.is_green() {
@@ -1698,7 +1755,12 @@ impl Engine {
                 "the report has no test named after a criterion, so the frozen suite never ran at this revision",
             ),
             "head" | "landing" if payload.status == "succeeded" => {
-                if report.is_green() {
+                // The suite and the house rules both have to pass: the pull request
+                // runs `just ci`, so a head that only satisfies `just test` arrives
+                // with failing checks.
+                if let Some(reason) = &house_reason {
+                    ("failed", reason.as_str())
+                } else if report.is_green() {
                     ("succeeded", "")
                 } else {
                     ("failed", "the suite is red")
@@ -1742,8 +1804,19 @@ impl Engine {
                     .bind(issue.id)
                     .execute(&self.db.pool)
                     .await?;
-                    self.transition(issue.id, IssueEvent::ImplementerCompleted)
+                    // The pull request is what a human is asked to look at, so it
+                    // exists before the asking. The issue does not move to review
+                    // here: a pull request with failing checks is not ready for a
+                    // human, so `watch_checks` owns that transition.
+                    if let Some(run_id) = replay.run_id {
+                        self.queue_job(
+                            issue.repo_id,
+                            Some(issue.id),
+                            "open_pr",
+                            serde_json::json!({ "run_id": run_id }),
+                        )
                         .await?;
+                    }
                 } else {
                     let failing = report.failed_names();
                     let body = if failing.is_empty() {
@@ -1913,22 +1986,48 @@ impl Engine {
                     .and_then(|v| v.as_str())
                     .and_then(|id| Uuid::parse_str(id).ok());
                 let url = payload.get("pr_url").and_then(|v| v.as_str());
-                match (run_id, url) {
-                    (Some(run_id), Some(url)) if !url.is_empty() => {
+                match (url, job.issue_id) {
+                    (Some(url), Some(issue_id)) if !url.is_empty() => {
                         sqlx::query(
-                            "update runs set pr_url = ?, pr_number = ?, pr_branch = ? where id = ?",
+                            "update issues set pr_url = ?, pr_number = ?, pr_branch = ?, updated_at = ? where id = ?",
                         )
                         .bind(url)
                         .bind(payload.get("pr_number").and_then(|v| v.as_i64()))
                         .bind(payload.get("pr_branch").and_then(|v| v.as_str()))
-                        .bind(run_id)
+                        .bind(crate::db::now_rfc3339())
+                        .bind(issue_id)
                         .execute(&self.db.pool)
                         .await?;
+                        if let Some(issue_id) = job.issue_id {
+                            // A pull request is only ready once its checks are green
+                            // and nobody on the team is still asking for changes.
+                            self.queue_job(
+                                job.repo_id,
+                                Some(issue_id),
+                                "watch_checks",
+                                serde_json::json!({
+                                    "number": payload.get("pr_number").and_then(|v| v.as_i64()),
+                                    "sha": payload.get("head_revision").and_then(|v| v.as_str()),
+                                }),
+                            )
+                            .await?;
+                        }
+                        if let Some(run_id) = run_id {
+                            sqlx::query(
+                                "update runs set pr_url = ?, pr_number = ?, pr_branch = ? where id = ?",
+                            )
+                            .bind(url)
+                            .bind(payload.get("pr_number").and_then(|v| v.as_i64()))
+                            .bind(payload.get("pr_branch").and_then(|v| v.as_str()))
+                            .bind(run_id)
+                            .execute(&self.db.pool)
+                            .await?;
+                        }
                     }
                     _ => {
-                        let reason = payload
-                            .get("error")
-                            .and_then(|v| v.as_str())
+                        let reason = error
+                            .as_deref()
+                            .or_else(|| payload.get("error").and_then(|v| v.as_str()))
                             .unwrap_or("it reported no pull request");
                         if let Some(issue_id) = job.issue_id {
                             self.comment(
@@ -1936,12 +2035,92 @@ impl Engine {
                                 hulahoop_core::AuthorType::Server,
                                 None,
                                 &format!(
-                                    "The pull request could not be opened: {reason}. The approval still stands, so the merge is yours to make by hand."
+                                    "The pull request could not be opened: {reason}. There is nothing on GitHub to check, so the issue moves to review the way it did before pull requests existed."
                                 ),
                                 false,
                             )
                             .await?;
+                            // No pull request means no checks and no team review to
+                            // wait for, and a repository without a remote still has to
+                            // run the loop.
+                            let _ = self
+                                .transition(issue_id, IssueEvent::ImplementerCompleted)
+                                .await;
                         }
+                    }
+                }
+            }
+            "watch_checks" => {
+                let conclusion = payload
+                    .get("conclusion")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let sha = payload.get("sha").and_then(|v| v.as_str()).unwrap_or("");
+                if let Some(issue_id) = job.issue_id {
+                    if conclusion == "success" {
+                        // Green checks and no outstanding change requests: the pull
+                        // request is now something a human can be asked to read.
+                        self.comment(
+                            issue_id,
+                            hulahoop_core::AuthorType::Server,
+                            None,
+                            &format!(
+                                "The pull request checks are green on {} and no change request is open. The head replay and the house rules passed, so the issue moved to review.",
+                                short_revision(sha)
+                            ),
+                            false,
+                        )
+                        .await?;
+                        self.transition(issue_id, IssueEvent::ImplementerCompleted)
+                            .await?;
+                    } else {
+                        let failing = payload
+                            .get("failing")
+                            .and_then(|v| v.as_array())
+                            .map(|names| {
+                                names
+                                    .iter()
+                                    .filter_map(|name| name.as_str())
+                                    .map(|name| format!("- {name}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        let requests = payload
+                            .get("change_requests")
+                            .and_then(|v| v.as_array())
+                            .map(|names| {
+                                names
+                                    .iter()
+                                    .filter_map(|name| name.as_str())
+                                    .map(|name| format!("- {name}"))
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .unwrap_or_default();
+                        let mut body = format!(
+                            "The pull request is not ready to review: {conclusion} on {}.",
+                            short_revision(sha)
+                        );
+                        if !failing.is_empty() {
+                            body.push_str(&format!("\n\nFailing checks:\n\n{failing}"));
+                        }
+                        if !requests.is_empty() {
+                            body.push_str(&format!(
+                                "\n\nChange requests still open:\n\n{requests}"
+                            ));
+                        }
+                        body.push_str(
+                            "\n\nThe issue stays in progress: start another attempt to fix it, or resolve it on the pull request and check again.",
+                        );
+                        self.comment(
+                            issue_id,
+                            hulahoop_core::AuthorType::Server,
+                            None,
+                            &body,
+                            false,
+                        )
+                        .await?;
                     }
                 }
             }
@@ -2136,8 +2315,17 @@ pub struct ReplayCompletion {
     pub junit_xml: Option<String>,
     #[serde(default)]
     pub ancestry_ok: Option<bool>,
+    /// The `fmt-check`/`lint` recipes the repository declares, run at the same
+    /// revision as the suite. A head that fails them is not finished.
+    #[serde(default)]
+    pub house_rules: Option<serde_json::Value>,
     #[serde(default)]
     pub revision: Option<String>,
+}
+
+/// Twelve characters of a revision, which is what a human reads in a comment.
+fn short_revision(sha: &str) -> String {
+    sha.chars().take(12).collect()
 }
 
 /// The prompt files are embedded so a run never depends on the checkout's
