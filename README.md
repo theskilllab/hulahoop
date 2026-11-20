@@ -349,7 +349,7 @@ runs
   head_revision, head_bookmark, parent_run_id, runner_id, claimed_at,
   last_heartbeat_at, pid, pgid, toolchain_lock, prompt_revision, sandbox,
   env_keys, artifact_dir, diff_sha, flags, status, started_at, finished_at,
-  exit_code, error
+  exit_code, error, tokens_in, tokens_out
                         role: test_author | implementer | reviewer
                         attempt: copied from `issues.attempt` for an implementer
                         base_bookmark: the bookmark the checkout was created from
@@ -365,6 +365,11 @@ runs
                         flags: touched_contract | large_diff | artifact_limit,
                           read by the approve dialog
                         artifact_dir: $DATA/runs/<run-id>/
+                        tokens_in, tokens_out: what the adapter's stream reported,
+                          one value per message at its last snapshot; 0 when the
+                          stream carries no usage; read on every path that
+                          finishes a run, including cancel and the dead-runner
+                          reaper
 
 replays               one row per suite execution Hulahoop verifies itself
   id, issue_id, run_id, approval_id, kind, attempt, revision, tests_bookmark,
@@ -891,6 +896,8 @@ type Run {
   diff: String
   durationMs: Int
   exitCode: Int
+  tokensIn: Int!
+  tokensOut: Int!
   error: String
   checkoutPath: String
   artifactDir: String!

@@ -204,6 +204,10 @@ pub struct Run {
     pub finished_at: Option<DateTime<Utc>>,
     pub exit_code: Option<i64>,
     pub error: Option<String>,
+    /// Summed over the run's finished messages, from the usage its adapter
+    /// writes into the transcript. A stream that reports none spends zero.
+    pub tokens_in: i64,
+    pub tokens_out: i64,
     pub created_at: DateTime<Utc>,
 }
 
