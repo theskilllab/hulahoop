@@ -530,6 +530,8 @@ jj workspace add \
 
 `$DATA` is the data root: `~/.local/share/hulahoop` by default, `~/Library/Application Support/hulahoop` on macOS, overridable with `HULAHOOP_DATA`. Every path in this document is relative to it.
 
+Before migrations run, the server copies `hulahoop.sqlite` (and its `-wal`/`-shm` sidecars) to `$DATA/backups/hulahoop-<timestamp>.sqlite` and keeps the newest five. This exists because a migration that rebuilds a parent table — `drop table repos` to make `repos.path` nullable, for instance — performs an implicit delete while foreign keys are enforced, and every child row goes with it. A copy from the last start is the only thing that turns that from data loss into a slow start.
+
 `<base>` is `repo.base_revision` for the Test Author, the `tests/<issue>` bookmark for the Implementer, and the implementer's `issue/<id>/head/<attempt>` bookmark for the Reviewer — the review happens against the tree that contains the implementation. `jj workspace add -r` takes a bookmark name, so the workspace opens at whatever that bookmark points at when it is created.
 
 Rules:
