@@ -623,6 +623,23 @@ impl Executor {
             .or_else(|| payload["head_bookmark"].as_str())
             .context("merge_verify needs the landing bookmark")?;
         let vcs = Vcs::detect(repo_path)?;
+        // The merge commit is always new to this repository, so the verify fetches
+        // before it resolves: without the fetch every merge looked like a revision
+        // that does not exist.
+        let _ = run_command(
+            repo_path,
+            &["jj", "git", "fetch"],
+            hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
+            None,
+        );
+        if vcs.resolve(merge_revision).is_err() {
+            let _ = run_command(
+                repo_path,
+                &["git", "fetch", "--all"],
+                hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
+                None,
+            );
+        }
         let contained = vcs.contains(merge_revision, landing)?;
         // A squash merge does not contain the landing commit: GitHub builds a new
         // commit with the same tree. That is still the change the replay proved, so

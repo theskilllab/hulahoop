@@ -1141,7 +1141,7 @@ impl Engine {
             }
             let now = crate::db::now_rfc3339();
             sqlx::query(
-                "insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at, updated_at) values (?, ?, ?, ?, ?, ?, ?, ?)",
+                "insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at) values (?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(Uuid::now_v7())
             .bind(issue_id)
@@ -1149,7 +1149,6 @@ impl Engine {
             .bind::<Option<Uuid>>(None)
             .bind("approved")
             .bind(format!("Overridden by the human: {reason}"))
-            .bind(&now)
             .bind(&now)
             .execute(&self.db.pool)
             .await?;
@@ -2007,7 +2006,14 @@ impl Engine {
                         }
                         self.transition(issue_id, IssueEvent::RecordMerge).await?;
                     } else {
-                        let body = format!(
+                        let body = if let Some(reason) =
+                            payload.get("error").and_then(|v| v.as_str())
+                        {
+                            format!(
+                                "The merge could not be verified: {reason}. The commit has to exist in this repository, so fetch it first, or paste the revision the landing replay verified."
+                            )
+                        } else {
+                            format!(
                             "`{}` neither contains the landing revision `{}` nor has its tree, so the merge was not recorded. Merge the revision the landing replay verified, or squash it to that tree.",
                             payload
                                 .get("merge_revision")
@@ -2017,7 +2023,8 @@ impl Engine {
                                 .get("landing_bookmark")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or_default()
-                        );
+                            )
+                        };
                         self.comment(
                             issue_id,
                             hulahoop_core::AuthorType::Server,
