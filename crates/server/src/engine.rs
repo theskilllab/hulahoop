@@ -2011,14 +2011,26 @@ impl Engine {
                         .await?;
                         if let Some(issue_id) = job.issue_id {
                             // A pull request is only ready once its checks are green
-                            // and nobody on the team is still asking for changes.
+                            // and nobody on the team is still asking for changes. The
+                            // runner reports no revision for a pull request, so the
+                            // head comes from the run that produced it.
+                            let head: Option<String> = match run_id {
+                                Some(run_id) => sqlx::query_scalar::<_, Option<String>>(
+                                    "select head_revision from runs where id = ?",
+                                )
+                                .bind(run_id)
+                                .fetch_optional(&self.db.pool)
+                                .await?
+                                .flatten(),
+                                None => None,
+                            };
                             self.queue_job(
                                 job.repo_id,
                                 Some(issue_id),
                                 "watch_checks",
                                 serde_json::json!({
                                     "number": payload.get("pr_number").and_then(|v| v.as_i64()),
-                                    "sha": payload.get("head_revision").and_then(|v| v.as_str()),
+                                    "sha": head,
                                 }),
                             )
                             .await?;

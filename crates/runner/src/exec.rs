@@ -238,6 +238,12 @@ impl Executor {
             )
             .with_context(|| format!("describing the {prefix} commit"))?;
         }
+        // The suite the gate freezes has to be formatted, or every head built on it
+        // fails `fmt-check` in CI and no agent may touch the frozen file to fix it.
+        // The loop formats what it is about to freeze.
+        if role != AgentRole::Reviewer {
+            self.format_tree(&checkout, &artifact_dir);
+        }
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
@@ -766,6 +772,33 @@ impl Executor {
         Ok(outcome)
     }
 
+    /// `just fmt` when the repository declares it, so the tree the loop records is
+    /// the tree the house rules would accept.
+    fn format_tree(&self, checkout: &Path, artifact_dir: &Path) {
+        if std::fs::create_dir_all(artifact_dir).is_err() {
+            return;
+        }
+        let summary = match run_command(
+            checkout,
+            &["direnv", "exec", ".", "just", "--summary"],
+            hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
+            None,
+        ) {
+            Ok(outcome) => outcome.final_text,
+            Err(_) => return,
+        };
+        if !summary.split_whitespace().any(|recipe| recipe == "fmt") {
+            return;
+        }
+        let log = artifact_dir.join("just-fmt.log");
+        let _ = run_command(
+            checkout,
+            &["direnv", "exec", ".", "just", "fmt"],
+            hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
+            Some(&log),
+        );
+    }
+
     /// The recipes a repository declares beyond the suite, run at the same revision
     /// the suite ran at. The pull request's checks run `just ci`, so a head that
     /// passes the suite and fails `fmt-check` is a head that was never finished.
@@ -784,7 +817,7 @@ impl Executor {
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             None,
         ) {
-            Ok(outcome) => outcome.lines.join("\n"),
+            Ok(outcome) => outcome.final_text,
             Err(_) => return Ok(Vec::new()),
         };
         let declared: Vec<&str> = summary.split_whitespace().collect();
