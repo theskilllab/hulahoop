@@ -4,6 +4,7 @@ import {
   gql,
   loadArtifacts,
   loadMilestones,
+  loadWorkflow,
   loadWorkspace,
   loadWorkspaceIssues,
   savedRemote,
@@ -15,6 +16,7 @@ import {
   type Milestone,
   type Project,
   type Workspace,
+  type WorkflowDoc,
 } from "./api";
 import { WORKSPACE_KEY } from "./api";
 import { applyTheme, savedTheme, type Theme } from "./theme";
@@ -23,6 +25,7 @@ import Board from "./screens/Board";
 import Connect from "./screens/Connect";
 import IssueDetail from "./screens/IssueDetail";
 import Milestones from "./screens/Milestones";
+import WorkflowScreen from "./screens/Workflow";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
 
@@ -30,6 +33,7 @@ type View =
   | { name: "board" }
   | { name: "issue"; id: string }
   | { name: "new" }
+  | { name: "workflow" }
   | { name: "milestones" }
   | { name: "artifacts" }
   | { name: "settings" }
@@ -53,6 +57,7 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [workflow, setWorkflow] = useState<WorkflowDoc | null>(null);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [view, setView] = useState<View>({ name: "board" });
   const [connected, setConnected] = useState(false);
@@ -64,14 +69,16 @@ export default function App() {
   const refresh = useCallback(async () => {
     if (!workspace) return;
     try {
-      const [nextIssues, nextMilestones, nextArtifacts] = await Promise.all([
+      const [nextIssues, nextMilestones, nextArtifacts, nextWorkflow] = await Promise.all([
         loadWorkspaceIssues(workspace.id),
         loadMilestones(workspace.id),
         loadArtifacts(workspace.id),
+        loadWorkflow(workspace.id),
       ]);
       setIssues(nextIssues);
       setMilestones(nextMilestones);
       setArtifacts(nextArtifacts);
+      setWorkflow(nextWorkflow);
       setError(null);
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
@@ -230,6 +237,9 @@ export default function App() {
           <button className={view.name === "new" ? "on" : ""} onClick={() => setView({ name: "new" })}>
             New issue
           </button>
+          <button className={view.name === "workflow" ? "on" : ""} onClick={() => setView({ name: "workflow" })}>
+            Workflow <span className="tally">{workflow?.sections.length ?? 0}</span>
+          </button>
           <button className={view.name === "milestones" ? "on" : ""} onClick={() => setView({ name: "milestones" })}>
             Milestones <span className="tally">{milestones.filter((m) => m.status === "open").length}</span>
           </button>
@@ -295,9 +305,17 @@ export default function App() {
             {notice}
           </div>
         )}
+        {view.name === "workflow" && workspace && (
+          <WorkflowScreen workspaceId={workspace.id} />
+        )}
         {view.name === "board" && (
           <Board
             issues={shown}
+            columns={workflow?.sections.map((section) => ({
+              status: section.status,
+              title: section.title,
+              owner: section.owner,
+            }))}
             onOpen={(id) => setView({ name: "issue", id })}
             onNew={() => setView({ name: "new" })}
             hasRepo={Boolean(project?.repos.length)}

@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::model::*;
+use crate::workflows::WorkflowDoc;
 
 pub type HulahoopSchema = Schema<Query, Mutation, EmptySubscription>;
 
@@ -216,6 +217,15 @@ impl Query {
         )
     }
 
+    /// The document that drives the board.
+    async fn workflow(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<WorkflowDoc> {
+        Ok(engine(ctx).workflow(workspace_id).await?)
+    }
+
     async fn artifacts(
         &self,
         ctx: &Context<'_>,
@@ -407,6 +417,16 @@ impl Mutation {
         Ok(engine(ctx)
             .update_milestone(id, title, body, status, target_date)
             .await?)
+    }
+
+    /// Save the workflow document. The board follows it immediately.
+    async fn set_workflow(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        source: String,
+    ) -> async_graphql::Result<WorkflowDoc> {
+        Ok(engine(ctx).set_workflow(workspace_id, &source).await?)
     }
 
     async fn set_issue_milestone(

@@ -164,6 +164,22 @@ export interface WorkspaceMember {
   role: string;
 }
 
+export type WorkflowSection = {
+  status: IssueStatus;
+  title: string;
+  owner: string;
+  agent: string | null;
+  next: IssueStatus | null;
+  body: string;
+};
+
+export type WorkflowDoc = {
+  source: string;
+  updatedAt: string | null;
+  sections: WorkflowSection[];
+  errors: string[];
+};
+
 export interface Milestone {
   id: string;
   projectId: string | null;
@@ -375,6 +391,28 @@ export async function loadBoard(workspaceId: string): Promise<Issue[]> {
 }
 
 export const MILESTONE_FIELDS = `id projectId title body status targetDate createdAt`;
+
+export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
+  const data = await gql<{ workflow: WorkflowDoc }>(
+    `query ($w: UUID!) { workflow(workspaceId: $w) {
+      source updatedAt errors
+      sections { status title owner agent next body }
+    } }`,
+    { w: workspaceId },
+  );
+  return data.workflow;
+}
+
+export async function saveWorkflow(workspaceId: string, source: string): Promise<WorkflowDoc> {
+  const data = await gql<{ setWorkflow: WorkflowDoc }>(
+    `mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) {
+      source updatedAt errors
+      sections { status title owner agent next body }
+    } }`,
+    { w: workspaceId, s: source },
+  );
+  return data.setWorkflow;
+}
 
 export async function loadMilestones(workspaceId: string): Promise<Milestone[]> {
   const data = await gql<{ milestones: Milestone[] }>(

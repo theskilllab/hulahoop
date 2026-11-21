@@ -8,6 +8,7 @@ pub mod diff;
 pub mod junit;
 pub mod runspec;
 pub mod usage;
+pub mod workflow;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -95,6 +96,19 @@ impl IssueStatus {
 
     pub fn is_terminal(self) -> bool {
         matches!(self, IssueStatus::Done | IssueStatus::Cancelled)
+    }
+
+    /// How the status is written for people.
+    pub fn title(self) -> &'static str {
+        match self {
+            IssueStatus::Backlog => "Backlog",
+            IssueStatus::Todo => "To do",
+            IssueStatus::InProgress => "In progress",
+            IssueStatus::InReview => "In review",
+            IssueStatus::Blocked => "Blocked",
+            IssueStatus::Done => "Done",
+            IssueStatus::Cancelled => "Cancelled",
+        }
     }
 
     /// The six columns a board shows, in the order work moves through them.

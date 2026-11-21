@@ -10,6 +10,7 @@ pub mod gql;
 pub mod model;
 pub mod tenancy;
 pub mod vault;
+pub mod workflows;
 
 use anyhow::Context;
 use std::net::SocketAddr;
