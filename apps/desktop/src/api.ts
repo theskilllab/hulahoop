@@ -133,6 +133,8 @@ export interface Agent {
   name: string;
   adapter: string;
   model: string;
+  agentsMd: string;
+  skills: Skill[];
 }
 
 export interface ProjectAgent {
@@ -179,6 +181,14 @@ export type WorkflowDoc = {
   sections: WorkflowSection[];
   errors: string[];
 };
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  updatedAt: string;
+}
 
 export interface Milestone {
   id: string;
@@ -390,6 +400,68 @@ export async function loadBoard(workspaceId: string): Promise<Issue[]> {
   return data.issues;
 }
 
+export const SKILL_FIELDS = `id name description source updatedAt`;
+
+export async function loadSkills(workspaceId: string): Promise<Skill[]> {
+  const data = await gql<{ skills: Skill[] }>(
+    `query ($w: UUID!) { skills(workspaceId: $w) { ${SKILL_FIELDS} } }`,
+    { w: workspaceId },
+  );
+  return data.skills;
+}
+
+export async function createSkill(
+  workspaceId: string,
+  name: string,
+  description: string,
+  source: string,
+): Promise<Skill> {
+  const data = await gql<{ createSkill: Skill }>(
+    `mutation ($w: UUID!, $n: String!, $d: String, $s: String!) {
+      createSkill(workspaceId: $w, name: $n, description: $d, source: $s) { ${SKILL_FIELDS} }
+    }`,
+    { w: workspaceId, n: name, d: description, s: source },
+  );
+  return data.createSkill;
+}
+
+export async function updateSkill(
+  id: string,
+  changes: { name?: string; description?: string; source?: string },
+): Promise<Skill> {
+  const data = await gql<{ updateSkill: Skill }>(
+    `mutation ($id: UUID!, $n: String, $d: String, $s: String) {
+      updateSkill(id: $id, name: $n, description: $d, source: $s) { ${SKILL_FIELDS} }
+    }`,
+    { id, n: changes.name ?? null, d: changes.description ?? null, s: changes.source ?? null },
+  );
+  return data.updateSkill;
+}
+
+export async function deleteSkill(id: string): Promise<boolean> {
+  const data = await gql<{ deleteSkill: boolean }>(
+    `mutation ($id: UUID!) { deleteSkill(id: $id) }`,
+    { id },
+  );
+  return data.deleteSkill;
+}
+
+export async function setAgentSkills(agentId: string, skillIds: string[]): Promise<Skill[]> {
+  const data = await gql<{ setAgentSkills: Skill[] }>(
+    `mutation ($a: UUID!, $s: [UUID!]!) { setAgentSkills(agentId: $a, skillIds: $s) { ${SKILL_FIELDS} } }`,
+    { a: agentId, s: skillIds },
+  );
+  return data.setAgentSkills;
+}
+
+export async function setAgentInstructions(agentId: string, agentsMd: string): Promise<boolean> {
+  const data = await gql<{ setAgentInstructions: boolean }>(
+    `mutation ($a: UUID!, $m: String!) { setAgentInstructions(agentId: $a, agentsMd: $m) }`,
+    { a: agentId, m: agentsMd },
+  );
+  return data.setAgentInstructions;
+}
+
 export const MILESTONE_FIELDS = `id projectId title body status targetDate createdAt`;
 
 export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
@@ -507,7 +579,10 @@ export async function loadWorkspace(workspaceId?: string | null): Promise<Worksp
     { id: workspace.id },
   );
   const agents = await gql<{ agents: Agent[] }>(
-    `query ($id: UUID!) { agents(workspaceId: $id) { id name adapter model } }`,
+    `query ($id: UUID!) { agents(workspaceId: $id) {
+      id name adapter model agentsMd
+      skills { ${SKILL_FIELDS} }
+    } }`,
     { id: workspace.id },
   );
   return {

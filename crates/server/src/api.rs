@@ -1,7 +1,7 @@
 //! Internal HTTP API. This is the only door between the runner and the
 //! database, which is what keeps the server the single SQLite writer.
 
-use crate::engine::{prompt_for, Engine};
+use crate::engine::Engine;
 use crate::model::*;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -536,7 +536,8 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    std::fs::write(&prompt_path, prompt_for(run.role_enum()))?;
+    let prompt = engine.compose_prompt(run.role_enum(), &agent).await?;
+    std::fs::write(&prompt_path, &prompt)?;
 
     Ok(json!({
         "run_id": run.id,
@@ -545,7 +546,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "role": run.role_enum().as_str(),
         "adapter": agent.adapter,
         "model": agent.model,
-        "prompt": prompt_for(run.role_enum()),
+        "prompt": prompt,
         "prompt_path": prompt_path,
         "input_path": input_path,
         "repo_path": host_path(&repo, &engine.db.data_dir),
@@ -576,7 +577,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "commit_app_slug": engine.commit_identity().await?.1,
         "timeout_minutes": hulahoop_core::AGENT_WALL_CLOCK_MINUTES,
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
-        "prompt_revision": run.prompt_revision,
+        "prompt_revision": engine.prompt_revision(&prompt),
     }))
 }
 

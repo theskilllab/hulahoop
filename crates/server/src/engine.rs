@@ -128,7 +128,94 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        let issue = self.issue(issue_id).await?;
+        // Moving a task into a status an agent owns is the dispatch: nobody has
+        // to press start, and nothing starts twice because the run table allows
+        // one live run per issue.
+        if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+            let _ = self
+                .comment(
+                    issue_id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!("the workflow wants an agent here, but none could start: {error}"),
+                    false,
+                )
+                .await;
+        }
         self.issue(issue_id).await
+    }
+
+    /// Which role works a status. `To do` and `In progress` are the implementer's,
+    /// `In review` the reviewer's; every other status belongs to a person.
+    fn role_for_status(status: IssueStatus) -> Option<AgentRole> {
+        match status {
+            IssueStatus::Todo | IssueStatus::InProgress => Some(AgentRole::Implementer),
+            IssueStatus::InReview => Some(AgentRole::Reviewer),
+            _ => None,
+        }
+    }
+
+    /// Start a run when the workflow says an agent owns this status.
+    async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
+        let Some(role) = Self::role_for_status(issue.status_enum()) else {
+            return Ok(());
+        };
+        if issue.status_enum() == IssueStatus::Blocked || issue.project_id.is_none() {
+            return Ok(());
+        }
+        let workspace = issue.workspace_id;
+        if self.workflow_owner(workspace, issue.status_enum()).await?
+            != hulahoop_core::workflow::Owner::Agent
+        {
+            return Ok(());
+        }
+        // One live run per issue, and no second reviewer pass for a head that
+        // already has a verdict.
+        let live: Option<(Uuid,)> = sqlx::query_as(
+            "select id from runs where issue_id = ? and status in ('queued', 'running')",
+        )
+        .bind(issue.id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        if live.is_some() {
+            return Ok(());
+        }
+        if role == AgentRole::Reviewer && issue.current_run_id.is_some() {
+            let reviewed: Option<(Uuid,)> =
+                sqlx::query_as("select id from reviews where reviewed_run_id = ? limit 1")
+                    .bind(issue.current_run_id)
+                    .fetch_optional(&self.db.pool)
+                    .await?;
+            if reviewed.is_some() {
+                return Ok(());
+            }
+        }
+        let named = self.workflow_agent(workspace, issue.status_enum()).await?;
+        let agent = self.agent_for_name(workspace, named.as_deref()).await?;
+        self.start_run(issue.id, agent, role, issue.current_run_id)
+            .await?;
+        Ok(())
+    }
+
+    /// Resolve the workflow's `Agent:` value to a concrete agent: a name in the
+    /// workspace wins, `any` and an empty value fall back to the project binding.
+    async fn agent_for_name(&self, workspace_id: Uuid, name: Option<&str>) -> Result<Option<Uuid>> {
+        if let Some(name) = name {
+            if !name.eq_ignore_ascii_case("any") {
+                let found: Option<(Uuid,)> = sqlx::query_as(
+                    "select id from agents where workspace_id = ? and lower(name) = lower(?) limit 1",
+                )
+                .bind(workspace_id)
+                .bind(name)
+                .fetch_optional(&self.db.pool)
+                .await?;
+                if let Some((id,)) = found {
+                    return Ok(Some(id));
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub async fn comment(

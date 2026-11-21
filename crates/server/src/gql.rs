@@ -217,6 +217,15 @@ impl Query {
         )
     }
 
+    /// The workspace's reusable knowledge.
+    async fn skills(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<Skill>> {
+        Ok(engine(ctx).skills(workspace_id).await?)
+    }
+
     /// The document that drives the board.
     async fn workflow(
         &self,
@@ -417,6 +426,69 @@ impl Mutation {
         Ok(engine(ctx)
             .update_milestone(id, title, body, status, target_date)
             .await?)
+    }
+
+    async fn create_skill(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        name: String,
+        description: Option<String>,
+        source: String,
+    ) -> async_graphql::Result<Skill> {
+        Ok(engine(ctx)
+            .create_skill(
+                workspace_id,
+                &name,
+                description.as_deref().unwrap_or(""),
+                &source,
+            )
+            .await?)
+    }
+
+    async fn update_skill(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        source: Option<String>,
+    ) -> async_graphql::Result<Skill> {
+        Ok(engine(ctx)
+            .update_skill(
+                id,
+                name.as_deref(),
+                description.as_deref(),
+                source.as_deref(),
+            )
+            .await?)
+    }
+
+    async fn delete_skill(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).delete_skill(id).await?)
+    }
+
+    /// Replace the skills an agent carries.
+    async fn set_agent_skills(
+        &self,
+        ctx: &Context<'_>,
+        agent_id: Uuid,
+        skill_ids: Vec<Uuid>,
+    ) -> async_graphql::Result<Vec<Skill>> {
+        Ok(engine(ctx).set_agent_skills(agent_id, &skill_ids).await?)
+    }
+
+    /// The agent's own instructions, appended to its role prompt.
+    async fn set_agent_instructions(
+        &self,
+        ctx: &Context<'_>,
+        agent_id: Uuid,
+        agents_md: String,
+    ) -> async_graphql::Result<bool> {
+        engine(ctx)
+            .set_agent_instructions(agent_id, &agents_md)
+            .await?;
+        Ok(true)
     }
 
     /// Save the workflow document. The board follows it immediately.
@@ -1148,6 +1220,14 @@ impl Project {
         .bind(self.id)
         .fetch_all(&engine(ctx).db.pool)
         .await?)
+    }
+}
+
+#[ComplexObject]
+impl Agent {
+    /// The skills this agent carries, most relevant knowledge first by name.
+    async fn skills(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Skill>> {
+        Ok(engine(ctx).agent_skills(self.id).await?)
     }
 }
 

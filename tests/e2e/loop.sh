@@ -124,7 +124,7 @@ main() {
 
   echo "planned: $(gql 'mutation ($id: UUID!) { planIssue(issueId: $id, planned: true) { status } }' "{\"id\":\"$issue\"}" | jq -c '.data.planIssue.status')"
 
-  echo "start: $(gql 'mutation ($id: UUID!) { startRun(issueId: $id, role: "implementer") { id status } }' "{\"id\":\"$issue\"}" | jq -c '.data.startRun // .errors')"
+  # No startRun here on purpose: moving the task to To do is the dispatch.
   wait_status "$issue" "in_review" "${SLOW_WAIT:-600}"
   echo "in review: $(gql 'query ($id: UUID!) { issue(id: $id) { status } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue.status')"
 

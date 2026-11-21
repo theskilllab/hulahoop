@@ -47,12 +47,28 @@ pub struct Repo {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Agent {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
     pub adapter: String,
     pub model: String,
+    /// How this agent should behave, written by the person who knows it best.
+    pub agents_md: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A skill is reusable knowledge, kept in one place and attached to agents that
+/// need it: a convention, a checklist, a house rule with the story behind it.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct Skill {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub source: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

@@ -4,6 +4,7 @@ import {
   gql,
   loadArtifacts,
   loadMilestones,
+  loadSkills,
   loadWorkflow,
   loadWorkspace,
   loadWorkspaceIssues,
@@ -16,6 +17,7 @@ import {
   type Milestone,
   type Project,
   type Workspace,
+  type Skill,
   type WorkflowDoc,
 } from "./api";
 import { WORKSPACE_KEY } from "./api";
@@ -25,6 +27,7 @@ import Board from "./screens/Board";
 import Connect from "./screens/Connect";
 import IssueDetail from "./screens/IssueDetail";
 import Milestones from "./screens/Milestones";
+import Skills from "./screens/Skills";
 import WorkflowScreen from "./screens/Workflow";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
@@ -34,6 +37,7 @@ type View =
   | { name: "issue"; id: string }
   | { name: "new" }
   | { name: "workflow" }
+  | { name: "skills" }
   | { name: "milestones" }
   | { name: "artifacts" }
   | { name: "settings" }
@@ -58,6 +62,7 @@ export default function App() {
   const [issues, setIssues] = useState<Issue[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [workflow, setWorkflow] = useState<WorkflowDoc | null>(null);
+  const [skills, setSkills] = useState<Skill[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [view, setView] = useState<View>({ name: "board" });
   const [connected, setConnected] = useState(false);
@@ -69,16 +74,18 @@ export default function App() {
   const refresh = useCallback(async () => {
     if (!workspace) return;
     try {
-      const [nextIssues, nextMilestones, nextArtifacts, nextWorkflow] = await Promise.all([
+      const [nextIssues, nextMilestones, nextArtifacts, nextWorkflow, nextSkills] = await Promise.all([
         loadWorkspaceIssues(workspace.id),
         loadMilestones(workspace.id),
         loadArtifacts(workspace.id),
         loadWorkflow(workspace.id),
+        loadSkills(workspace.id),
       ]);
       setIssues(nextIssues);
       setMilestones(nextMilestones);
       setArtifacts(nextArtifacts);
       setWorkflow(nextWorkflow);
+      setSkills(nextSkills);
       setError(null);
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
@@ -240,6 +247,9 @@ export default function App() {
           <button className={view.name === "workflow" ? "on" : ""} onClick={() => setView({ name: "workflow" })}>
             Workflow <span className="tally">{workflow?.sections.length ?? 0}</span>
           </button>
+          <button className={view.name === "skills" ? "on" : ""} onClick={() => setView({ name: "skills" })}>
+            Skills <span className="tally">{skills.length}</span>
+          </button>
           <button className={view.name === "milestones" ? "on" : ""} onClick={() => setView({ name: "milestones" })}>
             Milestones <span className="tally">{milestones.filter((m) => m.status === "open").length}</span>
           </button>
@@ -305,6 +315,7 @@ export default function App() {
             {notice}
           </div>
         )}
+        {view.name === "skills" && workspace && <Skills workspaceId={workspace.id} />}
         {view.name === "workflow" && workspace && (
           <WorkflowScreen workspaceId={workspace.id} />
         )}
@@ -369,6 +380,7 @@ export default function App() {
             projects={projects}
             active={project}
             agents={agents}
+            skills={skills}
             onChanged={async () => {
               await reload();
             }}
