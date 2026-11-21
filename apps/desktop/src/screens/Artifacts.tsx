@@ -61,7 +61,7 @@ export default function Artifacts({ workspaceId, projects, milestones, artifacts
   }
 
   return (
-    <section className="sheet">
+    <section className="screen page">
       <header className="sheet-head">
         <div>
           <h1>Artifacts</h1>

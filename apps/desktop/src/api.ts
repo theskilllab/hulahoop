@@ -474,6 +474,32 @@ export async function setAgentInstructions(agentId: string, agentsMd: string): P
 
 export const MILESTONE_FIELDS = `id projectId title body status targetDate createdAt`;
 
+/** A run seen from the workspace, for Activity and Cost control. */
+export interface RecentRun {
+  id: string;
+  issueId: string;
+  agentId: string;
+  role: Role;
+  status: string;
+  adapter: string;
+  attempt: number;
+  tokensIn: number;
+  tokensOut: number;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export async function loadRecentRuns(workspaceId: string, limit = 120): Promise<RecentRun[]> {
+  const data = await gql<{ recentRuns: RecentRun[] }>(
+    `query ($w: UUID!, $n: Int) { recentRuns(workspaceId: $w, limit: $n) {
+      id issueId agentId role status adapter attempt tokensIn tokensOut error startedAt finishedAt
+    } }`,
+    { w: workspaceId, n: limit },
+  );
+  return data.recentRuns;
+}
+
 export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
   const data = await gql<{ workflow: WorkflowDoc }>(
     `query ($w: UUID!) { workflow(workspaceId: $w) {

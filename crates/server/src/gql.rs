@@ -270,6 +270,25 @@ impl Query {
         .await?)
     }
 
+    /// The newest runs across a workspace, so Activity and Cost control read one
+    /// query instead of walking every issue.
+    async fn recent_runs(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<Run>> {
+        let limit = limit.unwrap_or(60).clamp(1, 500);
+        Ok(sqlx::query_as::<_, Run>(
+            "select r.* from runs r join issues i on i.id = r.issue_id
+             where i.workspace_id = ? order by r.created_at desc limit ?",
+        )
+        .bind(workspace_id)
+        .bind(limit)
+        .fetch_all(&engine(ctx).db.pool)
+        .await?)
+    }
+
     /// Live tail of the newest run on an issue, so the desktop can poll without
     /// re-reading the log file.
     async fn run_events(
