@@ -284,15 +284,26 @@ export default function WorkflowScreen({
 
       <div className={`workflow-body ${tab}`}>
         {tab !== "diagram" ? (
-          <label className="workflow-editor">
-            <span className="label">WORKFLOWS.md</span>
+          <div className="workflow-editor">
+            <div className="head">
+              <span className="mono dim small">WORKFLOWS.md</span>
+              {dirty ? <span className="chip warn small">Unsaved</span> : null}
+              <button
+                className="link"
+                style={{ marginLeft: "auto" }}
+                onClick={() => setSource(doc?.source ?? source)}
+                disabled={!dirty}
+              >
+                Revert
+              </button>
+            </div>
             <textarea
               spellCheck={false}
               value={source}
               onChange={(event) => setSource(event.target.value)}
               rows={28}
             />
-          </label>
+          </div>
         ) : null}
 
         {tab !== "markdown" ? (

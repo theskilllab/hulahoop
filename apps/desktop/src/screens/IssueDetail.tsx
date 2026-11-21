@@ -71,6 +71,7 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
     <div className="detail">
       <PageHeader
         back={{ label: "← Tasks", onClick: onBack }}
+        size="big"
         title={issue.title}
         subtitle={`${issue.key} · ${issue.projectName ?? "no project"} · attempt ${issue.attempt}`}
         actions={
