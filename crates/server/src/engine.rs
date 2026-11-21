@@ -300,7 +300,7 @@ impl Engine {
 
     /// Every provider the screen offers, stored or not. "Available" and
     /// "connected" are two different answers, and only a complete list shows both.
-    pub const PROVIDERS: [&'static str; 4] = crate::connectors::ALL;
+    pub const PROVIDERS: [&'static str; 3] = crate::connectors::ALL;
 
     fn vault(&self) -> Result<crate::vault::Vault> {
         crate::vault::Vault::open(&self.db.data_dir)
@@ -785,6 +785,10 @@ impl Engine {
             );
         }
 
+        // The model is frozen onto the run: a roster edit later must not rewrite
+        // what a past run cost.
+        let run_agent = self.agent(agent_id).await?;
+
         let (base_bookmark, attempt) = match role {
             AgentRole::TestAuthor => {
                 bail!(
@@ -831,14 +835,15 @@ impl Engine {
         let prompt_revision = format!("{}+{}", env!("CARGO_PKG_VERSION"), prompt_hash());
 
         sqlx::query(
-            "insert into runs (id, issue_id, repo_id, agent_id, role, attempt, base_bookmark, base_revision,
+            "insert into runs (id, issue_id, repo_id, agent_id, model, role, attempt, base_bookmark, base_revision,
                 prompt_revision, artifact_dir, status, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
         )
         .bind(run_id)
         .bind(issue_id)
         .bind(issue.repo_id)
         .bind(agent_id)
+        .bind(&run_agent.model)
         .bind(role.as_str())
         .bind(attempt)
         .bind(&base_bookmark)

@@ -66,7 +66,7 @@
   --side-bg: #f6f6f7;
   --side-bg-2: #ececee;
   --side-line: #e2e2e6;
-  --side-text: #3d3d46;
+  --side-text: #4b4b55;
   --side-muted: #6b6b76;
   --side-active: #ffffff;
   --side-active-text: #17171a;
@@ -100,13 +100,13 @@
   --text-2: #b4b4be;
   --muted: #9a9aa6;
 
-  --side-bg: #171a2a;
-  --side-bg-2: #1d2133;
-  --side-line: #262c42;
-  --side-text: #cfd6ef;
-  --side-muted: #8790ad;
-  --side-active: #232a44;
-  --side-active-text: #eef1ff;
+  --side-bg: #1a1a1d;
+  --side-bg-2: #242428;
+  --side-line: #2b2b31;
+  --side-text: #b4b4be;
+  --side-muted: #9a9aa6;
+  --side-active: #242428;
+  --side-active-text: #f3f3f5;
 
   --accent: #1469f0;
   --accent-soft: #15294d;
@@ -136,12 +136,18 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* The window is translucent for the rail's vibrancy, so the page paints its own
+     surface instead of letting the system window colour show through. */
+  background: transparent;
 }
 
 body {
   font: var(--fs-md) / 1.5 var(--font-ui);
   color: var(--text);
-  background: var(--bg);
+  /* Transparent, not --bg: an opaque body would sit between the rail and the
+     window's vibrancy and the blur would have nothing to work on. The stage
+     paints the surface instead. */
+  background: transparent;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
@@ -171,8 +177,9 @@ p {
 
 h1 {
   font-size: var(--fs-title);
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: -0.01em;
+  gap: 6px;
 }
 
 h2 {
@@ -200,7 +207,11 @@ h3 {
 }
 
 .rail {
-  background: var(--side-bg);
+  /* 84% of the sidebar colour over the window's vibrancy: the prototype's exact
+     recipe, and the reason the window itself has to be transparent. */
+  background: color-mix(in srgb, var(--side-bg) 84%, transparent);
+  -webkit-backdrop-filter: saturate(180%) blur(28px);
+  backdrop-filter: saturate(180%) blur(28px);
   border-right: 1px solid var(--side-line);
   color: var(--side-text);
   display: grid;
@@ -224,7 +235,10 @@ h3 {
   app-region: drag;
   user-select: none;
 }
+/* The traffic lights are centred 20px from the top edge, so a 40px chrome row
+ * puts the wordmark on the same line as the buttons instead of 6px below them. */
 [data-os="mac"] .brand {
+  height: 40px;
   padding-left: 84px;
 }
 .brand .name {
@@ -266,17 +280,29 @@ h3 {
   width: 100%;
 }
 
+/* Hover and selection are the same fill in the prototype; selection adds weight.
+ * A white pill with a drop shadow reads as a button, which is what it looked
+ * like before and not what the design asks for. */
 .rail nav a:hover,
 .rail nav button:hover {
   background: var(--side-bg-2);
+  color: var(--side-active-text);
 }
 
 .rail nav a.on,
 .rail nav button.on {
-  background: var(--side-active);
+  background: var(--side-bg-2);
   color: var(--side-active-text);
-  font-weight: 500;
-  box-shadow: 0 1px 2px rgba(16, 16, 24, 0.08);
+  font-weight: 600;
+  box-shadow: none;
+}
+
+.rail nav .label {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .rail nav .tally {
@@ -380,6 +406,8 @@ h3 {
 
 .stage {
   padding: 0;
+  /* Only the rail is translucent; the page inside the window stays a solid surface. */
+  background: var(--bg);
 }
 
 /* ---------- Buttons ---------- */
@@ -1039,7 +1067,7 @@ label > select {
 
 .workflow-editor textarea {
   width: 100%;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: var(--fs-2);
   line-height: 1.55;
   padding: var(--s3);
@@ -1125,7 +1153,7 @@ label > select {
 
 .skill-body {
   margin: var(--s2) 0 0;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: var(--fs-1);
   white-space: pre-wrap;
   color: var(--ink-2);
@@ -1300,4 +1328,752 @@ label > select {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* --- a page that is not a dialog ------------------------------------------ */
+
+/* `.sheet` is a modal (fixed, tinted, full-bleed). Pages that merely look like a
+   document use this instead, or the overlay swallows every click. */
+.page {
+  overflow: auto;
+  align-content: start;
+}
+
+/* --- tasks toolbar -------------------------------------------------------- */
+
+.tasks-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4) 0;
+}
+
+.tasks-bar select {
+  height: var(--h-compact);
+  font-size: var(--fs-sm);
+  min-width: 160px;
+}
+
+.fill {
+  flex: 1;
+}
+
+/* --- workspace switcher and its menu -------------------------------------- */
+
+.ws-foot {
+  position: relative;
+  margin-top: auto;
+  padding: var(--s3);
+  border-top: 1px solid var(--side-line);
+}
+
+.ws-btn {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  width: 100%;
+  height: var(--h-row);
+  padding: 0 0 0 var(--s1);
+  border-radius: var(--r-md);
+  color: var(--side-text);
+  font-size: var(--fs-sm);
+  font-weight: 550;
+}
+
+.ws-btn:hover {
+  background: var(--side-hover);
+}
+
+/* Inverted, not brand-coloured: the prototype's avatar is the text colour with
+ * the page colour behind it, which survives both appearances. */
+.ws-av {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--r-xs);
+  background: var(--text);
+  color: var(--bg);
+  font-size: var(--fs-xs);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.ws-name {
+  flex: 1;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ws-menu {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: calc(100% + 6px);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  padding: 4px;
+  z-index: 30;
+  display: grid;
+  gap: 1px;
+  animation: pop var(--t-med) cubic-bezier(0.2, 0.8, 0.3, 1);
+}
+
+.ws-head {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  padding: var(--s1) var(--s2);
+}
+
+.ws-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  width: 100%;
+  height: var(--h-compact);
+  padding: 0 var(--s2);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  color: var(--text);
+  text-align: left;
+}
+
+.ws-item:hover {
+  background: var(--bg-2);
+}
+
+.ws-sep {
+  height: 1px;
+  background: var(--line);
+  margin: var(--s1) 0;
+}
+
+.ws-conn {
+  padding: var(--s1) var(--s2) var(--s2);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.ws-item kbd {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+/* --- collapsed rail ------------------------------------------------------- */
+
+.rail.collapsed {
+  width: 56px;
+  align-items: center;
+}
+
+.rail.collapsed .brand {
+  justify-content: center;
+  padding-left: 0;
+}
+
+.rail.collapsed nav button {
+  justify-content: center;
+  padding: 0;
+}
+
+.rail-toggle {
+  margin-left: auto;
+}
+
+.rail.collapsed .brand {
+  height: 40px;
+  padding: 0;
+  justify-content: center;
+}
+
+/* --- inbox ---------------------------------------------------------------- */
+
+.inbox-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--s1);
+}
+
+.inbox-row {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  width: 100%;
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  text-align: left;
+  font-size: var(--fs-sm);
+}
+
+.inbox-row:hover {
+  border-color: var(--line-strong);
+}
+
+.inbox-row .title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.inbox-row .key,
+.activity-row .key {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  min-width: 58px;
+}
+
+.empty-inbox {
+  display: grid;
+  place-items: center;
+  gap: var(--s1);
+  padding: var(--s6);
+  color: var(--muted);
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+}
+
+/* --- projects ------------------------------------------------------------- */
+
+.project-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: var(--s3);
+}
+
+.project-card {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  padding: var(--s3);
+  display: grid;
+  gap: var(--s2);
+}
+
+.project-card > header {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+}
+
+.project-card .prefix {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  padding: 1px 5px;
+}
+
+.project-card dl {
+  display: flex;
+  gap: var(--s4);
+  margin: 0;
+}
+
+.project-card dt {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.project-card dd {
+  margin: 0;
+  font-size: var(--fs-lg);
+}
+
+.repo-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 4px;
+  font-size: var(--fs-sm);
+}
+
+.repo-list li {
+  display: flex;
+  align-items: center;
+  gap: var(--s1);
+}
+
+.project-card > footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  font-size: var(--fs-xs);
+}
+
+/* --- connectors ----------------------------------------------------------- */
+
+.connector-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: var(--s1);
+}
+
+.connector-list li {
+  display: grid;
+  grid-template-columns: 16px 1fr 120px 160px;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s2) var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  font-size: var(--fs-sm);
+}
+
+/* --- cost and activity ---------------------------------------------------- */
+
+.stat-row {
+  display: flex;
+  gap: var(--s3);
+}
+
+.stat {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  padding: var(--s2) var(--s3);
+  min-width: 120px;
+}
+
+.stat .label {
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.stat strong {
+  display: block;
+  font-size: var(--fs-lg);
+  font-variant-numeric: tabular-nums;
+}
+
+.meter {
+  display: block;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.dot.running {
+  background: var(--accent);
+}
+
+.dot.failed {
+  background: var(--bad);
+}
+
+.dot.succeeded {
+  background: var(--ok);
+}
+
+.activity-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 1px;
+}
+
+.activity-row {
+  display: grid;
+  grid-template-columns: 8px 58px 120px 110px 110px 80px 100px;
+  align-items: center;
+  gap: var(--s2);
+  width: 100%;
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-sm);
+  font-size: var(--fs-sm);
+  text-align: left;
+}
+
+.activity-row:hover {
+  background: var(--bg-2);
+}
+
+.activity-row .who {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.activity-row .role {
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.tally.hot {
+  background: var(--bad);
+  color: #fff;
+}
+
+@keyframes pop {
+  from {
+    transform: translateY(6px) scale(0.98);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+/* --- agents: roster on the left, one agent on the right ------------------- */
+
+.agents-screen {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  min-height: 0;
+  border-top: 1px solid var(--line);
+}
+
+.roster {
+  overflow-y: auto;
+  padding: var(--s2);
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  border-right: 1px solid var(--line);
+  background: var(--bg-2);
+}
+
+/* A roster card is a row, not a tile: name, status, harness, and what it is on. */
+.acard {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: var(--s2);
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  text-align: left;
+  transition: background var(--t-fast);
+}
+
+.acard:hover {
+  background: var(--bg-3);
+}
+
+.acard[aria-selected="true"] {
+  background: var(--bg);
+  border-color: var(--line-strong);
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--bg-3);
+  color: var(--text-2);
+  border: 1px solid var(--line);
+}
+
+.ahead .avatar {
+  width: 28px;
+  height: 28px;
+}
+
+.pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.agent-pane {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ahead {
+  display: grid;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4);
+}
+
+.ahead h2 {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  margin: 0;
+}
+
+.pillrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.linkbtn {
+  font-size: var(--fs-sm);
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  padding: 0;
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 0 var(--s4);
+  border-bottom: 1px solid var(--line);
+}
+
+.tabs button {
+  height: 32px;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.tabs button[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-body {
+  overflow: auto;
+  padding: var(--s4);
+  min-height: 0;
+}
+
+.empty {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  padding: var(--s6);
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--muted);
+}
+
+.empty strong {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+/* --- the agent dialog ----------------------------------------------------- */
+
+.dialog-card {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  display: grid;
+  gap: var(--s2);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  padding: var(--s4);
+}
+
+.dialog-card header h2 {
+  font-size: var(--fs-lg);
+  margin: 0;
+}
+
+.skills-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* A skill is a pill whether or not it is on; on is filled, off is outlined. */
+.sk {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: var(--h-chip);
+  padding: 0 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.sk.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+/* --- small helpers -------------------------------------------------------- */
+
+.truncate {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tiny {
+  font-size: var(--fs-2xs);
+}
+
+.chip.info {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+}
+
+.chip.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: transparent;
+}
+
+.chip.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+}
+
+/* --- ⌘K palette ----------------------------------------------------------- */
+
+.nav-search {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin: var(--s1) var(--s2) 0;
+  height: var(--h-control);
+  padding: 0 var(--s2);
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: var(--fs-md);
+}
+
+.nav-search:hover {
+  background: var(--side-bg-2);
+  color: var(--text);
+}
+
+.nav-search .label {
+  flex: 1;
+  text-align: left;
+}
+
+.nav-search kbd {
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono);
+  color: var(--muted);
+}
+
+.palette {
+  width: min(560px, 92vw);
+  max-height: 60vh;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+
+.palette-field {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 0 var(--s3);
+  height: 44px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.palette-field input {
+  flex: 1;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  height: 100%;
+  outline: none;
+}
+
+.palette-field kbd {
+  font-size: var(--fs-2xs);
+  font-family: var(--font-mono);
+}
+
+.palette-list {
+  overflow-y: auto;
+  padding: 4px;
+  display: grid;
+  align-content: start;
+  gap: 1px;
+}
+
+.pitem {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  height: var(--h-control);
+  padding: 0 var(--s2);
+  border-radius: var(--r-sm);
+  text-align: left;
+  font-size: var(--fs-sm);
+  color: var(--text);
+}
+
+.pitem[aria-selected="true"] {
+  background: var(--bg-3);
 }

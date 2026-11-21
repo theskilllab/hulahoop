@@ -74,7 +74,7 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
   }
 
   return (
-    <section className="sheet">
+    <section className="screen page">
       <header className="sheet-head">
         <div>
           <h1>Milestones</h1>

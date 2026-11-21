@@ -100,6 +100,12 @@ impl Query {
         .await?)
     }
 
+    /// What a harness can run, read from the harness's own catalogue: pi reports the
+    /// providers this machine is signed in to, Claude Code reports its aliases.
+    async fn models(&self, harness: String) -> Vec<crate::models::ModelOption> {
+        crate::models::catalogue(&harness)
+    }
+
     async fn project_agents(
         &self,
         ctx: &Context<'_>,
@@ -266,6 +272,25 @@ impl Query {
             "select p.* from agent_preflight p join repos r on r.id = p.repo_id where r.project_id = ?",
         )
         .bind(project_id)
+        .fetch_all(&engine(ctx).db.pool)
+        .await?)
+    }
+
+    /// The newest runs across a workspace, so Activity and Cost control read one
+    /// query instead of walking every issue.
+    async fn recent_runs(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        limit: Option<i32>,
+    ) -> async_graphql::Result<Vec<Run>> {
+        let limit = limit.unwrap_or(60).clamp(1, 500);
+        Ok(sqlx::query_as::<_, Run>(
+            "select r.* from runs r join issues i on i.id = r.issue_id
+             where i.workspace_id = ? order by r.created_at desc limit ?",
+        )
+        .bind(workspace_id)
+        .bind(limit)
         .fetch_all(&engine(ctx).db.pool)
         .await?)
     }

@@ -38,6 +38,8 @@ export interface Criterion {
 
 export interface Run {
   id: string;
+  /** Who ran it. Every run records its agent, so a roster can read its own history. */
+  agentId: string;
   role: Role;
   status: string;
   attempt: number;
@@ -145,6 +147,16 @@ export interface Agent {
   model: string;
   agentsMd: string;
   skills: Skill[];
+}
+
+/** A model a harness offers, with the price a cost estimate needs. */
+export interface ModelOption {
+  id: string;
+  label: string;
+  provider: string;
+  costIn: number | null;
+  costOut: number | null;
+  contextWindow: number | null;
 }
 
 export interface ProjectAgent {
@@ -396,10 +408,10 @@ export const ISSUE_FIELDS = `
   title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
   blockedBy projectName prUrl prNumber
   criteria { id position text testName }
-  runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
+  runs { id agentId role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments { id author authorType body pinned createdAt }
-  currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
+  currentRun { id agentId role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
 export async function loadBoard(workspaceId: string): Promise<Issue[]> {
@@ -473,6 +485,34 @@ export async function setAgentInstructions(agentId: string, agentsMd: string): P
 }
 
 export const MILESTONE_FIELDS = `id projectId title body status targetDate createdAt`;
+
+/** A run seen from the workspace, for Activity and Cost control. */
+export interface RecentRun {
+  id: string;
+  issueId: string;
+  agentId: string;
+  role: Role;
+  status: string;
+  adapter: string;
+  /** The model the run was given, frozen at spawn. */
+  model: string;
+  attempt: number;
+  tokensIn: number;
+  tokensOut: number;
+  error: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+}
+
+export async function loadRecentRuns(workspaceId: string, limit = 120): Promise<RecentRun[]> {
+  const data = await gql<{ recentRuns: RecentRun[] }>(
+    `query ($w: UUID!, $n: Int) { recentRuns(workspaceId: $w, limit: $n) {
+      id issueId agentId role status adapter model attempt tokensIn tokensOut error startedAt finishedAt
+    } }`,
+    { w: workspaceId, n: limit },
+  );
+  return data.recentRuns;
+}
 
 export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
   const data = await gql<{ workflow: WorkflowDoc }>(
@@ -674,4 +714,13 @@ export async function loadWorkspaceMembers(workspaceId: string): Promise<Workspa
 
 export async function loadWorkspaceIssues(workspaceId: string): Promise<Issue[]> {
   return loadBoard(workspaceId);
+}
+
+/** The harness's own catalogue; the server reads it from the harness, not from us. */
+export async function loadModels(harness: string): Promise<ModelOption[]> {
+  const data = await gql<{ models: ModelOption[] }>(
+    `query ($h: String!) { models(harness: $h) { id label provider costIn costOut contextWindow } }`,
+    { h: harness },
+  );
+  return data.models;
 }
