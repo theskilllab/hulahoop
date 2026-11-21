@@ -66,7 +66,7 @@
   --side-bg: #f6f6f7;
   --side-bg-2: #ececee;
   --side-line: #e2e2e6;
-  --side-text: #3d3d46;
+  --side-text: #4b4b55;
   --side-muted: #6b6b76;
   --side-active: #ffffff;
   --side-active-text: #17171a;
@@ -100,13 +100,13 @@
   --text-2: #b4b4be;
   --muted: #9a9aa6;
 
-  --side-bg: #171a2a;
-  --side-bg-2: #1d2133;
-  --side-line: #262c42;
-  --side-text: #cfd6ef;
-  --side-muted: #8790ad;
-  --side-active: #232a44;
-  --side-active-text: #eef1ff;
+  --side-bg: #1a1a1d;
+  --side-bg-2: #242428;
+  --side-line: #2b2b31;
+  --side-text: #b4b4be;
+  --side-muted: #9a9aa6;
+  --side-active: #242428;
+  --side-active-text: #f3f3f5;
 
   --accent: #1469f0;
   --accent-soft: #15294d;
@@ -136,12 +136,18 @@ body,
 #root {
   height: 100%;
   margin: 0;
+  /* The window is translucent for the rail's vibrancy, so the page paints its own
+     surface instead of letting the system window colour show through. */
+  background: transparent;
 }
 
 body {
   font: var(--fs-md) / 1.5 var(--font-ui);
   color: var(--text);
-  background: var(--bg);
+  /* Transparent, not --bg: an opaque body would sit between the rail and the
+     window's vibrancy and the blur would have nothing to work on. The stage
+     paints the surface instead. */
+  background: transparent;
   overflow: hidden;
   -webkit-font-smoothing: antialiased;
 }
@@ -201,7 +207,11 @@ h3 {
 }
 
 .rail {
-  background: var(--side-bg);
+  /* 84% of the sidebar colour over the window's vibrancy: the prototype's exact
+     recipe, and the reason the window itself has to be transparent. */
+  background: color-mix(in srgb, var(--side-bg) 84%, transparent);
+  -webkit-backdrop-filter: saturate(180%) blur(28px);
+  backdrop-filter: saturate(180%) blur(28px);
   border-right: 1px solid var(--side-line);
   color: var(--side-text);
   display: grid;
@@ -396,6 +406,8 @@ h3 {
 
 .stage {
   padding: 0;
+  /* Only the rail is translucent; the page inside the window stays a solid surface. */
+  background: var(--bg);
 }
 
 /* ---------- Buttons ---------- */
@@ -1055,7 +1067,7 @@ label > select {
 
 .workflow-editor textarea {
   width: 100%;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: var(--fs-2);
   line-height: 1.55;
   padding: var(--s3);
@@ -1141,7 +1153,7 @@ label > select {
 
 .skill-body {
   margin: var(--s2) 0 0;
-  font-family: var(--mono);
+  font-family: var(--font-mono);
   font-size: var(--fs-1);
   white-space: pre-wrap;
   color: var(--ink-2);
