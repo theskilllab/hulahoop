@@ -38,9 +38,11 @@ pub struct StatusSection {
     /// The heading as written, so the board can show the team's own wording.
     pub title: String,
     pub owner: Owner,
-    /// An agent name, or `any` to mean the project's binding for that status.
-    pub agent: Option<String>,
-    pub next: Option<IssueStatus>,
+    /// The agents named for this status. Empty means the project's binding decides.
+    pub agents: Vec<String>,
+    /// Where this status leads. A document may name several places, which is
+    /// what makes the board a graph instead of a queue.
+    pub next: Vec<IssueStatus>,
     /// Why the move happens. `When:` is what the diagram writes on the arrow and
     /// what the transitions table shows, so the picture and the rule agree.
     pub when: Option<String>,
@@ -63,7 +65,17 @@ impl Workflow {
 
     /// The agent a status dispatches to, when the document gives one.
     pub fn agent_for(&self, status: IssueStatus) -> Option<&str> {
-        self.section(status).and_then(|s| s.agent.as_deref())
+        self.section(status)
+            .and_then(|s| s.agents.first())
+            .map(|name| name.as_str())
+    }
+
+    /// Every place a status leads, in the order the document lists them. The
+    /// board uses the first, the diagram draws all of them.
+    pub fn next_of(&self, status: IssueStatus) -> Vec<IssueStatus> {
+        self.section(status)
+            .map(|s| s.next.clone())
+            .unwrap_or_default()
     }
 
     /// The board order: the sections in the order the document lists them.
@@ -80,6 +92,36 @@ impl Workflow {
                 .iter()
                 .all(|status| self.section(*status).is_some())
     }
+}
+
+/// The names in a metadata line: comma or semicolon separated, `@` optional,
+/// and the words that mean "nobody" dropped.
+fn names_in(value: &str) -> Vec<String> {
+    value
+        .split([',', ';'])
+        .map(|token| token.trim().trim_start_matches('@').trim())
+        .filter(|token| {
+            !token.is_empty()
+                && !token.eq_ignore_ascii_case("none")
+                && !token.eq_ignore_ascii_case("none.")
+                && !token.eq_ignore_ascii_case("any")
+                && !token.eq_ignore_ascii_case("noone")
+                && !token.eq_ignore_ascii_case("no one")
+                && !token.eq_ignore_ascii_case("nobody")
+        })
+        .map(|token| token.to_string())
+        .collect()
+}
+
+/// `To do - when it is ready` keeps `To do`; the sentence belongs to `When:`.
+fn strip_reason(token: &str) -> &str {
+    let mut cut = token.len();
+    for marker in [" - ", " — ", " – ", " (", " when "] {
+        if let Some(at) = token.to_lowercase().find(marker) {
+            cut = cut.min(at);
+        }
+    }
+    token[..cut].trim()
 }
 
 /// Parse `WORKFLOWS.md`.
@@ -135,8 +177,8 @@ pub fn parse(source: &str) -> Workflow {
                         status,
                         title: heading.trim().to_string(),
                         owner: Owner::Human,
-                        agent: None,
-                        next: None,
+                        agents: Vec::new(),
+                        next: Vec::new(),
                         when: None,
                         body: String::new(),
                     });
@@ -172,20 +214,25 @@ pub fn parse(source: &str) -> Workflow {
                     .push(format!("`Owner: {value}` should be `human` or `agent`.")),
             }
         } else if let Some(value) = line.strip_prefix("Agent:") {
-            let value = value.trim();
-            if !value.is_empty() && !value.eq_ignore_ascii_case("none") {
-                section.agent = Some(value.to_string());
+            // People write `@TestAuthor`, `Test Author`, `@Implementer, @Reviewer`
+            // and `any`. Only real names survive: the rest is the project's call.
+            for token in names_in(value) {
+                section.agents.push(token);
             }
         } else if let Some(value) = line.strip_prefix("Next:") {
-            let value = value.trim();
-            if value.eq_ignore_ascii_case("none") || value.is_empty() {
-                section.next = None;
-            } else {
-                match status_by_title(value) {
-                    Some(next) => section.next = Some(next),
+            // A `Next:` line may name several places and may carry the reason
+            // inline (`Next: To do - when it is ready`). Only the names are read.
+            for token in names_in(value) {
+                let name = strip_reason(&token);
+                match status_by_title(name) {
+                    Some(next) => {
+                        if !section.next.contains(&next) {
+                            section.next.push(next);
+                        }
+                    }
                     None => workflow
                         .errors
-                        .push(format!("`Next: {value}` names no status.")),
+                        .push(format!("`Next: {name}` names no status.")),
                 }
             }
         } else if let Some(value) = line.strip_prefix("When:") {
@@ -214,13 +261,23 @@ pub fn parse(source: &str) -> Workflow {
             None => workflow
                 .errors
                 .push(format!("`{}` has no section.", status.title())),
-            Some(section) if section.owner == Owner::Agent => match section.agent.as_deref() {
-                None | Some("") | Some("any") => workflow.errors.push(format!(
+            Some(section) if section.owner == Owner::Agent && section.agents.is_empty() => {
+                workflow.errors.push(format!(
                     "`{}` is worked by an agent, but names none. Write `Agent: <agent name>`.",
                     section.title
-                )),
-                Some(_) => {}
-            },
+                ))
+            }
+            Some(section) if section.owner == Owner::Human && !section.agents.is_empty() => {
+                // A section that names agents is agent-owned; saying so twice is
+                // noise, so the names win and the line is corrected silently.
+                let index = workflow
+                    .sections
+                    .iter()
+                    .position(|s| s.status == section.status);
+                if let Some(index) = index {
+                    workflow.sections[index].owner = Owner::Agent;
+                }
+            }
             _ => {}
         }
     }
@@ -318,7 +375,7 @@ mod tests {
     fn next_lines_name_a_status() {
         let workflow = parse("## Backlog\nOwner: human\nNext: To do\n");
         let section = workflow.section(IssueStatus::Backlog).unwrap();
-        assert_eq!(section.next, Some(IssueStatus::Todo));
+        assert_eq!(section.next, vec![IssueStatus::Todo]);
     }
 
     #[test]
@@ -326,6 +383,85 @@ mod tests {
         let workflow = parse("## Reviewing\nOwner: human\n");
         assert!(workflow.errors.iter().any(|e| e.contains("Reviewing")));
         assert!(workflow.sections.is_empty());
+    }
+
+    #[test]
+    fn a_document_written_by_hand_is_read() {
+        let workflow = parse(
+            "## To do\n\nAgent: @TestAuthor, @Reviewer\nNext: In progress - when it is picked up, Blocked\n",
+        );
+        let section = workflow.section(IssueStatus::Todo).unwrap();
+        assert_eq!(section.agents, vec!["TestAuthor", "Reviewer"]);
+        assert_eq!(
+            section.next,
+            vec![IssueStatus::InProgress, IssueStatus::Blocked]
+        );
+        assert_eq!(section.owner, Owner::Agent);
+    }
+
+    #[test]
+    fn a_team_written_document_loads_without_complaint() {
+        // The shape a person actually writes: `Owner:` sometimes absent, agents
+        // with an `@`, two agents on one status, `Next: none` at the end.
+        let source = "\
+# Workflows
+
+## Backlog
+
+Owner: human
+Agent: none
+Next: To do
+
+Work you still want to do yourself.
+
+## To do
+
+Agent: @TestAuthor
+Next: In progress
+
+Ready for the team.
+
+## In progress
+
+Owner: human
+Agent: @Implementer, @Reviewer
+Next: In review
+
+An agent is working.
+
+## Blocked
+
+Owner: human
+Agent: none
+Next: To do
+
+A question was asked.
+
+## In review
+
+Owner: human
+Agent: any
+Next: Done
+
+A pull request is open.
+
+## Done
+
+Owner: human
+Agent: none
+Next: none
+
+Merged.
+";
+        let workflow = parse(source);
+        assert!(workflow.errors.is_empty(), "{:?}", workflow.errors);
+        assert!(workflow.is_complete());
+        assert_eq!(workflow.agent_for(IssueStatus::Todo), Some("TestAuthor"));
+        assert_eq!(
+            workflow.section(IssueStatus::InProgress).unwrap().owner,
+            Owner::Agent
+        );
+        assert!(workflow.next_of(IssueStatus::Done).is_empty());
     }
 
     #[test]

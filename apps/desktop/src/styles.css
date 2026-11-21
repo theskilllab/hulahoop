@@ -2801,3 +2801,138 @@ table.transitions td {
   flex: 1 1 auto;
   overflow: hidden;
 }
+
+/* --- one panel for the workflow document ---------------------------------- */
+/* The prototype draws a single framed panel: a header row across the whole
+ * width, then the editor and the diagram inside it, split by a rule. */
+
+.wf {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  overflow: hidden;
+  gap: 0;
+}
+
+.wf.both {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+}
+
+.wf-head {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  height: var(--h-control-6);
+  padding: 0 var(--s3);
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-2);
+}
+
+.wf-head-right {
+  margin-left: auto;
+}
+
+.wf-src {
+  border-right: 1px solid var(--line);
+}
+
+.wf.diagram .wf-src,
+.wf.markdown .wf-src {
+  border-right: 0;
+}
+
+.wf-src textarea {
+  border: 0;
+  border-radius: 0;
+  background: var(--bg);
+  padding: var(--s4);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  resize: none;
+}
+
+.wf-src textarea:focus {
+  box-shadow: none;
+}
+
+.wf-diagram {
+  padding: var(--s4);
+}
+
+/* --- no scrollbars, anywhere ---------------------------------------------- */
+
+* {
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+}
+
+/* --- the agent picker ------------------------------------------------------ */
+
+.mention-pop button {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+}
+
+.mention-pop button.on {
+  background: var(--bg-3);
+}
+
+/* --- folded rail: one canonical rule set ----------------------------------- */
+/* Earlier blocks disagreed about the folded rail; these are the ones that win. */
+
+.rail.collapsed {
+  width: 48px;
+  display: grid;
+  grid-template-rows: var(--toolbar-h) minmax(0, 1fr) auto;
+  align-items: start;
+  justify-items: center;
+  padding: 0;
+}
+
+.rail.collapsed .brand {
+  display: flex;
+  width: 100%;
+  height: var(--toolbar-h);
+  padding: 0;
+  justify-content: center;
+}
+
+.rail.collapsed nav {
+  width: 100%;
+  padding: 0 0 var(--s3);
+  justify-items: center;
+  align-content: start;
+}
+
+.rail.collapsed nav button {
+  width: 34px;
+  height: 30px;
+  justify-content: center;
+  padding: 0;
+}
+
+.rail .brand {
+  height: 52px;
+}
+
+/* The workspace menu is a popover beside the rail, never a squeezed column. */
+
+.ws-menu {
+  left: var(--s2);
+  right: auto;
+  width: 236px;
+  z-index: 90;
+  box-shadow: var(--shadow-lg);
+}
+
+.rail.collapsed .ws-menu {
+  left: calc(100% + var(--s2));
+  bottom: 0;
+}
