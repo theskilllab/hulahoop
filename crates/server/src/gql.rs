@@ -753,6 +753,29 @@ impl Mutation {
             .await?)
     }
 
+    /// Remove an agent. Its runs keep their history; a workflow that names it
+    /// refuses to dispatch until another agent is chosen.
+    async fn delete_agent(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        let engine = engine(ctx);
+        sqlx::query("delete from agent_preflight where agent_id = ?")
+            .bind(id)
+            .execute(&engine.db.pool)
+            .await?;
+        sqlx::query("delete from agent_skills where agent_id = ?")
+            .bind(id)
+            .execute(&engine.db.pool)
+            .await?;
+        sqlx::query("delete from project_agents where agent_id = ?")
+            .bind(id)
+            .execute(&engine.db.pool)
+            .await?;
+        let done = sqlx::query("delete from agents where id = ?")
+            .bind(id)
+            .execute(&engine.db.pool)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
     async fn update_agent(
         &self,
         ctx: &Context<'_>,

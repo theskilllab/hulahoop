@@ -2,6 +2,12 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import "./styles.css";
+
+// The window's title bar is an overlay on macOS: the traffic lights float over
+// our first row, so that row has to make room for them.
+if (/Mac/i.test(navigator.platform) || /Mac OS X/i.test(navigator.userAgent)) {
+  document.documentElement.dataset.os = "mac";
+}
 import { applyTheme, watchSystemTheme } from "./theme";
 
 applyTheme();

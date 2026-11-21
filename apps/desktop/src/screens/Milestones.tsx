@@ -23,6 +23,7 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [linking, setLinking] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   async function create() {
     if (title.trim().length < 3) {
@@ -75,10 +76,18 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
   return (
     <section className="sheet">
       <header className="sheet-head">
-        <h1>Milestones</h1>
-        <p className="hint">A name for a body of work. Issues point at one; nothing about the loop depends on it.</p>
+        <div>
+          <h1>Milestones</h1>
+          <p className="hint">
+            A name for a body of work. Issues point at one; nothing about the loop depends on it.
+          </p>
+        </div>
+        <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+          {creating ? "Cancel" : "New milestone"}
+        </button>
       </header>
 
+      {creating ? (
       <div className="panel">
         <h2>New milestone</h2>
         <div className="grid-2">
@@ -107,10 +116,20 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
           </label>
         </div>
         {error && <p className="error">{error}</p>}
-        <button className="primary" onClick={() => void create()} disabled={busy}>
-          {busy ? "creating…" : "create milestone"}
-        </button>
+        <div className="row">
+          <button
+            className="primary"
+            onClick={() => void create().then(() => setCreating(false))}
+            disabled={busy}
+          >
+            {busy ? "creating…" : "create milestone"}
+          </button>
+          <button className="ghost" onClick={() => setCreating(false)}>
+            Cancel
+          </button>
+        </div>
       </div>
+      ) : null}
 
       {milestones.length === 0 && <p className="hint">No milestones yet.</p>}
 

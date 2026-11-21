@@ -6,8 +6,6 @@ import {
   loadGithubRepos,
   loadWorkspaceMembers,
   renameProject,
-  setAgentInstructions,
-  setAgentSkills,
   updateWorkspace,
   type Agent,
   type GithubRepo,
@@ -19,19 +17,10 @@ import {
 } from "../api";
 
 const ROLES = ["test_author", "implementer", "reviewer"] as const;
-const ADAPTERS = ["pi", "claude_code", "fake"] as const;
 
 interface Binding {
   role: string;
   agentId: string;
-}
-
-interface Preflight {
-  agentId: string;
-  repoId: string;
-  ok: boolean;
-  detail: string;
-  checkedAt: string;
 }
 
 export default function Settings({
@@ -40,7 +29,6 @@ export default function Settings({
   projects,
   active,
   agents,
-  skills = [],
   onChanged,
   onSwitchWorkspace,
 }: {
@@ -54,7 +42,6 @@ export default function Settings({
   onSwitchWorkspace: (id: string) => Promise<void>;
 }) {
   const [bindings, setBindings] = useState<Record<string, string>>({});
-  const [preflight, setPreflight] = useState<Preflight[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string>(active?.id ?? "");
@@ -151,47 +138,18 @@ export default function Settings({
     setBindings(next);
   }
 
-  async function loadPreflight() {
-    if (!project) return;
-    const data = await gql<{ preflight: Preflight[] }>(
-      `query ($id: UUID!) { preflight(projectId: $id) { agentId repoId ok detail checkedAt } }`,
-      { id: project.id },
-    );
-    setPreflight(data.preflight);
-  }
-
   useEffect(() => {
     void loadBindings();
-    void loadPreflight();
-    const timer = setInterval(() => void loadPreflight(), 4000);
-    return () => clearInterval(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project?.id]);
 
   /** A new harness or model invalidates its probe, so ask for a fresh one. */
-  async function saveAgent(id: string, adapter: string, model: string) {
-    await action("agent", async () => {
-      await gql(`mutation ($id: UUID!, $adapter: String!, $model: String!) { updateAgent(id: $id, adapter: $adapter, model: $model) { id } }`, {
-        id,
-        adapter,
-        model,
-      });
-      if (repo) {
-        await gql(`mutation ($agentId: UUID!, $repoId: UUID!) { runPreflight(agentId: $agentId, repoId: $repoId) }`, {
-          agentId: id,
-          repoId: repo.id,
-        });
-      }
-    });
-  }
-
   async function action(label: string, work: () => Promise<unknown>) {
     setBusy(label);
     setError(null);
     try {
       await work();
       await onChanged();
-      await loadPreflight();
       await loadBindings();
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
@@ -487,112 +445,10 @@ export default function Settings({
       ))}
 
       <h2 className="section">Agents</h2>
-      <ul className="agents">
-        {agents.map((agent) => {
-          const probe = preflight.find((entry) => entry.agentId === agent.id && entry.repoId === repo?.id);
-          return (
-            <li key={agent.id}>
-              <div>
-                <strong>{agent.name}</strong>
-                <div className="agent-edit">
-                  <select
-                    value={agent.adapter}
-                    disabled={busy !== null}
-                    onChange={(e) => void saveAgent(agent.id, e.target.value, agent.model)}
-                  >
-                    {ADAPTERS.map((adapter) => (
-                      <option key={adapter} value={adapter}>
-                        {adapter}
-                      </option>
-                    ))}
-                  </select>
-                  <input
-                    defaultValue={agent.model}
-                    key={`${agent.id}-${agent.model}`}
-                    placeholder="model"
-                    onBlur={(e) => {
-                      const model = e.target.value.trim();
-                      if (model !== agent.model) void saveAgent(agent.id, agent.adapter, model);
-                    }}
-                  />
-                </div>
-              </div>
-              <details className="agent-brain">
-                <summary>
-                  how it works
-                  <span className="dim">
-                    {" "}
-                    · {agent.skills?.length ?? 0} skills · {agent.agentsMd ? "instructions written" : "no instructions"}
-                  </span>
-                </summary>
-                <label className="stack">
-                  <span className="label">AGENTS.md — how this agent works</span>
-                  <textarea
-                    rows={6}
-                    defaultValue={agent.agentsMd}
-                    placeholder="Read CLAUDE conventions first. Prefer small diffs. Ask before touching CI."
-                    onBlur={(event) => {
-                      const next = event.target.value;
-                      if (next !== agent.agentsMd) {
-                        void action("instructions", () =>
-                          setAgentInstructions(agent.id, next),
-                        );
-                      }
-                    }}
-                  />
-                </label>
-                <div className="stack">
-                  <span className="label">skills it carries</span>
-                  {skills.length === 0 ? (
-                    <span className="dim">no skills in this workspace yet</span>
-                  ) : (
-                    skills.map((skill) => (
-                      <label key={skill.id} className="check">
-                        <input
-                          type="checkbox"
-                          checked={(agent.skills ?? []).some((carried) => carried.id === skill.id)}
-                          onChange={(event) => {
-                            const carried = (agent.skills ?? []).map((entry) => entry.id);
-                            const next = event.target.checked
-                              ? [...carried, skill.id]
-                              : carried.filter((id) => id !== skill.id);
-                            void action("skills", () => setAgentSkills(agent.id, next));
-                          }}
-                        />
-                        <span>{skill.name}</span>
-                        <span className="dim">{skill.description}</span>
-                      </label>
-                    ))
-                  )}
-                </div>
-              </details>
-              <div className="probe">
-                {probe ? (
-                  <span className={probe.ok ? "ok" : "bad"} title={probe.detail}>
-                    {probe.ok ? "preflight green" : "preflight failed"}
-                  </span>
-                ) : (
-                  <span className="dim">no probe yet</span>
-                )}
-                <button
-                  disabled={busy !== null || !repo}
-                  onClick={() =>
-                    repo &&
-                    action("probe", () =>
-                      gql(`mutation ($agentId: UUID!, $repoId: UUID!) { runPreflight(agentId: $agentId, repoId: $repoId) }`, {
-                        agentId: agent.id,
-                        repoId: repo.id,
-                      }),
-                    )
-                  }
-                >
-                  Run probe
-                </button>
-              </div>
-            </li>
-          );
-        })}
-      </ul>
+      <p className="dim small">
+        Agents are created and edited on the <strong>Agents</strong> screen: harness, model, its own
+        AGENTS.md and the skills it carries. This screen only decides which of them a status calls.
+      </p>
 
       <h2 className="section">Roles</h2>
       {!project && <p className="dim">Create a project before binding roles.</p>}

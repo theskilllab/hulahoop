@@ -18,7 +18,10 @@
         "minWidth": 960,
         "minHeight": 620,
         "resizable": true,
-        "titleBarStyle": "Transparent"
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "decorations": true,
+        "transparent": false
       }
     ],
     "security": {
@@ -27,7 +30,10 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["app", "dmg"],
+    "targets": [
+      "app",
+      "dmg"
+    ],
     "category": "DeveloperTool",
     "shortDescription": "The acceptance loop that keeps coding agents honest",
     "longDescription": "Hulahoop runs agents through a loop with a frozen failing suite: criteria, tests, implementation, review, and a human approval bound to the diff they read.",
@@ -38,7 +44,9 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "externalBin": ["binaries/hulahoop"],
+    "externalBin": [
+      "binaries/hulahoop"
+    ],
     "resources": [],
     "macOS": {
       "minimumSystemVersion": "14.0",

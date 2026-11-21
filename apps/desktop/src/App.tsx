@@ -23,6 +23,8 @@ import {
 import { WORKSPACE_KEY } from "./api";
 import { applyTheme, savedTheme, type Theme } from "./theme";
 import Artifacts from "./screens/Artifacts";
+import Agents from "./screens/Agents";
+import Icon from "./Icon";
 import Board from "./screens/Board";
 import Connect from "./screens/Connect";
 import IssueDetail from "./screens/IssueDetail";
@@ -38,6 +40,7 @@ type View =
   | { name: "new" }
   | { name: "workflow" }
   | { name: "skills" }
+  | { name: "agents" }
   | { name: "milestones" }
   | { name: "artifacts" }
   | { name: "settings" }
@@ -214,7 +217,8 @@ export default function App() {
       <aside className="rail">
         <div className="brand">
           <Logo />
-          hulahoop
+          <span className="name">hulahoop</span>
+          <span className="tag">{workspace.defaultPrefix}</span>
         </div>
         <label className="project-pick">
           <span>workspace</span>
@@ -239,25 +243,36 @@ export default function App() {
         </label>
         <nav>
           <button className={view.name === "board" ? "on" : ""} onClick={() => setView({ name: "board" })}>
-            Board <span className="tally">{shown.filter((i) => i.status !== "done" && i.status !== "cancelled").length}</span>
+            <Icon name="board" />
+            <span>Board</span> <span className="tally">{shown.filter((i) => i.status !== "done" && i.status !== "cancelled").length}</span>
           </button>
           <button className={view.name === "new" ? "on" : ""} onClick={() => setView({ name: "new" })}>
-            New issue
+            <Icon name="plus" />
+            <span>New issue</span>
           </button>
           <button className={view.name === "workflow" ? "on" : ""} onClick={() => setView({ name: "workflow" })}>
-            Workflow <span className="tally">{workflow?.sections.length ?? 0}</span>
+            <Icon name="workflow" />
+            <span>Workflow</span> <span className="tally">{workflow?.sections.length ?? 0}</span>
           </button>
           <button className={view.name === "skills" ? "on" : ""} onClick={() => setView({ name: "skills" })}>
-            Skills <span className="tally">{skills.length}</span>
+            <Icon name="skills" />
+            <span>Skills</span> <span className="tally">{skills.length}</span>
           </button>
           <button className={view.name === "milestones" ? "on" : ""} onClick={() => setView({ name: "milestones" })}>
-            Milestones <span className="tally">{milestones.filter((m) => m.status === "open").length}</span>
+            <Icon name="milestones" />
+            <span>Milestones</span> <span className="tally">{milestones.filter((m) => m.status === "open").length}</span>
           </button>
           <button className={view.name === "artifacts" ? "on" : ""} onClick={() => setView({ name: "artifacts" })}>
-            Artifacts <span className="tally">{artifacts.length}</span>
+            <Icon name="artifacts" />
+            <span>Artifacts</span> <span className="tally">{artifacts.length}</span>
+          </button>
+          <button className={view.name === "agents" ? "on" : ""} onClick={() => setView({ name: "agents" })}>
+            <Icon name="agents" />
+            <span>Agents</span> <span className="tally">{agents.length}</span>
           </button>
           <button className={view.name === "settings" ? "on" : ""} onClick={() => setView({ name: "settings" })}>
-            Settings
+            <Icon name="settings" />
+            <span>Settings</span>
           </button>
         </nav>
         <dl className="stats">
@@ -316,8 +331,18 @@ export default function App() {
           </div>
         )}
         {view.name === "skills" && workspace && <Skills workspaceId={workspace.id} />}
+        {view.name === "agents" && workspace && (
+          <Agents
+            workspaceId={workspace.id}
+            agents={agents}
+            skills={skills}
+            repoId={projects.flatMap((project) => project.repos)[0]?.id ?? null}
+            projectId={project?.id ?? null}
+            onChanged={reload}
+          />
+        )}
         {view.name === "workflow" && workspace && (
-          <WorkflowScreen workspaceId={workspace.id} />
+          <WorkflowScreen workspaceId={workspace.id} agents={agents} />
         )}
         {view.name === "board" && (
           <Board
