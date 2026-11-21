@@ -27,6 +27,7 @@ export default function Artifacts({ workspaceId, projects, milestones, artifacts
   const [projectId, setProjectId] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
   async function upload() {
     if (!file) {
@@ -62,10 +63,19 @@ export default function Artifacts({ workspaceId, projects, milestones, artifacts
   return (
     <section className="sheet">
       <header className="sheet-head">
-        <h1>Artifacts</h1>
-        <p className="hint">Reference files: a spec, a screenshot, a tarball. Attach one to a milestone or leave it loose.</p>
+        <div>
+          <h1>Artifacts</h1>
+          <p className="hint">
+            Reference files: a spec, a screenshot, a tarball. Attach one to a milestone or leave it
+            loose.
+          </p>
+        </div>
+        <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+          {creating ? "Cancel" : "Add a file"}
+        </button>
       </header>
 
+      {creating ? (
       <div className="panel">
         <h2>Add a file</h2>
         <div className="grid-2">
@@ -109,10 +119,20 @@ export default function Artifacts({ workspaceId, projects, milestones, artifacts
           </label>
         </div>
         {error && <p className="error">{error}</p>}
-        <button className="primary" onClick={() => void upload()} disabled={busy || !file}>
-          {busy ? "uploading…" : "upload"}
-        </button>
+        <div className="row">
+          <button
+            className="primary"
+            onClick={() => void upload().then(() => setCreating(false))}
+            disabled={busy || !file}
+          >
+            {busy ? "uploading…" : "upload"}
+          </button>
+          <button className="ghost" onClick={() => setCreating(false)}>
+            Cancel
+          </button>
+        </div>
       </div>
+      ) : null}
 
       {artifacts.length === 0 && <p className="hint">Nothing on the shelf yet.</p>}
 

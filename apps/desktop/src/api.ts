@@ -8,6 +8,16 @@ export type IssueStatus =
   | "done"
   | "cancelled";
 
+/** The six columns of the board, in the order the workflow document sets. */
+export const BOARD_STATUSES: IssueStatus[] = [
+  "backlog",
+  "todo",
+  "in_progress",
+  "blocked",
+  "in_review",
+  "done",
+];
+
 export type Role = "test_author" | "implementer" | "reviewer";
 
 export interface Connection {
