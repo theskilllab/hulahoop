@@ -15,6 +15,10 @@ type Tab = "both" | "markdown" | "diagram";
 /// Rewrite the status sections of a workflow document, keeping whatever preamble
 /// the person wrote above the first `## ` heading. The diagram and the document
 /// are the same thing, so editing one has to move the other.
+function agentsOf(section: WorkflowSection): string[] {
+  return section.agents?.length ? section.agents : section.agent ? [section.agent] : [];
+}
+
 function rewrite(source: string, sections: WorkflowSection[]): string {
   const firstHeading = source.search(/^##\s/m);
   const preamble = firstHeading === -1 ? source.trimEnd() : source.slice(0, firstHeading).trimEnd();
@@ -22,9 +26,8 @@ function rewrite(source: string, sections: WorkflowSection[]): string {
     .map((section) =>
       [
         `## ${section.title}`,
-        `Owner: ${section.owner}`,
-        `Agent: ${section.agent ?? "any"}`,
-        `Next: ${section.next ?? "none"}`,
+        `User: ${section.owner === "human" ? "human" : agentsOf(section).map((name) => `@${name}`).join(", ")}`,
+        `Next: ${section.nexts.length ? section.nexts.join(", ") : "none"}`,
         section.when ? `When: ${section.when}` : "",
         section.body.trim(),
       ]

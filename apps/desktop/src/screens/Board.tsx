@@ -64,6 +64,7 @@ export default function Board({
                 {column.title} <span>{items.length}</span>
                 {column.owner === "agent" ? <em className="owner">agent</em> : null}
               </h2>
+              <div className="col-b">
               {items.map((issue) => (
                 <button className="card" key={issue.id} onClick={() => onOpen(issue.id)}>
                   <span className="title">
@@ -85,6 +86,7 @@ export default function Board({
                 </button>
               ))}
               {items.length === 0 && <p className="dim small">empty</p>}
+              </div>
             </div>
           );
         })}

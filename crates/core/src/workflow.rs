@@ -113,6 +113,14 @@ fn names_in(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The words people use for themselves.
+fn is_person(token: &str) -> bool {
+    matches!(
+        token.trim().to_ascii_lowercase().as_str(),
+        "human" | "you" | "me" | "i" | "person" | "people" | "user" | "us"
+    )
+}
+
 /// `To do - when it is ready` keeps `To do`; the sentence belongs to `When:`.
 fn strip_reason(token: &str) -> &str {
     let mut cut = token.len();
@@ -213,6 +221,29 @@ pub fn parse(source: &str) -> Workflow {
                     .errors
                     .push(format!("`Owner: {value}` should be `human` or `agent`.")),
             }
+        } else if let Some(value) = line
+            .strip_prefix("User:")
+            .or_else(|| line.strip_prefix("Users:"))
+        {
+            // `User: human, @Implementer, @Reviewer` — who handles this status,
+            // on one line. A person and agents may both be named.
+            let mut people = false;
+            for token in names_in(value) {
+                if is_person(&token) {
+                    people = true;
+                } else {
+                    section.agents.push(token);
+                }
+            }
+            section.owner = if section.agents.is_empty() {
+                if people {
+                    Owner::Human
+                } else {
+                    section.owner
+                }
+            } else {
+                Owner::Agent
+            };
         } else if let Some(value) = line.strip_prefix("Agent:") {
             // People write `@TestAuthor`, `Test Author`, `@Implementer, @Reviewer`
             // and `any`. Only real names survive: the rest is the project's call.
@@ -397,6 +428,20 @@ mod tests {
             vec![IssueStatus::InProgress, IssueStatus::Blocked]
         );
         assert_eq!(section.owner, Owner::Agent);
+    }
+
+    #[test]
+    fn one_user_line_names_a_person_and_agents() {
+        let workflow =
+            parse("## In progress\nUser: human, @Implementer, @Reviewer\nNext: In review\n");
+        let section = workflow.section(IssueStatus::InProgress).unwrap();
+        assert_eq!(section.owner, Owner::Agent);
+        assert_eq!(section.agents, vec!["Implementer", "Reviewer"]);
+
+        let only_people = parse("## In review\nUser: human\nNext: Done\n");
+        let section = only_people.section(IssueStatus::InReview).unwrap();
+        assert_eq!(section.owner, Owner::Human);
+        assert!(section.agents.is_empty());
     }
 
     #[test]
