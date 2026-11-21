@@ -148,7 +148,7 @@ export default function Workflow({
   const [tab, setTab] = useState<Tab>("both");
   const [editing, setEditing] = useState<string | null>(null);
   const [note, setNote] = useState("");
-  const [mentions, setMentions] = useState<{ at: number; items: Agent[] } | null>(null);
+  const [mentions, setMentions] = useState<{ at: number; items: Agent[]; x: number; y: number } | null>(null);
   const area = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -167,6 +167,26 @@ export default function Workflow({
       ),
     [doc, known],
   );
+
+  const problems = useMemo(() => {
+    const list = [...(doc?.errors ?? [])];
+    for (const section of (doc?.sections ?? [])) {
+      if (section.owner !== "agent" || !section.agent) continue;
+      if (section.agent.toLowerCase() === "any") {
+        list.push(`\`${section.title}\` is worked by an agent, but names none. Write \`Agent: <agent name>\`.`);
+      }
+    }
+    return list;
+  }, [doc]);
+
+  const done = useMemo(() => {
+    const list = [...problems];
+    for (const section of unknown) {
+      list.push(`\`${section.title}\` names an agent nobody has: \`${section.agent}\`.`);
+    }
+    return list;
+  }, [problems, unknown]);
+
   const sections = doc?.sections ?? [];
   const edited = useMemo(() => sections.find((entry) => entry.status === editing) ?? null, [sections, editing]);
 
@@ -191,24 +211,77 @@ export default function Workflow({
     onSaved?.();
   }
 
-  /// An `@` name in the document is how a workflow points at a real agent.
+  /// An `@` name in the document is how a workflow points at a real agent. The
+  /// popover sits at the caret, so it reads as a continuation of what was typed.
+  function caretAt(field: HTMLTextAreaElement): { x: number; y: number } {
+    const style = getComputedStyle(field);
+    const mirror = document.createElement("div");
+    for (const name of [
+      "fontFamily",
+      "fontSize",
+      "fontWeight",
+      "letterSpacing",
+      "lineHeight",
+      "paddingTop",
+      "paddingRight",
+      "paddingBottom",
+      "paddingLeft",
+      "borderTopWidth",
+      "borderLeftWidth",
+      "boxSizing",
+    ] as const) {
+      mirror.style[name] = style[name];
+    }
+    Object.assign(mirror.style, {
+      position: "absolute",
+      visibility: "hidden",
+      top: "0",
+      left: "-9999px",
+      whiteSpace: "pre",
+    });
+    mirror.textContent = field.value.slice(0, field.selectionStart);
+    const mark = document.createElement("span");
+    mark.textContent = "\u200b";
+    mirror.appendChild(mark);
+    document.body.appendChild(mirror);
+    const box = field.getBoundingClientRect();
+    const x = box.left + mark.offsetLeft - field.scrollLeft;
+    const y = box.top + mark.offsetTop - field.scrollTop + (parseFloat(style.lineHeight) || 18);
+    mirror.remove();
+    return { x, y };
+  }
+
   function onType(value: string, caret: number) {
     setSource(value);
+    const field = area.current;
     const before = value.slice(0, caret);
     const match = /(^|[\s(])@([\w-]*)$/.exec(before);
     const found = match
       ? agents.filter((agent) => agent.name.toLowerCase().split(" ").some((word) => word.startsWith(match[2].toLowerCase())))
       : [];
-    setMentions(found.length ? { at: caret - match![2].length - 1, items: found } : null);
+    if (!found.length || !field) {
+      setMentions(null);
+      return;
+    }
+    const at = caret - match![2].length;
+    const point = caretAt(field);
+    setMentions({ at, items: found, x: point.x, y: point.y });
   }
 
+  /// The document is text: the picker edits the text and nothing else, so a
+  /// half-typed line is never rebuilt from a stale parse.
   function pick(agent: Agent) {
     if (!mentions) return;
     const caret = area.current?.selectionStart ?? source.length;
     const next = `${source.slice(0, mentions.at)}@${agent.name.replace(/\s+/g, "")}${source.slice(caret)}`;
-    setSource(rewrite(next, sections));
+    setSource(next);
     setMentions(null);
-    area.current?.focus();
+    const field = area.current;
+    if (field) {
+      field.focus();
+      const position = next.length - (source.length - caret);
+      field.setSelectionRange(position, position);
+    }
   }
 
   const tabs = (
@@ -222,7 +295,7 @@ export default function Workflow({
   );
 
   return (
-    <div className="screen">
+    <div className="screen fill">
       <PageHeader
         title="Workflow"
         subtitle="Workflow for this workspace"
@@ -237,18 +310,9 @@ export default function Workflow({
       />
 
       {note ? <p className="dim small">{note}</p> : null}
-      {unknown.length ? (
+      {doc && (doc.errors.length > 0 || unknown.length > 0) ? (
         <ul className="problems">
-          {unknown.map((section) => (
-            <li key={section.status}>
-              `{section.title}` names an agent nobody has: `{section.agent}`.
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      {doc && doc.errors.length ? (
-        <ul className="problems">
-          {doc.errors.map((problem) => (
+          {done.map((problem) => (
             <li key={problem}>{problem}</li>
           ))}
         </ul>
@@ -286,7 +350,15 @@ export default function Workflow({
               }}
             />
             {mentions ? (
-              <div className="mention-pop">
+              <div
+                className="mention-pop"
+                style={{
+                  left: Math.min(mentions.x, window.innerWidth - 220),
+                  top: Math.min(mentions.y, window.innerHeight - 120),
+                  position: "fixed",
+                  bottom: "auto",
+                }}
+              >
                 {mentions.items.map((agent) => (
                   <button key={agent.id} onMouseDown={(event) => event.preventDefault()} onClick={() => pick(agent)}>
                     {agent.name}
