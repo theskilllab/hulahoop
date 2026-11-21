@@ -10,12 +10,11 @@ use hulahoop_core::Adapter;
 
 pub const GITHUB: &str = "github";
 pub const CLAUDE_CODE: &str = "claude_code";
-pub const CODEX: &str = "codex";
 pub const PI: &str = "pi";
 
 /// Every provider the screen offers, stored or not: "available" and "connected"
 /// are two different answers, and only a complete list can show the first.
-pub const ALL: [&str; 4] = [GITHUB, CLAUDE_CODE, CODEX, PI];
+pub const ALL: [&str; 3] = [GITHUB, CLAUDE_CODE, PI];
 
 /// What the secret is. The kind decides which field the payload carries.
 pub const KIND_GITHUB_APP: &str = "github_app";
@@ -37,7 +36,6 @@ pub fn for_adapter(adapter: Adapter) -> Option<&'static str> {
 pub fn api_key_env(provider: &str) -> Option<&'static str> {
     match provider {
         CLAUDE_CODE => Some("ANTHROPIC_API_KEY"),
-        CODEX => Some("OPENAI_API_KEY"),
         PI => Some("PI_API_KEY"),
         _ => None,
     }
@@ -48,7 +46,6 @@ pub fn api_key_env(provider: &str) -> Option<&'static str> {
 pub fn credentials_file(provider: &str) -> Option<&'static str> {
     match provider {
         CLAUDE_CODE => Some(".claude/.credentials.json"),
-        CODEX => Some(".codex/auth.json"),
         PI => Some(".pi/agent/auth.json"),
         _ => None,
     }
@@ -81,7 +78,7 @@ mod tests {
 
     #[test]
     fn every_agent_connector_has_a_home_for_its_secret() {
-        for provider in [CLAUDE_CODE, CODEX, PI] {
+        for provider in [CLAUDE_CODE, PI] {
             assert!(
                 api_key_env(provider).is_some() || credentials_file(provider).is_some(),
                 "{provider} has nowhere to put a credential"

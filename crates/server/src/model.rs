@@ -212,6 +212,9 @@ pub struct Run {
     /// or produced it before the loop could name itself.
     pub commit_name: Option<String>,
     pub commit_email: Option<String>,
+    /// The model this run was given, frozen at spawn: the agent's model may
+    /// change later and a cost report must not rewrite history.
+    pub model: String,
     /// Where the loop opened a pull request for this run, when it did.
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,

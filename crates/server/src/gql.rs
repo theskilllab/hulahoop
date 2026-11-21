@@ -100,6 +100,12 @@ impl Query {
         .await?)
     }
 
+    /// What a harness can run, read from the harness's own catalogue: pi reports the
+    /// providers this machine is signed in to, Claude Code reports its aliases.
+    async fn models(&self, harness: String) -> Vec<crate::models::ModelOption> {
+        crate::models::catalogue(&harness)
+    }
+
     async fn project_agents(
         &self,
         ctx: &Context<'_>,

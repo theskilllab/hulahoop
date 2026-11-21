@@ -8,6 +8,7 @@ pub mod engine;
 pub mod github;
 pub mod gql;
 pub mod model;
+pub mod models;
 pub mod skills;
 pub mod tenancy;
 pub mod vault;

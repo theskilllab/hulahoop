@@ -508,7 +508,6 @@ const AGENT_CONNECTORS: { provider: string; title: string; file: string; keyHint
     file: ".claude/.credentials.json",
     keyHint: "sk-ant-…",
   },
-  { provider: "codex", title: "Codex subscription", file: ".codex/auth.json", keyHint: "sk-…" },
   { provider: "pi", title: "Pi subscription", file: ".pi/agent/auth.json", keyHint: "provider key" },
 ];
 

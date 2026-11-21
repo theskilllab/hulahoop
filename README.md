@@ -1393,8 +1393,9 @@ your subscription.
 | --- | --- | --- | --- |
 | `github` | `github_app` | app id + private key | `GITHUB_TOKEN`, the bot commit identity, the pull request |
 | `claude_code` | `subscription` or `api_key` | `.claude/.credentials.json` or `ANTHROPIC_API_KEY` | a copy of that file in the run's scratch home, or the variable |
-| `codex` | `subscription` or `api_key` | `.codex/auth.json` or `OPENAI_API_KEY` | the same |
 | `pi` | `subscription` or `api_key` | `.pi/agent/auth.json` or `PI_API_KEY` | the same |
+
+Codex is not a harness of its own: pi runs those providers with its own sign-in, so the `codex` connector was removed rather than maintained twice.
 
 Every payload is sealed with the vault key before it touches the database, field by
 field: reading the app id never requires opening the private key. Settings shows one row

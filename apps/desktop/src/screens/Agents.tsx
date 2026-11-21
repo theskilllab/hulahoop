@@ -2,19 +2,21 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   gql,
+  loadModels,
   setAgentInstructions,
   setAgentSkills,
   type Agent,
   type Issue,
+  type ModelOption,
   type Skill,
 } from "../api";
 import Icon from "../Icon";
 
 /** Harnesses we can run. `harness` is the provider key a connection is stored under. */
-const HARNESSES: { adapter: string; harness: string; name: string; models: string[] }[] = [
-  { adapter: "pi", harness: "pi", name: "Pi", models: ["opencode-go/deepseek-v4.1-flash", "opencode-go/qwen3-coder", "anthropic/claude-sonnet-4.5", "openai/gpt-5-codex"] },
-  { adapter: "claude_code", harness: "claude_code", name: "Claude Code", models: ["sonnet", "opus", "haiku"] },
-  { adapter: "fake", harness: "", name: "Fake (development)", models: ["fake"] },
+const HARNESSES: { adapter: string; harness: string; name: string }[] = [
+  { adapter: "pi", harness: "pi", name: "Pi" },
+  { adapter: "claude_code", harness: "claude_code", name: "Claude Code" },
+  { adapter: "fake", harness: "", name: "Fake (development)" },
 ];
 
 interface Connection {
@@ -103,12 +105,12 @@ export default function Agents({
   const connected = (harness: string) =>
     harness === "" || connections.some((entry) => entry.provider === harness && entry.connected);
 
-  /** The newest run whose harness matches — runs do not record their agent yet. */
+  /** The newest run this agent started. Every run records whose time it was. */
   const current = useMemo(() => {
     if (!agent) return null;
     const flat = issues.flatMap((issue) => issue.runs.map((run) => ({ issue, run })));
     const mine = flat
-      .filter((entry) => entry.run.adapter === agent.adapter)
+      .filter((entry) => entry.run.agentId === agent.id)
       .sort((a, b) => (a.run.startedAt ?? "").localeCompare(b.run.startedAt ?? ""));
     return mine.at(-1) ?? null;
   }, [agent, issues]);
@@ -116,9 +118,9 @@ export default function Agents({
   const running = current?.run.status === "running";
 
   /** Which harnesses have a live run right now — the roster's status chip reads it. */
-  const runningAdapters = new Set(
+  const runningAgents = new Set(
     issues.flatMap((issue) =>
-      issue.runs.filter((run) => run.status === "running").map((run) => run.adapter),
+      issue.runs.filter((run) => run.status === "running").map((run) => run.agentId),
     ),
   );
 
@@ -128,7 +130,7 @@ export default function Agents({
         <h1>Agents</h1>
         <div className="row">
           <span className="dim small">
-            {agents.filter((entry) => runningAdapters.has(entry.adapter)).length} running · local runner
+            {agents.filter((entry) => runningAgents.has(entry.id)).length} running · local runner
           </span>
           <button className="primary" onClick={() => setEditing("new")}>
             <Icon name="plus" size={14} /> New agent
@@ -141,7 +143,7 @@ export default function Agents({
       <div className="split">
         <div className="roster">
           {agents.map((entry) => {
-            const isRunning = runningAdapters.has(entry.adapter);
+            const isRunning = runningAgents.has(entry.id);
             const link = harnessOf(entry.adapter);
             const lost = !connected(link?.harness ?? "");
             return (
@@ -342,13 +344,37 @@ function AgentDialog({
 }) {
   const [name, setName] = useState(agent?.name ?? "");
   const [adapter, setAdapter] = useState(agent?.adapter ?? HARNESSES[0].adapter);
-  const [model, setModel] = useState(agent?.model ?? HARNESSES[0].models[0]);
+  const [model, setModel] = useState(agent?.model ?? "");
   const [md, setMd] = useState(agent?.agentsMd ?? "");
   const [picked, setPicked] = useState<string[]>(agent?.skills.map((skill) => skill.id) ?? []);
   const [busy, setBusy] = useState<string | null>(null);
 
   const harness = harnessOf(adapter) ?? HARNESSES[0];
-  const models = harness.models;
+  const [models, setModels] = useState<ModelOption[]>([]);
+
+  // The list comes from the harness, not from us: pi reports the providers it is
+  // signed in to, Claude Code reports its aliases.
+  useEffect(() => {
+    let live = true;
+    loadModels(adapter)
+      .then((next) => {
+        if (!live) return;
+        setModels(next);
+        if (next.length && !next.some((entry) => entry.id === model)) setModel(next[0].id);
+      })
+      .catch(() => live && setModels([]));
+    return () => {
+      live = false;
+    };
+  }, [adapter]);
+
+  const providers = useMemo(() => {
+    const groups = new Map<string, ModelOption[]>();
+    for (const entry of models) {
+      groups.set(entry.provider, [...(groups.get(entry.provider) ?? []), entry]);
+    }
+    return [...groups.entries()];
+  }, [models]);
 
   async function save() {
     setBusy("save");
@@ -408,10 +434,8 @@ function AgentDialog({
           <select
             value={adapter}
             onChange={(event) => {
-              const next = event.target.value;
-              setAdapter(next);
-              const first = harnessOf(next)?.models[0] ?? "";
-              setModel(first);
+              setAdapter(event.target.value);
+              setModel("");
             }}
           >
             {HARNESSES.map((entry) => {
@@ -433,14 +457,36 @@ function AgentDialog({
 
         <label>
           Model
-          <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!connected(harness.harness)}>
-            {models.map((entry) => (
-              <option key={entry} value={entry}>
-                {entry}
-              </option>
-            ))}
-          </select>
+          {models.length > 0 ? (
+            <select
+              value={model}
+              onChange={(event) => setModel(event.target.value)}
+              disabled={!connected(harness.harness)}
+            >
+              {providers.map(([provider, entries]) => (
+                <optgroup key={provider} label={provider}>
+                  {entries.map((entry) => (
+                    <option key={entry.id} value={entry.id}>
+                      {entry.label}
+                      {entry.costOut !== null ? ` — $${entry.costIn ?? 0}/$${entry.costOut} per Mtok` : ""}
+                    </option>
+                  ))}
+                </optgroup>
+              ))}
+            </select>
+          ) : (
+            <input
+              value={model}
+              placeholder="provider/model"
+              onChange={(event) => setModel(event.target.value)}
+            />
+          )}
         </label>
+        <p className="dim small">
+          {models.length > 0
+            ? `${models.length} models from ${harness.name}'s own catalogue.`
+            : `${harness.name} did not report a catalogue, so type the model it takes.`}
+        </p>
 
         <label>
           AGENTS.md

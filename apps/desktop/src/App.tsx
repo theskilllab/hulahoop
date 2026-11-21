@@ -29,6 +29,7 @@ import Agents from "./screens/Agents";
 import Icon from "./Icon";
 import Board from "./screens/Board";
 import Connect from "./screens/Connect";
+import Palette, { type PaletteTarget } from "./screens/Palette";
 import IssueDetail from "./screens/IssueDetail";
 import Milestones from "./screens/Milestones";
 import Skills from "./screens/Skills";
@@ -86,6 +87,7 @@ export default function App() {
   const [projectFilter, setProjectFilter] = useState<string | "all">("all");
   const [collapsed, setCollapsed] = useState(localStorage.getItem(RAIL_KEY) === "collapsed");
   const [wsMenu, setWsMenu] = useState(false);
+  const [palette, setPalette] = useState(false);
 
   const refresh = useCallback(async () => {
     if (!workspace) return;
@@ -172,6 +174,10 @@ export default function App() {
           localStorage.setItem(RAIL_KEY, was ? "expanded" : "collapsed");
           return !was;
         });
+      }
+      if (meta && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPalette((was) => !was);
       }
       if (meta && event.key.toLowerCase() === "n") {
         event.preventDefault();
@@ -291,6 +297,14 @@ export default function App() {
           </button>
         </div>
 
+        {!collapsed ? (
+          <button className="nav-search" onClick={() => setPalette(true)} title="Search (⌘K)">
+            <Icon name="search" size={15} />
+            <span className="label">Search</span>
+            <kbd>⌘K</kbd>
+          </button>
+        ) : null}
+
         <nav>
           {items.map((item) => (
             <button
@@ -403,6 +417,20 @@ export default function App() {
           ) : null}
         </footer>
       </aside>
+
+      {palette ? (
+        <Palette
+          issues={issues}
+          agents={agents}
+          onClose={() => setPalette(false)}
+          onPick={(target: PaletteTarget) => {
+            setPalette(false);
+            if (target.kind === "view") setView({ name: target.id } as View);
+            if (target.kind === "issue") setView({ name: "issue", id: target.id });
+            if (target.kind === "agent") setView({ name: "agents" });
+          }}
+        />
+      ) : null}
 
       <main className="stage">
         {notice && (
