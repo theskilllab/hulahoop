@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { gql, type Project } from "../api";
+import PageHeader from "../PageHeader";
 
 interface Props {
   workspaceId: string;
@@ -117,7 +118,7 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
 
   return (
     <section className="detail narrow">
-      <h1>New issue</h1>
+      <PageHeader subtitle="A title, and the behaviour you want to be true when it works." title="New issue" />
       {error && <p className="error">{error}</p>}
       <label>
         Project

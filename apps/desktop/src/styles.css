@@ -215,7 +215,9 @@ h3 {
   border-right: 1px solid var(--side-line);
   color: var(--side-text);
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  /* brand · search · the list · the workspace footer. The list is the only row that
+     grows, which is why the first entry sits right under the search field. */
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
   min-height: 0;
 }
 
@@ -255,6 +257,11 @@ h3 {
 
 .brand svg {
   flex: none;
+}
+
+.rail .brand {
+  -webkit-app-region: drag;
+  app-region: drag;
 }
 
 .rail nav {
@@ -2076,4 +2083,386 @@ label > select {
 
 .pitem[aria-selected="true"] {
   background: var(--bg-3);
+}
+
+/* --- the page header every screen shares ---------------------------------- */
+
+.screen {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+/* One gutter for the content area, and a row that drags the window. */
+.screen > :not(.page-head) {
+  padding-left: var(--s5);
+  padding-right: var(--s5);
+}
+
+.page-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  height: 48px;
+  padding: 0 var(--s5) 0 var(--s4);
+  border-bottom: 1px solid var(--line);
+  -webkit-app-region: drag;
+  app-region: drag;
+  user-select: none;
+}
+
+.page-head h1 {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s2);
+  margin: 0;
+  font-size: var(--fs-md);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+/* The one place the prototype uses a large title: a task's own page. */
+.page-head.big h1 {
+  font-size: var(--fs-title);
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.page-head h1 small {
+  font-size: var(--fs-sm);
+  font-weight: 400;
+  color: var(--muted);
+  letter-spacing: 0;
+}
+
+.page-tools {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+.page-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 200px;
+  height: var(--h-control);
+  padding: 0 var(--s2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: var(--fs-sm);
+  background: var(--bg);
+}
+
+.page-search:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+.page-search kbd {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+
+/* --- the rail when it is folded ------------------------------------------- */
+
+.shell.collapsed {
+  grid-template-columns: 48px minmax(0, 1fr);
+}
+
+.rail.collapsed {
+  /* No brand row when folded: the toggle floats over the first entries. */
+  position: relative;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+
+.rail.collapsed .brand {
+  display: none;
+}
+
+.rail.collapsed nav button {
+  justify-content: center;
+  padding: 0;
+}
+
+.rail.collapsed .label,
+.rail.collapsed .tally {
+  display: none;
+}
+
+.rail.collapsed .rail-toggle {
+  position: absolute;
+  top: 6px;
+  left: 50%;
+  transform: translateX(-50%);
+  opacity: 0;
+}
+
+.rail.collapsed:hover .rail-toggle {
+  opacity: 1;
+}
+
+/* --- the workflow document: three views of one thing ---------------------- */
+
+.workflow-tabs {
+  margin: var(--s3) var(--s5) var(--s2) var(--s5);
+  align-self: flex-start;
+}
+
+.tab {
+  height: var(--h-control);
+  padding: 0 var(--s3);
+  border-radius: var(--r-sm);
+  color: var(--muted);
+  font-size: var(--fs-md);
+}
+
+.tab.on {
+  background: var(--bg-3);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.workflow-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--s3);
+  padding: 0 var(--s5) var(--s3);
+  min-height: 0;
+  overflow: auto;
+}
+
+.workflow-body.both {
+  grid-template-columns: minmax(0, 420px) minmax(0, 1fr);
+  align-items: start;
+}
+
+.workflow-editor {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.workflow-editor .head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s1) var(--s3);
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-editor textarea {
+  width: 100%;
+  min-height: 420px;
+  padding: var(--s4);
+  border: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  resize: vertical;
+  white-space: pre;
+  tab-size: 2;
+}
+
+.workflow-editor textarea:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.diagram-block {
+  display: grid;
+  gap: var(--s2);
+  min-width: 0;
+}
+
+.diagram-label {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.diagram {
+  position: relative;
+  height: 360px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.diagram svg {
+  position: absolute;
+  inset: 0;
+  width: 1180px;
+  height: 360px;
+}
+
+.diagram-edge {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.2;
+}
+
+.diagram-edge-label {
+  fill: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-anchor: middle;
+}
+
+.dnode {
+  position: absolute;
+  width: 150px;
+  height: 62px;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  padding: 0 var(--s2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  text-align: center;
+}
+
+.dnode strong {
+  font-size: var(--fs-md);
+  font-weight: 600;
+}
+
+.dnode small {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.dnode.agent {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+  background: var(--accent-soft);
+}
+
+.dnode.final {
+  background: var(--bg-2);
+}
+
+.diagram-hint {
+  margin: 0;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+}
+
+.legend {
+  display: flex;
+  gap: var(--s3);
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+}
+
+.legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend .sw {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  display: inline-block;
+}
+
+.legend .sw.agent {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+
+.legend .sw.human {
+  background: var(--bg);
+}
+
+.legend .sw.final {
+  background: var(--bg-2);
+}
+
+.check-ok {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-sm);
+  background: var(--ok-soft);
+  color: var(--ok);
+  font-size: var(--fs-sm);
+}
+
+table.transitions {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+table.transitions th {
+  text-align: left;
+  font-weight: 500;
+  color: var(--muted);
+  padding: var(--s1) var(--s2) var(--s1) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+table.transitions td {
+  padding: var(--s2) var(--s2) var(--s2) 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.workflow-fields {
+  margin: 0 var(--s5) var(--s4);
+}
+
+.workflow-fields summary {
+  cursor: pointer;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  padding: var(--s2) 0;
+}
+
+.status-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: var(--s2);
+  padding-top: var(--s2);
+}
+
+/* The old flow styles stay because the status cards reuse a few of them. */
+.flow-node {
+  display: grid;
+  gap: var(--s1);
+  padding: var(--s2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+
+.page-back {
+  flex: none;
+  margin-right: var(--s1);
+}
+
+/* The task screen still has a body grid of its own. */
+.detail .page-head + * {
+  margin-top: var(--s3);
 }

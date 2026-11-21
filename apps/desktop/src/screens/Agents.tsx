@@ -11,6 +11,7 @@ import {
   type Skill,
 } from "../api";
 import Icon from "../Icon";
+import PageHeader from "../PageHeader";
 
 /** Harnesses we can run. `harness` is the provider key a connection is stored under. */
 const HARNESSES: { adapter: string; harness: string; name: string }[] = [
@@ -126,17 +127,15 @@ export default function Agents({
 
   return (
     <section className="screen agents-screen">
-      <header className="bar">
-        <h1>Agents</h1>
-        <div className="row">
-          <span className="dim small">
-            {agents.filter((entry) => runningAgents.has(entry.id)).length} running · local runner
-          </span>
+      <PageHeader
+        title="Agents"
+        subtitle={`${agents.filter((entry) => runningAgents.has(entry.id)).length} running · local runner`}
+        actions={
           <button className="primary" onClick={() => setEditing("new")}>
             <Icon name="plus" size={14} /> New agent
           </button>
-        </div>
-      </header>
+        }
+      />
 
       {error ? <p className="error">{error}</p> : null}
 

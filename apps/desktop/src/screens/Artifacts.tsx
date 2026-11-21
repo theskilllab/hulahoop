@@ -1,5 +1,6 @@
 import { useRef, useState } from "react";
 import { downloadArtifact, gql, uploadArtifact, type Artifact, type Milestone, type Project } from "../api";
+import PageHeader from "../PageHeader";
 
 interface Props {
   workspaceId: string;
@@ -62,18 +63,15 @@ export default function Artifacts({ workspaceId, projects, milestones, artifacts
 
   return (
     <section className="screen page">
-      <header className="sheet-head">
-        <div>
-          <h1>Artifacts</h1>
-          <p className="hint">
-            Reference files: a spec, a screenshot, a tarball. Attach one to a milestone or leave it
-            loose.
-          </p>
-        </div>
-        <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
-          {creating ? "Cancel" : "Add a file"}
-        </button>
-      </header>
+      <PageHeader
+        title="Artifacts"
+        subtitle="Reference files: a spec, a screenshot, a tarball. Attach one to a milestone or leave it loose."
+        actions={
+          <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+            {creating ? "Cancel" : "Add a file"}
+          </button>
+        }
+      />
 
       {creating ? (
       <div className="panel">

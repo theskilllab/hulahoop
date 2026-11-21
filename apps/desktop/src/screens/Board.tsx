@@ -1,4 +1,5 @@
 import type { Issue, IssueStatus } from "../api";
+import PageHeader from "../PageHeader";
 
 /// The board is a view of the workspace's workflow document, so the columns and
 /// their wording arrive as props. This is the fallback for a workspace that has
@@ -45,12 +46,15 @@ export default function Board({
 
   return (
     <section className="board">
-      <header className="board-head">
-        <h1>Loop</h1>
-        <button className="primary" onClick={onNew}>
-          New issue
-        </button>
-      </header>
+      <PageHeader
+        title="Tasks"
+        subtitle={`${issues.length} open · agents work the middle columns, you decide the ones that ask`}
+        actions={
+          <button className="primary" onClick={onNew}>
+            New issue
+          </button>
+        }
+      />
       <div className="columns">
         {columns.map((column) => {
           const items = issues.filter((issue) => issue.status === column.status);

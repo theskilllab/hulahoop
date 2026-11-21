@@ -41,6 +41,9 @@ pub struct StatusSection {
     /// An agent name, or `any` to mean the project's binding for that status.
     pub agent: Option<String>,
     pub next: Option<IssueStatus>,
+    /// Why the move happens. `When:` is what the diagram writes on the arrow and
+    /// what the transitions table shows, so the picture and the rule agree.
+    pub when: Option<String>,
     /// Everything under the metadata lines, kept verbatim for the status screen.
     pub body: String,
 }
@@ -134,6 +137,7 @@ pub fn parse(source: &str) -> Workflow {
                         owner: Owner::Human,
                         agent: None,
                         next: None,
+                        when: None,
                         body: String::new(),
                     });
                 }
@@ -184,6 +188,11 @@ pub fn parse(source: &str) -> Workflow {
                         .push(format!("`Next: {value}` names no status.")),
                 }
             }
+        } else if let Some(value) = line.strip_prefix("When:") {
+            let value = value.trim();
+            if !value.is_empty() {
+                section.when = Some(value.to_string());
+            }
         } else if !line.trim().is_empty() || !body_lines.is_empty() {
             body_lines.push(line.to_string());
         }
@@ -221,6 +230,7 @@ pub const DEFAULT_SOURCE: &str = "\
 Owner: human
 Agent: none
 Next: To do
+When: it has been planned
 
 Work you still want to do yourself. Nothing here is dispatched.
 
@@ -229,6 +239,7 @@ Work you still want to do yourself. Nothing here is dispatched.
 Owner: agent
 Agent: any
 Next: In progress
+When: an agent picks it up
 
 Ready for the team. An agent picks a task up from here.
 
@@ -237,6 +248,7 @@ Ready for the team. An agent picks a task up from here.
 Owner: agent
 Agent: any
 Next: In review
+When: a pull request is opened
 
 An agent is working. It opens a pull request when it hands over.
 
@@ -244,7 +256,8 @@ An agent is working. It opens a pull request when it hands over.
 
 Owner: human
 Agent: none
-Next: To do
+Next: In progress
+When: the question is answered
 
 The agent asked a question, or the work waits on somebody outside.
 
@@ -253,6 +266,7 @@ The agent asked a question, or the work waits on somebody outside.
 Owner: human
 Agent: any
 Next: Done
+When: you approve and the pull request is merged
 
 A pull request is open and the checks have run. A person reads it.
 
