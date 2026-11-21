@@ -1,16 +1,18 @@
 import type { Issue, IssueStatus } from "../api";
 
-const COLUMNS: { status: IssueStatus; label: string }[] = [
-  { status: "backlog", label: "Backlog" },
-  { status: "ready", label: "Tests to write" },
-  { status: "tests_in_progress", label: "Authoring" },
-  { status: "tests_ready", label: "Tests frozen" },
-  { status: "in_progress", label: "Implementing" },
-  { status: "in_review", label: "Review" },
-  { status: "merging", label: "Merging" },
-  { status: "blocked", label: "Blocked" },
-  { status: "done", label: "Done" },
+/// The board is a view of the workspace's workflow document, so the columns and
+/// their wording arrive as props. This is the fallback for a workspace that has
+/// not loaded one yet.
+const FALLBACK: Column[] = [
+  { status: "backlog", title: "Backlog", owner: "human" },
+  { status: "todo", title: "To do", owner: "human" },
+  { status: "in_progress", title: "In progress", owner: "agent" },
+  { status: "blocked", title: "Blocked", owner: "human" },
+  { status: "in_review", title: "In review", owner: "human" },
+  { status: "done", title: "Done", owner: "human" },
 ];
+
+export type Column = { status: IssueStatus; title: string; owner: string };
 
 export function StatusPill({ status }: { status: string }) {
   return <span className={`pill ${status}`}>{status.replaceAll("_", " ")}</span>;
@@ -18,11 +20,13 @@ export function StatusPill({ status }: { status: string }) {
 
 export default function Board({
   issues,
+  columns = FALLBACK,
   onOpen,
   onNew,
   hasRepo,
 }: {
   issues: Issue[];
+  columns?: Column[];
   onOpen: (id: string) => void;
   onNew: () => void;
   hasRepo: boolean;
@@ -48,12 +52,13 @@ export default function Board({
         </button>
       </header>
       <div className="columns">
-        {COLUMNS.map((column) => {
+        {columns.map((column) => {
           const items = issues.filter((issue) => issue.status === column.status);
           return (
             <div className="column" key={column.status}>
-              <h2>
-                {column.label} <span>{items.length}</span>
+              <h2 title={column.owner === "agent" ? "an agent works this column" : "a person works this column"}>
+                {column.title} <span>{items.length}</span>
+                {column.owner === "agent" ? <em className="owner">agent</em> : null}
               </h2>
               {items.map((issue) => (
                 <button className="card" key={issue.id} onClick={() => onOpen(issue.id)}>

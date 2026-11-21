@@ -63,14 +63,9 @@ pub fn probe_command(adapter: crate::Adapter, model: &str) -> Vec<String> {
             "claude".into(),
             "--version".into(),
         ],
-        Adapter::Fake => vec![
-            "direnv".into(),
-            "exec".into(),
-            ".".into(),
-            "sh".into(),
-            "-c".into(),
-            format!("echo fake {model}"),
-        ],
+        // The scripted adapter has no CLI, so there is nothing to resolve through
+        // a dev shell: the probe is the shell itself.
+        Adapter::Fake => vec!["sh".into(), "-c".into(), format!("echo fake {model}")],
     }
 }
 

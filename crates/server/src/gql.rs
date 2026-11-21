@@ -4,11 +4,12 @@
 use async_graphql::{
     ComplexObject, Context, EmptySubscription, InputObject, Object, Schema, SimpleObject,
 };
-use hulahoop_core::{AgentRole, RunFlag};
+use hulahoop_core::AgentRole;
 use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::model::*;
+use crate::workflows::WorkflowDoc;
 
 pub type HulahoopSchema = Schema<Query, Mutation, EmptySubscription>;
 
@@ -169,19 +170,6 @@ impl Query {
             .await?)
     }
 
-    async fn replays(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-    ) -> async_graphql::Result<Vec<Replay>> {
-        Ok(sqlx::query_as::<_, Replay>(
-            "select * from replays where issue_id = ? order by created_at desc",
-        )
-        .bind(issue_id)
-        .fetch_all(&engine(ctx).db.pool)
-        .await?)
-    }
-
     async fn reviews(
         &self,
         ctx: &Context<'_>,
@@ -227,6 +215,24 @@ impl Query {
                 .fetch_optional(&engine(ctx).db.pool)
                 .await?,
         )
+    }
+
+    /// The workspace's reusable knowledge.
+    async fn skills(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<Skill>> {
+        Ok(engine(ctx).skills(workspace_id).await?)
+    }
+
+    /// The document that drives the board.
+    async fn workflow(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<WorkflowDoc> {
+        Ok(engine(ctx).workflow(workspace_id).await?)
     }
 
     async fn artifacts(
@@ -420,6 +426,79 @@ impl Mutation {
         Ok(engine(ctx)
             .update_milestone(id, title, body, status, target_date)
             .await?)
+    }
+
+    async fn create_skill(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        name: String,
+        description: Option<String>,
+        source: String,
+    ) -> async_graphql::Result<Skill> {
+        Ok(engine(ctx)
+            .create_skill(
+                workspace_id,
+                &name,
+                description.as_deref().unwrap_or(""),
+                &source,
+            )
+            .await?)
+    }
+
+    async fn update_skill(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        name: Option<String>,
+        description: Option<String>,
+        source: Option<String>,
+    ) -> async_graphql::Result<Skill> {
+        Ok(engine(ctx)
+            .update_skill(
+                id,
+                name.as_deref(),
+                description.as_deref(),
+                source.as_deref(),
+            )
+            .await?)
+    }
+
+    async fn delete_skill(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).delete_skill(id).await?)
+    }
+
+    /// Replace the skills an agent carries.
+    async fn set_agent_skills(
+        &self,
+        ctx: &Context<'_>,
+        agent_id: Uuid,
+        skill_ids: Vec<Uuid>,
+    ) -> async_graphql::Result<Vec<Skill>> {
+        Ok(engine(ctx).set_agent_skills(agent_id, &skill_ids).await?)
+    }
+
+    /// The agent's own instructions, appended to its role prompt.
+    async fn set_agent_instructions(
+        &self,
+        ctx: &Context<'_>,
+        agent_id: Uuid,
+        agents_md: String,
+    ) -> async_graphql::Result<bool> {
+        engine(ctx)
+            .set_agent_instructions(agent_id, &agents_md)
+            .await?;
+        Ok(true)
+    }
+
+    /// Save the workflow document. The board follows it immediately.
+    async fn set_workflow(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        source: String,
+    ) -> async_graphql::Result<WorkflowDoc> {
+        Ok(engine(ctx).set_workflow(workspace_id, &source).await?)
     }
 
     async fn set_issue_milestone(
@@ -934,8 +1013,41 @@ impl Mutation {
         let texts: Vec<String> = criteria.iter().map(|c| c.text.clone()).collect();
         Engine::validate_criteria(&texts).map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(engine
-            .transition(issue_id, hulahoop_core::IssueEvent::ApproveCriteria)
+            .transition(issue_id, hulahoop_core::IssueEvent::Plan)
             .await?)
+    }
+
+    /// The pull request merged, which is what closes a task.
+    async fn merge_issue(&self, ctx: &Context<'_>, issue_id: Uuid) -> async_graphql::Result<Issue> {
+        Ok(engine(ctx)
+            .transition(issue_id, hulahoop_core::IssueEvent::Merge)
+            .await?)
+    }
+
+    /// Back to To do, for work that is queued again after a merge or an abandon.
+    async fn reopen_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+    ) -> async_graphql::Result<Issue> {
+        Ok(engine(ctx)
+            .transition(issue_id, hulahoop_core::IssueEvent::Reopen)
+            .await?)
+    }
+
+    /// Backlog and To do are the same task on either side of the human's line.
+    async fn plan_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        planned: bool,
+    ) -> async_graphql::Result<Issue> {
+        let event = if planned {
+            hulahoop_core::IssueEvent::Plan
+        } else {
+            hulahoop_core::IssueEvent::Unplan
+        };
+        Ok(engine(ctx).transition(issue_id, event).await?)
     }
 
     async fn add_comment(
@@ -1007,50 +1119,6 @@ impl Mutation {
             .await?)
     }
 
-    async fn freeze_suite(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-    ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).freeze_suite(issue_id).await?)
-    }
-
-    async fn unfreeze_suite(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-        reason: String,
-    ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).unfreeze_suite(issue_id, &reason).await?)
-    }
-
-    async fn approve_issue(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-        run_id: Uuid,
-        reviewed_head: String,
-        diff_sha: String,
-        acknowledge_flags: Vec<String>,
-    ) -> async_graphql::Result<Issue> {
-        let flags: Vec<RunFlag> = acknowledge_flags
-            .iter()
-            .filter_map(|f| RunFlag::parse(f))
-            .collect();
-        Ok(engine(ctx)
-            .approve_issue(issue_id, run_id, &reviewed_head, &diff_sha, flags)
-            .await?)
-    }
-
-    async fn record_merge(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-        merge_revision: String,
-    ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).record_merge(issue_id, &merge_revision).await?)
-    }
-
     async fn resume_issue(
         &self,
         ctx: &Context<'_>,
@@ -1084,13 +1152,37 @@ impl Mutation {
     /// The base replay reads a report the suite produced. When the report is missing
     /// for a reason of the harness (a `just test` that only wrote its JUnit file after a
     /// green run), asking again costs one suite run and no model call.
-    async fn retry_base_replay(
+    async fn recheck_pull_request(
         &self,
         ctx: &Context<'_>,
         issue_id: Uuid,
-    ) -> async_graphql::Result<Replay> {
+    ) -> async_graphql::Result<Issue> {
         let engine = engine(ctx);
-        Ok(engine.retry_base_replay(issue_id).await?)
+        let issue = engine.issue(issue_id).await?;
+        let number = issue
+            .pr_number
+            .ok_or_else(|| async_graphql::Error::new("this issue has no pull request yet"))?;
+        // The revision GitHub has to look at is the head the pull request points
+        // at, which is the current run's head.
+        let sha: Option<String> = match issue.current_run_id {
+            Some(run_id) => sqlx::query_scalar::<_, Option<String>>(
+                "select head_revision from runs where id = ?",
+            )
+            .bind(run_id)
+            .fetch_optional(&engine.db.pool)
+            .await?
+            .flatten(),
+            None => None,
+        };
+        engine
+            .queue_job(
+                issue.repo_id,
+                Some(issue_id),
+                "watch_checks",
+                serde_json::json!({ "number": number, "sha": sha }),
+            )
+            .await?;
+        Ok(engine.issue(issue_id).await?)
     }
 
     async fn clear_run_cap(
@@ -1132,6 +1224,14 @@ impl Project {
 }
 
 #[ComplexObject]
+impl Agent {
+    /// The skills this agent carries, most relevant knowledge first by name.
+    async fn skills(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Skill>> {
+        Ok(engine(ctx).agent_skills(self.id).await?)
+    }
+}
+
+#[ComplexObject]
 impl Issue {
     /// The milestone this issue was filed under, if any.
     async fn milestone(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Milestone>> {
@@ -1140,6 +1240,36 @@ impl Issue {
         };
         Ok(
             sqlx::query_as::<_, Milestone>("select * from milestones where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
+    /// What the task waits for, read from the agent's question. Shown where a
+    /// person can act on it, so the drawer never just says "blocked".
+    async fn blocked_by(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<String>> {
+        if self.status != "blocked" {
+            return Ok(None);
+        }
+        let Some(comment_id) = self.pinned_comment_id else {
+            return Ok(None);
+        };
+        Ok(
+            sqlx::query_scalar::<_, String>("select body from comments where id = ?")
+                .bind(comment_id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?,
+        )
+    }
+
+    /// The project's name, so a drawer can show where the task lives in one query.
+    async fn project_name(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<String>> {
+        let Some(id) = self.project_id else {
+            return Ok(None);
+        };
+        Ok(
+            sqlx::query_scalar::<_, String>("select name from projects where id = ?")
                 .bind(id)
                 .fetch_optional(&engine(ctx).db.pool)
                 .await?,
@@ -1172,14 +1302,24 @@ impl Issue {
         .await?)
     }
 
+    /// The run the task is on. A task carries the newest attempt even when no run
+    /// is live, so a screen never has to guess which attempt it is reading.
     async fn current_run(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Run>> {
-        let Some(id) = self.current_run_id else {
-            return Ok(None);
-        };
-        Ok(sqlx::query_as::<_, Run>("select * from runs where id = ?")
-            .bind(id)
-            .fetch_optional(&engine(ctx).db.pool)
-            .await?)
+        if let Some(id) = self.current_run_id {
+            let run: Option<Run> = sqlx::query_as("select * from runs where id = ?")
+                .bind(id)
+                .fetch_optional(&engine(ctx).db.pool)
+                .await?;
+            if run.is_some() {
+                return Ok(run);
+            }
+        }
+        Ok(sqlx::query_as::<_, Run>(
+            "select * from runs where issue_id = ? order by created_at desc limit 1",
+        )
+        .bind(self.id)
+        .fetch_optional(&engine(ctx).db.pool)
+        .await?)
     }
 
     async fn reviews(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Review>> {
@@ -1194,15 +1334,6 @@ impl Issue {
     async fn comments(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Comment>> {
         Ok(sqlx::query_as::<_, Comment>(
             "select * from comments where issue_id = ? order by created_at",
-        )
-        .bind(self.id)
-        .fetch_all(&engine(ctx).db.pool)
-        .await?)
-    }
-
-    async fn replays(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Replay>> {
-        Ok(sqlx::query_as::<_, Replay>(
-            "select * from replays where issue_id = ? order by created_at desc",
         )
         .bind(self.id)
         .fetch_all(&engine(ctx).db.pool)
@@ -1271,17 +1402,21 @@ impl Run {
         Ok(adapter.unwrap_or_else(|| "unknown".to_string()))
     }
 }
-
 #[ComplexObject]
-impl Replay {
-    /// The tests that failed, read from the JUnit report this replay stored. A
-    /// red base replay is the wanted outcome, so this is evidence, not an error.
-    async fn failed_tests(&self) -> async_graphql::Result<Vec<String>> {
-        let path = std::path::Path::new(&self.artifact_dir).join("junit.xml");
-        match hulahoop_core::junit::parse_file(&path) {
-            Ok(report) => Ok(report.failed_names()),
-            Err(_) => Ok(Vec::new()),
+impl Comment {
+    /// Who wrote it: the agent's name, or `you` for a person.
+    async fn author(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
+        if self.author_type == "human" {
+            return Ok("you".to_string());
         }
+        let Some(id) = self.author_id.clone() else {
+            return Ok(self.author_type.clone());
+        };
+        let name: Option<String> = sqlx::query_scalar("select name from agents where id = ?")
+            .bind(id)
+            .fetch_optional(&engine(ctx).db.pool)
+            .await?;
+        Ok(name.unwrap_or_else(|| self.author_type.clone()))
     }
 }
 

@@ -4,6 +4,8 @@ import {
   gql,
   loadArtifacts,
   loadMilestones,
+  loadSkills,
+  loadWorkflow,
   loadWorkspace,
   loadWorkspaceIssues,
   savedRemote,
@@ -15,13 +17,18 @@ import {
   type Milestone,
   type Project,
   type Workspace,
+  type Skill,
+  type WorkflowDoc,
 } from "./api";
 import { WORKSPACE_KEY } from "./api";
+import { applyTheme, savedTheme, type Theme } from "./theme";
 import Artifacts from "./screens/Artifacts";
 import Board from "./screens/Board";
 import Connect from "./screens/Connect";
 import IssueDetail from "./screens/IssueDetail";
 import Milestones from "./screens/Milestones";
+import Skills from "./screens/Skills";
+import WorkflowScreen from "./screens/Workflow";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
 
@@ -29,10 +36,21 @@ type View =
   | { name: "board" }
   | { name: "issue"; id: string }
   | { name: "new" }
+  | { name: "workflow" }
+  | { name: "skills" }
   | { name: "milestones" }
   | { name: "artifacts" }
   | { name: "settings" }
   | { name: "connect" };
+
+/** The mark: a filled circle in the brand indigo, the same everywhere. */
+function Logo() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+      <circle cx="8" cy="8" r="7" fill="var(--brand)" />
+    </svg>
+  );
+}
 
 export default function App() {
   const [connection, setConnection] = useState<Connection | null>(null);
@@ -43,24 +61,31 @@ export default function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [issues, setIssues] = useState<Issue[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
+  const [workflow, setWorkflow] = useState<WorkflowDoc | null>(null);
+  const [skills, setSkills] = useState<Skill[]>([]);
   const [artifacts, setArtifacts] = useState<Artifact[]>([]);
   const [view, setView] = useState<View>({ name: "board" });
   const [connected, setConnected] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   /** `all` shows every project's issues, including the ones filed under none. */
   const [projectFilter, setProjectFilter] = useState<string | "all">("all");
+  const [theme, setTheme] = useState<Theme>(savedTheme());
 
   const refresh = useCallback(async () => {
     if (!workspace) return;
     try {
-      const [nextIssues, nextMilestones, nextArtifacts] = await Promise.all([
+      const [nextIssues, nextMilestones, nextArtifacts, nextWorkflow, nextSkills] = await Promise.all([
         loadWorkspaceIssues(workspace.id),
         loadMilestones(workspace.id),
         loadArtifacts(workspace.id),
+        loadWorkflow(workspace.id),
+        loadSkills(workspace.id),
       ]);
       setIssues(nextIssues);
       setMilestones(nextMilestones);
       setArtifacts(nextArtifacts);
+      setWorkflow(nextWorkflow);
+      setSkills(nextSkills);
       setError(null);
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
@@ -188,7 +213,7 @@ export default function App() {
     <div className="shell">
       <aside className="rail">
         <div className="brand">
-          <span className="mark" aria-hidden="true" />
+          <Logo />
           hulahoop
         </div>
         <label className="project-pick">
@@ -213,19 +238,25 @@ export default function App() {
           </select>
         </label>
         <nav>
-          <button className={view.name === "board" ? "active" : ""} onClick={() => setView({ name: "board" })}>
+          <button className={view.name === "board" ? "on" : ""} onClick={() => setView({ name: "board" })}>
             Board <span className="tally">{shown.filter((i) => i.status !== "done" && i.status !== "cancelled").length}</span>
           </button>
-          <button className={view.name === "new" ? "active" : ""} onClick={() => setView({ name: "new" })}>
+          <button className={view.name === "new" ? "on" : ""} onClick={() => setView({ name: "new" })}>
             New issue
           </button>
-          <button className={view.name === "milestones" ? "active" : ""} onClick={() => setView({ name: "milestones" })}>
+          <button className={view.name === "workflow" ? "on" : ""} onClick={() => setView({ name: "workflow" })}>
+            Workflow <span className="tally">{workflow?.sections.length ?? 0}</span>
+          </button>
+          <button className={view.name === "skills" ? "on" : ""} onClick={() => setView({ name: "skills" })}>
+            Skills <span className="tally">{skills.length}</span>
+          </button>
+          <button className={view.name === "milestones" ? "on" : ""} onClick={() => setView({ name: "milestones" })}>
             Milestones <span className="tally">{milestones.filter((m) => m.status === "open").length}</span>
           </button>
-          <button className={view.name === "artifacts" ? "active" : ""} onClick={() => setView({ name: "artifacts" })}>
+          <button className={view.name === "artifacts" ? "on" : ""} onClick={() => setView({ name: "artifacts" })}>
             Artifacts <span className="tally">{artifacts.length}</span>
           </button>
-          <button className={view.name === "settings" ? "active" : ""} onClick={() => setView({ name: "settings" })}>
+          <button className={view.name === "settings" ? "on" : ""} onClick={() => setView({ name: "settings" })}>
             Settings
           </button>
         </nav>
@@ -246,6 +277,16 @@ export default function App() {
         <footer>
           <p>{project ? project.name : `${workspace.defaultPrefix} (no project)`}</p>
           <p className="dim">{project?.repos[0]?.vcs ?? "no repo"} · v{project?.repos[0]?.contractVersion ?? "?"}</p>
+          <button
+            className="link"
+            onClick={() => {
+              const next: Theme = theme === "system" ? "light" : theme === "light" ? "dark" : "system";
+              setTheme(next);
+              applyTheme(next);
+            }}
+          >
+            theme: {theme}
+          </button>
           <p className="dim">
             {connection?.label ?? "no server"}
             {savedRemote() ? (
@@ -274,9 +315,18 @@ export default function App() {
             {notice}
           </div>
         )}
+        {view.name === "skills" && workspace && <Skills workspaceId={workspace.id} />}
+        {view.name === "workflow" && workspace && (
+          <WorkflowScreen workspaceId={workspace.id} />
+        )}
         {view.name === "board" && (
           <Board
             issues={shown}
+            columns={workflow?.sections.map((section) => ({
+              status: section.status,
+              title: section.title,
+              owner: section.owner,
+            }))}
             onOpen={(id) => setView({ name: "issue", id })}
             onNew={() => setView({ name: "new" })}
             hasRepo={Boolean(project?.repos.length)}
@@ -330,6 +380,7 @@ export default function App() {
             projects={projects}
             active={project}
             agents={agents}
+            skills={skills}
             onChanged={async () => {
               await reload();
             }}

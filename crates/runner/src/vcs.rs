@@ -149,9 +149,31 @@ impl Vcs {
 
     /// Give the working-copy commit a message. jj refuses to push a commit that
     /// has none, and `jj log` is unreadable without it, so a run names its own.
-    pub fn describe_here(&self, checkout: &Path, message: &str) -> Result<()> {
-        let output = self.run(checkout, "jj", &["describe", "-m", message])?;
-        let _ = output;
+    /// The same as `describe_here`, but the rewrite is
+    /// recorded under the bot that owns the run. jj stamps the committer from the
+    /// configured user on every rewrite, so describing a commit without this puts
+    /// the developer back on it as committer.
+    pub fn describe_as(
+        &self,
+        checkout: &Path,
+        message: &str,
+        name: &str,
+        email: &str,
+    ) -> Result<()> {
+        let output = Command::new("jj")
+            .args(["describe", "-m", message])
+            .current_dir(checkout)
+            .env("JJ_USER", name)
+            .env("JJ_EMAIL", email)
+            .output()
+            .context("running jj describe")?;
+        if !output.status.success() {
+            bail!(
+                "jj describe failed in {}: {}",
+                checkout.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
         Ok(())
     }
 
@@ -287,34 +309,6 @@ impl Vcs {
     /// Rebasing a bookmark that sits on the last commit of a chain moves only that
     /// commit; the landing preview needs the suite commit beneath the implementation
     /// to travel too, so this takes a revision rather than a bookmarked head.
-    pub fn rebase_chain(&self, checkout: &Path, source: &str, dest: &str) -> Result<()> {
-        let source = self.resolve(source)?;
-        let dest = self.resolve(dest)?;
-        // The repository pins every bookmarked revision so an agent cannot rewrite
-        // accepted history. The landing replay is the loop itself moving an approved
-        // head onto a newer base, which is exactly the privileged rewrite that pin is
-        // meant to reserve for us.
-        self.run(
-            checkout,
-            "jj",
-            &["rebase", "-s", &source, "-d", &dest, "--ignore-immutable"],
-        )?;
-        Ok(())
-    }
-
-    /// Put the checkout's working copy on `revision`, so the files the suite runs
-    /// against are the files of that commit.
-    pub fn edit(&self, checkout: &Path, revision: &str) -> Result<()> {
-        let revision = self.resolve(revision)?;
-        // `edit` refuses an immutable commit for the same reason `rebase` does, and a
-        // replay always edits the revision it is proving.
-        self.run(checkout, "jj", &["edit", &revision, "--ignore-immutable"])?;
-        Ok(())
-    }
-
-    /// True when the approved head is contained in the merged revision.
-    /// `checkout` is kept in the signature because every jj call runs in one; the
-    /// repo is resolved from it.
     pub fn contains(&self, merge: &str, head: &str) -> Result<bool> {
         let merge = self.resolve(merge)?;
         let head = self.resolve(head)?;

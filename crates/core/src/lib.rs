@@ -8,6 +8,7 @@ pub mod diff;
 pub mod junit;
 pub mod runspec;
 pub mod usage;
+pub mod workflow;
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -76,32 +77,50 @@ macro_rules! string_enum {
 
 string_enum!(IssueStatus {
     Backlog => "backlog",
-    Ready => "ready",
-    TestsInProgress => "tests_in_progress",
-    TestsReady => "tests_ready",
+    Todo => "todo",
     InProgress => "in_progress",
     InReview => "in_review",
-    Merging => "merging",
     Blocked => "blocked",
     Done => "done",
     Cancelled => "cancelled",
 });
 
 impl IssueStatus {
-    /// States an issue can be in while an agent run may be live.
+    /// States where an agent run may be live or queued behind the issue.
     pub fn is_active(self) -> bool {
         matches!(
             self,
-            IssueStatus::TestsInProgress
-                | IssueStatus::TestsReady
-                | IssueStatus::InProgress
-                | IssueStatus::InReview
-                | IssueStatus::Merging
+            IssueStatus::Todo | IssueStatus::InProgress | IssueStatus::InReview
         )
     }
 
     pub fn is_terminal(self) -> bool {
         matches!(self, IssueStatus::Done | IssueStatus::Cancelled)
+    }
+
+    /// How the status is written for people.
+    pub fn title(self) -> &'static str {
+        match self {
+            IssueStatus::Backlog => "Backlog",
+            IssueStatus::Todo => "To do",
+            IssueStatus::InProgress => "In progress",
+            IssueStatus::InReview => "In review",
+            IssueStatus::Blocked => "Blocked",
+            IssueStatus::Done => "Done",
+            IssueStatus::Cancelled => "Cancelled",
+        }
+    }
+
+    /// The six columns a board shows, in the order work moves through them.
+    pub fn board() -> [IssueStatus; 6] {
+        [
+            IssueStatus::Backlog,
+            IssueStatus::Todo,
+            IssueStatus::InProgress,
+            IssueStatus::Blocked,
+            IssueStatus::InReview,
+            IssueStatus::Done,
+        ]
     }
 }
 
@@ -247,88 +266,54 @@ string_enum!(OwnerKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum IssueEvent {
-    ApproveCriteria,
-    StartTestAuthor,
-    /** An authoring run finished and wrote its candidate bookmark. */
-    AuthoringCompleted,
-    FreezeSuite,
-    FreezeRejected {
-        reason: String,
-    },
-    AuthoringFailed,
-    StartImplementer {
-        parent_run_id: Option<uuid::Uuid>,
-    },
-    ImplementerCompleted,
-    ImplementerFailed,
-    StartReviewer,
-    ReviewerApproved,
-    ReviewerChangesRequested,
+    /** Backlog is yours; To do is where the team picks work up. */
+    Plan,
+    Unplan,
+    /** An agent takes the task, or starts another attempt at it. */
+    Start,
+    /** The agent finished and handed the work over for review. */
+    Submit,
     RequestChanges,
-    ApproveIssue,
-    LandingRed,
-    RecordMerge,
+    /** The pull request merged, which is what closes a task. */
+    Merge,
     Blocked,
     Resume,
+    Reopen,
     CancelRun,
     Abandon,
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum TransitionError {
-    #[error("an issue in `{from}` cannot handle `{event}`")]
+    #[error("a task in `{from}` cannot handle `{event}`")]
     NotAllowed { from: IssueStatus, event: String },
-    #[error("`{from}` is terminal")]
+    #[error("`{from}` is terminal, so it has to be reopened first")]
     Terminal { from: IssueStatus },
 }
 
-/// The issue state machine, transcribed from the table in the product spec.
+/// The task state machine: six statuses, six moves.
 ///
-/// `startRun` is the only way into a working state, which is why the same event
-/// carries both the "no active run" guard and the role being started.
+/// Backlog and To do are the human's line. To do is the queue an agent reads, so
+/// moving a task there is what asks for work; from To do the agent ever only goes
+/// forward, to review, and the merge closes it.
 pub fn next(from: IssueStatus, event: &IssueEvent) -> Result<IssueStatus, TransitionError> {
     use IssueEvent as E;
     use IssueStatus as S;
 
-    if from.is_terminal() {
-        return Err(TransitionError::Terminal { from });
-    }
-
     let to = match (from, event) {
-        (S::Backlog, E::ApproveCriteria) => S::Ready,
-        (S::Ready, E::StartTestAuthor) => S::TestsInProgress,
-        (S::TestsInProgress, E::StartTestAuthor) => S::TestsInProgress,
-        (S::TestsInProgress, E::AuthoringCompleted) => S::TestsInProgress,
-        (S::TestsInProgress, E::FreezeSuite) => S::TestsReady,
-        (S::TestsInProgress, E::FreezeRejected { .. }) => S::TestsInProgress,
-        (S::TestsInProgress, E::AuthoringFailed) => S::Ready,
-        (S::TestsReady, E::StartImplementer { .. }) => S::InProgress,
-        (S::TestsReady, E::StartTestAuthor) => S::TestsInProgress,
-        (S::InProgress, E::StartImplementer { .. }) => S::InProgress,
-        (S::InProgress, E::ImplementerCompleted) => S::InReview,
-        (S::InProgress, E::ImplementerFailed) => S::InProgress,
-        (S::InProgress, E::StartTestAuthor) => S::TestsInProgress,
-        // A thaw is the human saying the criteria were wrong, and that decision has
-        // to be possible while an implementation already exists.
-        (S::InReview, E::StartTestAuthor) => S::TestsInProgress,
-        (S::Merging, E::StartTestAuthor) => S::TestsInProgress,
-        (S::InReview, E::StartReviewer) => S::InReview,
-        (S::InReview, E::ReviewerApproved) => S::InReview,
-        (S::InReview, E::ReviewerChangesRequested) => S::InProgress,
+        (S::Backlog, E::Plan) => S::Todo,
+        (S::Todo, E::Unplan) => S::Backlog,
+        (S::Todo, E::Start) => S::InProgress,
+        (S::InProgress, E::Start) => S::InProgress,
+        (S::InProgress, E::Submit) => S::InReview,
         (S::InReview, E::RequestChanges) => S::InProgress,
-        (S::InReview, E::ApproveIssue) => S::Merging,
-        (S::Merging, E::LandingRed) => S::InProgress,
-        (S::Merging, E::RecordMerge) => S::Done,
-        (_, E::Blocked) if from.is_active() => S::Blocked,
+        (S::InReview, E::Merge) => S::Done,
         (S::Blocked, E::Resume) => S::InProgress,
-        (_, E::Abandon) => S::Cancelled,
-        (_, E::CancelRun) => from,
-        (from, event) if from.is_active() => {
-            return Err(TransitionError::NotAllowed {
-                from,
-                event: format!("{event:?}"),
-            })
-        }
+        (_, E::Reopen) if from.is_terminal() => S::Todo,
+        (_, E::Blocked) if from.is_active() || from == S::Backlog => S::Blocked,
+        (_, E::Abandon) if !from.is_terminal() => S::Cancelled,
+        (_, E::CancelRun) if from.is_active() => from,
+        (_, _) if from.is_terminal() => return Err(TransitionError::Terminal { from }),
         (from, event) => {
             return Err(TransitionError::NotAllowed {
                 from,
@@ -340,196 +325,72 @@ pub fn next(from: IssueStatus, event: &IssueEvent) -> Result<IssueStatus, Transi
     Ok(to)
 }
 
-/// `resumeIssue` returns to the status the issue left, so the caller has to say
+/// `resumeIssue` returns to the status the task left, so the caller has to say
 /// what that was. The server passes `issues.status_before_blocked`.
 pub fn resume_to(status_before_blocked: Option<IssueStatus>) -> Option<IssueStatus> {
-    status_before_blocked.filter(|s| s.is_active())
+    status_before_blocked.filter(|s| s.is_active() || *s == IssueStatus::Backlog)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use IssueEvent as E;
+    use IssueStatus as S;
 
     #[test]
-    fn gate_cannot_be_skipped() {
-        // Approving straight from backlog is impossible: criteria come first.
-        assert!(next(IssueStatus::Backlog, &IssueEvent::ApproveIssue).is_err());
-        // Implementation cannot start before the suite is frozen.
-        assert!(next(
-            IssueStatus::TestsInProgress,
-            &IssueEvent::StartImplementer {
-                parent_run_id: None
-            }
-        )
-        .is_err());
+    fn the_team_only_works_forward() {
+        assert_eq!(next(S::Todo, &E::Start).unwrap(), S::InProgress);
+        assert_eq!(next(S::InProgress, &E::Submit).unwrap(), S::InReview);
+        assert_eq!(next(S::InReview, &E::Merge).unwrap(), S::Done);
+        // No shortcut from the queue straight to review.
+        assert!(next(S::Todo, &E::Submit).is_err());
+        assert!(next(S::Backlog, &E::Start).is_err());
     }
 
     #[test]
-    fn terminal_states_are_terminal() {
-        for status in [IssueStatus::Done, IssueStatus::Cancelled] {
-            assert_eq!(
-                next(status, &IssueEvent::Abandon),
-                Err(TransitionError::Terminal { from: status })
-            );
-        }
+    fn backlog_is_the_human_line() {
+        assert_eq!(next(S::Backlog, &E::Plan).unwrap(), S::Todo);
+        assert_eq!(next(S::Todo, &E::Unplan).unwrap(), S::Backlog);
     }
 
     #[test]
-    fn rework_paths_converge_on_in_progress() {
+    fn review_can_send_work_back() {
         assert_eq!(
-            next(IssueStatus::InReview, &IssueEvent::ReviewerChangesRequested).unwrap(),
-            IssueStatus::InProgress
-        );
-        assert_eq!(
-            next(IssueStatus::Merging, &IssueEvent::LandingRed).unwrap(),
-            IssueStatus::InProgress
-        );
-        assert_eq!(
-            next(IssueStatus::InReview, &IssueEvent::RequestChanges).unwrap(),
-            IssueStatus::InProgress
+            next(S::InReview, &E::RequestChanges).unwrap(),
+            S::InProgress
         );
     }
 
     #[test]
-    fn cancel_keeps_the_status_and_abandon_ends_it() {
-        assert_eq!(
-            next(IssueStatus::InProgress, &IssueEvent::CancelRun).unwrap(),
-            IssueStatus::InProgress
-        );
-        assert_eq!(
-            next(IssueStatus::InProgress, &IssueEvent::Abandon).unwrap(),
-            IssueStatus::Cancelled
-        );
-    }
-
-    #[test]
-    fn every_active_state_can_block_and_resume() {
-        for status in [
-            IssueStatus::TestsInProgress,
-            IssueStatus::TestsReady,
-            IssueStatus::InProgress,
-            IssueStatus::InReview,
-            IssueStatus::Merging,
-        ] {
-            assert_eq!(
-                next(status, &IssueEvent::Blocked).unwrap(),
-                IssueStatus::Blocked
-            );
-            assert_eq!(
-                next(IssueStatus::Blocked, &IssueEvent::Resume).unwrap(),
-                IssueStatus::InProgress
-            );
+    fn blocked_and_resumed_from_every_working_state() {
+        for status in [S::Todo, S::InProgress, S::InReview] {
+            assert_eq!(next(status, &E::Blocked).unwrap(), S::Blocked);
             assert_eq!(resume_to(Some(status)), Some(status));
         }
+        assert_eq!(next(S::Blocked, &E::Resume).unwrap(), S::InProgress);
     }
 
     #[test]
-    fn thaw_is_possible_while_an_implementation_exists() {
-        for from in [
-            IssueStatus::TestsReady,
-            IssueStatus::InProgress,
-            IssueStatus::InReview,
-            IssueStatus::Merging,
-        ] {
+    fn terminal_states_need_reopening() {
+        for status in [S::Done, S::Cancelled] {
             assert_eq!(
-                next(from, &IssueEvent::StartTestAuthor).unwrap(),
-                IssueStatus::TestsInProgress,
-                "a thaw from {from} has to reach the authoring state"
+                next(status, &E::Abandon),
+                Err(TransitionError::Terminal { from: status })
             );
+            assert_eq!(next(status, &E::Reopen).unwrap(), S::Todo);
         }
     }
 
     #[test]
-    fn done_only_through_record_merge() {
-        let mut status = IssueStatus::Backlog;
-        for event in [
-            IssueEvent::ApproveCriteria,
-            IssueEvent::StartTestAuthor,
-            IssueEvent::AuthoringCompleted,
-            IssueEvent::FreezeSuite,
-            IssueEvent::StartImplementer {
-                parent_run_id: None,
-            },
-            IssueEvent::ImplementerCompleted,
-            IssueEvent::StartReviewer,
-            IssueEvent::ReviewerApproved,
-            IssueEvent::ApproveIssue,
-            IssueEvent::RecordMerge,
-        ] {
-            status = next(status, &event).unwrap();
-        }
-        assert_eq!(status, IssueStatus::Done);
+    fn abandoning_ends_a_live_task() {
+        assert_eq!(next(S::InProgress, &E::Abandon).unwrap(), S::Cancelled);
+        assert_eq!(next(S::InProgress, &E::CancelRun).unwrap(), S::InProgress);
     }
 
     #[test]
-    fn status_strings_round_trip_for_the_database() {
-        for status in [
-            IssueStatus::Backlog,
-            IssueStatus::Ready,
-            IssueStatus::TestsInProgress,
-            IssueStatus::TestsReady,
-            IssueStatus::InProgress,
-            IssueStatus::InReview,
-            IssueStatus::Merging,
-            IssueStatus::Blocked,
-            IssueStatus::Done,
-            IssueStatus::Cancelled,
-        ] {
-            assert_eq!(IssueStatus::parse(status.as_str()), Some(status));
-        }
-    }
-}
-
-#[cfg(test)]
-mod identity_tests {
-    use super::AgentRole;
-
-    #[test]
-    fn an_app_address_is_the_one_github_links_to_the_bot() {
-        assert_eq!(
-            AgentRole::Implementer.app_commit_email(Some("123456"), Some("hulahoop-dev")),
-            "123456+hulahoop-dev[bot]@users.noreply.github.com"
-        );
-    }
-
-    #[test]
-    fn without_both_halves_the_role_address_stands() {
-        for (app_id, slug) in [
-            (None, None),
-            (Some("123456"), None),
-            (None, Some("hulahoop-dev")),
-        ] {
-            let email = AgentRole::TestAuthor.app_commit_email(app_id, slug);
-            assert_eq!(email, "hulahoop-test-author@hulahoop.invalid");
-        }
-    }
-}
-
-#[cfg(test)]
-mod commit_name_tests {
-    use super::AgentRole;
-
-    #[test]
-    fn the_name_follows_the_app_slug() {
-        assert_eq!(
-            AgentRole::Implementer.app_commit_name(Some("hulahoop-dev")),
-            "hulahoop-dev-implementer"
-        );
-        assert_eq!(
-            AgentRole::TestAuthor.app_commit_name(Some("acme-loop")),
-            "acme-loop-test-author"
-        );
-    }
-
-    #[test]
-    fn without_an_app_the_loop_keeps_its_own_name() {
-        assert_eq!(
-            AgentRole::TestAuthor.app_commit_name(None),
-            "hulahoop-test-author"
-        );
-        assert_eq!(
-            AgentRole::Implementer.app_commit_name(Some("  ")),
-            "hulahoop-implementer"
-        );
+    fn the_board_shows_six_columns() {
+        assert_eq!(IssueStatus::board().len(), 6);
+        assert!(IssueStatus::board().contains(&S::Blocked));
+        assert!(!IssueStatus::board().contains(&S::Cancelled));
     }
 }

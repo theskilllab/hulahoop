@@ -1,11 +1,9 @@
+/** The six columns of the board, plus the states a task can leave it through. */
 export type IssueStatus =
   | "backlog"
-  | "ready"
-  | "tests_in_progress"
-  | "tests_ready"
+  | "todo"
   | "in_progress"
   | "in_review"
-  | "merging"
   | "blocked"
   | "done"
   | "cancelled";
@@ -22,6 +20,7 @@ export interface Connection {
 }
 
 export interface Criterion {
+  id: string;
   position: number;
   text: string;
   testName: string | null;
@@ -41,6 +40,9 @@ export interface Run {
   commitEmail: string | null;
   prUrl: string | null;
   prNumber: number | null;
+  /** Set when the task is blocked, naming what it waits for. */
+  blockedBy: string | null;
+  projectName: string | null;
   error: string | null;
   tokensIn: number;
   tokensOut: number;
@@ -59,6 +61,8 @@ export interface Review {
 
 export interface Comment {
   id: string;
+  /** The agent's name, or `you` for a person. */
+  author: string;
   authorType: string;
   body: string;
   pinned: boolean;
@@ -98,12 +102,16 @@ export interface Issue {
   runCount: number;
   testsFrozenAt: string | null;
   mergeRevision: string | null;
+  prUrl: string | null;
+  prNumber: number | null;
   pinnedCommentId: string | null;
+  /** Set when the task is blocked, naming what it waits for. */
+  blockedBy: string | null;
+  projectName: string | null;
   criteria: Criterion[];
   runs: Run[];
   reviews: Review[];
   comments: Comment[];
-  replays: Replay[];
   approval: Approval | null;
   currentRun: Run | null;
 }
@@ -125,6 +133,8 @@ export interface Agent {
   name: string;
   adapter: string;
   model: string;
+  agentsMd: string;
+  skills: Skill[];
 }
 
 export interface ProjectAgent {
@@ -154,6 +164,30 @@ export interface WorkspaceMember {
   name: string;
   email: string | null;
   role: string;
+}
+
+export type WorkflowSection = {
+  status: IssueStatus;
+  title: string;
+  owner: string;
+  agent: string | null;
+  next: IssueStatus | null;
+  body: string;
+};
+
+export type WorkflowDoc = {
+  source: string;
+  updatedAt: string | null;
+  sections: WorkflowSection[];
+  errors: string[];
+};
+
+export interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  source: string;
+  updatedAt: string;
 }
 
 export interface Milestone {
@@ -350,12 +384,11 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
 export const ISSUE_FIELDS = `
   id key number projectId projectPrefix milestoneId
   title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
-  criteria { position text testName }
+  blockedBy projectName prUrl prNumber
+  criteria { id position text testName }
   runs { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
-  comments { id authorType body pinned createdAt }
-  replays { id kind status failedTests createdAt }
-  approval { id headRevision diffSha landingBookmark flags createdAt }
+  comments { id author authorType body pinned createdAt }
   currentRun { id role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
@@ -367,7 +400,91 @@ export async function loadBoard(workspaceId: string): Promise<Issue[]> {
   return data.issues;
 }
 
+export const SKILL_FIELDS = `id name description source updatedAt`;
+
+export async function loadSkills(workspaceId: string): Promise<Skill[]> {
+  const data = await gql<{ skills: Skill[] }>(
+    `query ($w: UUID!) { skills(workspaceId: $w) { ${SKILL_FIELDS} } }`,
+    { w: workspaceId },
+  );
+  return data.skills;
+}
+
+export async function createSkill(
+  workspaceId: string,
+  name: string,
+  description: string,
+  source: string,
+): Promise<Skill> {
+  const data = await gql<{ createSkill: Skill }>(
+    `mutation ($w: UUID!, $n: String!, $d: String, $s: String!) {
+      createSkill(workspaceId: $w, name: $n, description: $d, source: $s) { ${SKILL_FIELDS} }
+    }`,
+    { w: workspaceId, n: name, d: description, s: source },
+  );
+  return data.createSkill;
+}
+
+export async function updateSkill(
+  id: string,
+  changes: { name?: string; description?: string; source?: string },
+): Promise<Skill> {
+  const data = await gql<{ updateSkill: Skill }>(
+    `mutation ($id: UUID!, $n: String, $d: String, $s: String) {
+      updateSkill(id: $id, name: $n, description: $d, source: $s) { ${SKILL_FIELDS} }
+    }`,
+    { id, n: changes.name ?? null, d: changes.description ?? null, s: changes.source ?? null },
+  );
+  return data.updateSkill;
+}
+
+export async function deleteSkill(id: string): Promise<boolean> {
+  const data = await gql<{ deleteSkill: boolean }>(
+    `mutation ($id: UUID!) { deleteSkill(id: $id) }`,
+    { id },
+  );
+  return data.deleteSkill;
+}
+
+export async function setAgentSkills(agentId: string, skillIds: string[]): Promise<Skill[]> {
+  const data = await gql<{ setAgentSkills: Skill[] }>(
+    `mutation ($a: UUID!, $s: [UUID!]!) { setAgentSkills(agentId: $a, skillIds: $s) { ${SKILL_FIELDS} } }`,
+    { a: agentId, s: skillIds },
+  );
+  return data.setAgentSkills;
+}
+
+export async function setAgentInstructions(agentId: string, agentsMd: string): Promise<boolean> {
+  const data = await gql<{ setAgentInstructions: boolean }>(
+    `mutation ($a: UUID!, $m: String!) { setAgentInstructions(agentId: $a, agentsMd: $m) }`,
+    { a: agentId, m: agentsMd },
+  );
+  return data.setAgentInstructions;
+}
+
 export const MILESTONE_FIELDS = `id projectId title body status targetDate createdAt`;
+
+export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
+  const data = await gql<{ workflow: WorkflowDoc }>(
+    `query ($w: UUID!) { workflow(workspaceId: $w) {
+      source updatedAt errors
+      sections { status title owner agent next body }
+    } }`,
+    { w: workspaceId },
+  );
+  return data.workflow;
+}
+
+export async function saveWorkflow(workspaceId: string, source: string): Promise<WorkflowDoc> {
+  const data = await gql<{ setWorkflow: WorkflowDoc }>(
+    `mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) {
+      source updatedAt errors
+      sections { status title owner agent next body }
+    } }`,
+    { w: workspaceId, s: source },
+  );
+  return data.setWorkflow;
+}
 
 export async function loadMilestones(workspaceId: string): Promise<Milestone[]> {
   const data = await gql<{ milestones: Milestone[] }>(
@@ -462,7 +579,10 @@ export async function loadWorkspace(workspaceId?: string | null): Promise<Worksp
     { id: workspace.id },
   );
   const agents = await gql<{ agents: Agent[] }>(
-    `query ($id: UUID!) { agents(workspaceId: $id) { id name adapter model } }`,
+    `query ($id: UUID!) { agents(workspaceId: $id) {
+      id name adapter model agentsMd
+      skills { ${SKILL_FIELDS} }
+    } }`,
     { id: workspace.id },
   );
   return {

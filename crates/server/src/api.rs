@@ -1,7 +1,7 @@
 //! Internal HTTP API. This is the only door between the runner and the
 //! database, which is what keeps the server the single SQLite writer.
 
-use crate::engine::{prompt_for, Engine};
+use crate::engine::Engine;
 use crate::model::*;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -93,15 +93,6 @@ fn runner_mode() -> &'static str {
 
 /// Replays read the loop's own bookmarks (`tests/<issue>/…`), which never leave the
 /// host repository, so they always run in the borrowed one.
-fn replay_checkout(
-    data_dir: &std::path::Path,
-    project: &uuid::Uuid,
-    issue: &uuid::Uuid,
-    owner: &uuid::Uuid,
-) -> std::path::PathBuf {
-    hulahoop_core::contract::checkout_dir(data_dir, &project.to_string(), issue, &owner.to_string())
-}
-
 fn checkout_for(
     data_dir: &std::path::Path,
     project: &uuid::Uuid,
@@ -132,8 +123,6 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/internal/runs/{id}/heartbeat", post(heartbeat))
         .route("/internal/runs/{id}/events", post(append_event))
         .route("/internal/runs/{id}/complete", post(complete_run))
-        .route("/internal/replays/claim", post(claim_replay))
-        .route("/internal/replays/{id}/complete", post(complete_replay))
         .route("/internal/jobs/claim", post(claim_job))
         .route("/internal/jobs/{id}/complete", post(complete_job))
         .route("/internal/repos/{id}/lock", post(lock_repo))
@@ -184,13 +173,6 @@ struct RunEnvelope {
     run: Run,
     spec: Value,
 }
-
-#[derive(Serialize)]
-struct ReplayEnvelope {
-    replay: Replay,
-    spec: Value,
-}
-
 #[derive(Serialize)]
 struct JobEnvelope {
     job: RunnerJob,
@@ -294,40 +276,6 @@ async fn complete_run(
     Ok(Json(
         json!({ "run": { "id": run.id.to_string(), "status": run.status } }),
     ))
-}
-
-async fn claim_replay(
-    State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
-) -> ApiResult<Option<ReplayEnvelope>> {
-    authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
-    let replay = state
-        .engine
-        .claim_replay()
-        .await
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let Some(replay) = replay else {
-        return Ok(Json(None));
-    };
-    let spec = build_replay_spec(&state.engine, &replay)
-        .await
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(Some(ReplayEnvelope { replay, spec })))
-}
-
-async fn complete_replay(
-    State(state): State<Arc<ApiState>>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-    Json(body): Json<crate::engine::ReplayCompletion>,
-) -> ApiResult<Value> {
-    authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
-    state
-        .engine
-        .complete_replay(id, body)
-        .await
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(json!({ "ok": true })))
 }
 
 async fn claim_job(
@@ -588,7 +536,8 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    std::fs::write(&prompt_path, prompt_for(run.role_enum()))?;
+    let prompt = engine.compose_prompt(run.role_enum(), &agent).await?;
+    std::fs::write(&prompt_path, &prompt)?;
 
     Ok(json!({
         "run_id": run.id,
@@ -597,7 +546,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "role": run.role_enum().as_str(),
         "adapter": agent.adapter,
         "model": agent.model,
-        "prompt": prompt_for(run.role_enum()),
+        "prompt": prompt,
         "prompt_path": prompt_path,
         "input_path": input_path,
         "repo_path": host_path(&repo, &engine.db.data_dir),
@@ -628,100 +577,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "commit_app_slug": engine.commit_identity().await?.1,
         "timeout_minutes": hulahoop_core::AGENT_WALL_CLOCK_MINUTES,
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
-        "prompt_revision": run.prompt_revision,
-    }))
-}
-
-async fn build_replay_spec(engine: &Engine, replay: &Replay) -> anyhow::Result<Value> {
-    let issue = engine.issue(replay.issue_id).await?;
-    let repo: Repo = sqlx::query_as("select * from repos where id = ?")
-        .bind(replay.repo_id)
-        .fetch_one(&engine.db.pool)
-        .await?;
-    let project: Project = sqlx::query_as("select * from projects where id = ?")
-        .bind(issue.project_id)
-        .fetch_one(&engine.db.pool)
-        .await?;
-    let checkout_path = replay_checkout(&engine.db.data_dir, &project.id, &issue.id, &replay.id);
-
-    // A landing replay runs on the freshly fetched base after a rebase; the base
-    // and head replays run on the revision they were queued for.
-    // A landing replay hangs off the approval rather than off a run of its own, and
-    // the run behind that approval is the one holding the head bookmark.
-    let mut head_run_id = replay.run_id.or(replay.candidate_run_id);
-    if head_run_id.is_none() {
-        if let Some(approval_id) = replay.approval_id {
-            head_run_id =
-                sqlx::query_scalar::<_, Uuid>("select run_id from approvals where id = ?")
-                    .bind(approval_id)
-                    .fetch_optional(&engine.db.pool)
-                    .await?;
-        }
-    }
-    let head_bookmark = match head_run_id {
-        Some(run_id) => {
-            let run: Option<Run> = sqlx::query_as("select * from runs where id = ?")
-                .bind(run_id)
-                .fetch_optional(&engine.db.pool)
-                .await?;
-            run.and_then(|r| r.head_bookmark)
-        }
-        None => None,
-    };
-    let approval: Option<Approval> = match replay.approval_id {
-        Some(id) => {
-            sqlx::query_as("select * from approvals where id = ?")
-                .bind(id)
-                .fetch_optional(&engine.db.pool)
-                .await?
-        }
-        None => None,
-    };
-    let candidate = match replay.candidate_run_id {
-        Some(id) => {
-            sqlx::query_as::<_, Run>("select * from runs where id = ?")
-                .bind(id)
-                .fetch_optional(&engine.db.pool)
-                .await?
-        }
-        None => None,
-    };
-
-    // The candidate was authored on the base of *its own* run, and the paths to lay
-    // back down are the difference from there. Diffing against the repo's current base
-    // would turn every commit landed since then into a "change" and lay the old files
-    // back over the new ones.
-    let candidate_bookmark = candidate
-        .as_ref()
-        .and_then(|c| c.candidate_bookmark.clone());
-    let candidate_revision = candidate.as_ref().and_then(|c| c.head_revision.clone());
-    let candidate_base_revision = candidate.as_ref().and_then(|c| c.base_revision.clone());
-
-    Ok(json!({
-        "replay_id": replay.id,
-        "issue_id": issue.id,
-        "attempt": replay.attempt,
-        "kind": replay.kind,
-        "repo_path": host_path(&repo, &engine.db.data_dir),
-        "repo_mirror": is_mirror(&repo),
-        "clone_token": clone_token(engine, &repo).await,
-        "repo_id": repo.id,
-        "vcs": repo.vcs,
-        "checkout_path": checkout_path,
-        "base_bookmark": repo.base_bookmark,
-        "base_revision": repo.base_revision,
-        "tests_bookmark": replay.tests_bookmark,
-        "frozen_paths": issue.frozen_path_list(),
-        "artifact_dir": replay.artifact_dir,
-        "data_dir": engine.db.data_dir,
-        "caller_role": "replay",
-        "head_bookmark": head_bookmark,
-        "candidate_bookmark": candidate_bookmark,
-        "candidate_revision": candidate_revision,
-        "candidate_base_revision": candidate_base_revision,
-        "landing_bookmark": approval.clone().and_then(|a| a.landing_bookmark),
-        "approval_head_revision": approval.map(|a| a.head_revision),
-        "timeout_minutes": hulahoop_core::REPLAY_WALL_CLOCK_MINUTES,
+        "prompt_revision": engine.prompt_revision(&prompt),
     }))
 }
 
@@ -758,7 +614,20 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
     // A pull request needs the story a reviewer reads: what the issue asked for,
     // what the suite proves, and what the reviewer said, plus the app token that
     // lets the push and the API call be made as the app.
-    let pull_request = if job.kind == "open_pr" {
+    let pull_request = if job.kind == "watch_checks" {
+        Some(json!({
+            "number": payload.get("number"),
+            "sha": payload.get("sha"),
+            "app_token": engine.github_token().await?,
+        }))
+    } else if job.kind == "review_pr" {
+        Some(json!({
+            "number": payload.get("number"),
+            "verdict": payload.get("verdict"),
+            "body": payload.get("body"),
+            "app_token": engine.github_token().await?,
+        }))
+    } else if job.kind == "open_pr" {
         let run_id = payload
             .get("run_id")
             .and_then(|v| v.as_str())
@@ -795,9 +664,18 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
                 };
                 Some(json!({
                     "run_id": run_id,
+                    "number": issue.as_ref().and_then(|i| i.pr_number),
+                    "branch": issue
+                        .as_ref()
+                        .and_then(|i| i.pr_branch.clone())
+                        .or_else(|| {
+                            run.as_ref().map(|r| {
+                                format!("hulahoop/issue-{}-attempt-{}", r.issue_id, r.attempt)
+                            })
+                        }),
                     "head_revision": run.as_ref().and_then(|r| r.head_revision.clone()),
                     "attempt": run.as_ref().map(|r| r.attempt),
-                    "branch": run.as_ref().map(|r| format!("hulahoop/issue-{}-attempt-{}", r.issue_id, r.attempt)),
+
                     "title": issue.as_ref().map(|i| i.title.clone()),
                     "body": issue.as_ref().map(|i| i.body.clone()),
                     "criteria": criteria.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),

@@ -47,12 +47,28 @@ pub struct Repo {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Agent {
     pub id: Uuid,
     pub workspace_id: Uuid,
     pub name: String,
     pub adapter: String,
     pub model: String,
+    /// How this agent should behave, written by the person who knows it best.
+    pub agents_md: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// A skill is reusable knowledge, kept in one place and attached to agents that
+/// need it: a convention, a checklist, a house rule with the story behind it.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct Skill {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub name: String,
+    pub description: String,
+    pub source: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -116,6 +132,9 @@ pub struct Issue {
     pub tests_frozen_at: Option<DateTime<Utc>>,
     pub merge_revision: Option<String>,
     pub merged_at: Option<DateTime<Utc>>,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<i64>,
+    pub pr_branch: Option<String>,
     pub abandon_reason: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -226,7 +245,6 @@ impl Run {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
-#[graphql(complex)]
 pub struct Replay {
     pub id: Uuid,
     pub issue_id: Uuid,
@@ -259,6 +277,7 @@ pub struct Review {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Comment {
     pub id: Uuid,
     pub issue_id: Uuid,

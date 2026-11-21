@@ -19,17 +19,14 @@ from pathlib import Path
 
 OUT = Path(__file__).resolve().parent.parent / "apps/desktop/src-tauri/icons"
 
-BACKDROP_TOP = (0x16, 0x1B, 0x22)
-BACKDROP_BOTTOM = (0x0B, 0x0E, 0x13)
-ACCENT = (0x6E, 0xE7, 0xA8)
-
-# The ring is a broken circle: the gap is where the loop stays open.
-GAP_START = math.radians(-55.0)
-GAP_END = math.radians(-25.0)
-RING_RADIUS = 0.265
-RING_WIDTH = 0.062
-CORNER_RADIUS = 0.222
-INSET = 0.035
+# The mark from the prototype: a white rounded tile with the brand dot in the
+# middle. The dot is 53% of the tile's width, and its colour never changes with
+# the theme, so the icon reads the same in Finder and in the dock.
+TILE = (0xFF, 0xFF, 0xFF)
+DOT = (0x6F, 0x86, 0xD6)
+DOT_RADIUS = 0.53 / 2
+CORNER_RADIUS = 0.2237
+INSET = 0.0
 
 
 def _rounded_rect_sd(x: float, y: float, half: float, radius: float) -> float:
@@ -41,32 +38,15 @@ def _rounded_rect_sd(x: float, y: float, half: float, radius: float) -> float:
     return outside + inside - radius
 
 
-def _in_gap(angle: float) -> bool:
-    start = GAP_START % (2 * math.pi)
-    end = GAP_END % (2 * math.pi)
-    angle %= 2 * math.pi
-    if start <= end:
-        return start <= angle <= end
-    return angle >= start or angle <= end
-
-
 def _pixel(px: float, py: float) -> tuple[int, int, int, int]:
     """Colour of the icon at one point, in unit coordinates from -0.5 to 0.5."""
     half = 0.5 - INSET
     if _rounded_rect_sd(px, py, half, CORNER_RADIUS) > 0.0:
         return (0, 0, 0, 0)
 
-    t = (py + half) / (2 * half)
-    t = min(max(t, 0.0), 1.0)
-    colour = tuple(
-        round(BACKDROP_TOP[i] + (BACKDROP_BOTTOM[i] - BACKDROP_TOP[i]) * t) for i in range(3)
-    )
-
-    distance = math.hypot(px, py)
-    if abs(distance - RING_RADIUS) <= RING_WIDTH / 2 and not _in_gap(math.atan2(py, px)):
-        colour = ACCENT
-
-    return (colour[0], colour[1], colour[2], 255)
+    if math.hypot(px, py) <= DOT_RADIUS:
+        return (DOT[0], DOT[1], DOT[2], 255)
+    return (TILE[0], TILE[1], TILE[2], 255)
 
 
 def _byte(value: float) -> int:

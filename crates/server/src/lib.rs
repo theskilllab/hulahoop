@@ -8,8 +8,10 @@ pub mod engine;
 pub mod github;
 pub mod gql;
 pub mod model;
+pub mod skills;
 pub mod tenancy;
 pub mod vault;
+pub mod workflows;
 
 use anyhow::Context;
 use std::net::SocketAddr;
@@ -54,6 +56,16 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         }
         index += 1;
     }
+
+    // A relative `--data-dir` is what a person types, and it is resolved against this
+    // process's working directory. Every path handed to a runner is resolved against
+    // *that* process's working directory — a checkout, elsewhere entirely — where the
+    // same relative string points at nothing. Six hours went into a run that could not
+    // find its own credentials for exactly this reason, so the data dir is absolute
+    // from here on.
+    std::fs::create_dir_all(&data_dir).context("creating the data directory")?;
+    data_dir = std::fs::canonicalize(&data_dir)
+        .with_context(|| format!("resolving {}", data_dir.display()))?;
 
     let database = db::Db::open(&data_dir).await?;
     let workspace_id = database.seed_local().await?;

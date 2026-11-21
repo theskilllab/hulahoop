@@ -6,11 +6,14 @@ import {
   loadGithubRepos,
   loadWorkspaceMembers,
   renameProject,
+  setAgentInstructions,
+  setAgentSkills,
   updateWorkspace,
   type Agent,
   type GithubRepo,
   type Project,
   type Repo,
+  type Skill,
   type Workspace,
   type WorkspaceMember,
 } from "../api";
@@ -37,6 +40,7 @@ export default function Settings({
   projects,
   active,
   agents,
+  skills = [],
   onChanged,
   onSwitchWorkspace,
 }: {
@@ -45,6 +49,7 @@ export default function Settings({
   projects: Project[];
   active: Project | null;
   agents: Agent[];
+  skills?: Skill[];
   onChanged: () => Promise<void>;
   onSwitchWorkspace: (id: string) => Promise<void>;
 }) {
@@ -512,6 +517,55 @@ export default function Settings({
                   />
                 </div>
               </div>
+              <details className="agent-brain">
+                <summary>
+                  how it works
+                  <span className="dim">
+                    {" "}
+                    · {agent.skills?.length ?? 0} skills · {agent.agentsMd ? "instructions written" : "no instructions"}
+                  </span>
+                </summary>
+                <label className="stack">
+                  <span className="label">AGENTS.md — how this agent works</span>
+                  <textarea
+                    rows={6}
+                    defaultValue={agent.agentsMd}
+                    placeholder="Read CLAUDE conventions first. Prefer small diffs. Ask before touching CI."
+                    onBlur={(event) => {
+                      const next = event.target.value;
+                      if (next !== agent.agentsMd) {
+                        void action("instructions", () =>
+                          setAgentInstructions(agent.id, next),
+                        );
+                      }
+                    }}
+                  />
+                </label>
+                <div className="stack">
+                  <span className="label">skills it carries</span>
+                  {skills.length === 0 ? (
+                    <span className="dim">no skills in this workspace yet</span>
+                  ) : (
+                    skills.map((skill) => (
+                      <label key={skill.id} className="check">
+                        <input
+                          type="checkbox"
+                          checked={(agent.skills ?? []).some((carried) => carried.id === skill.id)}
+                          onChange={(event) => {
+                            const carried = (agent.skills ?? []).map((entry) => entry.id);
+                            const next = event.target.checked
+                              ? [...carried, skill.id]
+                              : carried.filter((id) => id !== skill.id);
+                            void action("skills", () => setAgentSkills(agent.id, next));
+                          }}
+                        />
+                        <span>{skill.name}</span>
+                        <span className="dim">{skill.description}</span>
+                      </label>
+                    ))
+                  )}
+                </div>
+              </details>
               <div className="probe">
                 {probe ? (
                   <span className={probe.ok ? "ok" : "bad"} title={probe.detail}>

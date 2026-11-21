@@ -9,30 +9,23 @@ cd "$HULAHOOP_CHECKOUT"
 echo "{\"type\":\"message_start\",\"role\":\"${ROLE}\"}"
 
 case "$ROLE" in
-  test_author)
+  implementer|test_author)
+    # One commit does the whole job: the implementation and the test that proves
+    # it. An agent owns both now, so there is no separate authoring stage.
     cat > tests/test_subtract.py <<'PY'
 
 
 def test_ac1_subtract_returns_the_difference():
-    # Imported inside the test: at the base revision calc has no subtract yet, and
-    # a module-level import would turn the whole file into one collection error.
     from calc import subtract
 
     assert subtract(5, 3) == 2
 PY
-    echo "{\"type\":\"tool_call\",\"name\":\"write\",\"path\":\"tests/test_subtract.py\"}"
-    ;;
-  implementer)
-    cat >> calc.py <<'PY'
-
-
-def subtract(a: int, b: int) -> int:
-    return a - b
-PY
-    echo "{\"type\":\"tool_call\",\"name\":\"edit\",\"path\":\"calc.py\"}"
+    printf '\n\ndef subtract(a: int, b: int) -> int:\n    return a - b\n' >>calc.py
+    echo '{"type":"tool_call","name":"write","path":"calc.py"}'
+    echo "HULAHOOP_VERDICT: approved"
     ;;
   reviewer)
-    echo "{\"type\":\"message\",\"text\":\"The diff adds subtract and one failing-first test covers it.\"}"
+    echo '{"type":"message","text":"One test fails before the change and passes after it."}'
     echo "HULAHOOP_VERDICT: approved"
     ;;
   *)

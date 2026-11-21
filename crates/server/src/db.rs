@@ -6,6 +6,68 @@ use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+/// Copies kept beside the data, so a migration that rebuilds a parent table
+/// cannot cost a workspace.
+const DB_BACKUPS_KEPT: usize = 5;
+
+/// A migration that rebuilds a parent table (`drop table repos`) cascades
+/// through its children while foreign keys are enforced, and the rows go with
+/// it. Nothing here can undo that, but a copy taken before the migration runs
+/// can.
+fn backup_before_migrations(file: &Path, data_dir: &Path) {
+    let Ok(meta) = std::fs::metadata(file) else {
+        return; // first start: nothing to lose
+    };
+    if meta.len() == 0 {
+        return;
+    }
+    let dir = data_dir.join("backups");
+    if std::fs::create_dir_all(&dir).is_err() {
+        eprintln!(
+            "warning: could not create {}; skipping the backup",
+            dir.display()
+        );
+        return;
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let target = dir.join(format!("hulahoop-{stamp}.sqlite"));
+    if target.exists() {
+        return; // one copy per second is enough
+    }
+    if let Err(error) = std::fs::copy(file, &target) {
+        eprintln!("warning: could not back up the database: {error}");
+        return;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let side = PathBuf::from(format!("{}{suffix}", file.display()));
+        if side.exists() {
+            let _ = std::fs::copy(&side, dir.join(format!("hulahoop-{stamp}.sqlite{suffix}")));
+        }
+    }
+    prune_backups(&dir, DB_BACKUPS_KEPT);
+}
+
+fn prune_backups(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut copies: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|ext| ext == "sqlite").unwrap_or(false))
+        .collect();
+    copies.sort();
+    if copies.len() <= keep {
+        return;
+    }
+    for old in &copies[..copies.len() - keep] {
+        let _ = std::fs::remove_file(old);
+        for suffix in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(PathBuf::from(format!("{}{suffix}", old.display())));
+        }
+    }
+}
+
 pub struct Db {
     pub pool: SqlitePool,
     pub data_dir: PathBuf,
@@ -20,6 +82,8 @@ impl Db {
         std::fs::create_dir_all(data_dir.join("home"))?;
 
         let file = contract::database_file(data_dir);
+        backup_before_migrations(&file, data_dir);
+
         let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", file.display()))?
             .create_if_missing(true)
             .busy_timeout(std::time::Duration::from_millis(
@@ -133,4 +197,61 @@ pub fn json_list_of_flags(raw: &str) -> Vec<hulahoop_core::RunFlag> {
 
 pub fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("hulahoop-{name}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn a_copy_is_taken_before_the_database_is_opened() {
+        let dir = scratch("backup");
+        let file = dir.join("hulahoop.sqlite");
+        std::fs::write(&file, b"rows").expect("write");
+        backup_before_migrations(&file, &dir);
+        let copies: Vec<_> = std::fs::read_dir(dir.join("backups"))
+            .expect("backups")
+            .filter_map(|entry| entry.ok())
+            .collect();
+        assert_eq!(copies.len(), 1, "one copy per start");
+        assert_eq!(
+            copies[0].path().extension().and_then(|ext| ext.to_str()),
+            Some("sqlite")
+        );
+        assert_eq!(std::fs::read(copies[0].path()).expect("read"), b"rows");
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn a_first_start_has_nothing_to_copy() {
+        let dir = scratch("first");
+        backup_before_migrations(&dir.join("hulahoop.sqlite"), &dir);
+        assert!(!dir.join("backups").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    #[test]
+    fn only_the_newest_copies_are_kept() {
+        let dir = scratch("prune");
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).expect("backups");
+        for day in 0..8 {
+            std::fs::write(
+                backups.join(format!("hulahoop-2026010{day}-000000.sqlite")),
+                b"x",
+            )
+            .expect("write");
+        }
+        prune_backups(&backups, 5);
+        assert_eq!(std::fs::read_dir(&backups).expect("list").count(), 5);
+        assert!(backups.join("hulahoop-20260107-000000.sqlite").exists());
+        assert!(!backups.join("hulahoop-20260100-000000.sqlite").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }
