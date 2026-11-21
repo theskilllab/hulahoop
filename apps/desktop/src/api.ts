@@ -248,6 +248,15 @@ interface SavedRemote {
 
 /** A server saved from the connect screen; work runs wherever it listens. */
 /** Where the chosen workspace is remembered between reloads. */
+/// Calls a Rust command. Only the desktop shell has them, so every caller must
+/// tolerate a failure: the same screen has to work in a plain browser tab.
+export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+  const bridge = (window as unknown as { __TAURI_INTERNALS__?: { invoke: (c: string, a?: unknown) => Promise<T> } })
+    .__TAURI_INTERNALS__;
+  if (!bridge) throw new Error("this build has no desktop shell");
+  return (await bridge.invoke(command, args)) as T;
+}
+
 export const WORKSPACE_KEY = "hulahoop.workspace";
 
 export function savedRemote(): SavedRemote | null {

@@ -217,7 +217,7 @@ h3 {
   display: grid;
   /* brand · search · the list · the workspace footer. The list is the only row that
      grows, which is why the first entry sits right under the search field. */
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   min-height: 0;
 }
 
@@ -1491,6 +1491,15 @@ label > select {
   padding: 0;
 }
 
+.rail .brand {
+  padding-right: var(--s2);
+}
+
+.rail.collapsed .brand {
+  justify-content: center;
+  padding: 0;
+}
+
 .rail-toggle {
   margin-left: auto;
 }
@@ -2106,7 +2115,7 @@ label > select {
   display: flex;
   align-items: center;
   gap: var(--s3);
-  height: 48px;
+  height: var(--toolbar-h);
   padding: 0 var(--s5) 0 var(--s4);
   border-bottom: 1px solid var(--line);
   -webkit-app-region: drag;
@@ -2465,4 +2474,263 @@ table.transitions td {
 /* The task screen still has a body grid of its own. */
 .detail .page-head + * {
   margin-top: var(--s3);
+}
+
+/* ---- atomics the workflow screen needs ---- */
+.seg.small button {
+  height: 22px;
+  padding: 0 var(--s2);
+  font-size: var(--fs-xs);
+}
+
+.select.small,
+.input.small {
+  height: 26px;
+  font-size: var(--fs-xs);
+  padding: 0 var(--s2);
+  width: auto;
+  min-width: 140px;
+}
+
+.input.small {
+  min-width: 220px;
+  flex: 1 1 220px;
+}
+
+.chip.ok {
+  background: color-mix(in srgb, var(--ok) 14%, transparent);
+  color: var(--ok);
+}
+
+/* ---- the workflow screen: the document and the picture of it ---- */
+.wf {
+  display: grid;
+  gap: var(--s4);
+  min-height: 0;
+  flex: 1;
+  align-items: stretch;
+}
+
+.wf.both {
+  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+}
+
+.wf.markdown,
+.wf.diagram {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.wf-src {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  min-width: 0;
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.wf-src .head {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s1) var(--s3);
+  border-bottom: 1px solid var(--line);
+}
+
+.wf-src textarea {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  padding: var(--s4);
+  border: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  resize: none;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
+}
+
+.wf-src textarea:focus {
+  outline: none;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.mention-pop {
+  position: absolute;
+  left: var(--s4);
+  bottom: var(--s4);
+  display: grid;
+  min-width: 180px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+  box-shadow: var(--shadow);
+  z-index: 5;
+}
+
+.mention-pop button {
+  justify-content: flex-start;
+  height: 26px;
+  padding: 0 var(--s2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--text-2);
+  font-size: var(--fs-sm);
+}
+
+.mention-pop button:hover {
+  background: var(--bg-3);
+  color: var(--text);
+}
+
+.wf-diagram {
+  display: grid;
+  gap: var(--s3);
+  min-height: 0;
+  min-width: 0;
+  align-content: start;
+  overflow: auto;
+}
+
+.wf-guide {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  flex-wrap: wrap;
+  min-height: 36px;
+  padding: var(--s1) var(--s2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg-2);
+}
+
+.wf-canvas {
+  position: relative;
+  height: 360px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: auto;
+}
+
+.wf-canvas svg {
+  position: absolute;
+  inset: 0;
+  width: 1180px;
+  height: 360px;
+  pointer-events: none;
+}
+
+.wf-edge {
+  pointer-events: all;
+  cursor: pointer;
+}
+
+.wf-edge path {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 1.5;
+}
+
+.wf-edge text {
+  font-size: 10px;
+  fill: var(--muted);
+}
+
+.wf-edge:hover path {
+  stroke: var(--accent);
+  stroke-width: 2;
+}
+
+.wf-edge:hover text {
+  fill: var(--text);
+}
+
+.wf-node {
+  position: absolute;
+  display: grid;
+  align-content: center;
+  gap: 2px;
+  padding: 0 var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  text-align: left;
+  cursor: pointer;
+}
+
+.wf-node .n-name {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text);
+}
+
+.wf-node .n-who {
+  font-size: var(--fs-2xs);
+  color: var(--muted);
+}
+
+.wf-node.agent {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
+}
+
+.wf-node.human {
+  border-style: dashed;
+}
+
+.wf-node.final {
+  background: var(--bg-2);
+}
+
+.wf-node.on {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+.wf-legend {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+
+.wf-legend .sw {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid var(--line-strong);
+  margin-left: var(--s3);
+}
+
+.wf-legend .sw:first-child {
+  margin-left: 0;
+}
+
+.wf-legend .sw.agent {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.wf-legend .sw.human {
+  border-style: dashed;
+}
+
+.wf-legend .sw.final {
+  background: var(--bg-3);
+}
+
+.wf-ok {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  margin: 0;
 }

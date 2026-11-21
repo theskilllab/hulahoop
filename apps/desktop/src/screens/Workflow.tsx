@@ -1,18 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  BOARD_STATUSES,
   loadWorkflow,
   saveWorkflow,
   type Agent,
-  type IssueStatus,
   type WorkflowDoc,
   type WorkflowSection,
 } from "../api";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
 
-const OWNERS = ["human", "agent"] as const;
+type Tab = "both" | "markdown" | "diagram";
 
 /// Rewrite the status sections of a workflow document, keeping whatever preamble
 /// the person wrote above the first `## ` heading. The diagram and the document
@@ -27,7 +25,7 @@ function rewrite(source: string, sections: WorkflowSection[]): string {
         `Owner: ${section.owner}`,
         `Agent: ${section.agent ?? "any"}`,
         `Next: ${section.next ?? "none"}`,
-        `When: ${section.when ?? ""}`,
+        section.when ? `When: ${section.when}` : "",
         section.body.trim(),
       ]
         .filter((line) => line.length > 0)
@@ -61,371 +59,320 @@ function centre(status: string): { x: number; y: number } {
 function edgePath(from: string, to: string): string {
   const a = centre(from);
   const b = centre(to);
-  const vertical = Math.abs(a.x - b.x) < 40;
-  if (vertical) {
-    const bow = 96;
-    return `M ${a.x + W / 2} ${a.y} C ${a.x + W / 2 + bow} ${a.y}, ${b.x + W / 2 + bow} ${b.y}, ${b.x + W / 2} ${b.y}`;
+  const stacked = Math.abs(b.x - a.x) < 1;
+  if (stacked) {
+    const bow = b.y > a.y ? 1 : -1;
+    return `M ${a.x} ${a.y} C ${a.x + 78 * bow} ${a.y}, ${b.x + 78 * bow} ${b.y}, ${b.x} ${b.y}`;
   }
-  const right = b.x > a.x;
-  const x1 = a.x + (right ? W / 2 : -W / 2);
-  const x2 = b.x + (right ? -W / 2 : W / 2);
-  const mid = (x1 + x2) / 2;
-  return `M ${x1} ${a.y} C ${mid} ${a.y}, ${mid} ${b.y}, ${x2} ${b.y}`;
-}
-
-function statusOf(section: WorkflowSection): string {
-  return section.status;
+  const mid = (a.x + b.x) / 2;
+  return `M ${a.x} ${a.y} C ${mid} ${a.y}, ${mid} ${b.y}, ${b.x} ${b.y}`;
 }
 
 function Diagram({
   sections,
-  errors,
+  editing,
+  onEdit,
 }: {
   sections: WorkflowSection[];
-  errors: string[];
+  editing: string | null;
+  onEdit: (id: string) => void;
 }) {
-  const known = new Set(Object.keys(NODE));
   const edges = sections
-    .filter((section) => section.next && known.has(section.next) && known.has(section.status))
-    .map((section) => ({ from: statusOf(section), to: section.next as string, label: section.when ?? "then" }));
-
+    .filter((section) => section.next && NODE[section.next])
+    .map((section) => ({
+      id: section.status,
+      from: section.status,
+      to: section.next as string,
+      label: section.when ?? "then",
+    }));
   return (
-    <div className="diagram-block">
-      <div className="diagram-label">State diagram</div>
-      <div className="diagram" role="img" aria-label="the workflow as a diagram">
-        <svg viewBox="0 0 1180 360" preserveAspectRatio="xMinYMin meet">
-          <defs>
-            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)" />
-            </marker>
-          </defs>
-          {edges.map((edge) => {
-            const a = centre(edge.from);
-            const b = centre(edge.to);
-            return (
-              <g key={`${edge.from}-${edge.to}`}>
-                <path d={edgePath(edge.from, edge.to)} className="diagram-edge" markerEnd="url(#arrow)" />
-                <text x={(a.x + b.x) / 2} y={(a.y + b.y) / 2 - 8} className="diagram-edge-label">
-                  {edge.label.length > 34 ? `${edge.label.slice(0, 33)}…` : edge.label}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
-        {sections
-          .filter((section) => known.has(section.status))
-          .map((section) => {
-            const node = NODE[section.status];
-            const agent = section.owner === "agent";
-            return (
-              <div
-                key={section.status}
-                className={`dnode ${agent ? "agent" : ""} ${section.next ? "" : "final"}`}
-                style={{ left: node.x, top: node.y }}
-                title={`${section.title} — ${section.owner}`}
-              >
-                <strong>{section.title}</strong>
-                <small>
-                  {agent ? (section.agent ? section.agent : "Any idle agent") : "You"}
-                </small>
-              </div>
-            );
-          })}
-      </div>
-      <p className="diagram-hint">
-        Not what you meant? Switch to Markdown and correct the lines, or use the fields under each
-        status below.
-      </p>
-      <div className="legend">
-        <span>
-          <i className="sw agent" /> An agent handles it
-        </span>
-        <span>
-          <i className="sw human" /> You handle it
-        </span>
-        <span>
-          <i className="sw final" /> Final status
-        </span>
-      </div>
-
-      <div className="diagram-label">Checks</div>
-      {errors.length === 0 ? (
-        <p className="check-ok">
-          <Icon name="check" size={13} /> No problems found
-        </p>
-      ) : (
-        <ul className="problems">
-          {errors.map((problem) => (
-            <li key={problem}>{problem}</li>
-          ))}
-        </ul>
-      )}
-
-      <div className="diagram-label">Transitions</div>
-      <table className="transitions">
-        <thead>
-          <tr>
-            <th>From</th>
-            <th>To</th>
-            <th>Handled by</th>
-            <th>When</th>
-          </tr>
-        </thead>
-        <tbody>
-          {sections.map((section) => (
-            <tr key={section.status}>
-              <td>{section.title}</td>
-              <td>{sections.find((entry) => entry.status === section.next)?.title ?? "—"}</td>
-              <td>{section.owner === "agent" ? (section.agent ?? "Any idle agent") : "You"}</td>
-              <td className="dim">{section.when ?? "—"}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="wf-canvas">
+      <svg viewBox="0 0 1180 360" role="img" aria-label="Workflow diagram">
+        <defs>
+          <marker id="wf-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+            <path d="M0 0 L8 4 L0 8 z" fill="var(--line-strong)" />
+          </marker>
+        </defs>
+        {edges.map((edge) => {
+          const a = centre(edge.from);
+          const b = centre(edge.to);
+          const stacked = Math.abs(b.x - a.x) < 1;
+          const bow = b.y > a.y ? 1 : -1;
+          const mid = stacked
+            ? { x: a.x + 78 * bow, y: (a.y + b.y) / 2 }
+            : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+          return (
+            <g key={`e-${edge.id}`} className="wf-edge" onClick={() => onEdit(edge.id)}>
+              <path d={edgePath(edge.from, edge.to)} markerEnd="url(#wf-arrow)" />
+              <text x={mid.x} y={mid.y - 7} textAnchor="middle">
+                {edge.label.length > 26 ? `${edge.label.slice(0, 26)}…` : edge.label}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+      {sections.map((section) => {
+        const node = NODE[section.status];
+        if (!node) return null;
+        const agent = section.owner === "agent";
+        return (
+          <button
+            key={section.status}
+            className={`wf-node ${agent ? "agent" : "human"} ${section.next ? "" : "final"} ${
+              editing === section.status ? "on" : ""
+            }`}
+            style={{ left: node.x, top: node.y, width: W, height: H }}
+            onClick={() => onEdit(section.status)}
+            title={`${section.title} — ${agent ? (section.agent ?? "any agent") : "you"}`}
+          >
+            <span className="n-name">{section.title}</span>
+            <span className="n-who">{agent ? (section.agent ?? "An agent") : "You"}</span>
+          </button>
+        );
+      })}
     </div>
   );
 }
 
-/// The workflow is one markdown document per workspace. This screen shows it three
-/// ways: the text, the diagram the text produces, or both side by side.
-export default function WorkflowScreen({
+export default function Workflow({
   workspaceId,
   agents,
+  onSaved,
 }: {
   workspaceId: string;
   agents: Agent[];
+  onSaved?: () => void;
 }) {
   const [doc, setDoc] = useState<WorkflowDoc | null>(null);
   const [source, setSource] = useState("");
-  const [sections, setSections] = useState<WorkflowSection[]>([]);
-  const [note, setNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [tab, setTab] = useState<"both" | "markdown" | "diagram">("both");
+  const [tab, setTab] = useState<Tab>("both");
+  const [editing, setEditing] = useState<string | null>(null);
+  const [note, setNote] = useState("");
+  const [mentions, setMentions] = useState<{ at: number; items: Agent[] } | null>(null);
+  const area = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
-    let live = true;
-    loadWorkflow(workspaceId)
-      .then((next) => {
-        if (!live) return;
-        setDoc(next);
-        setSource(next.source);
-        setSections(next.sections);
-      })
-      .catch((problem) => live && setError(problem.message));
-    return () => {
-      live = false;
-    };
+    loadWorkflow(workspaceId).then((next) => {
+      setDoc(next);
+      setSource(next?.source ?? "");
+    });
   }, [workspaceId]);
 
   const dirty = doc !== null && source !== doc.source;
+  const sections = doc?.sections ?? [];
+  const edited = useMemo(() => sections.find((entry) => entry.status === editing) ?? null, [sections, editing]);
 
-  function change(next: WorkflowSection[]) {
-    setSections(next);
+  function change(patch: (next: WorkflowSection[]) => WorkflowSection[]) {
+    if (!doc) return;
+    const next = patch(doc.sections);
+    setDoc({ ...doc, sections: next });
     setSource(rewrite(source, next));
   }
 
   async function save() {
-    setBusy(true);
-    setError(null);
-    setNote(null);
-    try {
-      const next = await saveWorkflow(workspaceId, source);
-      setDoc(next);
-      setSections(next.sections);
-      setNote("saved — the board follows this document");
-    } catch (problem) {
-      setError(problem instanceof Error ? problem.message : String(problem));
-    } finally {
-      setBusy(false);
-    }
+    setNote("");
+    const saved = await saveWorkflow(workspaceId, source).catch((error: Error) => {
+      setNote(error.message);
+      return null;
+    });
+    if (!saved) return;
+    setDoc(saved);
+    setSource(saved.source);
+    setEditing(null);
+    setNote(saved.errors.length ? `saved, ${saved.errors.length} check(s)` : "saved");
+    onSaved?.();
   }
 
-  const flow = useMemo(
-    () => BOARD_STATUSES.map((status) => sections.find((section) => section.status === status)),
-    [sections],
+  /// An `@` name in the document is how a workflow points at a real agent.
+  function onType(value: string, caret: number) {
+    setSource(value);
+    const before = value.slice(0, caret);
+    const match = /(^|[\s(])@([\w-]*)$/.exec(before);
+    const found = match
+      ? agents.filter((agent) => agent.name.toLowerCase().split(" ").some((word) => word.startsWith(match[2].toLowerCase())))
+      : [];
+    setMentions(found.length ? { at: caret - match![2].length - 1, items: found } : null);
+  }
+
+  function pick(agent: Agent) {
+    if (!mentions) return;
+    const caret = area.current?.selectionStart ?? source.length;
+    const next = `${source.slice(0, mentions.at)}@${agent.name.replace(/\s+/g, "")}${source.slice(caret)}`;
+    setSource(rewrite(next, sections));
+    setMentions(null);
+    area.current?.focus();
+  }
+
+  const tabs = (
+    <div className="seg small">
+      {(["both", "markdown", "diagram"] as Tab[]).map((value) => (
+        <button key={value} className={tab === value ? "on" : ""} onClick={() => setTab(value)}>
+          {value === "both" ? "Both" : value === "markdown" ? "Markdown" : "Diagram"}
+        </button>
+      ))}
+    </div>
   );
 
   return (
-    <section className="screen workflow">
+    <div className="screen">
       <PageHeader
         title="Workflow"
-        subtitle="One document per workspace. Every ## status heading is a column and says who works it, which agent picks it up, and where it leads."
+        subtitle="Workflow for this workspace"
         actions={
-          <button className="primary" onClick={save} disabled={busy || !dirty}>
-            {busy ? "Saving…" : dirty ? "Save workflow" : "Saved"}
-          </button>
+          <>
+            {tabs}
+            <button className="btn primary" onClick={() => void save()} disabled={!dirty}>
+              Save
+            </button>
+          </>
         }
       />
 
-      {error ? <p className="error">{error}</p> : null}
-      {note ? <p className="note">{note}</p> : null}
-      {doc && doc.errors.length > 0 ? (
+      {note ? <p className="dim small">{note}</p> : null}
+      {doc && doc.errors.length ? (
         <ul className="problems">
           {doc.errors.map((problem) => (
             <li key={problem}>{problem}</li>
           ))}
         </ul>
-      ) : null}
+      ) : (
+        <p className="wf-ok">
+          <span className="chip ok">
+            <Icon name="check" size={12} /> No problems found
+          </span>
+          <span className="dim small">The document and the statuses agree.</span>
+        </p>
+      )}
 
-      <div className="tabs workflow-tabs" role="tablist">
-        {(["both", "markdown", "diagram"] as const).map((name) => (
-          <button
-            key={name}
-            role="tab"
-            aria-selected={tab === name}
-            className={tab === name ? "tab on" : "tab"}
-            onClick={() => setTab(name)}
-          >
-            {name === "both" ? "Both" : name === "markdown" ? "Markdown" : "Diagram"}
-          </button>
-        ))}
-      </div>
-
-      <div className={`workflow-body ${tab}`}>
+      <div className={`wf ${tab}`}>
         {tab !== "diagram" ? (
-          <div className="workflow-editor">
+          <section className="wf-src">
             <div className="head">
               <span className="mono dim small">WORKFLOWS.md</span>
               {dirty ? <span className="chip warn small">Unsaved</span> : null}
-              <button
-                className="link"
-                style={{ marginLeft: "auto" }}
-                onClick={() => setSource(doc?.source ?? source)}
-                disabled={!dirty}
-              >
+              <button className="link" style={{ marginLeft: "auto" }} onClick={() => setSource(doc?.source ?? "")} disabled={!dirty}>
                 Revert
               </button>
             </div>
             <textarea
-              spellCheck={false}
+              ref={area}
               value={source}
-              onChange={(event) => setSource(event.target.value)}
-              rows={28}
+              spellCheck={false}
+              onChange={(event) => onType(event.target.value, event.target.selectionStart)}
+              onKeyDown={(event) => {
+                if (!mentions) return;
+                if (event.key === "Enter" || event.key === "Tab") {
+                  event.preventDefault();
+                  pick(mentions.items[0]);
+                }
+                if (event.key === "Escape") setMentions(null);
+              }}
             />
-          </div>
+            {mentions ? (
+              <div className="mention-pop">
+                {mentions.items.map((agent) => (
+                  <button key={agent.id} onMouseDown={(event) => event.preventDefault()} onClick={() => pick(agent)}>
+                    {agent.name}
+                  </button>
+                ))}
+              </div>
+            ) : null}
+          </section>
         ) : null}
 
         {tab !== "markdown" ? (
-          <Diagram sections={sections} errors={doc?.errors ?? []} />
-        ) : (
-          <div className="workflow-preview">
-            <div className="label">what the server reads</div>
-            <table>
+          <section className="wf-diagram">
+            <div className="wf-guide">
+              {edited ? (
+                <>
+                  <strong>{edited.title}</strong>
+                  <div className="seg small">
+                    {(["human", "agent"] as const).map((owner) => (
+                      <button
+                        key={owner}
+                        className={edited.owner === owner ? "on" : ""}
+                        onClick={() =>
+                          change((next) => next.map((s) => (s.status === edited.status ? { ...s, owner } : s)))
+                        }
+                      >
+                        {owner === "human" ? "I handle it" : "An agent handles it"}
+                      </button>
+                    ))}
+                  </div>
+                  {edited.owner === "agent" ? (
+                    <select
+                      className="select small"
+                      value={edited.agent ?? ""}
+                      onChange={(event) =>
+                        change((next) =>
+                          next.map((s) =>
+                            s.status === edited.status ? { ...s, agent: event.target.value || null } : s,
+                          ),
+                        )
+                      }
+                    >
+                      <option value="">any agent</option>
+                      {agents.map((agent) => (
+                        <option key={agent.id} value={agent.name}>
+                          {agent.name}
+                        </option>
+                      ))}
+                    </select>
+                  ) : null}
+                  <input
+                    className="input small"
+                    placeholder="the condition, in words"
+                    value={edited.when ?? ""}
+                    onChange={(event) =>
+                      change((next) =>
+                        next.map((s) => (s.status === edited.status ? { ...s, when: event.target.value } : s)),
+                      )
+                    }
+                  />
+                  <button className="link" onClick={() => setEditing(null)}>
+                    Done
+                  </button>
+                </>
+              ) : (
+                <span className="dim small">
+                  Click a status or an arrow to change who works it, or the sentence that moves it along.
+                </span>
+              )}
+            </div>
+
+            <Diagram sections={sections} editing={editing} onEdit={setEditing} />
+
+            <div className="wf-legend">
+              <span className="sw agent" /> An agent handles it
+              <span className="sw human" /> You handle it
+              <span className="sw final" /> Final status
+            </div>
+
+            <table className="vals">
               <thead>
                 <tr>
-                  <th>column</th>
-                  <th>owner</th>
-                  <th>agent</th>
-                  <th>next</th>
+                  <th>From</th>
+                  <th>To</th>
+                  <th>Handled by</th>
+                  <th>When</th>
                 </tr>
               </thead>
               <tbody>
                 {sections.map((section) => (
                   <tr key={section.status}>
                     <td>{section.title}</td>
+                    <td>{sections.find((entry) => entry.status === section.next)?.title ?? "—"}</td>
                     <td>
-                      <span className={`chip ${section.owner}`}>{section.owner}</span>
+                      {section.owner === "agent" ? (section.agent ?? "Any idle agent") : "You"}
                     </td>
-                    <td className="mono">{section.agent ?? "—"}</td>
-                    <td className="mono">{section.next ?? "—"}</td>
+                    <td className="dim">{section.when ?? "—"}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
-          </div>
-        )}
+          </section>
+        ) : null}
       </div>
-
-      <details className="workflow-fields">
-        <summary>Edit a status</summary>
-        <div className="status-cards">
-          {flow.map((section) =>
-            section ? (
-              <article key={section.status} className="flow-node">
-                <div className="spread">
-                  <span className="name">{section.title}</span>
-                  <span className={`chip ${section.owner}`}>{section.owner}</span>
-                </div>
-                <div className="owner" role="group" aria-label={`who works ${section.title}`}>
-                  {OWNERS.map((owner) => (
-                    <button
-                      key={owner}
-                      className={section.owner === owner ? "on" : ""}
-                      onClick={() =>
-                        change(
-                          sections.map((entry) =>
-                            entry.status === section.status ? { ...entry, owner } : entry,
-                          ),
-                        )
-                      }
-                    >
-                      {owner}
-                    </button>
-                  ))}
-                </div>
-                {section.owner === "agent" ? (
-                  <select
-                    value={section.agent ?? ""}
-                    onChange={(event) =>
-                      change(
-                        sections.map((entry) =>
-                          entry.status === section.status
-                            ? { ...entry, agent: event.target.value || null }
-                            : entry,
-                        ),
-                      )
-                    }
-                  >
-                    <option value="">any agent on the project</option>
-                    {agents.map((agent) => (
-                      <option key={agent.id} value={agent.name}>
-                        {agent.name}
-                      </option>
-                    ))}
-                  </select>
-                ) : null}
-                <label className="stack">
-                  <span className="label">then</span>
-                  <select
-                    value={section.next ?? ""}
-                    onChange={(event) =>
-                      change(
-                        sections.map((entry) =>
-                          entry.status === section.status
-                            ? { ...entry, next: (event.target.value || null) as IssueStatus | null }
-                            : entry,
-                        ),
-                      )
-                    }
-                  >
-                    <option value="">stays here</option>
-                    {BOARD_STATUSES.filter((status) => status !== section.status).map((status) => (
-                      <option key={status} value={status}>
-                        {sections.find((entry) => entry.status === status)?.title ?? status}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <label className="stack">
-                  <span className="label">when</span>
-                  <input
-                    value={section.when ?? ""}
-                    placeholder="the sentence the arrow shows"
-                    onChange={(event) =>
-                      change(
-                        sections.map((entry) =>
-                          entry.status === section.status ? { ...entry, when: event.target.value } : entry,
-                        ),
-                      )
-                    }
-                  />
-                </label>
-              </article>
-            ) : null,
-          )}
-        </div>
-      </details>
-    </section>
+    </div>
   );
 }
