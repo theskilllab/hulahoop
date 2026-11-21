@@ -126,7 +126,7 @@ function Diagram({
             title={`${section.title} — ${agent ? (section.agent ?? "any agent") : "you"}`}
           >
             <span className="n-name">{section.title}</span>
-            <span className="n-who">{agent ? (section.agent ?? "An agent") : "You"}</span>
+            <span className="n-who">{agent ? (section.agent ?? "no agent yet") : "You"}</span>
           </button>
         );
       })}
@@ -159,6 +159,14 @@ export default function Workflow({
   }, [workspaceId]);
 
   const dirty = doc !== null && source !== doc.source;
+  const known = useMemo(() => new Set(agents.map((agent) => agent.name.toLowerCase())), [agents]);
+  const unknown = useMemo(
+    () =>
+      (doc?.sections ?? []).filter(
+        (section) => section.owner === "agent" && section.agent && !known.has(section.agent.toLowerCase()),
+      ),
+    [doc, known],
+  );
   const sections = doc?.sections ?? [];
   const edited = useMemo(() => sections.find((entry) => entry.status === editing) ?? null, [sections, editing]);
 
@@ -229,6 +237,15 @@ export default function Workflow({
       />
 
       {note ? <p className="dim small">{note}</p> : null}
+      {unknown.length ? (
+        <ul className="problems">
+          {unknown.map((section) => (
+            <li key={section.status}>
+              `{section.title}` names an agent nobody has: `{section.agent}`.
+            </li>
+          ))}
+        </ul>
+      ) : null}
       {doc && doc.errors.length ? (
         <ul className="problems">
           {doc.errors.map((problem) => (
@@ -311,7 +328,9 @@ export default function Workflow({
                         )
                       }
                     >
-                      <option value="">any agent</option>
+                      <option value="" disabled>
+                        pick an agent
+                      </option>
                       {agents.map((agent) => (
                         <option key={agent.id} value={agent.name}>
                           {agent.name}
