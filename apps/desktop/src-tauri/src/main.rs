@@ -40,8 +40,8 @@ fn set_traffic_lights(window: tauri::Window, visible: bool) {
         use objc2::runtime::AnyObject;
         let Ok(ns_window) = window.ns_window() else { return };
         let ns_window = ns_window as *mut AnyObject;
-        for kind in [15u64, 16, 17] {
-            // 15 close, 16 miniaturise, 17 zoom
+        for kind in [0u64, 1, 2] {
+            // NSWindowButton: 0 close, 1 miniaturise, 2 zoom
             let button: *mut AnyObject = msg_send![ns_window, standardWindowButton: kind];
             if !button.is_null() {
                 let hidden: i8 = if visible { 0 } else { 1 };

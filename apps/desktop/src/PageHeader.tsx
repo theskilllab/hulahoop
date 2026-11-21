@@ -35,6 +35,7 @@ export default function PageHeader({
         ) : null}
       </h1>
       <div className="page-tools">
+        {actions}
         <button
           className="page-search"
           onClick={() => window.dispatchEvent(new CustomEvent("hulahoop:search"))}
@@ -44,7 +45,6 @@ export default function PageHeader({
           <span>Search</span>
           <kbd>⌘K</kbd>
         </button>
-        {actions}
       </div>
     </header>
   );
