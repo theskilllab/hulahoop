@@ -1,15 +1,29 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 
 import {
   gql,
   setAgentInstructions,
   setAgentSkills,
   type Agent,
+  type Issue,
   type Skill,
 } from "../api";
 import Icon from "../Icon";
 
-const ADAPTERS = ["pi", "claude_code", "fake"] as const;
+/** Harnesses we can run. `harness` is the provider key a connection is stored under. */
+const HARNESSES: { adapter: string; harness: string; name: string; models: string[] }[] = [
+  { adapter: "pi", harness: "pi", name: "Pi", models: ["opencode-go/deepseek-v4.1-flash", "opencode-go/qwen3-coder", "anthropic/claude-sonnet-4.5", "openai/gpt-5-codex"] },
+  { adapter: "claude_code", harness: "claude_code", name: "Claude Code", models: ["sonnet", "opus", "haiku"] },
+  { adapter: "fake", harness: "", name: "Fake (development)", models: ["fake"] },
+];
+
+interface Connection {
+  provider: string;
+  kind: string;
+  connected: boolean;
+  label: string | null;
+  connectedAt: string | null;
+}
 
 interface Preflight {
   agentId: string;
@@ -19,12 +33,20 @@ interface Preflight {
   checkedAt: string;
 }
 
-/// Agents are the workers: a name, a harness, a model, the instructions it works
-/// by and the skills it carries. The workflow document picks among these by name.
+const harnessOf = (adapter: string) => HARNESSES.find((entry) => entry.adapter === adapter);
+const statusOf = (running: boolean): { label: string; tone: string } =>
+  running ? { label: "Running", tone: "ok" } : { label: "Idle", tone: "" };
+
+/**
+ * Agents are the workers: a name, a harness, a model, the instructions it works by and
+ * the skills it carries. The workflow document picks among them by name, so this screen
+ * is where a team is assembled — a roster on the left, one agent on the right.
+ */
 export default function Agents({
   workspaceId,
   agents,
   skills,
+  issues,
   repoId,
   projectId,
   onChanged,
@@ -32,16 +54,24 @@ export default function Agents({
   workspaceId: string;
   agents: Agent[];
   skills: Skill[];
+  issues: Issue[];
   repoId: string | null;
   projectId: string | null;
   onChanged: () => Promise<void>;
 }) {
+  const [selected, setSelected] = useState<string | null>(agents[0]?.id ?? null);
+  const [connections, setConnections] = useState<Connection[]>([]);
   const [preflight, setPreflight] = useState<Preflight[]>([]);
-  const [openId, setOpenId] = useState<string | null>(null);
-  const [draft, setDraft] = useState({ name: "", adapter: "pi", model: "" });
-  const [creating, setCreating] = useState(false);
+  const [editing, setEditing] = useState<null | "new" | string>(null);
+  const [tab, setTab] = useState<"diff" | "tx" | "log">("diff");
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
+
+  async function loadConnections() {
+    const data = await gql<{ connections: Connection[] }>(
+      `query { connections { provider kind connected label connectedAt } }`,
+    );
+    setConnections(data.connections);
+  }
 
   async function loadPreflight() {
     if (!projectId) return;
@@ -57,263 +87,419 @@ export default function Agents({
   }
 
   useEffect(() => {
+    void loadConnections().catch(() => setConnections([]));
+  }, [workspaceId]);
+
+  useEffect(() => {
     void loadPreflight();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projectId, agents.length]);
 
-  async function run(key: string, work: () => Promise<unknown>) {
-    setBusy(key);
+  useEffect(() => {
+    if (!selected && agents.length) setSelected(agents[0].id);
+    if (selected && !agents.some((agent) => agent.id === selected)) setSelected(agents[0]?.id ?? null);
+  }, [agents, selected]);
+
+  const agent = agents.find((entry) => entry.id === selected) ?? null;
+  const connected = (harness: string) =>
+    harness === "" || connections.some((entry) => entry.provider === harness && entry.connected);
+
+  /** The newest run whose harness matches — runs do not record their agent yet. */
+  const current = useMemo(() => {
+    if (!agent) return null;
+    const flat = issues.flatMap((issue) => issue.runs.map((run) => ({ issue, run })));
+    const mine = flat
+      .filter((entry) => entry.run.adapter === agent.adapter)
+      .sort((a, b) => (a.run.startedAt ?? "").localeCompare(b.run.startedAt ?? ""));
+    return mine.at(-1) ?? null;
+  }, [agent, issues]);
+
+  const running = current?.run.status === "running";
+
+  /** Which harnesses have a live run right now — the roster's status chip reads it. */
+  const runningAdapters = new Set(
+    issues.flatMap((issue) =>
+      issue.runs.filter((run) => run.status === "running").map((run) => run.adapter),
+    ),
+  );
+
+  return (
+    <section className="screen agents-screen">
+      <header className="bar">
+        <h1>Agents</h1>
+        <div className="row">
+          <span className="dim small">
+            {agents.filter((entry) => runningAdapters.has(entry.adapter)).length} running · local runner
+          </span>
+          <button className="primary" onClick={() => setEditing("new")}>
+            <Icon name="plus" size={14} /> New agent
+          </button>
+        </div>
+      </header>
+
+      {error ? <p className="error">{error}</p> : null}
+
+      <div className="split">
+        <div className="roster">
+          {agents.map((entry) => {
+            const isRunning = runningAdapters.has(entry.adapter);
+            const link = harnessOf(entry.adapter);
+            const lost = !connected(link?.harness ?? "");
+            return (
+              <button
+                key={entry.id}
+                className="acard"
+                aria-selected={entry.id === selected}
+                onClick={() => setSelected(entry.id)}
+              >
+                <span className="row spread">
+                  <span className="avatar">
+                    <Icon name="bot" size={14} />
+                  </span>
+                  <strong className="fill truncate">{entry.name}</strong>
+                  <span className={statusOf(isRunning).tone === "ok" ? "chip ok" : "chip"}>
+                    {isRunning ? <span className="pulse" /> : null}
+                    {statusOf(isRunning).label}
+                  </span>
+                </span>
+                <span className="truncate small dim">
+                  {link?.name ?? entry.adapter} · {entry.model || "default model"}
+                  {entry.skills.length ? ` · ${entry.skills.length} skill${entry.skills.length === 1 ? "" : "s"}` : ""}
+                </span>
+                <span className={lost ? "truncate tiny warn" : "truncate tiny dim"}>
+                  {lost ? `${link?.name} is not connected` : (current?.issue.key ?? "No task assigned")}
+                </span>
+              </button>
+            );
+          })}
+          {agents.length === 0 ? (
+            <p className="dim small">No agents yet. Create one, then give it a harness that has a connection.</p>
+          ) : null}
+        </div>
+
+        {agent ? (
+          <div className="agent-pane">
+            <div className="ahead">
+              <div className="row spread">
+                <span className="avatar">
+                  <Icon name="bot" size={16} />
+                </span>
+                <h2 className="fill truncate">{agent.name}</h2>
+                <span className={running ? "chip ok" : "chip"}>
+                  {running ? <span className="pulse" /> : null}
+                  {running ? "Running" : "Idle"}
+                </span>
+              </div>
+
+              <div className="pillrow">
+                <span className="chip">{harnessOf(agent.adapter)?.name ?? agent.adapter}</span>
+                <span className="chip">{agent.model || "default model"}</span>
+                {connected(harnessOf(agent.adapter)?.harness ?? "") ? null : (
+                  <span className="chip warn">Not connected</span>
+                )}
+                <button className="linkbtn" onClick={() => setEditing(agent.id)}>
+                  AGENTS.md
+                </button>
+                {agent.skills.slice(0, 4).map((skill) => (
+                  <span className="chip" key={skill.id} title="Skill">
+                    {skill.name}
+                  </span>
+                ))}
+                {agent.skills.length > 4 ? <span className="chip">+{agent.skills.length - 4}</span> : null}
+              </div>
+
+              <div className="pillrow">
+                {current ? (
+                  <>
+                    <span className="chip info mono">{current.issue.key}</span>
+                    <span className="truncate">{current.issue.title}</span>
+                    {current.run.headBookmark ? (
+                      <span className="chip mono">
+                        <Icon name="branch" size={12} /> {current.run.headBookmark}
+                      </span>
+                    ) : null}
+                  </>
+                ) : (
+                  <span className="dim small">No task assigned. Planning a task in To do hands it to an agent.</span>
+                )}
+              </div>
+
+              <div className="row">
+                <button onClick={() => setEditing(agent.id)}>
+                  <Icon name="gear" size={14} /> Edit agent
+                </button>
+                {repoId && projectId ? (
+                  <button
+                    onClick={async () => {
+                      await gql(
+                        `mutation ($agentId: UUID!, $repoId: UUID!) { runPreflight(agentId: $agentId, repoId: $repoId) }`,
+                        { agentId: agent.id, repoId },
+                      );
+                      setTimeout(() => void loadPreflight(), 6000);
+                    }}
+                  >
+                    <Icon name="refresh" size={14} /> Probe
+                  </button>
+                ) : null}
+                {preflight.find((entry) => entry.agentId === agent.id) ? (
+                  <span
+                    className={
+                      preflight.find((entry) => entry.agentId === agent.id)!.ok ? "ok small" : "bad small"
+                    }
+                  >
+                    {preflight.find((entry) => entry.agentId === agent.id)!.ok
+                      ? `harness answers (${preflight.find((entry) => entry.agentId === agent.id)!.detail})`
+                      : `probe failed: ${preflight.find((entry) => entry.agentId === agent.id)!.detail}`}
+                  </span>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="tabs" role="tablist">
+              <button role="tab" aria-selected={tab === "diff"} onClick={() => setTab("diff")}>
+                Live diff
+              </button>
+              <button role="tab" aria-selected={tab === "tx"} onClick={() => setTab("tx")}>
+                Transcript
+              </button>
+              <button role="tab" aria-selected={tab === "log"} onClick={() => setTab("log")}>
+                Activity log
+              </button>
+            </div>
+
+            <div className="tab-body">
+              {tab === "diff" ? (
+                <div className="empty">
+                  <strong>No changes to show</strong>
+                  <span className="dim small">
+                    A run's diff streams here once the run starts. Task runs are shown on the task, not
+                    here.
+                  </span>
+                </div>
+              ) : null}
+              {tab === "tx" ? (
+                <div className="empty">
+                  <strong>Transcript</strong>
+                  <span className="dim small">
+                    The agent's own words for its current run. Open the task to read the full transcript
+                    of a finished one.
+                  </span>
+                </div>
+              ) : null}
+              {tab === "log" ? (
+                <div className="empty">
+                  <strong>Activity log</strong>
+                  <span className="dim small">
+                    Every run this agent started, with its outcome, will be listed here.
+                  </span>
+                </div>
+              ) : null}
+            </div>
+          </div>
+        ) : (
+          <div className="empty">
+            <strong>No agent selected</strong>
+            <span className="dim small">Pick one on the left, or create one.</span>
+          </div>
+        )}
+      </div>
+
+      {editing ? (
+        <AgentDialog
+          workspaceId={workspaceId}
+          agent={editing === "new" ? null : (agents.find((entry) => entry.id === editing) ?? null)}
+          skills={skills}
+          connected={connected}
+          onClose={() => setEditing(null)}
+          onError={setError}
+          onSaved={async (id) => {
+            await onChanged();
+            if (id) setSelected(id);
+            setEditing(null);
+          }}
+        />
+      ) : null}
+    </section>
+  );
+}
+
+/** The edit form: name, harness (only what is connected), model, AGENTS.md, skills. */
+function AgentDialog({
+  workspaceId,
+  agent,
+  skills,
+  connected,
+  onClose,
+  onSaved,
+  onError,
+}: {
+  workspaceId: string;
+  agent: Agent | null;
+  skills: Skill[];
+  connected: (harness: string) => boolean;
+  onClose: () => void;
+  onSaved: (id: string | null) => Promise<void>;
+  onError: (message: string | null) => void;
+}) {
+  const [name, setName] = useState(agent?.name ?? "");
+  const [adapter, setAdapter] = useState(agent?.adapter ?? HARNESSES[0].adapter);
+  const [model, setModel] = useState(agent?.model ?? HARNESSES[0].models[0]);
+  const [md, setMd] = useState(agent?.agentsMd ?? "");
+  const [picked, setPicked] = useState<string[]>(agent?.skills.map((skill) => skill.id) ?? []);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const harness = harnessOf(adapter) ?? HARNESSES[0];
+  const models = harness.models;
+
+  async function save() {
+    setBusy("save");
+    onError(null);
     try {
-      await work();
-      await onChanged();
-      await loadPreflight();
-      setError(null);
-    } catch (problem) {
-      setError(problem instanceof Error ? problem.message : String(problem));
+      let id = agent?.id ?? null;
+      if (agent) {
+        await gql(
+          `mutation ($id: UUID!, $name: String!, $adapter: String!, $model: String) {
+             updateAgent(id: $id, name: $name, adapter: $adapter, model: $model) { id }
+           }`,
+          { id: agent.id, name, adapter, model },
+        );
+      } else {
+        const data = await gql<{ createAgent: { id: string } }>(
+          `mutation ($w: UUID!, $n: String!, $a: String!, $m: String) {
+             createAgent(workspaceId: $w, name: $n, adapter: $a, model: $m) { id }
+           }`,
+          { w: workspaceId, n: name, a: adapter, m: model },
+        );
+        id = data.createAgent.id;
+      }
+      if (id) {
+        await setAgentInstructions(id, md);
+        await setAgentSkills(id, picked);
+      }
+      await onSaved(id);
+    } catch (failure) {
+      onError(failure instanceof Error ? failure.message : String(failure));
     } finally {
       setBusy(null);
     }
   }
 
   return (
-    <section className="screen agents">
-      <header>
-        <div>
-          <h1>Agents</h1>
-          <p className="dim">
-            The workers. Each one is a harness plus a model, its own instructions, and the skills it
-            carries. The workflow names one of these per status.
-          </p>
-        </div>
-        <button
-          className="primary"
-          onClick={() => setCreating(!creating)}
-          aria-expanded={creating}
-        >
-          <Icon name={creating ? "close" : "plus"} /> {creating ? "Cancel" : "New agent"}
-        </button>
-      </header>
-
-      {error ? <p className="error">{error}</p> : null}
-
-      {creating ? (
-        <form
-          className="panel new-agent"
-          onSubmit={(event) => {
-            event.preventDefault();
-            void run("create", async () => {
-              await gql(
-                `mutation ($w: UUID!, $n: String!, $a: String!, $m: String) {
-                  createAgent(workspaceId: $w, name: $n, adapter: $a, model: $m) { id }
-                }`,
-                { w: workspaceId, n: draft.name.trim(), a: draft.adapter, m: draft.model.trim() || null },
-              );
-              setDraft({ name: "", adapter: "pi", model: "" });
-              setCreating(false);
-            });
-          }}
-        >
-          <div className="row">
-            <label className="stack">
-              <span className="label">name</span>
-              <input
-                autoFocus
-                placeholder="ada"
-                value={draft.name}
-                onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-              />
-            </label>
-            <label className="stack">
-              <span className="label">harness</span>
-              <select
-                value={draft.adapter}
-                onChange={(event) => setDraft({ ...draft, adapter: event.target.value })}
-              >
-                {ADAPTERS.map((adapter) => (
-                  <option key={adapter} value={adapter}>
-                    {adapter}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="stack">
-              <span className="label">model</span>
-              <input
-                placeholder="empty means the harness default"
-                value={draft.model}
-                onChange={(event) => setDraft({ ...draft, model: event.target.value })}
-              />
-            </label>
-          </div>
-          <button className="primary" disabled={busy !== null || !draft.name.trim()}>
-            Create agent
+    <div className="dialog" role="dialog" aria-modal="true" onClick={onClose}>
+      <div
+        className="dialog-card"
+        onClick={(event) => {
+          event.stopPropagation();
+        }}
+      >
+        <header className="row spread">
+          <h2>{agent ? `Edit ${agent.name}` : "New agent"}</h2>
+          <button className="ghost" onClick={onClose} aria-label="Close">
+            <Icon name="close" size={14} />
           </button>
-        </form>
-      ) : null}
+        </header>
 
-      <div className="agent-list">
-        {agents.length === 0 ? (
-          <p className="dim">No agents yet. Create one, and the workflow can send work to it.</p>
-        ) : null}
-        {agents.map((agent) => {
-          const probe = preflight.find((entry) => entry.agentId === agent.id && entry.repoId === repoId);
-          const isOpen = openId === agent.id;
-          return (
-            <article key={agent.id} className="agent-card">
-              <header>
-                <div className="agent-name">
-                  <strong>{agent.name}</strong>
-                  <span className="chip">{agent.adapter}</span>
-                  {agent.model ? <span className="mono dim">{agent.model}</span> : null}
-                </div>
-                <div className="probe">
-                  {probe ? (
-                    <span className={probe.ok ? "ok" : "bad"} title={probe.detail}>
-                      {probe.ok ? "ready" : "needs attention"}
-                    </span>
-                  ) : (
-                    <span className="dim">not probed</span>
-                  )}
-                  <button
-                    className="ghost small"
-                    disabled={busy !== null || !repoId}
-                    onClick={() =>
-                      repoId &&
-                      run(`probe-${agent.id}`, () =>
-                        gql(
-                          `mutation ($agentId: UUID!, $repoId: UUID!) { runPreflight(agentId: $agentId, repoId: $repoId) }`,
-                          { agentId: agent.id, repoId },
-                        ),
-                      )
-                    }
-                  >
-                    Probe
-                  </button>
-                  <button className="link" onClick={() => setOpenId(isOpen ? null : agent.id)}>
-                    {isOpen ? "close" : "edit"}
-                  </button>
-                </div>
-              </header>
+        <label>
+          Name
+          <input value={name} onChange={(event) => setName(event.target.value)} autoFocus />
+        </label>
 
-              {isOpen ? (
-                <div className="stack">
-                  <div className="row">
-                    <label className="stack">
-                      <span className="label">harness</span>
-                      <select
-                        value={agent.adapter}
-                        onChange={(event) =>
-                          void run(`adapter-${agent.id}`, () =>
-                            gql(
-                              `mutation ($id: UUID!, $adapter: String!, $model: String) {
-                                updateAgent(id: $id, adapter: $adapter, model: $model) { id }
-                              }`,
-                              { id: agent.id, adapter: event.target.value, model: agent.model || null },
-                            ),
-                          )
-                        }
-                      >
-                        {ADAPTERS.map((adapter) => (
-                          <option key={adapter} value={adapter}>
-                            {adapter}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="stack">
-                      <span className="label">model</span>
-                      <input
-                        defaultValue={agent.model}
-                        key={`${agent.id}-${agent.model}`}
-                        onBlur={(event) => {
-                          const model = event.target.value.trim();
-                          if (model !== agent.model) {
-                            void run(`model-${agent.id}`, () =>
-                              gql(
-                                `mutation ($id: UUID!, $adapter: String!, $model: String) {
-                                  updateAgent(id: $id, adapter: $adapter, model: $model) { id }
-                                }`,
-                                { id: agent.id, adapter: agent.adapter, model: model || null },
-                              ),
-                            );
-                          }
-                        }}
-                      />
-                    </label>
-                  </div>
+        <label>
+          Harness
+          <select
+            value={adapter}
+            onChange={(event) => {
+              const next = event.target.value;
+              setAdapter(next);
+              const first = harnessOf(next)?.models[0] ?? "";
+              setModel(first);
+            }}
+          >
+            {HARNESSES.map((entry) => {
+              const usable = connected(entry.harness);
+              return (
+                <option key={entry.adapter} value={entry.adapter} disabled={!usable}>
+                  {entry.name}
+                  {usable ? "" : " — not connected"}
+                </option>
+              );
+            })}
+          </select>
+        </label>
+        <p className="dim small">
+          {connected(harness.harness)
+            ? `${harness.name} runs on your ${harness.name} connection.`
+            : `${harness.name} has no connection yet. Connect it on the Connectors screen, then come back.`}
+        </p>
 
-                  <label className="stack">
-                    <span className="label">AGENTS.md — how this one works</span>
-                    <textarea
-                      rows={7}
-                      defaultValue={agent.agentsMd}
-                      placeholder="Read the crate you touch before you change it. Prefer small diffs. Ask before touching CI."
-                      onBlur={(event) => {
-                        const next = event.target.value;
-                        if (next !== agent.agentsMd) {
-                          void run(`md-${agent.id}`, () => setAgentInstructions(agent.id, next));
-                        }
-                      }}
-                    />
-                  </label>
+        <label>
+          Model
+          <select value={model} onChange={(event) => setModel(event.target.value)} disabled={!connected(harness.harness)}>
+            {models.map((entry) => (
+              <option key={entry} value={entry}>
+                {entry}
+              </option>
+            ))}
+          </select>
+        </label>
 
-                  <div className="stack">
-                    <span className="label">skills it carries</span>
-                    {skills.length === 0 ? (
-                      <span className="dim">no skills in this workspace yet</span>
-                    ) : (
-                      <div className="skill-picks">
-                        {skills.map((skill) => (
-                          <label key={skill.id} className="check">
-                            <input
-                              type="checkbox"
-                              checked={(agent.skills ?? []).some((carried) => carried.id === skill.id)}
-                              onChange={(event) => {
-                                const carried = (agent.skills ?? []).map((entry) => entry.id);
-                                const next = event.target.checked
-                                  ? [...carried, skill.id]
-                                  : carried.filter((id) => id !== skill.id);
-                                void run(`skills-${agent.id}`, () => setAgentSkills(agent.id, next));
-                              }}
-                            />
-                            <span>{skill.name}</span>
-                            <span className="dim">{skill.description}</span>
-                          </label>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+        <label>
+          AGENTS.md
+          <textarea rows={8} value={md} onChange={(event) => setMd(event.target.value)} />
+        </label>
+        <p className="dim small">Read on every run, before the skills. Keep it short: how this agent works.</p>
 
-                  <details className="danger-zone">
-                    <summary>Delete this agent</summary>
-                    <p className="dim">
-                      Its runs stay in the history. A workflow that names it will refuse to dispatch
-                      until you pick another.
-                    </p>
-                    <button
-                      className="danger"
-                      disabled={busy !== null}
-                      onClick={() =>
-                        void run(`delete-${agent.id}`, () =>
-                          gql(`mutation ($id: UUID!) { deleteAgent(id: $id) }`, { id: agent.id }),
-                        )
-                      }
-                    >
-                      Delete {agent.name}
-                    </button>
-                  </details>
-                </div>
-              ) : (
-                <p className="dim agent-line">
-                  {agent.agentsMd ? "instructions written" : "no instructions yet"}
-                  {" · "}
-                  {(agent.skills ?? []).length} skills
-                </p>
-              )}
-            </article>
-          );
-        })}
+        <div className="skills-pick">
+          {skills.length === 0 ? (
+            <p className="dim small">No skills in this workspace yet. Create one on the Skills screen.</p>
+          ) : (
+            skills.map((skill) => {
+              const on = picked.includes(skill.id);
+              return (
+                <button
+                  key={skill.id}
+                  className={on ? "sk on" : "sk"}
+                  onClick={() =>
+                    setPicked(on ? picked.filter((id) => id !== skill.id) : [...picked, skill.id])
+                  }
+                  aria-pressed={on}
+                >
+                  <Icon name="book" size={12} />
+                  {skill.name}
+                </button>
+              );
+            })
+          )}
+        </div>
+
+        <footer className="row spread">
+          <div className="row">
+            {agent ? (
+              <button
+                className="danger"
+                disabled={busy !== null}
+                onClick={async () => {
+                  const yes = confirm(`Delete ${agent.name}? Runs it started stay in the history.`);
+                  if (!yes) return;
+                  await gql(`mutation ($id: UUID!) { deleteAgent(id: $id) }`, { id: agent.id });
+                  await onSaved(null);
+                }}
+              >
+                Delete agent
+              </button>
+            ) : null}
+          </div>
+          <div className="row">
+            <button onClick={onClose}>Cancel</button>
+            <button
+              className="primary"
+              onClick={() => void save()}
+              disabled={busy !== null || name.trim().length < 2 || !connected(harness.harness)}
+            >
+              {agent ? "Save agent" : "Create agent"}
+            </button>
+          </div>
+        </footer>
       </div>
-    </section>
+    </div>
   );
 }

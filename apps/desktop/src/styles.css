@@ -1740,3 +1740,238 @@ label > select {
     opacity: 1;
   }
 }
+
+/* --- agents: roster on the left, one agent on the right ------------------- */
+
+.agents-screen {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  min-height: 0;
+  border-top: 1px solid var(--line);
+}
+
+.roster {
+  overflow-y: auto;
+  padding: var(--s2);
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  border-right: 1px solid var(--line);
+  background: var(--bg-2);
+}
+
+/* A roster card is a row, not a tile: name, status, harness, and what it is on. */
+.acard {
+  display: grid;
+  gap: 3px;
+  width: 100%;
+  padding: var(--s2);
+  border-radius: var(--r-md);
+  border: 1px solid transparent;
+  text-align: left;
+  transition: background var(--t-fast);
+}
+
+.acard:hover {
+  background: var(--bg-3);
+}
+
+.acard[aria-selected="true"] {
+  background: var(--bg);
+  border-color: var(--line-strong);
+}
+
+.avatar {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--bg-3);
+  color: var(--text-2);
+  border: 1px solid var(--line);
+}
+
+.ahead .avatar {
+  width: 28px;
+  height: 28px;
+}
+
+.pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+  display: inline-block;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.agent-pane {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ahead {
+  display: grid;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4);
+}
+
+.ahead h2 {
+  font-size: var(--fs-lg);
+  font-weight: 650;
+  margin: 0;
+}
+
+.pillrow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.linkbtn {
+  font-size: var(--fs-sm);
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  padding: 0;
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 0 var(--s4);
+  border-bottom: 1px solid var(--line);
+}
+
+.tabs button {
+  height: 32px;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+}
+
+.tabs button[aria-selected="true"] {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+  font-weight: 600;
+}
+
+.tab-body {
+  overflow: auto;
+  padding: var(--s4);
+  min-height: 0;
+}
+
+.empty {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  padding: var(--s6);
+  text-align: center;
+  border: 1px dashed var(--line);
+  border-radius: var(--r-md);
+  color: var(--muted);
+}
+
+.empty strong {
+  color: var(--text-2);
+  font-weight: 600;
+}
+
+/* --- the agent dialog ----------------------------------------------------- */
+
+.dialog-card {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow: auto;
+  display: grid;
+  gap: var(--s2);
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  padding: var(--s4);
+}
+
+.dialog-card header h2 {
+  font-size: var(--fs-lg);
+  margin: 0;
+}
+
+.skills-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* A skill is a pill whether or not it is on; on is filled, off is outlined. */
+.sk {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: var(--h-chip);
+  padding: 0 8px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--fs-xs);
+}
+
+.sk.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+/* --- small helpers -------------------------------------------------------- */
+
+.truncate {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tiny {
+  font-size: var(--fs-2xs);
+}
+
+.chip.info {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: transparent;
+}
+
+.chip.warn {
+  background: var(--warn-soft);
+  color: var(--warn);
+  border-color: transparent;
+}
+
+.chip.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-2xs);
+}

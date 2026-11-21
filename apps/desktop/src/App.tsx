@@ -449,6 +449,7 @@ export default function App() {
             workspaceId={workspace.id}
             agents={agents}
             skills={skills}
+            issues={issues}
             repoId={projects.flatMap((entry) => entry.repos)[0]?.id ?? null}
             projectId={project?.id ?? null}
             onChanged={reload}
