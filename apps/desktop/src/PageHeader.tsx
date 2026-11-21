@@ -22,16 +22,16 @@ export default function PageHeader({
   actions?: React.ReactNode;
 }) {
   return (
-    <header className={size === "big" ? "page-head big" : "page-head"} data-tauri-drag-region>
+    <header className={size === "big" ? "page-head big" : "page-head"} data-drag>
       {back ? (
         <button className="ghost small page-back" onClick={back.onClick}>
           {back.label}
         </button>
       ) : null}
-      <h1 data-tauri-drag-region>
+      <h1 data-drag>
         {title}
         {subtitle || children ? (
-          <small data-tauri-drag-region>{subtitle ?? children}</small>
+          <small data-drag>{subtitle ?? children}</small>
         ) : null}
       </h1>
       <div className="page-tools">

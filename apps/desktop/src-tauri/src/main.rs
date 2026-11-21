@@ -21,6 +21,40 @@ struct Connection {
     label: String,
 }
 
+/// Dragging: the window has an overlay title bar and no decorated frame, so the
+/// webview has to ask for a drag explicitly. Children of a drag region keep their
+/// own clicks, which is why this is a command rather than a DOM attribute.
+#[tauri::command]
+fn start_drag(window: tauri::Window) {
+    let _ = window.start_dragging();
+}
+
+/// On macOS the traffic lights live at the top-left corner, which is exactly where
+/// the folded rail is. They are hidden with the rail's labels and come back with
+/// them. Every other platform has no such buttons, so the command is a no-op.
+#[tauri::command]
+fn set_traffic_lights(window: tauri::Window, visible: bool) {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        let Ok(ns_window) = window.ns_window() else { return };
+        let ns_window = ns_window as *mut AnyObject;
+        for kind in [15u64, 16, 17] {
+            // 15 close, 16 miniaturise, 17 zoom
+            let button: *mut AnyObject = msg_send![ns_window, standardWindowButton: kind];
+            if !button.is_null() {
+                let hidden: i8 = if visible { 0 } else { 1 };
+                let _: () = msg_send![button, setHidden: hidden];
+            }
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (window, visible);
+    }
+}
+
 #[tauri::command]
 fn connection() -> Result<Connection, String> {
     let dir = data_dir();
@@ -107,7 +141,11 @@ fn main() {
             server: Mutex::new(None),
             runner: Mutex::new(None),
         })
-        .invoke_handler(tauri::generate_handler![connection])
+        .invoke_handler(tauri::generate_handler![
+            connection,
+            start_drag,
+            set_traffic_lights,
+        ])
         .setup(|app| {
             let dir = data_dir();
             std::fs::create_dir_all(&dir)?;

@@ -210,10 +210,18 @@ pub fn parse(source: &str) -> Workflow {
             .push("the document has no `## Status` sections, so the board would be empty.".into());
     }
     for status in IssueStatus::board() {
-        if workflow.section(status).is_none() {
-            workflow
+        match workflow.section(status) {
+            None => workflow
                 .errors
-                .push(format!("`{}` has no section.", status.title()));
+                .push(format!("`{}` has no section.", status.title())),
+            Some(section) if section.owner == Owner::Agent => match section.agent.as_deref() {
+                None | Some("") | Some("any") => workflow.errors.push(format!(
+                    "`{}` is worked by an agent, but names none. Write `Agent: <agent name>`.",
+                    section.title
+                )),
+                Some(_) => {}
+            },
+            _ => {}
         }
     }
 
@@ -237,7 +245,7 @@ Work you still want to do yourself. Nothing here is dispatched.
 ## To do
 
 Owner: agent
-Agent: any
+Agent: Implementer
 Next: In progress
 When: an agent picks it up
 
@@ -246,7 +254,7 @@ Ready for the team. An agent picks a task up from here.
 ## In progress
 
 Owner: agent
-Agent: any
+Agent: Implementer
 Next: In review
 When: a pull request is opened
 
@@ -264,7 +272,7 @@ The agent asked a question, or the work waits on somebody outside.
 ## In review
 
 Owner: human
-Agent: any
+Agent: Implementer
 Next: Done
 When: you approve and the pull request is merged
 
@@ -289,8 +297,21 @@ mod tests {
         assert!(workflow.errors.is_empty(), "{:?}", workflow.errors);
         assert!(workflow.is_complete());
         assert_eq!(workflow.board().first(), Some(&IssueStatus::Backlog));
-        assert_eq!(workflow.agent_for(IssueStatus::Todo), Some("any"));
+        assert_eq!(workflow.agent_for(IssueStatus::Todo), Some("Implementer"));
         assert_eq!(workflow.agent_for(IssueStatus::Backlog), None);
+    }
+
+    #[test]
+    fn an_agent_owned_status_must_name_its_agent() {
+        let workflow = parse("## Backlog\nOwner: agent\nAgent: any\n");
+        assert!(
+            workflow
+                .errors
+                .iter()
+                .any(|error| error.contains("names none")),
+            "{:?}",
+            workflow.errors
+        );
     }
 
     #[test]

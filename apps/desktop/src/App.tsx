@@ -22,7 +22,7 @@ import {
   type Skill,
   type WorkflowDoc,
 } from "./api";
-import { WORKSPACE_KEY } from "./api";
+import { invoke, WORKSPACE_KEY } from "./api";
 import { applyTheme } from "./theme";
 import Artifacts from "./screens/Artifacts";
 import Agents from "./screens/Agents";
@@ -86,6 +86,12 @@ export default function App() {
   /** `all` shows every project's tasks, including the ones filed under none. */
   const [projectFilter, setProjectFilter] = useState<string | "all">("all");
   const [collapsed, setCollapsed] = useState(localStorage.getItem(RAIL_KEY) === "collapsed");
+
+  /// On macOS the traffic lights sit inside the folded rail's 48px, so they go
+  /// with the labels. Everywhere else this is a no-op.
+  useEffect(() => {
+    invoke("set_traffic_lights", { visible: !collapsed }).catch(() => undefined);
+  }, [collapsed]);
   const [wsMenu, setWsMenu] = useState(false);
   const [palette, setPalette] = useState(false);
 
@@ -286,23 +292,9 @@ export default function App() {
   return (
     <div className={collapsed ? "shell collapsed" : "shell"}>
       <aside className={collapsed ? "rail collapsed" : "rail"}>
-        {collapsed ? (
-          <button
-            className="ghost small rail-toggle"
-            onClick={() => {
-              setCollapsed((was) => {
-                localStorage.setItem(RAIL_KEY, was ? "expanded" : "collapsed");
-                return !was;
-              });
-            }}
-            title="Show the sidebar"
-          >
-            <Icon name="sidebar" />
-          </button>
-        ) : null}
-        <div className="brand" data-tauri-drag-region>
-          <Logo />
-          {!collapsed ? <span className="name">Hulahoop</span> : null}
+        <div className="brand" data-drag>
+          {collapsed ? null : <Logo />}
+          {collapsed ? null : <span className="name">Hulahoop</span>}
           <button
             className="ghost small rail-toggle"
             onClick={() => {
@@ -317,14 +309,6 @@ export default function App() {
             <Icon name="sidebar" size={15} />
           </button>
         </div>
-
-        {!collapsed ? (
-          <button className="nav-search" onClick={() => setPalette(true)} title="Search (⌘K)">
-            <Icon name="search" size={15} />
-            <span className="label">Search</span>
-            <kbd>⌘K</kbd>
-          </button>
-        ) : null}
 
         <nav>
           {items.map((item) => (

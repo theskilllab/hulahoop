@@ -1,6 +1,7 @@
 import React from "react";
-import ReactDOM from "react-dom/client";
+import { createRoot } from "react-dom/client";
 import App from "./App";
+import { installDrag } from "./drag";
 import "./styles.css";
 
 // The window's title bar is an overlay on macOS: the traffic lights float over
@@ -41,7 +42,9 @@ class Boundary extends React.Component<{ children: React.ReactNode }, { error: E
   }
 }
 
-ReactDOM.createRoot(document.getElementById("root")!).render(
+installDrag();
+
+createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <Boundary>
       <App />
