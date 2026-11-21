@@ -12,6 +12,7 @@ import {
   type RecentRun,
 } from "../api";
 import Icon from "../Icon";
+import PageHeader from "../PageHeader";
 
 function when(iso: string | null): string {
   if (!iso) return "—";
@@ -40,16 +41,11 @@ export function Inbox({ issues, onOpen }: { issues: Issue[]; onOpen: (id: string
 
   return (
     <section className="screen inbox">
-      <header>
-        <div>
-          <h1>Inbox</h1>
-          <p className="dim">
-            {rows.length === 0
-              ? "Nothing waits for you. Agents work the board; you decide the ones that ask."
-              : `${blocked.length} waiting on an answer, ${review.length} waiting on a merge.`}
-          </p>
-        </div>
-      </header>
+      <PageHeader title="Inbox">
+        {rows.length === 0
+          ? "Nothing waits for you. Agents work the tasks; you decide the ones that ask."
+          : `${blocked.length} waiting on an answer, ${review.length} waiting on a merge.`}
+      </PageHeader>
 
       {rows.length === 0 ? (
         <div className="empty-inbox">
@@ -94,18 +90,15 @@ export function Projects({
 }) {
   return (
     <section className="screen projects">
-      <header>
-        <div>
-          <h1>Projects</h1>
-          <p className="dim">
-            A project holds repositories, carries the prefix on every task, and binds the agents its
-            statuses call.
-          </p>
-        </div>
-        <button className="ghost" onClick={onOpenSettings}>
-          Manage in settings
-        </button>
-      </header>
+      <PageHeader
+        title="Projects"
+        subtitle="A project holds repositories, carries the prefix on every task, and binds the agents its statuses call."
+        actions={
+          <button className="ghost" onClick={onOpenSettings}>
+            Manage in settings
+          </button>
+        }
+      />
 
       <div className="project-grid">
         {projects.map((project) => {
@@ -191,18 +184,15 @@ export function Connectors({ onOpenSettings }: { onOpenSettings: () => void }) {
 
   return (
     <section className="screen connectors">
-      <header>
-        <div>
-          <h1>Connectors</h1>
-          <p className="dim">
-            What the agents sign in with. A connector is sealed on the host and handed to a run of
-            that harness only.
-          </p>
-        </div>
-        <button className="primary" onClick={onOpenSettings}>
-          Connect
-        </button>
-      </header>
+      <PageHeader
+        title="Connectors"
+        subtitle="What the agents sign in with. A connector is sealed on the host and handed to a run of that harness only."
+        actions={
+          <button className="primary" onClick={onOpenSettings}>
+            Connect
+          </button>
+        }
+      />
 
       {error ? <p className="error">{error}</p> : null}
 
@@ -277,15 +267,9 @@ export function Cost({ runners, agents }: { runners: RecentRun[]; agents: Agent[
 
   return (
     <section className="screen cost">
-      <header>
-        <div>
-          <h1>Cost control</h1>
-          <p className="dim">
-            Tokens the agents reported, from {runners.length} recent runs. Nothing is estimated: a run
-            that reported nothing counts as nothing.
-          </p>
-        </div>
-      </header>
+      <PageHeader title="Cost control">
+        {`Tokens the agents reported, from ${runners.length} recent runs. Nothing is estimated: a run that reported nothing counts as nothing.`}
+      </PageHeader>
 
       <div className="stat-row">
         <div className="stat">
@@ -353,15 +337,10 @@ export function PullRequests({ issues, onOpen }: { issues: Issue[]; onOpen: (id:
   const withPr = issues.filter((issue) => issue.prUrl);
   return (
     <section className="screen prs">
-      <header>
-        <div>
-          <h1>Pull requests</h1>
-          <p className="dim">
-            Opened when the implementation is green, so a person reviews a pull request rather than a
-            branch.
-          </p>
-        </div>
-      </header>
+      <PageHeader
+        title="Pull requests"
+        subtitle="Opened when the implementation is green, so a person reviews a pull request rather than a branch."
+      />
 
       {withPr.length === 0 ? (
         <p className="dim">No pull requests yet.</p>
@@ -415,12 +394,10 @@ export function Activity({
 
   return (
     <section className="screen activity">
-      <header>
-        <div>
-          <h1>Activity</h1>
-          <p className="dim">Every run, newest first. A run that says nothing is a run that changed nothing.</p>
-        </div>
-      </header>
+      <PageHeader
+        title="Activity"
+        subtitle="Every run, newest first. A run that says nothing is a run that changed nothing."
+      />
 
       <ul className="activity-list">
         {runners.map((run) => {

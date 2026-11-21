@@ -21,6 +21,8 @@ pub struct WorkflowSection {
     pub agent: Option<String>,
     /// The status this one leads to, if it leads anywhere.
     pub next: Option<String>,
+    /// Why that move happens: the sentence the diagram writes on the arrow.
+    pub when: Option<String>,
     pub body: String,
 }
 
@@ -44,6 +46,7 @@ fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
             owner: section.owner.as_str().to_string(),
             agent: section.agent.clone(),
             next: section.next.map(|s| s.as_str().to_string()),
+            when: section.when.clone(),
             body: section.body.clone(),
         })
         .collect()

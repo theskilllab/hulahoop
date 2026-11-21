@@ -89,6 +89,13 @@ export default function App() {
   const [wsMenu, setWsMenu] = useState(false);
   const [palette, setPalette] = useState(false);
 
+  // The page header's search field is the same door as ⌘K.
+  useEffect(() => {
+    const open = () => setPalette(true);
+    window.addEventListener("hulahoop:search", open);
+    return () => window.removeEventListener("hulahoop:search", open);
+  }, []);
+
   const refresh = useCallback(async () => {
     if (!workspace) return;
     try {
@@ -277,9 +284,23 @@ export default function App() {
   const initial = workspaces.find((entry) => entry.id === workspace.id)?.name?.[0] ?? "H";
 
   return (
-    <div className={collapsed ? "shell rail-collapsed" : "shell"}>
+    <div className={collapsed ? "shell collapsed" : "shell"}>
       <aside className={collapsed ? "rail collapsed" : "rail"}>
-        <div className="brand">
+        {collapsed ? (
+          <button
+            className="ghost small rail-toggle"
+            onClick={() => {
+              setCollapsed((was) => {
+                localStorage.setItem(RAIL_KEY, was ? "expanded" : "collapsed");
+                return !was;
+              });
+            }}
+            title="Show the sidebar"
+          >
+            <Icon name="sidebar" />
+          </button>
+        ) : null}
+        <div className="brand" data-tauri-drag-region>
           <Logo />
           {!collapsed ? <span className="name">Hulahoop</span> : null}
           <button

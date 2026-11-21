@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 
 import { createSkill, deleteSkill, loadSkills, updateSkill, type Skill } from "../api";
+import PageHeader from "../PageHeader";
 
 /// Skills are what an agent knows: written once, attached wherever it helps.
 export default function Skills({ workspaceId }: { workspaceId: string }) {
@@ -68,15 +69,10 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
 
   return (
     <section className="screen skills">
-      <header>
-        <div>
-          <h1>Skills</h1>
-          <p className="dim">
-            What an agent knows. One skill is one piece of knowledge — a convention, a checklist, a
-            house rule with the story behind it — and an agent carries the ones it needs.
-          </p>
-        </div>
-      </header>
+      <PageHeader
+        title="Skills"
+        subtitle="What an agent knows. One skill is one piece of knowledge — a convention, a checklist, a house rule with the story behind it — and an agent carries the ones it needs."
+      />
 
       {error ? <p className="error">{error}</p> : null}
 

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { gql, type Issue, type Milestone } from "../api";
 import { StatusPill } from "./Board";
+import PageHeader from "../PageHeader";
 
 interface Props {
   /** The milestones this workspace knows about, so a task can be filed under one. */
@@ -68,31 +69,21 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
 
   return (
     <div className="detail">
-      <div className="detail-head">
-        <div className="row">
-          <button className="ghost" onClick={onBack}>
-            ← Board
-          </button>
-          <span className="dim" style={{ marginLeft: "auto" }}>
-            {issue.key}
-          </span>
-          <StatusPill status={issue.status} />
-        </div>
-        <h1>{issue.title}</h1>
-        <div className="meta">
-          {issue.projectName ? <span>{issue.projectName}</span> : <span>no project</span>}
-          <span>·</span>
-          <span>attempt {issue.attempt}</span>
-          {issue.prUrl ? (
-            <>
-              <span>·</span>
+      <PageHeader
+        back={{ label: "← Tasks", onClick: onBack }}
+        title={issue.title}
+        subtitle={`${issue.key} · ${issue.projectName ?? "no project"} · attempt ${issue.attempt}`}
+        actions={
+          <>
+            {issue.prUrl ? (
               <a className="pr-link" href={issue.prUrl} target="_blank" rel="noreferrer">
                 pull request #{issue.prNumber}
               </a>
-            </>
-          ) : null}
-        </div>
-      </div>
+            ) : null}
+            <StatusPill status={issue.status} />
+          </>
+        }
+      />
 
       {error && <p className="error">{error}</p>}
 

@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import PageHeader from "../PageHeader";
 import {
   attachGithubRepo,
   createWorkspace,
@@ -160,7 +161,7 @@ export default function Settings({
 
   return (
     <section className="detail">
-      <h1>Settings</h1>
+      <PageHeader subtitle="Workspace, projects, repositories, connectors and the agent roster." title="Settings" />
 
       <div className="settings-block">
         <div className="row spread">

@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { gql, type Artifact, type Issue, type Milestone, type Project } from "../api";
+import PageHeader from "../PageHeader";
 
 interface Props {
   workspaceId: string;
@@ -75,17 +76,15 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
 
   return (
     <section className="screen page">
-      <header className="sheet-head">
-        <div>
-          <h1>Milestones</h1>
-          <p className="hint">
-            A name for a body of work. Issues point at one; nothing about the loop depends on it.
-          </p>
-        </div>
-        <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
-          {creating ? "Cancel" : "New milestone"}
-        </button>
-      </header>
+      <PageHeader
+        title="Milestones"
+        subtitle="A name for a body of work. Issues point at one; nothing about the loop depends on it."
+        actions={
+          <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
+            {creating ? "Cancel" : "New milestone"}
+          </button>
+        }
+      />
 
       {creating ? (
       <div className="panel">
