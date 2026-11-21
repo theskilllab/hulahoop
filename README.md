@@ -4,9 +4,19 @@
 
 Hulahoop is a desktop-first, local-first workspace for running autonomous coding agents through one opinionated loop:
 
-> criteria → failing tests (frozen) → implementation → review → approve → merge
+> backlog → to do → an agent works → in review → the pull request merges → done
 
-It is intentionally small. One workflow, one repo per run, one active run per issue, one human approver, almost no settings.
+It is intentionally small. One workflow document per workspace, one repository per run, one active run per issue, one person who merges, almost no settings.
+
+> **The shipped build runs a simpler loop than sections 2–17 describe.** Those
+> sections specify the frozen-suite model: a separate Test Author, a suite proven
+> red at the base revision, replays, and an approval bound to a diff hash. The
+> product outgrew that. Today a task moves through six statuses
+> (Backlog, To do, In progress, Blocked, In review, Done), the workflow lives in a
+> `WORKFLOWS.md` document per workspace, an agent owns a status and is dispatched
+> when work enters it, and the merged pull request is what closes a task. Section
+> [19](#19-the-loop-as-it-ships) is the current model; the rest is the reasoning
+> that led here, kept because it explains the constraints.
 
 - Domain: `hulahoop.dev`
 - Status: **runnable** — the server, runner, CLI and desktop shell are built, and the
@@ -1588,3 +1598,49 @@ above when the loop has run for a while.
   The workflow ships Apple silicon only: GitHub's hosted x86_64 macOS image is
   retired, so an Intel build needs a larger runner or a local `just bundle
   x86_64-apple-darwin`.
+
+---
+
+## 19. The loop as it ships
+
+Six statuses, and nothing else:
+
+| status | owner | what happens |
+| --- | --- | --- |
+| Backlog | person | ideas you have not committed to. Nothing is dispatched |
+| To do | agent | entering this column **is** the dispatch: an agent starts |
+| In progress | agent | the agent works, opens a pull request, and hands over |
+| Blocked | person | the agent asked a question; answer it and the task resumes |
+| In review | person | the pull request is open and its checks have run |
+| Done | person | the pull request merged |
+
+The workflow is a document. `WORKFLOWS.md` in the workspace, one `## Status`
+heading per column, and three lines under each:
+
+```markdown
+## To do
+
+Owner: agent
+Agent: any
+Next: In progress
+```
+
+`Owner` says whether a person or an agent works the column. `Agent` names one, or
+`any` to use the project's binding. `Next` is where the column leads. The parser
+refuses a document that names an unknown status, omits a column, or leaves a
+`Next` pointing nowhere, because a board that silently drops a column lies about
+where work can go.
+
+An agent is a role plus its own knowledge: a role prompt, its `AGENTS.md`, and the
+skills attached to it. Skills are workspace knowledge — a convention, a checklist,
+a house rule with the story behind it — written once and carried by whichever
+agents need them.
+
+What a run leaves behind: a workspace of the repository at the current base, a
+transcript in `agent.jsonl`, the diff, the token count, and a pull request. What
+closes a task is that pull request merging; nothing else moves a task to Done.
+
+What the loop keeps from the frozen-suite years: one workspace per run, the house
+rules (`just fmt-check`, `just lint`) checked at the same revision as the suite,
+the pull-request check gate, and the transcripts. What it dropped: the separate
+Test Author, frozen test files, replays, and the diff-hash approval.
