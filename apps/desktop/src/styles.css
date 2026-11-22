@@ -3180,3 +3180,9 @@ table.transitions td {
   height: 0;
   pointer-events: none;
 }
+
+/* The inspector edits one status's prose in place, so the field should not push
+   the moves and the transitions out of reach. */
+.wf-insp .richtext {
+  max-height: 220px;
+}

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { loadWorkflow, saveWorkflow, type Agent, type WorkflowDoc, type WorkflowSection } from "../api";
 import Icon from "../Icon";
+import RichText from "../RichText";
 import PageHeader from "../PageHeader";
 
 /**
@@ -98,6 +99,41 @@ function apply(source: string, title: string, state: Editable): string {
   return [...lines.slice(0, spot.start), ...written, ...lines.slice(spot.end)].join("\n");
 }
 
+/** The prose under a section's metadata: everything from the first blank line after it. */
+function bodyRange(source: string, title: string): { from: number; to: number } | null {
+  const spot = block(source, title);
+  if (!spot) return null;
+  const lines = source.split("\n");
+  let from = spot.end;
+  while (from < lines.length && lines[from].trim() === "") from += 1;
+  let to = from;
+  while (to < lines.length && !/^##\s/.test(lines[to])) to += 1;
+  while (to > from && lines[to - 1].trim() === "") to -= 1;
+  return { from, to };
+}
+
+/**
+ * Replace one section's prose, leaving its metadata and every other section alone.
+ *
+ * This is what lets a rich editor sit above a file whose first lines are machine
+ * metadata: markdown goes back exactly where the paragraph was, and `Users:` and
+ * `Next:` never travel through a rich document.
+ */
+function applyBody(source: string, title: string, markdown: string): string {
+  const spot = block(source, title);
+  const range = bodyRange(source, title);
+  if (!spot || !range) return source;
+  const lines = source.split("\n");
+  const written = markdown.replace(/\s+$/, "").split("\n").filter((line, i, all) =>
+    !(i === all.length - 1 && line === ""),
+  );
+  const head = lines.slice(0, range.from);
+  const tail = lines.slice(range.to);
+  const gap = written.length > 0 ? [""] : [];
+  const after = tail.length > 0 ? [""] : [];
+  return [...head, ...gap, ...written, ...after, ...tail].join("\n");
+}
+
 const PEOPLE = new Set(["human", "you", "me", "i", "person", "people", "user", "us"]);
 
 function editable(section: WorkflowSection): Editable {
@@ -127,6 +163,8 @@ const H = 58;
 const GX = 128;
 const GY = 28;
 const PAD = 20;
+/** Space between wrapped rows of ranks. */
+const ROW_GAP = 56;
 
 interface Node {
   key: string;
@@ -147,7 +185,18 @@ interface Edge {
   label: { x: number; y: number; text: string } | null;
 }
 
-function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; width: number; height: number } {
+/**
+ * Place the statuses in a layered grid that fits the pane it is drawn in.
+ *
+ * The prototype's canvas is one long row per rank, which is fine on a page of its
+ * own and cut off inside a split view. Ranks are wrapped into rows instead: as
+ * many columns as the pane fits, then the next row, so the whole workflow is
+ * visible at its natural size rather than scaled down to unreadable type.
+ */
+function layout(
+  sections: WorkflowSection[],
+  avail = 0,
+): { nodes: Node[]; edges: Edge[]; width: number; height: number } {
   const index = new Map(sections.map((section, i) => [section.title, i]));
   const raw = sections.map((section) =>
     (section.transitions ?? [])
@@ -175,20 +224,27 @@ function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; wi
   const tallest = Math.max(1, ...columns.map((column) => column.length));
   const heightOf = (count: number) => count * H + (count - 1) * GY;
   const body = heightOf(tallest);
+  // How many rank columns fit side by side; at least two, and one per rank when
+  // the pane is wide enough.
+  const perRow =
+    avail > 0 ? Math.max(2, Math.floor((avail - 2 * PAD + GX) / (W + GX))) : columns.length;
+  const rows = Math.ceil(columns.length / perRow) || 1;
   const nodes: Node[] = [];
-  columns.forEach((column, r) =>
+  columns.forEach((column, r) => {
+    const row = Math.floor(r / perRow);
+    const slot = r % perRow;
     column.forEach((i, k) => {
       nodes[i] = {
         key: sections[i].title,
         title: sections[i].title,
         agents: sections[i].agents ?? [],
         owner: sections[i].owner,
-        x: PAD + r * (W + GX),
-        y: PAD + (body - heightOf(column.length)) / 2 + k * (H + GY),
+        x: PAD + slot * (W + GX),
+        y: PAD + row * (body + ROW_GAP) + (body - heightOf(column.length)) / 2 + k * (H + GY),
         rank: r,
       };
-    }),
-  );
+    });
+  });
 
   const forward = raw.flatMap((edges) => edges).filter((edge) => rank[edge.b!] > rank[edge.a]);
   const backward = raw.flatMap((edges) => edges).filter((edge) => rank[edge.b!] <= rank[edge.a]);
@@ -221,7 +277,7 @@ function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; wi
   for (const edge of backward) {
     const a = nodes[edge.a];
     const b = nodes[edge.b!];
-    const y = PAD + body + 10 + loop * 18;
+    const y = a.y + H + 16 + loop * 16;
     loop += 1;
     const x1 = a.x + W / 2;
     const x2 = b.x + W / 2;
@@ -244,8 +300,8 @@ function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; wi
   return {
     nodes,
     edges,
-    width: PAD * 2 + (Math.max(...rank) + 1) * W + Math.max(...rank) * GX,
-    height: PAD + body + 24 + backward.length * 18 + PAD,
+    width: PAD * 2 + Math.min(perRow, columns.length) * W + (Math.min(perRow, columns.length) - 1) * GX,
+    height: PAD * 2 + rows * body + (rows - 1) * ROW_GAP + backward.length * 18,
   };
 }
 
@@ -377,7 +433,19 @@ export default function Workflow({
     : [];
 
   const shown = selected ? sectionOf(sections, selected) : undefined;
-  const diagram = useMemo(() => layout(sections), [sections]);
+  // The diagram is laid out to the width it actually gets, so a split pane wraps
+  // the ranks into a second row instead of cutting them off.
+  const wrap = useRef<HTMLDivElement | null>(null);
+  const [avail, setAvail] = useState(0);
+  useEffect(() => {
+    const element = wrap.current;
+    if (!element) return;
+    setAvail(element.clientWidth);
+    const watcher = new ResizeObserver(([entry]) => setAvail(entry.contentRect.width));
+    watcher.observe(element);
+    return () => watcher.disconnect();
+  }, [view]);
+  const diagram = useMemo(() => layout(sections, avail), [sections, avail]);
 
   return (
     <section className="screen fill">
@@ -526,6 +594,10 @@ export default function Workflow({
                     moves: state.moves.filter((_, i) => i !== index),
                   }))
                 }
+                onBody={(markdown) => {
+                  const next = applyBody(source, shown.title, markdown);
+                  if (next !== source) change(next);
+                }}
                 onClose={() => setSelected(null)}
                 sections={sections}
               />
@@ -541,7 +613,7 @@ export default function Workflow({
               </div>
               {sections.length ? (
                 <>
-                  <div className="wf-svgwrap">
+                  <div className="wf-svgwrap" ref={wrap}>
                     <svg
                       className="wf-svg"
                       width={diagram.width}
@@ -721,6 +793,7 @@ function Inspector({
   onMove,
   onAdd,
   onRemove,
+  onBody,
   onClose,
 }: {
   section: WorkflowSection;
@@ -730,6 +803,7 @@ function Inspector({
   onMove: (index: number, patch: { to?: string; when?: string }) => void;
   onAdd: () => void;
   onRemove: (index: number) => void;
+  onBody: (markdown: string) => void;
   onClose: () => void;
 }) {
   const state = editable(section);
@@ -752,6 +826,17 @@ function Inspector({
       <div className="od-stack tight">
         <span className="field-label">How this was read</span>
         <p className="small">{say(section)}</p>
+      </div>
+
+      <div className="od-stack tight">
+        <span className="field-label">What it says</span>
+        <RichText
+          value={section.body ?? ""}
+          onChange={onBody}
+          minHeight={90}
+          placeholder="Describe what this status means. Markdown is fine."
+          ariaLabel={`Prose under ${section.title}`}
+        />
       </div>
 
       <div className="od-stack tight">
