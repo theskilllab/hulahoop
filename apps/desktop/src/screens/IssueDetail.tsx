@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { gql, type Issue, type Milestone } from "../api";
-import { StatusPill } from "./Board";
+import { StatusPill, TurnQueue } from "./Board";
 import PageHeader from "../PageHeader";
 
 interface Props {
@@ -84,11 +84,7 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
             <StatusPill status={issue.status} />
             {/* Who still owes a turn: the document lists the team, the queue
                 says who has not been served yet. */}
-            {issue.turnRemaining && issue.turnRemaining.length > 0 ? (
-              <span className="turn-queue" title="Turns left in this status">
-                turn {(issue.turnsUsed ?? 0) + 1} · {issue.turnRemaining.join(", ")} still to go
-              </span>
-            ) : null}
+            <TurnQueue issue={issue} />
           </>
         }
       />
