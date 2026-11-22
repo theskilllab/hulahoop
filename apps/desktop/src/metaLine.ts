@@ -4,53 +4,51 @@ import { Node } from "@tiptap/core";
 const META = /^(Users|Next):/i;
 
 function attr(value: string): string {
-  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
 }
 
 /**
- * A metadata line inside a rich document.
+ * A metadata line inside the formatted document.
  *
- * `WORKFLOWS.md` is prose with five machine-read lines in it. A plain markdown
- * editor folds `Users: human` into the paragraph after it — CommonMark treats a
- * single newline as a soft break — and the file stops parsing. This node keeps
- * those lines as atoms: markdown-it hands each one back as its own block, the
- * serializer writes it out verbatim, and the document can be edited as one piece
- * without the contract underneath it moving.
+ * `WORKFLOWS.md` is prose with a few machine-read lines in it. A plain markdown
+ * editor folds `Users: human` into the paragraph that follows — CommonMark reads
+ * a single newline as a soft break — and the file stops parsing. This node keeps
+ * each such line a block of its own, with the text *editable in place*: markdown-it
+ * hands every one back as its own token, the serializer writes the line exactly as
+ * it stands, and the prose around it keeps behaving like prose.
  */
 export const MetaLine = Node.create({
   name: "metaLine",
   group: "block",
-  atom: true,
-  selectable: true,
-  draggable: false,
-
-  addAttributes() {
-    return {
-      text: {
-        default: "",
-        parseHTML: (element) => element.getAttribute("data-meta") ?? element.textContent ?? "",
-        renderHTML: () => ({}),
-      },
-    };
-  },
+  content: "inline*",
+  // Deliberately not `isolating`: that flag makes the block a unit the cursor
+  // skips, so arrow keys could never walk into or out of a metadata line and the
+  // document would feel like a form. It behaves like any other block.
 
   parseHTML() {
     return [{ tag: "div[data-meta]" }];
   },
 
-  renderHTML({ node }) {
-    return [
-      "div",
-      { "data-meta": node.attrs.text, class: "wf-meta-line" },
-      ["code", { class: "mono" }, node.attrs.text as string],
-    ];
+  renderHTML({ HTMLAttributes }) {
+    return ["div", { ...HTMLAttributes, class: "wf-meta-line" }, 0];
   },
 
   addStorage() {
     return {
       markdown: {
-        serialize(state: { write: (text: string) => void; closeBlock: (node: unknown) => void }, node: { attrs: { text?: string } }) {
-          state.write(node.attrs.text ?? "");
+        serialize(
+          state: {
+            write: (text: string, escape?: boolean) => void;
+            closeBlock: (node: unknown) => void;
+          },
+          node: { textContent: string },
+        ) {
+          // Verbatim: these lines are read by a parser, so no escaping may creep in.
+          state.write(node.textContent, false);
           state.closeBlock(node);
         },
         parse: {
@@ -61,19 +59,24 @@ export const MetaLine = Node.create({
             markdownit.block.ruler.before(
               "paragraph",
               "wf_meta",
-              (state: {
-                bMarks: number[];
-                tShift: number[];
-                eMarks: number[];
-                src: string;
-                line: number;
-                push: (type: string, tag: string, nesting: number) => {
-                  block: boolean;
-                  content: string;
-                  map: number[];
-                  markup: string;
-                };
-              }, startLine: number, _endLine: number, silent: boolean) => {
+              (
+                state: {
+                  bMarks: number[];
+                  tShift: number[];
+                  eMarks: number[];
+                  src: string;
+                  line: number;
+                  push: (type: string, tag: string, nesting: number) => {
+                    block: boolean;
+                    content: string;
+                    map: number[];
+                    markup: string;
+                  };
+                },
+                startLine: number,
+                _endLine: number,
+                silent: boolean,
+              ) => {
                 const start = state.bMarks[startLine] + state.tShift[startLine];
                 const end = state.eMarks[startLine];
                 const line = state.src.slice(start, end).trim();
@@ -89,7 +92,7 @@ export const MetaLine = Node.create({
               },
             );
             markdownit.renderer.rules.wf_meta = (tokens: { content: string }[], index: number) =>
-              `<div data-meta="${attr(tokens[index].content)}"></div>`;
+              `<div data-meta="line">${attr(tokens[index].content)}</div>`;
           },
         },
       },
