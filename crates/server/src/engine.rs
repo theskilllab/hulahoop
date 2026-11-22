@@ -1387,6 +1387,29 @@ impl Engine {
                 // only a status nobody is owed a turn in hands the task over.
                 let _ = self.mark_served(&issue, run.agent_id).await;
                 let issue = self.issue(issue.id).await?;
+
+                // "Ask for changes" is how a second agent hands the work back
+                // without a move of its own: the round starts again with the same
+                // team, and the turn cap keeps counting so it cannot spin.
+                if payload.verdict.as_deref() == Some("changes_requested") {
+                    sqlx::query("update issues set turn_served = '[]' where id = ?")
+                        .bind(issue.id)
+                        .execute(&self.db.pool)
+                        .await?;
+                    let issue = self.issue(issue.id).await?;
+                    if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+                        let _ = self
+                            .comment(
+                                issue.id,
+                                hulahoop_core::AuthorType::Server,
+                                None,
+                                &format!("the next agent could not start: {error}"),
+                                false,
+                            )
+                            .await;
+                    }
+                    return self.run(run_id).await;
+                }
                 if self.next_turn_agent(&issue).await?.is_some() {
                     if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
                         let _ = self
