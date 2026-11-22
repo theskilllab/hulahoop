@@ -27,12 +27,29 @@ interface Editable {
 const KEYWORDS = /^(users|user|next|when)\s*:/i;
 
 /** Where the caret sits inside a textarea, in the textarea's own coordinates. */
-function caretPoint(area: HTMLTextAreaElement, index: number): { x: number; y: number } {
+/**
+ * Where the caret is, in the textarea's own coordinates.
+ *
+ * A mirror of the text is laid over the textarea itself rather than appended to
+ * the page, so padding and border cancel out, and the textarea's own scroll is
+ * subtracted. Without that subtraction the caret of a long file reports its
+ * height in the document and the `@` list walks off the bottom of the pane — which
+ * is exactly what happened once a document grew past one screen.
+ */
+function caretPoint(
+  area: HTMLTextAreaElement,
+  index: number,
+): { x: number; y: number; height: number; line: number } {
   const style = window.getComputedStyle(area);
+  const rect = area.getBoundingClientRect();
   const mirror = document.createElement("div");
   mirror.style.position = "absolute";
   mirror.style.visibility = "hidden";
+  mirror.style.pointerEvents = "none";
+  mirror.style.left = `${rect.left + window.scrollX}px`;
+  mirror.style.top = `${rect.top + window.scrollY}px`;
   mirror.style.whiteSpace = "pre-wrap";
+  mirror.style.overflowWrap = "break-word";
   mirror.style.width = `${area.clientWidth}px`;
   mirror.style.fontFamily = style.fontFamily;
   mirror.style.fontSize = style.fontSize;
@@ -47,9 +64,12 @@ function caretPoint(area: HTMLTextAreaElement, index: number): { x: number; y: n
   marker.textContent = "\u200b";
   mirror.appendChild(marker);
   document.body.appendChild(mirror);
+  const line = Number.parseFloat(style.lineHeight || "18") || 18;
   const point = {
     x: marker.offsetLeft - area.scrollLeft,
-    y: marker.offsetTop - area.scrollTop + Number.parseFloat(style.lineHeight || "18"),
+    y: marker.offsetTop - area.scrollTop,
+    height: area.clientHeight,
+    line,
   };
   mirror.remove();
   return point;
@@ -420,7 +440,7 @@ export default function Workflow({
   }
 
   const [mention, setMention] = useState<
-    { start: number; query: string; x: number; y: number; index: number } | null
+    { start: number; query: string; x: number; y: number; above: boolean; index: number } | null
   >(null);
 
   /** `@` at the caret opens the team up: type to filter, arrows and Enter to pick. */
@@ -429,11 +449,15 @@ export default function Workflow({
     const match = /(?:^|\s)@([\w -]*)$/.exec(before);
     if (!match || !area.current) return setMention(null);
     const point = caretPoint(area.current, caret);
+    const below = point.y + point.line + 232;
     setMention({
       start: caret - match[1].length - 1,
       query: match[1],
       x: point.x,
       y: point.y,
+      // More room above than below, and the caret is past the halfway mark: open
+      // upwards so the list is never clipped by the pane.
+      above: below > point.height && point.y > point.height - point.y,
       index: 0,
     });
   }
@@ -618,7 +642,15 @@ export default function Workflow({
               />
               )}
               {!rich && mention && candidates.length > 0 ? (
-                <ul className="wf-at" style={{ left: mention.x, top: mention.y }} role="listbox">
+                <ul
+                  className="wf-at"
+                  style={
+                    mention.above
+                      ? { left: mention.x, top: mention.y, transform: "translateY(-100%) translateY(-4px)" }
+                      : { left: mention.x, top: mention.y + 20 }
+                  }
+                  role="listbox"
+                >
                   {candidates.map((name, index) => (
                     <li key={name}>
                       <button
