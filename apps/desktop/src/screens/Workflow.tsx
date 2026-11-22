@@ -27,7 +27,9 @@ function rewrite(source: string, sections: WorkflowSection[]): string {
       [
         `## ${section.title}`,
         `User: ${section.owner === "human" ? "human" : agentsOf(section).map((name) => `@${name}`).join(", ")}`,
-        `Next: ${section.nexts.length ? section.nexts.join(", ") : "none"}`,
+        ...(section.transitions.length
+          ? section.transitions.map((move) => `Next: ${move.title}${move.when ? ` - ${move.when}` : ""}`)
+          : [`Next: none`]),
         section.when ? `When: ${section.when}` : "",
         section.body.trim(),
       ]
@@ -62,6 +64,12 @@ function centre(status: string): { x: number; y: number } {
 function edgePath(from: string, to: string): string {
   const a = centre(from);
   const b = centre(to);
+  if (from === to) {
+    // A status that can hand back to itself: a loop over its own head.
+    return `M ${a.x - 22} ${a.y - H / 2} C ${a.x - 44} ${a.y - H / 2 - 58}, ${a.x + 44} ${
+      a.y - H / 2 - 58
+    }, ${a.x + 22} ${a.y - H / 2}`;
+  }
   const stacked = Math.abs(b.x - a.x) < 1;
   if (stacked) {
     const bow = b.y > a.y ? 1 : -1;
@@ -81,14 +89,16 @@ function Diagram({
   onEdit: (id: string) => void;
 }) {
   const edges = sections.flatMap((section) => {
-    const moves = section.nexts?.length ? section.nexts : section.next ? [section.next] : [];
+    const moves = section.transitions?.length
+      ? section.transitions.map((move) => ({ to: move.to, when: move.when }))
+      : (section.nexts ?? []).map((to) => ({ to, when: section.when }));
     return moves
-      .filter((to) => NODE[to])
-      .map((to) => ({
+      .filter((move) => NODE[move.to])
+      .map((move) => ({
         id: section.status,
         from: section.status,
-        to,
-        label: section.when ?? "then",
+        to: move.to,
+        label: move.when ?? "then",
       }));
   });
   return (
@@ -104,9 +114,12 @@ function Diagram({
           const b = centre(edge.to);
           const stacked = Math.abs(b.x - a.x) < 1;
           const bow = b.y > a.y ? 1 : -1;
-          const mid = stacked
-            ? { x: a.x + 78 * bow, y: (a.y + b.y) / 2 }
-            : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+          const mid =
+            edge.from === edge.to
+              ? { x: a.x, y: a.y - H / 2 - 52 }
+              : stacked
+                ? { x: a.x + 78 * bow, y: (a.y + b.y) / 2 }
+                : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
           return (
             <g key={`e-${edge.id}-${edge.to}`} className="wf-edge" onClick={() => onEdit(edge.id)}>
               <path d={edgePath(edge.from, edge.to)} markerEnd="url(#wf-arrow)" />
@@ -489,14 +502,17 @@ export default function Workflow({
               </thead>
               <tbody>
                 {sections.flatMap((section) => {
-                  // A section may lead to several statuses; each move is its own row.
-                  const moves = section.nexts.length ? section.nexts : [""];
-                  return moves.map((next) => (
-                    <tr key={`${section.status}-${next}`}>
+                  // A section may lead to several statuses; each move is its own
+                  // row, because each move carries its own reason.
+                  const moves = section.transitions?.length
+                    ? section.transitions.map((move) => ({ to: move.to, when: move.when }))
+                    : [{ to: "" as string, when: section.when }];
+                  return moves.map((move) => (
+                    <tr key={`${section.status}-${move.to}`}>
                       <td>{section.title}</td>
-                      <td>{sections.find((entry) => entry.status === next)?.title ?? "—"}</td>
+                      <td>{sections.find((entry) => entry.status === move.to)?.title ?? "—"}</td>
                       <td>{section.owner === "agent" ? (section.agent ?? "Any idle agent") : "You"}</td>
-                      <td className="dim">{section.when ?? "—"}</td>
+                      <td className="dim">{move.when ?? "—"}</td>
                     </tr>
                   ));
                 })}

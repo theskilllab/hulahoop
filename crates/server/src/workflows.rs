@@ -25,6 +25,8 @@ pub struct WorkflowSection {
     pub next: Option<String>,
     /// Every status this one leads to: a document may branch.
     pub nexts: Vec<String>,
+    /// Each move with its own reason, which is what the arrows print.
+    pub transitions: Vec<WorkflowTransition>,
     /// Why that move happens: the sentence the diagram writes on the arrow.
     pub when: Option<String>,
     pub body: String,
@@ -40,6 +42,14 @@ pub struct WorkflowDoc {
     pub errors: Vec<String>,
 }
 
+/// One arrow: where it goes and why.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct WorkflowTransition {
+    pub to: String,
+    pub title: String,
+    pub when: Option<String>,
+}
+
 fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
     parsed
         .sections
@@ -50,11 +60,23 @@ fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
             owner: section.owner.as_str().to_string(),
             agent: section.agents.first().cloned(),
             agents: section.agents.clone(),
-            next: section.next.first().map(|s| s.as_str().to_string()),
+            next: section
+                .transitions
+                .first()
+                .map(|m| m.to.as_str().to_string()),
             nexts: section
-                .next
+                .transitions
                 .iter()
-                .map(|s| s.as_str().to_string())
+                .map(|m| m.to.as_str().to_string())
+                .collect(),
+            transitions: section
+                .transitions
+                .iter()
+                .map(|move_| WorkflowTransition {
+                    to: move_.to.as_str().to_string(),
+                    title: move_.to.title().to_string(),
+                    when: move_.when.clone(),
+                })
                 .collect(),
             when: section.when.clone(),
             body: section.body.clone(),
@@ -125,7 +147,7 @@ impl Engine {
         let parsed = workflow::parse(&doc.source);
         Ok(parsed
             .section(status)
-            .and_then(|section| section.next.first().copied()))
+            .and_then(|section| section.transitions.first().map(|m| m.to)))
     }
 
     /// The agent name a status dispatches to, when the document names one.

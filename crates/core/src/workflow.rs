@@ -31,6 +31,16 @@ impl Owner {
     }
 }
 
+/// One move out of a status: where it goes and why. A section lists as many as
+/// the team needs, and each may carry its own sentence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Transition {
+    pub to: IssueStatus,
+    /// The reason, from `Next: To do - when it is ready` or from the section's
+    /// `When:` line when the move gives none.
+    pub when: Option<String>,
+}
+
 /// One status section of the document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusSection {
@@ -40,9 +50,8 @@ pub struct StatusSection {
     pub owner: Owner,
     /// The agents named for this status. Empty means the project's binding decides.
     pub agents: Vec<String>,
-    /// Where this status leads. A document may name several places, which is
-    /// what makes the board a graph instead of a queue.
-    pub next: Vec<IssueStatus>,
+    /// Every move out of this status, in the order the document lists them.
+    pub transitions: Vec<Transition>,
     /// Why the move happens. `When:` is what the diagram writes on the arrow and
     /// what the transitions table shows, so the picture and the rule agree.
     pub when: Option<String>,
@@ -74,7 +83,15 @@ impl Workflow {
     /// board uses the first, the diagram draws all of them.
     pub fn next_of(&self, status: IssueStatus) -> Vec<IssueStatus> {
         self.section(status)
-            .map(|s| s.next.clone())
+            .map(|s| s.transitions.iter().map(|m| m.to).collect())
+            .unwrap_or_default()
+    }
+
+    /// The moves out of a status with their reasons: what the diagram draws on
+    /// each arrow and what the transitions table prints.
+    pub fn transitions_of(&self, status: IssueStatus) -> Vec<Transition> {
+        self.section(status)
+            .map(|s| s.transitions.clone())
             .unwrap_or_default()
     }
 
@@ -200,7 +217,7 @@ pub fn parse(source: &str) -> Workflow {
                         title: heading.trim().to_string(),
                         owner: Owner::Human,
                         agents: Vec::new(),
-                        next: Vec::new(),
+                        transitions: Vec::new(),
                         when: None,
                         body: String::new(),
                     });
@@ -269,17 +286,13 @@ pub fn parse(source: &str) -> Workflow {
             // inline (`Next: To do - when it is ready`). Only the names are read.
             for token in names_in(value) {
                 let name = strip_reason(&token);
-                // `Next: To do - when it is ready` says the move *and* its reason.
-                // The reason belongs on `When:`, which is what the arrow shows.
-                if section.when.is_none() {
-                    if let Some(reason) = reason_in(&token) {
-                        section.when = Some(reason);
-                    }
-                }
+                // `Next: To do - when it is ready` states the move and its reason
+                // in one line; a section may have several such lines.
+                let reason = reason_in(&token);
                 match status_by_title(name) {
-                    Some(next) => {
-                        if !section.next.contains(&next) {
-                            section.next.push(next);
+                    Some(to) => {
+                        if !section.transitions.iter().any(|move_| move_.to == to) {
+                            section.transitions.push(Transition { to, when: reason });
                         }
                     }
                     None => workflow
@@ -301,6 +314,16 @@ pub fn parse(source: &str) -> Workflow {
         let mut section = section;
         section.body = body_lines.join("\n").trim().to_string();
         workflow.sections.push(section);
+    }
+
+    for section in &mut workflow.sections {
+        if let Some(sentence) = section.when.clone() {
+            for move_ in &mut section.transitions {
+                if move_.when.is_none() {
+                    move_.when = Some(sentence.clone());
+                }
+            }
+        }
     }
 
     if workflow.sections.is_empty() {
@@ -427,7 +450,13 @@ mod tests {
     fn next_lines_name_a_status() {
         let workflow = parse("## Backlog\nOwner: human\nNext: To do\n");
         let section = workflow.section(IssueStatus::Backlog).unwrap();
-        assert_eq!(section.next, vec![IssueStatus::Todo]);
+        assert_eq!(
+            section.transitions,
+            vec![Transition {
+                to: IssueStatus::Todo,
+                when: None
+            }]
+        );
     }
 
     #[test]
@@ -445,10 +474,41 @@ mod tests {
         let section = workflow.section(IssueStatus::Todo).unwrap();
         assert_eq!(section.agents, vec!["TestAuthor", "Reviewer"]);
         assert_eq!(
-            section.next,
+            section.transitions.iter().map(|m| m.to).collect::<Vec<_>>(),
             vec![IssueStatus::InProgress, IssueStatus::Blocked]
         );
         assert_eq!(section.owner, Owner::Agent);
+    }
+
+    #[test]
+    fn several_next_lines_each_keep_their_reason() {
+        let lines = [
+            "## In progress",
+            "User: human, @Implementer, @Reviewer",
+            "Next: In review - @Reviewer has read the work",
+            "Next: Blocked - an agent needs a decision",
+            "Next: In progress - @Reviewer found something to fix",
+            "",
+        ];
+        let source = lines.join("\n");
+        let workflow = parse(&source);
+        let moves = workflow.transitions_of(IssueStatus::InProgress);
+        assert_eq!(moves.len(), 3);
+        assert_eq!(moves[0].to, IssueStatus::InReview);
+        assert_eq!(
+            moves[0].when.as_deref(),
+            Some("@Reviewer has read the work")
+        );
+        assert_eq!(moves[2].to, IssueStatus::InProgress);
+        // The document is short on purpose; only the moves are under test.
+        assert!(
+            !workflow
+                .errors
+                .iter()
+                .any(|error| error.contains("names no status")),
+            "{:?}",
+            workflow.errors
+        );
     }
 
     #[test]
