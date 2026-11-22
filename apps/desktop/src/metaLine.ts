@@ -25,8 +25,9 @@ export const MetaLine = Node.create({
   name: "metaLine",
   group: "block",
   content: "inline*",
-  defining: true,
-  isolating: true,
+  // Deliberately not `isolating`: that flag makes the block a unit the cursor
+  // skips, so arrow keys could never walk into or out of a metadata line and the
+  // document would feel like a form. It behaves like any other block.
 
   parseHTML() {
     return [{ tag: "div[data-meta]" }];
