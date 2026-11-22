@@ -2908,7 +2908,6 @@ table.transitions td {
 .wf-src {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  border-right: 1px solid var(--line);
   min-height: 0;
   min-width: 0;
 }
@@ -3195,6 +3194,12 @@ table.transitions td {
   touch-action: none;
 }
 
+/* The divider is the only rule between the panes: the file's own border would
+   draw a second line three pixels away from it. */
+.wf-both .wf-src {
+  border-right: 0;
+}
+
 .wf-grip::before {
   content: "";
   position: absolute;
@@ -3305,4 +3310,31 @@ table.transitions td {
 
 .wf-doc .richtext-prose > * + * {
   margin-top: 6px;
+}
+
+/* A metadata line inside the formatted document: the parser's line, kept as a
+   chip so the prose around it reads as prose. */
+.wf-meta-line {
+  margin: 2px 0;
+}
+
+.wf-meta-line code {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+.wf-meta-line.ProseMirror-selectednode code {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* Every connector is solid. A rework move is already legible from the floor it
+   runs on and the direction of its arrow. */
+.wf-edge.back {
+  stroke-dasharray: none;
 }

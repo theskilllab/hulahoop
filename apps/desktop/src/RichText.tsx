@@ -1,3 +1,4 @@
+import type { Extensions } from "@tiptap/core";
 import Placeholder from "@tiptap/extension-placeholder";
 import { EditorContent, useEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
@@ -23,6 +24,7 @@ export default function RichText({
   minHeight = 120,
   ariaLabel,
   autoFocus = false,
+  extensions = [],
 }: {
   /** Markdown in. */
   value: string;
@@ -32,6 +34,8 @@ export default function RichText({
   minHeight?: number;
   ariaLabel?: string;
   autoFocus?: boolean;
+  /** Extra nodes this field needs, e.g. the workflow's metadata lines. */
+  extensions?: Extensions;
 }) {
   // The last markdown this component emitted, so an echo of our own change does
   // not reset the document (and the caret) while a person is typing.
@@ -42,6 +46,7 @@ export default function RichText({
       StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
       Placeholder.configure({ placeholder: placeholder ?? "" }),
       Markdown.configure({ html: false, tightLists: true, linkify: true, breaks: false }),
+      ...extensions,
     ],
     content: value,
     autofocus: autoFocus,

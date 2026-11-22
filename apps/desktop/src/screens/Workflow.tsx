@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { loadWorkflow, saveWorkflow, type Agent, type WorkflowDoc, type WorkflowSection } from "../api";
 import Icon from "../Icon";
 import RichText from "../RichText";
+import { MetaLine } from "../metaLine";
 import PageHeader from "../PageHeader";
 
 /**
@@ -213,10 +214,7 @@ interface Edge {
  * many columns as the pane fits, then the next row, so the whole workflow is
  * visible at its natural size rather than scaled down to unreadable type.
  */
-function layout(
-  sections: WorkflowSection[],
-  avail = 0,
-): { nodes: Node[]; edges: Edge[]; width: number; height: number } {
+function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; width: number; height: number } {
   const index = new Map(sections.map((section, i) => [section.title, i]));
   const raw = sections.map((section) =>
     (section.transitions ?? [])
@@ -246,9 +244,9 @@ function layout(
   const body = heightOf(tallest);
   // How many rank columns fit side by side; at least two, and one per rank when
   // the pane is wide enough.
-  const perRow =
-    avail > 0 ? Math.max(2, Math.floor((avail - 2 * PAD + GX) / (W + GX))) : columns.length;
-  const rows = Math.ceil(columns.length / perRow) || 1;
+  // One row: the flow reads left to right, and the zoom fits it to the pane.
+  const perRow = Math.max(1, columns.length);
+  const rows = 1;
   const nodes: Node[] = [];
   columns.forEach((column, r) => {
     const row = Math.floor(r / perRow);
@@ -288,31 +286,50 @@ function layout(
       to: b.key,
       when: edge.when ?? null,
       back: false,
-      path: `M${x1} ${y1} C${mx} ${y1} ${mx} ${y2} ${x2 - 2} ${y2}`,
+      path: elbow(x1, y1, x2 - 2, y2, mx),
       label: edge.when
-        ? { x: mx, y: (y1 + y2) / 2 - 6, text: cut(edge.when, 22) }
+        ? { x: (mx + x2) / 2, y: y2 - 7, text: cut(edge.when, 26) }
         : null,
     });
   }
   for (const edge of backward) {
     const a = nodes[edge.a];
     const b = nodes[edge.b!];
-    const y = a.y + H + 16 + loop * 16;
+    const same = edge.a === edge.b;
     loop += 1;
+    if (same) {
+      // A status that sends itself back: out of the right edge, down, and in again.
+      const out = a.x + W + 34;
+      const top = a.y + 16;
+      const bottom = a.y + 42;
+      edges.push({
+        from: a.key,
+        to: b.key,
+        when: edge.when ?? null,
+        back: true,
+        path: `M${a.x + W} ${top} H${out - R} Q${out} ${top} ${out} ${top + R} V${bottom - R} Q${out} ${bottom} ${out - R} ${bottom} H${a.x + W + 2}`,
+        label: edge.when
+          ? { x: out + 6, y: (top + bottom) / 2 + 4, text: cut(edge.when, 26) }
+          : null,
+      });
+      continue;
+    }
+    // A rework move: leave the bottom, run along its own lane, and come back up
+    // into the bottom of the status it returns to.
+    const lane = Math.max(a.y, b.y) + H + 22 + loop * 20;
     const x1 = a.x + W / 2;
     const x2 = b.x + W / 2;
-    const same = edge.a === edge.b;
-    const path = same
-      ? `M${a.x + W} ${a.y + 18} C${a.x + W + 46} ${a.y + 18} ${a.x + W + 46} ${a.y + 44} ${a.x + W + 2} ${a.y + 44}`
-      : `M${x1} ${a.y + H} C${x1} ${y} ${x2} ${y} ${x2} ${b.y + H + 2}`;
+    const left = x2 < x1;
     edges.push({
       from: a.key,
       to: b.key,
       when: edge.when ?? null,
       back: true,
-      path,
+      path:
+        `M${x1} ${a.y + H} V${lane - R} Q${x1} ${lane} ${x1 - (left ? R : -R)} ${lane} ` +
+        `H${x2 + (left ? R : -R)} Q${x2} ${lane} ${x2} ${lane - R} V${b.y + H + 2}`,
       label: edge.when
-        ? { x: same ? a.x + W + 30 : (x1 + x2) / 2, y: same ? a.y + 34 : y - 5, text: cut(edge.when, 30) }
+        ? { x: (x1 + x2) / 2, y: lane - 5, text: cut(edge.when, 30) }
         : null,
     });
   }
@@ -321,8 +338,26 @@ function layout(
     nodes,
     edges,
     width: PAD * 2 + Math.min(perRow, columns.length) * W + (Math.min(perRow, columns.length) - 1) * GX,
-    height: PAD * 2 + rows * body + (rows - 1) * ROW_GAP + backward.length * 18,
+    height: PAD * 2 + rows * body + (rows - 1) * ROW_GAP + backward.length * 16,
   };
+}
+
+/** Corner radius on every elbow. */
+const R = 8;
+
+/**
+ * An orthogonal connector: out of the right edge, across at the midpoint, into
+ * the left edge — with rounded corners, because square joints at this node size
+ * read as a spreadsheet.
+ */
+function elbow(x1: number, y1: number, x2: number, y2: number, mid: number): string {
+  if (Math.abs(y2 - y1) < 1) return `M${x1} ${y1} H${x2}`;
+  const dir = y2 > y1 ? 1 : -1;
+  const turn = Math.min(R, Math.abs(y2 - y1) / 2);
+  return (
+    `M${x1} ${y1} H${mid - turn} Q${mid} ${y1} ${mid} ${y1 + dir * turn} ` +
+    `V${y2 - dir * turn} Q${mid} ${y2} ${mid + turn} ${y2} H${x2}`
+  );
 }
 
 const cut = (text: string, limit: number) =>
@@ -346,7 +381,8 @@ export default function Workflow({
   // and `Next:` are lines the parser reads and sometimes want typing by hand.
   const [rich, setRich] = useState<boolean>(() => localStorage.getItem("hulahoop.wf-editor") !== "source");
   const [ratio, setRatio] = useState<number>(() => Number(localStorage.getItem("hulahoop.wf-ratio") ?? 0.42));
-  const [zoom, setZoom] = useState(1);
+  // null means "fit the pane", which is what a fresh screen shows.
+  const [zoom, setZoom] = useState<number | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -491,7 +527,9 @@ export default function Workflow({
     watcher.observe(wrapEl);
     return () => watcher.disconnect();
   }, [wrapEl, view]);
-  const diagram = useMemo(() => layout(sections, avail), [sections, avail]);
+  const diagram = useMemo(() => layout(sections), [sections]);
+  const fit = avail > 0 ? Math.min(1, (avail - 26) / diagram.width) : 1;
+  const scale = zoom ?? Math.max(0.55, Number(fit.toFixed(2)));
 
   return (
     <section className="screen fill">
@@ -571,44 +609,14 @@ export default function Workflow({
             </div>
             <div className="wf-edit">
               {rich ? (
-                <div className="wf-doc">
-                  {sections.length === 0 ? (
-                    <p className="dim small" style={{ padding: "var(--s4)" }}>
-                      Nothing to show yet. Switch to Source to write the first status.
-                    </p>
-                  ) : null}
-                  {sections.map((section) => (
-                    <section key={section.title} className="wf-doc-sec">
-                      <button
-                        type="button"
-                        className="wf-doc-h"
-                        onClick={() => setSelected(section.title)}
-                        title="Edit who handles this status"
-                      >
-                        {section.title}
-                      </button>
-                      <div className="wf-doc-meta">
-                        {[usersLine(editable(section))[0], ...nextLines(editable(section))].map(
-                          (line) => (
-                            <span className="mono" key={line}>
-                              {line}
-                            </span>
-                          ),
-                        )}
-                      </div>
-                      <RichText
-                        value={section.body ?? ""}
-                        onChange={(markdown) => {
-                          const next = applyBody(source, section.title, markdown);
-                          if (next !== source) change(next);
-                        }}
-                        minHeight={72}
-                        placeholder="What this status means, in your words."
-                        ariaLabel={`Prose under ${section.title}`}
-                      />
-                    </section>
-                  ))}
-                </div>
+                <RichText
+                  value={source}
+                  onChange={(markdown) => change(markdown)}
+                  minHeight={480}
+                  ariaLabel="WORKFLOWS.md"
+                  extensions={[MetaLine]}
+                  placeholder={"# Workflows\n\n## Backlog\nUsers: human\nNext: To do - an issue is ready"}
+                />
               ) : (
               <textarea
                 ref={area}
@@ -738,7 +746,15 @@ export default function Workflow({
                 <span className="wf-zoom">
                   <button
                     type="button"
-                    onClick={() => setZoom((value) => Math.max(0.6, Math.round((value - 0.1) * 10) / 10))}
+                    onClick={() => setZoom(null)}
+                    aria-label="Fit to the pane"
+                    title="Fit to the pane"
+                  >
+                    ⤢
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoom(Math.max(0.5, Math.round((scale - 0.1) * 10) / 10))}
                     aria-label="Zoom out"
                     title="Zoom out"
                   >
@@ -746,7 +762,7 @@ export default function Workflow({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setZoom((value) => Math.min(1.8, Math.round((value + 0.1) * 10) / 10))}
+                    onClick={() => setZoom(Math.min(1.8, Math.round((scale + 0.1) * 10) / 10))}
                     aria-label="Zoom in"
                     title="Zoom in"
                   >
@@ -759,14 +775,14 @@ export default function Workflow({
                   <div className="wf-svgwrap" ref={setWrapEl}>
                     <div
                       style={{
-                        width: diagram.width * zoom,
-                        height: diagram.height * zoom,
+                        width: diagram.width * scale,
+                        height: diagram.height * scale,
                       }}
                     >
                     <svg
                       className="wf-svg"
                       style={{
-                        transform: `scale(${zoom})`,
+                        transform: `scale(${scale})`,
                         transformOrigin: "top left",
                       }}
                       width={diagram.width}
@@ -790,7 +806,11 @@ export default function Workflow({
                       </defs>
                       {diagram.edges.map((edge, i) => (
                         <g key={`${edge.from}-${edge.to}-${i}`}>
-                          <path className="wf-edge" d={edge.path} markerEnd="url(#wf-arrow)" />
+                          <path
+                            className={edge.back ? "wf-edge back" : "wf-edge"}
+                            d={edge.path}
+                            markerEnd="url(#wf-arrow)"
+                          />
                           <path
                             className="wf-hit"
                             d={edge.path}
