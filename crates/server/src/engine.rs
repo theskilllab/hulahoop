@@ -128,6 +128,12 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        // A new status means a new round of turns; staying put (`Start`, a
+        // self-move) keeps the queue, so the cap counts real turns instead of
+        // being reset by every attempt.
+        if from != to {
+            let _ = self.reset_turns(issue_id, to).await;
+        }
         let issue = self.issue(issue_id).await?;
         // Moving a task into a status an agent owns is the dispatch: nobody has
         // to press start, and nothing starts twice because the run table allows
@@ -144,6 +150,70 @@ impl Engine {
                 .await;
         }
         self.issue(issue_id).await
+    }
+
+    /// Fill the turn queue for the status a task just entered.
+    ///
+    /// The document names the team; nothing starts until the queue exists, and the
+    /// order in `Users:` *is* the order of turns.
+    async fn reset_turns(&self, issue_id: Uuid, status: IssueStatus) -> Result<()> {
+        let issue = self.issue(issue_id).await?;
+        let agents = self.turn_agents(issue.workspace_id, status).await?;
+        sqlx::query(
+            "update issues set turn_queue = ?, turn_served = '[]', turns_used = 0 where id = ?",
+        )
+        .bind(serde_json::json!(agents).to_string())
+        .bind(issue_id)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The next agent owed a turn in this status, if any.
+    ///
+    /// The queue holds names because that is what the document says; service is
+    /// recorded by id, because an agent's display name can be anything while the
+    /// row that ran is unambiguous.
+    async fn next_turn_agent(&self, issue: &Issue) -> Result<Option<String>> {
+        let queue: Vec<String> = serde_json::from_str(&issue.turn_queue).unwrap_or_default();
+        let served: Vec<String> = serde_json::from_str(&issue.turn_served).unwrap_or_default();
+        if queue.is_empty() {
+            // A task that predates the queue still gets one turn from the document.
+            if served.is_empty() {
+                return self
+                    .workflow_agent(issue.workspace_id, issue.status_enum())
+                    .await;
+            }
+            return Ok(None);
+        }
+        for name in queue {
+            let id = self
+                .agent_for_name(issue.workspace_id, Some(&name))
+                .await?
+                .map(|id| id.to_string());
+            match id {
+                Some(id) if served.contains(&id) => continue,
+                Some(_) => return Ok(Some(name)),
+                // A name nobody answers to cannot take a turn.
+                None => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Record that an agent has had its turn in the current status.
+    async fn mark_served(&self, issue: &Issue, agent_id: Uuid) -> Result<()> {
+        let mut served: Vec<String> = serde_json::from_str(&issue.turn_served).unwrap_or_default();
+        let id = agent_id.to_string();
+        if !served.contains(&id) {
+            served.push(id);
+        }
+        sqlx::query("update issues set turn_served = ? where id = ?")
+            .bind(serde_json::json!(served).to_string())
+            .bind(issue.id)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(())
     }
 
     /// Move a task to a status by name.
@@ -166,6 +236,7 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        let _ = self.reset_turns(issue_id, target).await;
         let issue = self.issue(issue_id).await?;
         if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
             let _ = self
@@ -226,8 +297,33 @@ impl Engine {
                 return Ok(());
             }
         }
-        let named = self.workflow_agent(workspace, issue.status_enum()).await?;
+        // A status that keeps passing the turn around gets fenced: the cap is in
+        // the document (`Turns:`), and hitting it is a question for a person.
+        let cap = self.turn_cap(workspace, issue.status_enum()).await?;
+        if issue.turns_used >= cap {
+            let _ = self
+                .comment(
+                    issue.id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!(
+                        "`{}` has taken {used} turns, which is the limit this workflow sets (`Turns: {cap}`). Somebody has to look at it.",
+                        issue.status_enum().title(),
+                        used = issue.turns_used
+                    ),
+                    false,
+                )
+                .await;
+            self.move_to(issue.id, IssueStatus::Blocked).await?;
+            return Ok(());
+        }
+
+        let named = self.next_turn_agent(issue).await?;
         let agent = self.agent_for_name(workspace, named.as_deref()).await?;
+        sqlx::query("update issues set turns_used = turns_used + 1 where id = ?")
+            .bind(issue.id)
+            .execute(&self.db.pool)
+            .await?;
         self.start_run(issue.id, agent, role, issue.current_run_id)
             .await?;
         Ok(())
@@ -1286,6 +1382,26 @@ impl Engine {
                 // review is what earns a pull request — everything else is just
                 // the next step of the flow, and the run that lands there is the
                 // one a reviewer will be shown.
+                // The turn is spent. If the status names another agent who has
+                // not worked it yet, the task stays here and the queue moves on;
+                // only a status nobody is owed a turn in hands the task over.
+                let _ = self.mark_served(&issue, run.agent_id).await;
+                let issue = self.issue(issue.id).await?;
+                if self.next_turn_agent(&issue).await?.is_some() {
+                    if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+                        let _ = self
+                            .comment(
+                                issue.id,
+                                hulahoop_core::AuthorType::Server,
+                                None,
+                                &format!("the next agent could not start: {error}"),
+                                false,
+                            )
+                            .await;
+                    }
+                    return self.run(run_id).await;
+                }
+
                 let target = self
                     .workflow_handoff(issue.workspace_id, issue.status_enum())
                     .await?

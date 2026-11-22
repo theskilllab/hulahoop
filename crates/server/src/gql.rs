@@ -1295,6 +1295,32 @@ impl Agent {
 
 #[ComplexObject]
 impl Issue {
+    /// Who still owes a turn in this status. Empty means the status is done with
+    /// its team, and the next move (or a person) takes over.
+    async fn turn_remaining(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
+        let queue: Vec<String> = serde_json::from_str(&self.turn_queue).unwrap_or_default();
+        let served: Vec<String> = serde_json::from_str(&self.turn_served).unwrap_or_default();
+        if queue.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut left = Vec::new();
+        for name in queue {
+            let found: Option<(uuid::Uuid,)> = sqlx::query_as(
+                "select id from agents where workspace_id = ? and lower(replace(name, ' ', '')) = lower(replace(?, ' ', '')) limit 1",
+            )
+            .bind(self.workspace_id)
+            .bind(name.trim_start_matches('@'))
+            .fetch_optional(&engine(ctx).db.pool)
+            .await?;
+            match found {
+                Some((id,)) if served.iter().any(|done| *done == id.to_string()) => {}
+                Some(_) => left.push(name),
+                None => {}
+            }
+        }
+        Ok(left)
+    }
+
     /// The milestone this issue was filed under, if any.
     async fn milestone(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Milestone>> {
         let Some(id) = self.milestone_id else {

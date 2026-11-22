@@ -49,6 +49,8 @@ pub struct StatusSection {
     pub any_agent: bool,
     /// Every move out of this status, in the order the document lists them.
     pub transitions: Vec<Transition>,
+    /// `Turns: 3` inside a section, when that status deserves different rope.
+    pub turns: Option<i64>,
     /// Why the move happens. `When:` is what the diagram writes on the arrow and
     /// what the transitions table shows, so the picture and the rule agree.
     pub when: Option<String>,
@@ -62,7 +64,15 @@ pub struct StatusSection {
 pub struct Workflow {
     pub sections: Vec<StatusSection>,
     pub errors: Vec<String>,
+    /// How many turns one status may take before a person is asked. `Turns: 6`
+    /// under the title sets it for the whole workflow; a section may override.
+    pub turns: i64,
 }
+
+/// What a workflow allows when it says nothing: two honest round trips between
+/// two agents and a margin.
+pub const DEFAULT_TURNS: i64 = 6;
+pub const MAX_TURNS: i64 = 12;
 
 impl Workflow {
     pub fn section(&self, status: IssueStatus) -> Option<&StatusSection> {
@@ -172,7 +182,10 @@ fn reason_in(token: &str) -> Option<String> {
 /// status, a missing owner, or a `Next` that names no status becomes an error
 /// rather than a silent default.
 pub fn parse(source: &str) -> Workflow {
-    let mut workflow = Workflow::default();
+    let mut workflow = Workflow {
+        turns: DEFAULT_TURNS,
+        ..Workflow::default()
+    };
     let mut current: Option<StatusSection> = None;
     let mut body_lines: Vec<String> = Vec::new();
 
@@ -222,6 +235,7 @@ pub fn parse(source: &str) -> Workflow {
                         agents: Vec::new(),
                         any_agent: false,
                         transitions: Vec::new(),
+                        turns: None,
                         when: None,
                         body: String::new(),
                     });
@@ -240,6 +254,23 @@ pub fn parse(source: &str) -> Workflow {
                     // not swallow the rest of the document.
                     current = None;
                 }
+            }
+            continue;
+        }
+
+        // `Turns: 3` is a policy line, not prose: it says how many turns a status
+        // may take before a person is asked. Validated here so a typo shows up in
+        // the Checks card instead of turning into a silent zero.
+        if let Some(value) = line.strip_prefix("Turns:") {
+            match value.trim().parse::<i64>() {
+                Ok(n) if (1..=MAX_TURNS).contains(&n) => match current.as_mut() {
+                    Some(section) => section.turns = Some(n),
+                    None => workflow.turns = n,
+                },
+                _ => workflow.errors.push(format!(
+                    "`Turns: {value}` needs a whole number from 1 to {MAX_TURNS}.",
+                    value = value.trim()
+                )),
             }
             continue;
         }
@@ -401,6 +432,56 @@ The pull request merged. Nothing is dispatched from here.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turns_are_a_policy_line_the_document_owns() {
+        // Absent: the default, which is two honest round trips.
+        let bare = parse(DEFAULT_SOURCE);
+        assert_eq!(bare.turns, DEFAULT_TURNS);
+        assert!(bare.errors.is_empty(), "{:?}", bare.errors);
+
+        // Under the title: the whole workflow.
+        let body = DEFAULT_SOURCE
+            .trim_start_matches("# Workflows")
+            .trim_start();
+        let document = parse(&format!("# Workflows\n\nTurns: 4\n\n{body}"));
+        assert_eq!(document.turns, 4);
+        assert!(document.errors.is_empty(), "{:?}", document.errors);
+
+        // Inside a section: that status only, the workflow keeps its own.
+        let with_override = format!(
+            "{}Turns: 2\n",
+            DEFAULT_SOURCE.replace("## In review\n", "## In review\n\nTurns: 2\n")
+        );
+        let per_status = parse(&with_override);
+        assert_eq!(
+            per_status
+                .sections
+                .iter()
+                .find(|section| section.status == IssueStatus::InReview)
+                .and_then(|section| section.turns),
+            Some(2)
+        );
+        assert_eq!(per_status.turns, DEFAULT_TURNS);
+    }
+
+    #[test]
+    fn a_turn_cap_that_cannot_work_is_refused_loudly() {
+        for bad in ["0", "13", "six", "-2"] {
+            let document = parse(&format!("Turns: {bad}\n{DEFAULT_SOURCE}"));
+            assert!(
+                document
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("whole number from 1 to")),
+                "`Turns: {bad}` was accepted"
+            );
+            assert_eq!(
+                document.turns, DEFAULT_TURNS,
+                "`Turns: {bad}` still applied"
+            );
+        }
+    }
 
     #[test]
     fn the_default_source_is_complete() {

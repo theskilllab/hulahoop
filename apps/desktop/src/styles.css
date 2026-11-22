@@ -3342,3 +3342,10 @@ table.transitions td {
 .wf-edge.back {
   stroke-dasharray: none;
 }
+
+/* Progress through a status that several agents work in turn. */
+.turn-queue {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
+}

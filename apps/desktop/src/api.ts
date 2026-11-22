@@ -120,6 +120,9 @@ export interface Issue {
   /** Set when the task is blocked, naming what it waits for. */
   blockedBy: string | null;
   projectName: string | null;
+  /** Who still owes a turn in the current status, in the workflow's order. */
+  turnRemaining?: string[];
+  turnsUsed?: number;
   criteria: Criterion[];
   runs: Run[];
   reviews: Review[];
@@ -431,6 +434,7 @@ export const ISSUE_FIELDS = `
   runs { id agentId role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments { id author authorType body pinned createdAt }
+  turnRemaining turnsUsed
   currentRun { id agentId role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
