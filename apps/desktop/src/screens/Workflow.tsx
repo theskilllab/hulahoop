@@ -322,6 +322,11 @@ export default function Workflow({
   const [doc, setDoc] = useState<WorkflowDoc | null>(null);
   const [source, setSource] = useState("");
   const [view, setView] = useState<View>("both");
+  // The file opens as formatted text and keeps a source view, because `Users:`
+  // and `Next:` are lines the parser reads and sometimes want typing by hand.
+  const [rich, setRich] = useState<boolean>(() => localStorage.getItem("hulahoop.wf-editor") !== "source");
+  const [ratio, setRatio] = useState<number>(() => Number(localStorage.getItem("hulahoop.wf-ratio") ?? 0.42));
+  const [zoom, setZoom] = useState(1);
   const [selected, setSelected] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -366,6 +371,24 @@ export default function Workflow({
     }
     return list;
   }, [doc, sections, names]);
+
+  /** Drag the divider between the file and the diagram. */
+  function startResize(event: React.PointerEvent<HTMLDivElement>) {
+    const pane = event.currentTarget.parentElement;
+    if (!pane) return;
+    const box = pane.getBoundingClientRect();
+    const move = (pointer: PointerEvent) => {
+      const share = Math.min(0.75, Math.max(0.2, (pointer.clientX - box.left) / box.width));
+      setRatio(share);
+      localStorage.setItem("hulahoop.wf-ratio", String(share));
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", stop);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", stop);
+  }
 
   function change(next: string, remember = true) {
     if (remember) undo.current = [...undo.current.slice(-199), source];
@@ -435,16 +458,15 @@ export default function Workflow({
   const shown = selected ? sectionOf(sections, selected) : undefined;
   // The diagram is laid out to the width it actually gets, so a split pane wraps
   // the ranks into a second row instead of cutting them off.
-  const wrap = useRef<HTMLDivElement | null>(null);
+  const [wrapEl, setWrapEl] = useState<HTMLDivElement | null>(null);
   const [avail, setAvail] = useState(0);
   useEffect(() => {
-    const element = wrap.current;
-    if (!element) return;
-    setAvail(element.clientWidth);
+    if (!wrapEl) return;
+    setAvail(wrapEl.clientWidth);
     const watcher = new ResizeObserver(([entry]) => setAvail(entry.contentRect.width));
-    watcher.observe(element);
+    watcher.observe(wrapEl);
     return () => watcher.disconnect();
-  }, [view]);
+  }, [wrapEl, view]);
   const diagram = useMemo(() => layout(sections, avail), [sections, avail]);
 
   return (
@@ -474,10 +496,30 @@ export default function Workflow({
       />
 
       <div className="wf-body">
-        <div className={`wf wf-${view}`}>
+        <div
+          className={`wf wf-${view}`}
+          style={
+            view === "both"
+              ? { gridTemplateColumns: `minmax(240px, ${ratio}fr) 7px minmax(0, ${1 - ratio}fr)` }
+              : undefined
+          }
+        >
           <section className="wf-src" aria-label="WORKFLOWS.md">
             <div className="wf-h">
               <span className="mono od-fill">WORKFLOWS.md</span>
+              <button
+                type="button"
+                className={rich ? "linkbtn on" : "linkbtn"}
+                aria-pressed={rich}
+                title={rich ? "Show the file as text" : "Show the file formatted"}
+                onClick={() => {
+                  const next = !rich;
+                  setRich(next);
+                  localStorage.setItem("hulahoop.wf-editor", next ? "rich" : "source");
+                }}
+              >
+                {rich ? "Formatted" : "Source"}
+              </button>
               {dirty ? <span className="chip warn">Unsaved</span> : null}
               {dirty ? (
                 <button
@@ -504,6 +546,46 @@ export default function Workflow({
               ) : null}
             </div>
             <div className="wf-edit">
+              {rich ? (
+                <div className="wf-doc">
+                  {sections.length === 0 ? (
+                    <p className="dim small" style={{ padding: "var(--s4)" }}>
+                      Nothing to show yet. Switch to Source to write the first status.
+                    </p>
+                  ) : null}
+                  {sections.map((section) => (
+                    <section key={section.title} className="wf-doc-sec">
+                      <button
+                        type="button"
+                        className="wf-doc-h"
+                        onClick={() => setSelected(section.title)}
+                        title="Edit who handles this status"
+                      >
+                        {section.title}
+                      </button>
+                      <div className="wf-doc-meta">
+                        {[usersLine(editable(section))[0], ...nextLines(editable(section))].map(
+                          (line) => (
+                            <span className="mono" key={line}>
+                              {line}
+                            </span>
+                          ),
+                        )}
+                      </div>
+                      <RichText
+                        value={section.body ?? ""}
+                        onChange={(markdown) => {
+                          const next = applyBody(source, section.title, markdown);
+                          if (next !== source) change(next);
+                        }}
+                        minHeight={72}
+                        placeholder="What this status means, in your words."
+                        ariaLabel={`Prose under ${section.title}`}
+                      />
+                    </section>
+                  ))}
+                </div>
+              ) : (
               <textarea
                 ref={area}
                 className="textarea mono"
@@ -534,7 +616,8 @@ export default function Workflow({
                 onBlur={() => window.setTimeout(() => setMention(null), 120)}
                 aria-label="WORKFLOWS.md contents"
               />
-              {mention && candidates.length > 0 ? (
+              )}
+              {!rich && mention && candidates.length > 0 ? (
                 <ul className="wf-at" style={{ left: mention.x, top: mention.y }} role="listbox">
                   {candidates.map((name, index) => (
                     <li key={name}>
@@ -554,6 +637,16 @@ export default function Workflow({
               ) : null}
             </div>
           </section>
+
+          {view === "both" ? (
+            <div
+              className="wf-grip"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="Resize the file and the diagram"
+              onPointerDown={startResize}
+            />
+          ) : null}
 
           <section className="wf-out" aria-label="Diagram preview">
             {shown ? (
@@ -610,12 +703,40 @@ export default function Workflow({
                   {sections.length} {sections.length === 1 ? "status" : "statuses"} ·{" "}
                   {diagram.edges.length} {diagram.edges.length === 1 ? "transition" : "transitions"}
                 </span>
+                <span className="wf-zoom">
+                  <button
+                    type="button"
+                    onClick={() => setZoom((value) => Math.max(0.6, Math.round((value - 0.1) * 10) / 10))}
+                    aria-label="Zoom out"
+                    title="Zoom out"
+                  >
+                    −
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoom((value) => Math.min(1.8, Math.round((value + 0.1) * 10) / 10))}
+                    aria-label="Zoom in"
+                    title="Zoom in"
+                  >
+                    +
+                  </button>
+                </span>
               </div>
               {sections.length ? (
                 <>
-                  <div className="wf-svgwrap" ref={wrap}>
+                  <div className="wf-svgwrap" ref={setWrapEl}>
+                    <div
+                      style={{
+                        width: diagram.width * zoom,
+                        height: diagram.height * zoom,
+                      }}
+                    >
                     <svg
                       className="wf-svg"
+                      style={{
+                        transform: `scale(${zoom})`,
+                        transformOrigin: "top left",
+                      }}
                       width={diagram.width}
                       height={diagram.height}
                       viewBox={`0 0 ${diagram.width} ${diagram.height}`}
@@ -686,6 +807,7 @@ export default function Workflow({
                         );
                       })}
                     </svg>
+                    </div>
                   </div>
                   <p className="dim small">
                     Not what you meant? Click a status or an arrow to correct it, or edit the file on the left.
