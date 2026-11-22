@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 
 import { createSkill, deleteSkill, loadSkills, updateSkill, type Skill } from "../api";
 import PageHeader from "../PageHeader";
+import RichText from "../RichText";
 
 /// Skills are what an agent knows: written once, attached wherever it helps.
 export default function Skills({ workspaceId }: { workspaceId: string }) {
@@ -111,15 +112,13 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
                       )
                     }
                   />
-                  <textarea
-                    rows={12}
+                  <RichText
                     value={skill.source}
-                    onChange={(event) =>
-                      setSkills((all) =>
-                        all.map((entry) =>
-                          entry.id === skill.id ? { ...entry, source: event.target.value } : entry,
-                        ),
-                      )
+                    ariaLabel={`${skill.name} body`}
+                    placeholder="The knowledge itself, in markdown."
+                    minHeight={220}
+                    onChange={(source) =>
+                      setSkills((all) => all.map((entry) => (entry.id === skill.id ? { ...entry, source } : entry)))
                     }
                   />
                   <div className="row">
@@ -150,11 +149,12 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
             value={draft.description}
             onChange={(event) => setDraft({ ...draft, description: event.target.value })}
           />
-          <textarea
-            rows={12}
-            placeholder="the knowledge itself, in markdown"
+          <RichText
             value={draft.source}
-            onChange={(event) => setDraft({ ...draft, source: event.target.value })}
+            onChange={(source) => setDraft({ ...draft, source })}
+            placeholder="The knowledge itself, in markdown."
+            minHeight={180}
+            ariaLabel="Skill body"
           />
           <button className="primary" disabled={busy || !draft.name.trim()} onClick={add}>
             Create skill

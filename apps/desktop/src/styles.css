@@ -2124,6 +2124,15 @@ label > select {
   padding-right: var(--s5);
 }
 
+/* The workflow pane is a split editor, so it takes the whole width and the
+   page gutter stops at the header. */
+.screen.fill > .wf-body,
+.screen > .wf-body {
+  padding-left: 0;
+  padding-right: 0;
+  padding-bottom: 0;
+}
+
 .page-head {
   flex: none;
   display: flex;
@@ -2575,6 +2584,13 @@ table.transitions td {
   padding: 2px;
   background: var(--bg-2);
   gap: 2px;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--bg);
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
 }
 
 .seg button {
@@ -3079,4 +3095,88 @@ table.transitions td {
 .wf-at button:hover {
   background: var(--bg-3);
   color: var(--text);
+}
+
+/* Rich text: a markdown field that shows its formatting while you type. The
+   surface matches `.input`, so a prose field and a one-line field sit together. */
+.richtext {
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  background: var(--bg);
+  overflow: auto;
+}
+
+.richtext:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.richtext .tiptap {
+  outline: none;
+  padding: var(--s3) var(--s3);
+  min-height: inherit;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--text);
+}
+
+.richtext-prose > * + * {
+  margin-top: var(--s2);
+}
+
+.richtext-prose h1,
+.richtext-prose h2,
+.richtext-prose h3 {
+  font-size: var(--fs-md);
+  font-weight: 600;
+  margin-top: var(--s3);
+}
+
+.richtext-prose ul,
+.richtext-prose ol {
+  padding-left: var(--s4);
+}
+
+.richtext-prose li + li {
+  margin-top: 2px;
+}
+
+.richtext-prose code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--bg-2);
+  border-radius: var(--r-sm);
+  padding: 1px 4px;
+}
+
+.richtext-prose pre {
+  background: var(--bg-2);
+  border-radius: var(--r);
+  padding: var(--s3);
+  overflow: auto;
+}
+
+.richtext-prose pre code {
+  background: none;
+  padding: 0;
+}
+
+.richtext-prose blockquote {
+  border-left: 2px solid var(--line);
+  padding-left: var(--s3);
+  color: var(--text-2);
+}
+
+.richtext-prose a {
+  color: var(--accent);
+}
+
+/* The placeholder is drawn by the editor itself, so an empty field still says
+   what to write. */
+.richtext-prose p.is-editor-empty:first-child::before {
+  content: attr(data-placeholder);
+  color: var(--muted);
+  float: left;
+  height: 0;
+  pointer-events: none;
 }
