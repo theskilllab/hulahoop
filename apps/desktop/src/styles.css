@@ -3186,3 +3186,123 @@ table.transitions td {
 .wf-insp .richtext {
   max-height: 220px;
 }
+
+/* The divider between the file and the diagram: drag to give either side room. */
+.wf-grip {
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  touch-action: none;
+}
+
+.wf-grip::before {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  background: var(--line);
+}
+
+.wf-grip:hover::before,
+.wf-grip:active::before {
+  background: var(--accent);
+}
+
+/* The document as formatted text fills the pane instead of sitting in a box. */
+.wf-src .richtext {
+  border: 0;
+  border-radius: 0;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.wf-src .richtext .tiptap {
+  min-height: 100%;
+  padding: var(--s4);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+}
+
+.linkbtn.on {
+  color: var(--text);
+  font-weight: 500;
+}
+
+.wf-zoom {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.wf-zoom button {
+  width: 22px;
+  height: 20px;
+  border-radius: var(--r-sm);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+}
+
+.wf-zoom button:hover {
+  background: var(--bg-2);
+  color: var(--text);
+}
+
+/* The formatted document: one block per status, with its metadata as the only
+   lines that stay literal — they are the parser's contract. */
+.wf-doc {
+  padding: var(--s4) var(--s4) var(--s6);
+  overflow: auto;
+  min-height: 0;
+}
+
+.wf-doc-sec + .wf-doc-sec {
+  margin-top: var(--s5);
+  padding-top: var(--s4);
+  border-top: 1px solid var(--line);
+}
+
+.wf-doc-h {
+  display: block;
+  width: 100%;
+  text-align: left;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: var(--s2);
+}
+
+.wf-doc-h:hover {
+  color: var(--accent);
+}
+
+.wf-doc-meta {
+  display: grid;
+  gap: 2px;
+  margin-bottom: var(--s3);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+.wf-doc .richtext {
+  border: 1px solid transparent;
+  background: transparent;
+  padding: 0;
+}
+
+.wf-doc .richtext:hover {
+  border-color: var(--line);
+}
+
+.wf-doc .richtext:focus-within {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* In the formatted document the prose is the page, so it carries no inner box. */
+.wf-doc .richtext .tiptap {
+  padding: 0;
+  min-height: 0;
+}
+
+.wf-doc .richtext-prose > * + * {
+  margin-top: 6px;
+}
