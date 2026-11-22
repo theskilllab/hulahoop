@@ -19,6 +19,17 @@ export function StatusPill({ status }: { status: string }) {
   return <span className={`pill ${status}`}>{status.replaceAll("_", " ")}</span>;
 }
 
+/// Who still owes a turn in the card's status, in the workflow's order. A team
+/// that has finished its turns shows nothing. The task page renders the same line.
+export function TurnQueue({ issue }: { issue: Pick<Issue, "turnRemaining" | "turnsUsed"> }) {
+  if (!issue.turnRemaining || issue.turnRemaining.length === 0) return null;
+  return (
+    <span className="turn-queue" title="Turns left in this status">
+      turn {(issue.turnsUsed ?? 0) + 1} · {issue.turnRemaining.join(", ")} still to go
+    </span>
+  );
+}
+
 export default function Board({
   issues,
   columns = FALLBACK,
@@ -76,6 +87,7 @@ export default function Board({
                       {issue.criteria.length} criteria · attempt {issue.attempt || 0}
                     </span>
                   </span>
+                  <TurnQueue issue={issue} />
                   {issue.runs.length > 0 && (
                     <span className="timeline">
                       {issue.runs.slice(-4).map((run) => (

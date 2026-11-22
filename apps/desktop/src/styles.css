@@ -3349,3 +3349,8 @@ table.transitions td {
   color: var(--muted);
   white-space: nowrap;
 }
+
+/* On a card the line may wrap rather than push the column wider. */
+.card .turn-queue {
+  white-space: normal;
+}
