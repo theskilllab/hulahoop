@@ -286,31 +286,50 @@ function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; wi
       to: b.key,
       when: edge.when ?? null,
       back: false,
-      path: `M${x1} ${y1} C${mx} ${y1} ${mx} ${y2} ${x2 - 2} ${y2}`,
+      path: elbow(x1, y1, x2 - 2, y2, mx),
       label: edge.when
-        ? { x: mx, y: (y1 + y2) / 2 - 6, text: cut(edge.when, 22) }
+        ? { x: (mx + x2) / 2, y: y2 - 7, text: cut(edge.when, 26) }
         : null,
     });
   }
   for (const edge of backward) {
     const a = nodes[edge.a];
     const b = nodes[edge.b!];
-    const y = a.y + H + 16 + loop * 16;
+    const same = edge.a === edge.b;
     loop += 1;
+    if (same) {
+      // A status that sends itself back: out of the right edge, down, and in again.
+      const out = a.x + W + 34;
+      const top = a.y + 16;
+      const bottom = a.y + 42;
+      edges.push({
+        from: a.key,
+        to: b.key,
+        when: edge.when ?? null,
+        back: true,
+        path: `M${a.x + W} ${top} H${out - R} Q${out} ${top} ${out} ${top + R} V${bottom - R} Q${out} ${bottom} ${out - R} ${bottom} H${a.x + W + 2}`,
+        label: edge.when
+          ? { x: out + 6, y: (top + bottom) / 2 + 4, text: cut(edge.when, 26) }
+          : null,
+      });
+      continue;
+    }
+    // A rework move: leave the bottom, run along its own lane, and come back up
+    // into the bottom of the status it returns to.
+    const lane = Math.max(a.y, b.y) + H + 22 + loop * 20;
     const x1 = a.x + W / 2;
     const x2 = b.x + W / 2;
-    const same = edge.a === edge.b;
-    const path = same
-      ? `M${a.x + W} ${a.y + 18} C${a.x + W + 46} ${a.y + 18} ${a.x + W + 46} ${a.y + 44} ${a.x + W + 2} ${a.y + 44}`
-      : `M${x1} ${a.y + H} C${x1} ${y} ${x2} ${y} ${x2} ${b.y + H + 2}`;
+    const left = x2 < x1;
     edges.push({
       from: a.key,
       to: b.key,
       when: edge.when ?? null,
       back: true,
-      path,
+      path:
+        `M${x1} ${a.y + H} V${lane - R} Q${x1} ${lane} ${x1 - (left ? R : -R)} ${lane} ` +
+        `H${x2 + (left ? R : -R)} Q${x2} ${lane} ${x2} ${lane - R} V${b.y + H + 2}`,
       label: edge.when
-        ? { x: same ? a.x + W + 30 : (x1 + x2) / 2, y: same ? a.y + 34 : y - 5, text: cut(edge.when, 30) }
+        ? { x: (x1 + x2) / 2, y: lane - 5, text: cut(edge.when, 30) }
         : null,
     });
   }
@@ -319,8 +338,26 @@ function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; wi
     nodes,
     edges,
     width: PAD * 2 + Math.min(perRow, columns.length) * W + (Math.min(perRow, columns.length) - 1) * GX,
-    height: PAD * 2 + rows * body + (rows - 1) * ROW_GAP + backward.length * 18,
+    height: PAD * 2 + rows * body + (rows - 1) * ROW_GAP + backward.length * 16,
   };
+}
+
+/** Corner radius on every elbow. */
+const R = 8;
+
+/**
+ * An orthogonal connector: out of the right edge, across at the midpoint, into
+ * the left edge — with rounded corners, because square joints at this node size
+ * read as a spreadsheet.
+ */
+function elbow(x1: number, y1: number, x2: number, y2: number, mid: number): string {
+  if (Math.abs(y2 - y1) < 1) return `M${x1} ${y1} H${x2}`;
+  const dir = y2 > y1 ? 1 : -1;
+  const turn = Math.min(R, Math.abs(y2 - y1) / 2);
+  return (
+    `M${x1} ${y1} H${mid - turn} Q${mid} ${y1} ${mid} ${y1 + dir * turn} ` +
+    `V${y2 - dir * turn} Q${mid} ${y2} ${mid + turn} ${y2} H${x2}`
+  );
 }
 
 const cut = (text: string, limit: number) =>

@@ -2908,7 +2908,6 @@ table.transitions td {
 .wf-src {
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
-  border-right: 1px solid var(--line);
   min-height: 0;
   min-width: 0;
 }
@@ -3193,6 +3192,12 @@ table.transitions td {
   background: transparent;
   position: relative;
   touch-action: none;
+}
+
+/* The divider is the only rule between the panes: the file's own border would
+   draw a second line three pixels away from it. */
+.wf-both .wf-src {
+  border-right: 0;
 }
 
 .wf-grip::before {
