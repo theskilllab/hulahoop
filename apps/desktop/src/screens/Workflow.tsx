@@ -15,6 +15,10 @@ type Tab = "both" | "markdown" | "diagram";
 /// Rewrite the status sections of a workflow document, keeping whatever preamble
 /// the person wrote above the first `## ` heading. The diagram and the document
 /// are the same thing, so editing one has to move the other.
+function agentsOf(section: WorkflowSection): string[] {
+  return section.agents?.length ? section.agents : section.agent ? [section.agent] : [];
+}
+
 function rewrite(source: string, sections: WorkflowSection[]): string {
   const firstHeading = source.search(/^##\s/m);
   const preamble = firstHeading === -1 ? source.trimEnd() : source.slice(0, firstHeading).trimEnd();
@@ -22,9 +26,10 @@ function rewrite(source: string, sections: WorkflowSection[]): string {
     .map((section) =>
       [
         `## ${section.title}`,
-        `Owner: ${section.owner}`,
-        `Agent: ${section.agent ?? "any"}`,
-        `Next: ${section.next ?? "none"}`,
+        `User: ${section.owner === "human" ? "human" : agentsOf(section).map((name) => `@${name}`).join(", ")}`,
+        ...(section.transitions.length
+          ? section.transitions.map((move) => `Next: ${move.title}${move.when ? ` - ${move.when}` : ""}`)
+          : [`Next: none`]),
         section.when ? `When: ${section.when}` : "",
         section.body.trim(),
       ]
@@ -59,6 +64,12 @@ function centre(status: string): { x: number; y: number } {
 function edgePath(from: string, to: string): string {
   const a = centre(from);
   const b = centre(to);
+  if (from === to) {
+    // A status that can hand back to itself: a loop over its own head.
+    return `M ${a.x - 22} ${a.y - H / 2} C ${a.x - 44} ${a.y - H / 2 - 58}, ${a.x + 44} ${
+      a.y - H / 2 - 58
+    }, ${a.x + 22} ${a.y - H / 2}`;
+  }
   const stacked = Math.abs(b.x - a.x) < 1;
   if (stacked) {
     const bow = b.y > a.y ? 1 : -1;
@@ -77,14 +88,19 @@ function Diagram({
   editing: string | null;
   onEdit: (id: string) => void;
 }) {
-  const edges = sections
-    .filter((section) => section.next && NODE[section.next])
-    .map((section) => ({
-      id: section.status,
-      from: section.status,
-      to: section.next as string,
-      label: section.when ?? "then",
-    }));
+  const edges = sections.flatMap((section) => {
+    const moves = section.transitions?.length
+      ? section.transitions.map((move) => ({ to: move.to, when: move.when }))
+      : (section.nexts ?? []).map((to) => ({ to, when: section.when }));
+    return moves
+      .filter((move) => NODE[move.to])
+      .map((move) => ({
+        id: section.status,
+        from: section.status,
+        to: move.to,
+        label: move.when ?? "then",
+      }));
+  });
   return (
     <div className="wf-canvas">
       <svg viewBox="0 0 1180 360" role="img" aria-label="Workflow diagram">
@@ -98,11 +114,14 @@ function Diagram({
           const b = centre(edge.to);
           const stacked = Math.abs(b.x - a.x) < 1;
           const bow = b.y > a.y ? 1 : -1;
-          const mid = stacked
-            ? { x: a.x + 78 * bow, y: (a.y + b.y) / 2 }
-            : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+          const mid =
+            edge.from === edge.to
+              ? { x: a.x, y: a.y - H / 2 - 52 }
+              : stacked
+                ? { x: a.x + 78 * bow, y: (a.y + b.y) / 2 }
+                : { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
           return (
-            <g key={`e-${edge.id}`} className="wf-edge" onClick={() => onEdit(edge.id)}>
+            <g key={`e-${edge.id}-${edge.to}`} className="wf-edge" onClick={() => onEdit(edge.id)}>
               <path d={edgePath(edge.from, edge.to)} markerEnd="url(#wf-arrow)" />
               <text x={mid.x} y={mid.y - 7} textAnchor="middle">
                 {edge.label.length > 26 ? `${edge.label.slice(0, 26)}…` : edge.label}
@@ -149,6 +168,10 @@ export default function Workflow({
   const [editing, setEditing] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [mentions, setMentions] = useState<{ at: number; items: Agent[]; x: number; y: number } | null>(null);
+  const [active, setActive] = useState(0);
+  // The textarea is controlled, so the browser's own undo history is gone.
+  // A plain stack gives back what a person expects from Cmd+Z.
+  const past = useRef<string[]>([]);
   const area = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -252,6 +275,11 @@ export default function Workflow({
   }
 
   function onType(value: string, caret: number) {
+    const previous = past.current[past.current.length - 1];
+    if (previous !== value) {
+      past.current.push(value);
+      if (past.current.length > 200) past.current.shift();
+    }
     setSource(value);
     const field = area.current;
     const before = value.slice(0, caret);
@@ -263,8 +291,10 @@ export default function Workflow({
       setMentions(null);
       return;
     }
-    const at = caret - match![2].length;
+    // `at` is the index of the `@` itself: the query starts one past it.
+    const at = caret - match![2].length - 1;
     const point = caretAt(field);
+    setActive(0);
     setMentions({ at, items: found, x: point.x, y: point.y });
   }
 
@@ -274,6 +304,7 @@ export default function Workflow({
     if (!mentions) return;
     const caret = area.current?.selectionStart ?? source.length;
     const next = `${source.slice(0, mentions.at)}@${agent.name.replace(/\s+/g, "")}${source.slice(caret)}`;
+    past.current.push(next);
     setSource(next);
     setMentions(null);
     const field = area.current;
@@ -326,25 +357,39 @@ export default function Workflow({
       )}
 
       <div className={`wf ${tab}`}>
+        <div className="wf-head">
+          <span className="mono dim small">WORKFLOWS.md</span>
+          {dirty ? <span className="chip warn small">Unsaved</span> : null}
+          <button className="link" onClick={() => setSource(doc?.source ?? "")} disabled={!dirty}>
+            Revert
+          </button>
+          <span className="dim small wf-head-right">{tab === "diagram" ? "Diagram" : "Markdown"}</span>
+        </div>
+
         {tab !== "diagram" ? (
           <section className="wf-src">
-            <div className="head">
-              <span className="mono dim small">WORKFLOWS.md</span>
-              {dirty ? <span className="chip warn small">Unsaved</span> : null}
-              <button className="link" style={{ marginLeft: "auto" }} onClick={() => setSource(doc?.source ?? "")} disabled={!dirty}>
-                Revert
-              </button>
-            </div>
             <textarea
               ref={area}
               value={source}
               spellCheck={false}
               onChange={(event) => onType(event.target.value, event.target.selectionStart)}
               onKeyDown={(event) => {
+                const meta = event.metaKey || event.ctrlKey;
+                if (meta && event.key.toLowerCase() === "z") {
+                  event.preventDefault();
+                  const previous = past.current.pop();
+                  if (previous !== undefined) setSource(previous);
+                  return;
+                }
                 if (!mentions) return;
+                if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  event.preventDefault();
+                  const step = event.key === "ArrowDown" ? 1 : -1;
+                  setActive((current) => (current + step + mentions.items.length) % mentions.items.length);
+                }
                 if (event.key === "Enter" || event.key === "Tab") {
                   event.preventDefault();
-                  pick(mentions.items[0]);
+                  pick(mentions.items[active] ?? mentions.items[0]);
                 }
                 if (event.key === "Escape") setMentions(null);
               }}
@@ -359,8 +404,15 @@ export default function Workflow({
                   bottom: "auto",
                 }}
               >
-                {mentions.items.map((agent) => (
-                  <button key={agent.id} onMouseDown={(event) => event.preventDefault()} onClick={() => pick(agent)}>
+                {mentions.items.map((agent, index) => (
+                  <button
+                    key={agent.id}
+                    className={index === active ? "on" : ""}
+                    onMouseDown={(event) => event.preventDefault()}
+                    onMouseEnter={() => setActive(index)}
+                    onClick={() => pick(agent)}
+                  >
+                    <Icon name="robot" size={12} />
                     {agent.name}
                   </button>
                 ))}
@@ -449,16 +501,21 @@ export default function Workflow({
                 </tr>
               </thead>
               <tbody>
-                {sections.map((section) => (
-                  <tr key={section.status}>
-                    <td>{section.title}</td>
-                    <td>{sections.find((entry) => entry.status === section.next)?.title ?? "—"}</td>
-                    <td>
-                      {section.owner === "agent" ? (section.agent ?? "Any idle agent") : "You"}
-                    </td>
-                    <td className="dim">{section.when ?? "—"}</td>
-                  </tr>
-                ))}
+                {sections.flatMap((section) => {
+                  // A section may lead to several statuses; each move is its own
+                  // row, because each move carries its own reason.
+                  const moves = section.transitions?.length
+                    ? section.transitions.map((move) => ({ to: move.to, when: move.when }))
+                    : [{ to: "" as string, when: section.when }];
+                  return moves.map((move) => (
+                    <tr key={`${section.status}-${move.to}`}>
+                      <td>{section.title}</td>
+                      <td>{sections.find((entry) => entry.status === move.to)?.title ?? "—"}</td>
+                      <td>{section.owner === "agent" ? (section.agent ?? "Any idle agent") : "You"}</td>
+                      <td className="dim">{move.when ?? "—"}</td>
+                    </tr>
+                  ));
+                })}
               </tbody>
             </table>
           </section>

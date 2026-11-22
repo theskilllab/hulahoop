@@ -17,10 +17,16 @@ pub struct WorkflowSection {
     pub title: String,
     /// `human` or `agent`.
     pub owner: String,
-    /// The agent name, or `any` when the project's binding decides.
+    /// The first agent named for this status, or `any` when the binding decides.
     pub agent: Option<String>,
-    /// The status this one leads to, if it leads anywhere.
+    /// Every agent named for this status, in the order the document lists them.
+    pub agents: Vec<String>,
+    /// The first status this one leads to, if it leads anywhere.
     pub next: Option<String>,
+    /// Every status this one leads to: a document may branch.
+    pub nexts: Vec<String>,
+    /// Each move with its own reason, which is what the arrows print.
+    pub transitions: Vec<WorkflowTransition>,
     /// Why that move happens: the sentence the diagram writes on the arrow.
     pub when: Option<String>,
     pub body: String,
@@ -36,6 +42,14 @@ pub struct WorkflowDoc {
     pub errors: Vec<String>,
 }
 
+/// One arrow: where it goes and why.
+#[derive(Debug, Clone, SimpleObject)]
+pub struct WorkflowTransition {
+    pub to: String,
+    pub title: String,
+    pub when: Option<String>,
+}
+
 fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
     parsed
         .sections
@@ -44,8 +58,26 @@ fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
             status: section.status.as_str().to_string(),
             title: section.title.clone(),
             owner: section.owner.as_str().to_string(),
-            agent: section.agent.clone(),
-            next: section.next.map(|s| s.as_str().to_string()),
+            agent: section.agents.first().cloned(),
+            agents: section.agents.clone(),
+            next: section
+                .transitions
+                .first()
+                .map(|m| m.to.as_str().to_string()),
+            nexts: section
+                .transitions
+                .iter()
+                .map(|m| m.to.as_str().to_string())
+                .collect(),
+            transitions: section
+                .transitions
+                .iter()
+                .map(|move_| WorkflowTransition {
+                    to: move_.to.as_str().to_string(),
+                    title: move_.to.title().to_string(),
+                    when: move_.when.clone(),
+                })
+                .collect(),
             when: section.when.clone(),
             body: section.body.clone(),
         })
@@ -88,13 +120,10 @@ impl Engine {
         workspace_id: Uuid,
         source: &str,
     ) -> anyhow::Result<WorkflowDoc> {
-        let parsed = workflow::parse(source);
-        if !parsed.is_complete() {
-            anyhow::bail!(
-                "this document cannot drive the board yet: {}",
-                parsed.errors.join(" ")
-            );
-        }
+        // The text is always kept. Refusing the write would lose what somebody
+        // typed, and a document that cannot drive the board yet is a normal
+        // state to be in while you are editing it: the board refuses, the
+        // editor says why.
         sqlx::query(
             "insert into workflows (workspace_id, source, updated_at) values (?, ?, ?) \
              on conflict (workspace_id) do update set source = excluded.source, \
@@ -116,7 +145,9 @@ impl Engine {
     ) -> anyhow::Result<Option<IssueStatus>> {
         let doc = self.workflow(workspace_id).await?;
         let parsed = workflow::parse(&doc.source);
-        Ok(parsed.section(status).and_then(|section| section.next))
+        Ok(parsed
+            .section(status)
+            .and_then(|section| section.transitions.first().map(|m| m.to)))
     }
 
     /// The agent name a status dispatches to, when the document names one.

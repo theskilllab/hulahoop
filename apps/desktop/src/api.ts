@@ -193,7 +193,11 @@ export type WorkflowSection = {
   title: string;
   owner: string;
   agent: string | null;
+  agents: string[];
   next: IssueStatus | null;
+  nexts: IssueStatus[];
+  /// Each move with its own reason: what the arrows and the table print.
+  transitions: { to: IssueStatus; title: string; when: string | null }[];
   /// The sentence the arrow shows and the transitions table prints.
   when: string | null;
   body: string;

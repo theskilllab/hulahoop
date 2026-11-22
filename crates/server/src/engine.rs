@@ -203,8 +203,10 @@ impl Engine {
     async fn agent_for_name(&self, workspace_id: Uuid, name: Option<&str>) -> Result<Option<Uuid>> {
         if let Some(name) = name {
             if !name.eq_ignore_ascii_case("any") {
+                // `@TestAuthor`, `test author` and `TestAuthor` are the same
+                // person; spaces and the `@` are how people write, not identity.
                 let found: Option<(Uuid,)> = sqlx::query_as(
-                    "select id from agents where workspace_id = ? and lower(name) = lower(?) limit 1",
+                    "select id from agents where workspace_id = ? and lower(replace(name, ' ', '')) = lower(replace(?, ' ', '')) limit 1",
                 )
                 .bind(workspace_id)
                 .bind(name)
