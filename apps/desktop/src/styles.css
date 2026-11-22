@@ -3306,3 +3306,30 @@ table.transitions td {
 .wf-doc .richtext-prose > * + * {
   margin-top: 6px;
 }
+
+/* A metadata line inside the formatted document: the parser's line, kept as a
+   chip so the prose around it reads as prose. */
+.wf-meta-line {
+  margin: 2px 0;
+}
+
+.wf-meta-line code {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: var(--r-sm);
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  font-size: var(--fs-xs);
+  color: var(--text-2);
+}
+
+.wf-meta-line.ProseMirror-selectednode code {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
+/* Rework: a move that goes back to where it came from is dashed, so the happy
+   path stays a single solid line from left to right. */
+.wf-edge.back {
+  stroke-dasharray: 5 4;
+}

@@ -3,6 +3,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { loadWorkflow, saveWorkflow, type Agent, type WorkflowDoc, type WorkflowSection } from "../api";
 import Icon from "../Icon";
 import RichText from "../RichText";
+import { MetaLine } from "../metaLine";
 import PageHeader from "../PageHeader";
 
 /**
@@ -213,10 +214,7 @@ interface Edge {
  * many columns as the pane fits, then the next row, so the whole workflow is
  * visible at its natural size rather than scaled down to unreadable type.
  */
-function layout(
-  sections: WorkflowSection[],
-  avail = 0,
-): { nodes: Node[]; edges: Edge[]; width: number; height: number } {
+function layout(sections: WorkflowSection[]): { nodes: Node[]; edges: Edge[]; width: number; height: number } {
   const index = new Map(sections.map((section, i) => [section.title, i]));
   const raw = sections.map((section) =>
     (section.transitions ?? [])
@@ -246,9 +244,9 @@ function layout(
   const body = heightOf(tallest);
   // How many rank columns fit side by side; at least two, and one per rank when
   // the pane is wide enough.
-  const perRow =
-    avail > 0 ? Math.max(2, Math.floor((avail - 2 * PAD + GX) / (W + GX))) : columns.length;
-  const rows = Math.ceil(columns.length / perRow) || 1;
+  // One row: the flow reads left to right, and the zoom fits it to the pane.
+  const perRow = Math.max(1, columns.length);
+  const rows = 1;
   const nodes: Node[] = [];
   columns.forEach((column, r) => {
     const row = Math.floor(r / perRow);
@@ -346,7 +344,8 @@ export default function Workflow({
   // and `Next:` are lines the parser reads and sometimes want typing by hand.
   const [rich, setRich] = useState<boolean>(() => localStorage.getItem("hulahoop.wf-editor") !== "source");
   const [ratio, setRatio] = useState<number>(() => Number(localStorage.getItem("hulahoop.wf-ratio") ?? 0.42));
-  const [zoom, setZoom] = useState(1);
+  // null means "fit the pane", which is what a fresh screen shows.
+  const [zoom, setZoom] = useState<number | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
@@ -491,7 +490,9 @@ export default function Workflow({
     watcher.observe(wrapEl);
     return () => watcher.disconnect();
   }, [wrapEl, view]);
-  const diagram = useMemo(() => layout(sections, avail), [sections, avail]);
+  const diagram = useMemo(() => layout(sections), [sections]);
+  const fit = avail > 0 ? Math.min(1, (avail - 26) / diagram.width) : 1;
+  const scale = zoom ?? Math.max(0.55, Number(fit.toFixed(2)));
 
   return (
     <section className="screen fill">
@@ -571,44 +572,14 @@ export default function Workflow({
             </div>
             <div className="wf-edit">
               {rich ? (
-                <div className="wf-doc">
-                  {sections.length === 0 ? (
-                    <p className="dim small" style={{ padding: "var(--s4)" }}>
-                      Nothing to show yet. Switch to Source to write the first status.
-                    </p>
-                  ) : null}
-                  {sections.map((section) => (
-                    <section key={section.title} className="wf-doc-sec">
-                      <button
-                        type="button"
-                        className="wf-doc-h"
-                        onClick={() => setSelected(section.title)}
-                        title="Edit who handles this status"
-                      >
-                        {section.title}
-                      </button>
-                      <div className="wf-doc-meta">
-                        {[usersLine(editable(section))[0], ...nextLines(editable(section))].map(
-                          (line) => (
-                            <span className="mono" key={line}>
-                              {line}
-                            </span>
-                          ),
-                        )}
-                      </div>
-                      <RichText
-                        value={section.body ?? ""}
-                        onChange={(markdown) => {
-                          const next = applyBody(source, section.title, markdown);
-                          if (next !== source) change(next);
-                        }}
-                        minHeight={72}
-                        placeholder="What this status means, in your words."
-                        ariaLabel={`Prose under ${section.title}`}
-                      />
-                    </section>
-                  ))}
-                </div>
+                <RichText
+                  value={source}
+                  onChange={(markdown) => change(markdown)}
+                  minHeight={480}
+                  ariaLabel="WORKFLOWS.md"
+                  extensions={[MetaLine]}
+                  placeholder={"# Workflows\n\n## Backlog\nUsers: human\nNext: To do - an issue is ready"}
+                />
               ) : (
               <textarea
                 ref={area}
@@ -738,7 +709,15 @@ export default function Workflow({
                 <span className="wf-zoom">
                   <button
                     type="button"
-                    onClick={() => setZoom((value) => Math.max(0.6, Math.round((value - 0.1) * 10) / 10))}
+                    onClick={() => setZoom(null)}
+                    aria-label="Fit to the pane"
+                    title="Fit to the pane"
+                  >
+                    ⤢
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoom(Math.max(0.5, Math.round((scale - 0.1) * 10) / 10))}
                     aria-label="Zoom out"
                     title="Zoom out"
                   >
@@ -746,7 +725,7 @@ export default function Workflow({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setZoom((value) => Math.min(1.8, Math.round((value + 0.1) * 10) / 10))}
+                    onClick={() => setZoom(Math.min(1.8, Math.round((scale + 0.1) * 10) / 10))}
                     aria-label="Zoom in"
                     title="Zoom in"
                   >
@@ -759,14 +738,14 @@ export default function Workflow({
                   <div className="wf-svgwrap" ref={setWrapEl}>
                     <div
                       style={{
-                        width: diagram.width * zoom,
-                        height: diagram.height * zoom,
+                        width: diagram.width * scale,
+                        height: diagram.height * scale,
                       }}
                     >
                     <svg
                       className="wf-svg"
                       style={{
-                        transform: `scale(${zoom})`,
+                        transform: `scale(${scale})`,
                         transformOrigin: "top left",
                       }}
                       width={diagram.width}
@@ -790,7 +769,11 @@ export default function Workflow({
                       </defs>
                       {diagram.edges.map((edge, i) => (
                         <g key={`${edge.from}-${edge.to}-${i}`}>
-                          <path className="wf-edge" d={edge.path} markerEnd="url(#wf-arrow)" />
+                          <path
+                            className={edge.back ? "wf-edge back" : "wf-edge"}
+                            d={edge.path}
+                            markerEnd="url(#wf-arrow)"
+                          />
                           <path
                             className="wf-hit"
                             d={edge.path}
