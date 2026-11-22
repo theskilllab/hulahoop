@@ -3319,8 +3319,8 @@ table.transitions td {
   margin: 1px 0 1px calc(-1 * var(--s1));
   padding: 1px var(--s1);
   border-radius: var(--r-sm);
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
+  font-family: inherit;
+  font-size: var(--fs-sm);
   line-height: 1.7;
   color: var(--text-2);
   white-space: pre-wrap;
@@ -3341,4 +3341,11 @@ table.transitions td {
    runs on and the direction of its arrow. */
 .wf-edge.back {
   stroke-dasharray: none;
+}
+
+/* Progress through a status that several agents work in turn. */
+.turn-queue {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  white-space: nowrap;
 }

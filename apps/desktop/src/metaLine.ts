@@ -1,7 +1,7 @@
 import { Node } from "@tiptap/core";
 
 /** The lines the parser reads: who handles a status, and where it goes next. */
-const META = /^(Users|Next):/i;
+const META = /^(Users|Next|Turns):/i;
 
 function attr(value: string): string {
   return value

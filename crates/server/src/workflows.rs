@@ -156,6 +156,55 @@ impl Engine {
             .and_then(|section| section.transitions.first().map(|m| m.to)))
     }
 
+    /// Where a finished run hands the task over.
+    ///
+    /// A section may list moves back into itself — "the reviewer asks for changes"
+    /// is a move inside `In progress` — so the handover is the first move that
+    /// actually leaves the status, and a self-move only counts when there is
+    /// nothing else.
+    pub async fn workflow_handoff(
+        &self,
+        workspace_id: Uuid,
+        status: IssueStatus,
+    ) -> anyhow::Result<Option<IssueStatus>> {
+        let doc = self.workflow(workspace_id).await?;
+        let parsed = workflow::parse(&doc.source);
+        let Some(section) = parsed.section(status) else {
+            return Ok(None);
+        };
+        Ok(section
+            .transitions
+            .iter()
+            .find(|m| m.to != status)
+            .or_else(|| section.transitions.first())
+            .map(|m| m.to))
+    }
+
+    /// The agents this status names, in the order the document lists them:
+    /// first is the first turn.
+    pub async fn turn_agents(
+        &self,
+        workspace_id: Uuid,
+        status: IssueStatus,
+    ) -> anyhow::Result<Vec<String>> {
+        let doc = self.workflow(workspace_id).await?;
+        let parsed = workflow::parse(&doc.source);
+        Ok(parsed
+            .section(status)
+            .map(|section| section.agents.clone())
+            .unwrap_or_default())
+    }
+
+    /// How many turns this status may take before a person is asked.
+    pub async fn turn_cap(&self, workspace_id: Uuid, status: IssueStatus) -> anyhow::Result<i64> {
+        let doc = self.workflow(workspace_id).await?;
+        let parsed = workflow::parse(&doc.source);
+        Ok(parsed
+            .section(status)
+            .and_then(|section| section.turns)
+            .unwrap_or(parsed.turns))
+    }
+
     /// The agent name a status dispatches to, when the document names one.
     pub async fn workflow_agent(
         &self,

@@ -128,6 +128,11 @@ pub struct Issue {
     pub suite_seq: i64,
     pub run_count: i64,
     pub current_run_id: Option<Uuid>,
+    /// Agents still owed a turn in this status, in the workflow's order, plus the
+    /// ones already served and how many turns the status has taken.
+    pub turn_queue: String,
+    pub turn_served: String,
+    pub turns_used: i64,
     pub tests_revision: Option<String>,
     pub tests_bookmark: Option<String>,
     #[graphql(skip)]

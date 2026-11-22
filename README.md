@@ -1602,6 +1602,35 @@ above when the loop has run for a while.
 
 ---
 
+## 18b. How a status runs its team
+
+A status names its team on one line, and the order is the order of turns:
+
+```markdown
+## To do
+
+Users: @Architect, @Test Author
+Next: In progress - the plan and the criteria are agreed.
+```
+
+`@Architect` works first. When its run succeeds, `@Test Author` picks the same
+status up with the plan in its prompt; the task only moves when nobody is owed a
+turn. A move that stays inside the status ("the reviewer asks for changes")
+restarts the queue, and the agents share context through comments on the task.
+
+`Turns:` fences a status that keeps passing the topic around. It lives in the same
+document, defaults to six, may be overridden per section, and reaching it moves
+the task to `Blocked` with a comment naming who kept handing back.
+
+```markdown
+# Workflows
+
+Turns: 6
+```
+
+Nothing else is needed: no handoff marker, no assignment screen. Edit the
+document and the execution changes with it.
+
 ## 19. The loop as it ships
 
 Six statuses, and nothing else:

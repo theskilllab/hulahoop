@@ -128,6 +128,12 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        // A new status means a new round of turns; staying put (`Start`, a
+        // self-move) keeps the queue, so the cap counts real turns instead of
+        // being reset by every attempt.
+        if from != to {
+            let _ = self.reset_turns(issue_id, to).await;
+        }
         let issue = self.issue(issue_id).await?;
         // Moving a task into a status an agent owns is the dispatch: nobody has
         // to press start, and nothing starts twice because the run table allows
@@ -146,21 +152,121 @@ impl Engine {
         self.issue(issue_id).await
     }
 
-    /// Which role works a status. `To do` and `In progress` are the implementer's,
-    /// `In review` the reviewer's; every other status belongs to a person.
-    fn role_for_status(status: IssueStatus) -> Option<AgentRole> {
+    /// Fill the turn queue for the status a task just entered.
+    ///
+    /// The document names the team; nothing starts until the queue exists, and the
+    /// order in `Users:` *is* the order of turns.
+    async fn reset_turns(&self, issue_id: Uuid, status: IssueStatus) -> Result<()> {
+        let issue = self.issue(issue_id).await?;
+        let agents = self.turn_agents(issue.workspace_id, status).await?;
+        sqlx::query(
+            "update issues set turn_queue = ?, turn_served = '[]', turns_used = 0 where id = ?",
+        )
+        .bind(serde_json::json!(agents).to_string())
+        .bind(issue_id)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The next agent owed a turn in this status, if any.
+    ///
+    /// The queue holds names because that is what the document says; service is
+    /// recorded by id, because an agent's display name can be anything while the
+    /// row that ran is unambiguous.
+    async fn next_turn_agent(&self, issue: &Issue) -> Result<Option<String>> {
+        let queue: Vec<String> = serde_json::from_str(&issue.turn_queue).unwrap_or_default();
+        let served: Vec<String> = serde_json::from_str(&issue.turn_served).unwrap_or_default();
+        if queue.is_empty() {
+            // A task that predates the queue still gets one turn from the document.
+            if served.is_empty() {
+                return self
+                    .workflow_agent(issue.workspace_id, issue.status_enum())
+                    .await;
+            }
+            return Ok(None);
+        }
+        for name in queue {
+            let id = self
+                .agent_for_name(issue.workspace_id, Some(&name))
+                .await?
+                .map(|id| id.to_string());
+            match id {
+                Some(id) if served.contains(&id) => continue,
+                Some(_) => return Ok(Some(name)),
+                // A name nobody answers to cannot take a turn.
+                None => continue,
+            }
+        }
+        Ok(None)
+    }
+
+    /// Record that an agent has had its turn in the current status.
+    async fn mark_served(&self, issue: &Issue, agent_id: Uuid) -> Result<()> {
+        let mut served: Vec<String> = serde_json::from_str(&issue.turn_served).unwrap_or_default();
+        let id = agent_id.to_string();
+        if !served.contains(&id) {
+            served.push(id);
+        }
+        sqlx::query("update issues set turn_served = ? where id = ?")
+            .bind(serde_json::json!(served).to_string())
+            .bind(issue.id)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Move a task to a status by name.
+    ///
+    /// The state machine only knows the shapes it was born with; a workflow is
+    /// what decides where a task goes next. Everything a transition does besides
+    /// the shape — clearing a block, dispatching whoever owns the new status —
+    /// happens here too, because the workflow is the source of truth.
+    pub async fn move_to(&self, issue_id: Uuid, target: IssueStatus) -> Result<Issue> {
+        let issue = self.issue(issue_id).await?;
+        if issue.status_enum() == target {
+            return Ok(issue);
+        }
+        sqlx::query(
+            "update issues set status = ?, status_before_blocked = null, updated_at = ? where id = ?",
+        )
+        .bind(target.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(issue_id)
+        .execute(&self.db.pool)
+        .await?;
+
+        let _ = self.reset_turns(issue_id, target).await;
+        let issue = self.issue(issue_id).await?;
+        if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+            let _ = self
+                .comment(
+                    issue_id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!("the workflow wants an agent here, but none could start: {error}"),
+                    false,
+                )
+                .await;
+        }
+        self.issue(issue_id).await
+    }
+
+    /// What a run on this status *is*, for the record: a review, or work.
+    ///
+    /// It no longer decides who may run — the workflow names the agent. It only
+    /// tells the engine which shape of completion to expect, because a review
+    /// writes a verdict and work opens a pull request.
+    fn role_for_status(status: IssueStatus) -> AgentRole {
         match status {
-            IssueStatus::Todo | IssueStatus::InProgress => Some(AgentRole::Implementer),
-            IssueStatus::InReview => Some(AgentRole::Reviewer),
-            _ => None,
+            IssueStatus::InReview => AgentRole::Reviewer,
+            _ => AgentRole::Implementer,
         }
     }
 
     /// Start a run when the workflow says an agent owns this status.
     async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
-        let Some(role) = Self::role_for_status(issue.status_enum()) else {
-            return Ok(());
-        };
+        let role = Self::role_for_status(issue.status_enum());
         if issue.status_enum() == IssueStatus::Blocked || issue.project_id.is_none() {
             return Ok(());
         }
@@ -191,8 +297,33 @@ impl Engine {
                 return Ok(());
             }
         }
-        let named = self.workflow_agent(workspace, issue.status_enum()).await?;
+        // A status that keeps passing the turn around gets fenced: the cap is in
+        // the document (`Turns:`), and hitting it is a question for a person.
+        let cap = self.turn_cap(workspace, issue.status_enum()).await?;
+        if issue.turns_used >= cap {
+            let _ = self
+                .comment(
+                    issue.id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!(
+                        "`{}` has taken {used} turns, which is the limit this workflow sets (`Turns: {cap}`). Somebody has to look at it.",
+                        issue.status_enum().title(),
+                        used = issue.turns_used
+                    ),
+                    false,
+                )
+                .await;
+            self.move_to(issue.id, IssueStatus::Blocked).await?;
+            return Ok(());
+        }
+
+        let named = self.next_turn_agent(issue).await?;
         let agent = self.agent_for_name(workspace, named.as_deref()).await?;
+        sqlx::query("update issues set turns_used = turns_used + 1 where id = ?")
+            .bind(issue.id)
+            .execute(&self.db.pool)
+            .await?;
         self.start_run(issue.id, agent, role, issue.current_run_id)
             .await?;
         Ok(())
@@ -758,21 +889,11 @@ impl Engine {
             .fetch_one(&self.db.pool)
             .await?;
 
+        // The workflow decides who works a status. When it names an agent, that
+        // agent runs — the role bindings are only the fallback for `Any agent`,
+        // which is the case below where nobody was named.
         let agent_id = match agent_id {
-            Some(id) => {
-                let bound = self.agent_role_binding(project_id, role).await?;
-                if bound != Some(id) {
-                    let bound_name = match bound {
-                        Some(other) => other.to_string(),
-                        None => "none".to_string(),
-                    };
-                    bail!(
-                        "agent {id} is not bound to the {} role in this project (bound: {bound_name}). Assign it on the project screen first.",
-                        role.as_str()
-                    );
-                }
-                id
-            }
+            Some(id) => id,
             None => self
                 .agent_role_binding(project_id, role)
                 .await?
@@ -1256,14 +1377,52 @@ impl Engine {
                     .bind(run_id)
                     .execute(&self.db.pool)
                     .await?;
-                self.transition(run.issue_id, IssueEvent::Submit).await?;
-                self.queue_job(
-                    issue.repo_id,
-                    Some(issue.id),
-                    "open_pr",
-                    serde_json::json!({ "run_id": run_id }),
-                )
-                .await?;
+                // Where the work goes next is the document's decision, not a
+                // constant in here: take the status's first move. A move into
+                // review is what earns a pull request — everything else is just
+                // the next step of the flow, and the run that lands there is the
+                // one a reviewer will be shown.
+                // The turn is spent. If the status names another agent who has
+                // not worked it yet, the task stays here and the queue moves on;
+                // only a status nobody is owed a turn in hands the task over.
+                let _ = self.mark_served(&issue, run.agent_id).await;
+                let issue = self.issue(issue.id).await?;
+                if self.next_turn_agent(&issue).await?.is_some() {
+                    if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+                        let _ = self
+                            .comment(
+                                issue.id,
+                                hulahoop_core::AuthorType::Server,
+                                None,
+                                &format!("the next agent could not start: {error}"),
+                                false,
+                            )
+                            .await;
+                    }
+                    return self.run(run_id).await;
+                }
+
+                let target = self
+                    .workflow_handoff(issue.workspace_id, issue.status_enum())
+                    .await?
+                    .unwrap_or(IssueStatus::InReview);
+                if target == IssueStatus::InReview {
+                    sqlx::query("update issues set current_run_id = ? where id = ?")
+                        .bind(run.id)
+                        .bind(issue.id)
+                        .execute(&self.db.pool)
+                        .await?;
+                }
+                let issue = self.move_to(run.issue_id, target).await?;
+                if issue.status_enum() == IssueStatus::InReview {
+                    self.queue_job(
+                        issue.repo_id,
+                        Some(issue.id),
+                        "open_pr",
+                        serde_json::json!({ "run_id": run_id }),
+                    )
+                    .await?;
+                }
             }
             (AgentRole::Implementer, _) => {
                 // A failed attempt leaves the task where it is so the human, or a
