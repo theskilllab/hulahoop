@@ -195,6 +195,10 @@ pub struct Run {
     pub agent_id: Uuid,
     pub role: String,
     pub attempt: i64,
+    /// The agent's closing message. A reviewer's becomes a review row; for every
+    /// other role this is the only record of what it decided, and the next turn
+    /// of a status reads it as `parent`.
+    pub summary: Option<String>,
     pub base_bookmark: String,
     pub base_revision: Option<String>,
     pub head_revision: Option<String>,

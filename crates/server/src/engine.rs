@@ -174,6 +174,26 @@ impl Engine {
     /// The queue holds names because that is what the document says; service is
     /// recorded by id, because an agent's display name can be anything while the
     /// row that ran is unambiguous.
+    /// The run a reviewer is reviewing: the one a status handed over to
+    /// `In review` when there is one, otherwise the newest finished run that
+    /// changed something. A reviewer inside a status reads the work of the turn
+    /// before it, which is the point of a team in a column.
+    pub async fn run_under_review(&self, issue: &crate::model::Issue) -> Result<Uuid> {
+        if let Some(id) = issue.current_run_id {
+            return Ok(id);
+        }
+        sqlx::query_scalar::<_, Uuid>(
+            "select id from runs
+              where issue_id = ? and role != 'reviewer' and status = 'succeeded'
+                and head_bookmark is not null
+              order by created_at desc limit 1",
+        )
+        .bind(issue.id)
+        .fetch_optional(&self.db.pool)
+        .await?
+        .ok_or_else(|| anyhow!("there is no finished run on this issue to review yet"))
+    }
+
     async fn next_turn_agent(&self, issue: &Issue) -> Result<Option<String>> {
         let queue: Vec<String> = serde_json::from_str(&issue.turn_queue).unwrap_or_default();
         let served: Vec<String> = serde_json::from_str(&issue.turn_served).unwrap_or_default();
@@ -324,9 +344,152 @@ impl Engine {
             .bind(issue.id)
             .execute(&self.db.pool)
             .await?;
-        self.start_run(issue.id, agent, role, issue.current_run_id)
-            .await?;
+        // The parent is the turn before this one, whatever role it had: that is
+        // where the message the next agent has to read lives.
+        let parent = self.last_finished_run(issue.id).await?;
+        self.start_run(issue.id, agent, role, parent).await?;
         Ok(())
+    }
+
+    /// Start the tasks that were waiting for this agent's probe.
+    pub async fn retry_owed_turns(&self, repo_id: Uuid, agent_id: Uuid) -> Result<()> {
+        let rows: Vec<(Uuid,)> = sqlx::query_as(
+            "select id from issues where repo_id = ? and status not in ('backlog', 'blocked', 'done', 'in_review')",
+        )
+        .bind(repo_id)
+        .fetch_all(&self.db.pool)
+        .await?;
+        for (issue_id,) in rows {
+            let issue = match self.issue(issue_id).await {
+                Ok(issue) => issue,
+                Err(_) => continue,
+            };
+            // Only a task whose next turn belongs to this agent: a probe passing
+            // must not push somebody else's task forward.
+            let named = match self.next_turn_agent(&issue).await {
+                Ok(named) => named,
+                Err(_) => continue,
+            };
+            let owed = match self
+                .agent_for_name(issue.workspace_id, named.as_deref())
+                .await
+            {
+                Ok(owed) => owed,
+                Err(_) => continue,
+            };
+            match owed {
+                Some(id) if id == agent_id => {
+                    let _ = Box::pin(self.dispatch_if_agent_owns(&issue)).await;
+                }
+                // `Any agent` means the project's binding, which may be this one.
+                None => {
+                    let _ = Box::pin(self.dispatch_if_agent_owns(&issue)).await;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a run the server could not finish, mark it failed, and refund its turn.
+    pub async fn finish_server_error(
+        &self,
+        issue_id: Uuid,
+        agent_id: Uuid,
+        error: &str,
+        run_id: Uuid,
+    ) -> Result<()> {
+        let message = format!("the server could not finish this run: {error}");
+        sqlx::query("update runs set status = 'failed', error = ?, finished_at = ? where id = ?")
+            .bind(&message)
+            .bind(crate::db::now_rfc3339())
+            .bind(run_id)
+            .execute(&self.db.pool)
+            .await?;
+        self.comment(
+            issue_id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            &format!("{message}\n\nThe turn was given back, so this did not cost the task one of its turns."),
+            false,
+        )
+        .await?;
+        self.refund_turn(issue_id, agent_id).await;
+        Ok(())
+    }
+
+    /// Give a turn back.
+    ///
+    /// A turn is spent when a run is dispatched. If the server then fails while
+    /// finishing that run — a rule that does not hold for this workflow, a column
+    /// that is null where a value was assumed — the agent never got to act, so
+    /// the turn it spent has to return, or a cap of six becomes a cap of five.
+    pub async fn refund_turn(&self, issue_id: Uuid, agent_id: Uuid) {
+        let _ = sqlx::query(
+            "update issues set turns_used = max(0, turns_used - 1), turn_served = null where id = ?",
+        )
+        .bind(issue_id)
+        .execute(&self.db.pool)
+        .await;
+        let _ = sqlx::query("update issues set turn_served = ? where id = ? and turn_served = ?")
+            .bind(Option::<String>::None)
+            .bind(issue_id)
+            .bind(agent_id.to_string())
+            .execute(&self.db.pool)
+            .await;
+    }
+
+    /// Queue a probe for this agent against every repository in its workspace.
+    ///
+    /// A probe answers "can this command line start in this repo", so it belongs
+    /// to the moment a command line changes, not to the moment work arrives: an
+    /// agent saved with a working harness should never make a task wait on one.
+    pub async fn probe_everywhere(&self, agent_id: Uuid) -> Result<usize> {
+        let agent = self.agent(agent_id).await?;
+        sqlx::query("delete from agent_preflight where agent_id = ?")
+            .bind(agent_id)
+            .execute(&self.db.pool)
+            .await?;
+        let repos: Vec<(Uuid,)> = sqlx::query_as(
+            "select r.id from repos r join projects p on p.id = r.project_id where p.workspace_id = ?",
+        )
+        .bind(agent.workspace_id)
+        .fetch_all(&self.db.pool)
+        .await?;
+        for (repo_id,) in &repos {
+            let existing: Option<(Uuid,)> = sqlx::query_as(
+                "select id from runner_jobs where repo_id = ? and kind = 'preflight' and status in ('queued', 'running') and json_extract(payload, '$.agent_id') = ?",
+            )
+            .bind(repo_id)
+            .bind(agent_id.to_string())
+            .fetch_optional(&self.db.pool)
+            .await?;
+            if existing.is_none() {
+                self.queue_job(
+                    *repo_id,
+                    None,
+                    "preflight",
+                    serde_json::json!({
+                        "agent_id": agent_id,
+                        "adapter": agent.adapter,
+                        "model": agent.model,
+                    }),
+                )
+                .await?;
+            }
+        }
+        Ok(repos.len())
+    }
+
+    /// The run a turn follows: the newest one that is over.
+    pub async fn last_finished_run(&self, issue_id: Uuid) -> Result<Option<Uuid>> {
+        let row: Option<(Uuid,)> = sqlx::query_as(
+            "select id from runs where issue_id = ? and status in ('succeeded', 'failed', 'cancelled', 'timed_out') order by created_at desc limit 1",
+        )
+        .bind(issue_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        Ok(row.map(|(id,)| id))
     }
 
     /// Resolve the workflow's `Agent:` value to a concrete agent: a name in the
@@ -996,9 +1159,12 @@ impl Engine {
                 (base, issue.attempt + 1)
             }
             AgentRole::Reviewer => {
-                let current = issue.current_run_id.ok_or_else(|| {
-                    anyhow!("there is no implementer run to review yet on this issue")
-                })?;
+                // The run to review is the one that produced what is on the branch:
+                // the pointed-at run when a status handed over to `In review`, and
+                // otherwise the newest finished run that changed something — a
+                // reviewer inside the same status reads the work of the turn before
+                // it, which is the whole point of a team in a column.
+                let current = self.run_under_review(&issue).await?;
                 let run: Run = sqlx::query_as("select * from runs where id = ?")
                     .bind(current)
                     .fetch_one(&self.db.pool)
@@ -1054,25 +1220,11 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
-        // A reviewer does not move the task: it reads what is already in review.
-        let event = match role {
-            AgentRole::TestAuthor => IssueEvent::Start,
-            AgentRole::Implementer => IssueEvent::Start,
-            AgentRole::Reviewer => IssueEvent::Start,
-        };
-        let moves_the_task = role != AgentRole::Reviewer;
-        if moves_the_task {
-            if let Err(error) = self.transition(issue_id, event.clone()).await {
-                // The run row exists; drop it so a refused transition cannot leave a
-                // queued run the runner would pick up.
-                sqlx::query("delete from runs where id = ?")
-                    .bind(run_id)
-                    .execute(&self.db.pool)
-                    .await?;
-                bail!("{error}");
-            }
-        }
-
+        // Starting a run never moves the task. An agent works *in* the status it
+        // was dispatched for — `To do` stays `To do` while the Architect plans —
+        // and the move happens when the run finishes and the workflow hands over.
+        // The old pipeline advanced on Start; with turns that would skip the rest
+        // of a status's team.
         self.run(run_id).await
     }
 
@@ -1264,6 +1416,22 @@ impl Engine {
         let status = RunStatus::parse(&payload.status)
             .ok_or_else(|| anyhow!("unknown run status {}", payload.status))?;
 
+        // What the agent said when it finished, trimmed to a length a person will
+        // read. Kept on the run, shown as a comment, handed to the next turn.
+        let summary: Option<String> = {
+            let text: String = payload
+                .body
+                .trim()
+                .chars()
+                .take(SUMMARY_CHARS)
+                .collect::<String>();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        };
+
         // The runner reports the paths it saw; the diff is the fallback because a
         // runner that crashed before naming them still left a patch behind.
         let changed_paths = if payload.changed_paths.is_empty() {
@@ -1271,7 +1439,7 @@ impl Engine {
         } else {
             payload.changed_paths.clone()
         };
-        let summary = diff::classify(&payload.diff, &issue.frozen_path_list());
+        let verdict = diff::classify(&payload.diff, &issue.frozen_path_list());
         let diff_sha = sha256_hex(payload.diff.as_bytes());
         let artifact_dir = std::path::Path::new(&run.artifact_dir);
         std::fs::create_dir_all(artifact_dir)?;
@@ -1279,7 +1447,7 @@ impl Engine {
         let (tokens_in, tokens_out) =
             spent_tokens(artifact_dir, payload.transcript.as_deref()).await;
 
-        let mut flags = summary.flags.clone();
+        let mut flags = verdict.flags.clone();
         if payload.artifact_limit_hit {
             flags.push(RunFlag::ArtifactLimit);
         }
@@ -1291,11 +1459,11 @@ impl Engine {
 
         // Frozen tests are a hard reject: an implementer that edits the suite
         // replaced the proof with its own assertion.
-        if run.role_enum() == AgentRole::Implementer && !summary.is_acceptable() {
+        if run.role_enum() == AgentRole::Implementer && !verdict.is_acceptable() {
             final_status = RunStatus::Failed;
             error = Some(format!(
                 "the run changed frozen test files: {}. Implementation code must make the frozen suite pass.",
-                summary.frozen_hits.join(", ")
+                verdict.frozen_hits.join(", ")
             ));
         }
         // A run that changed nothing did no work. pi exits 0 even when its provider
@@ -1332,7 +1500,7 @@ impl Engine {
             "update runs set status = ?, exit_code = ?, error = ?, diff_sha = ?, flags = ?,
                 changed_paths = ?, head_revision = coalesce(?, head_revision),
                 commit_name = ?, commit_email = ?, tokens_in = ?, tokens_out = ?,
-                finished_at = ? where id = ?",
+                summary = ?, finished_at = ? where id = ?",
         )
         .bind(final_status.as_str())
         .bind(payload.exit_code)
@@ -1345,10 +1513,27 @@ impl Engine {
         .bind(&payload.commit_email)
         .bind(tokens_in)
         .bind(tokens_out)
+        .bind(summary.as_deref())
         .bind(&finished)
         .bind(run_id)
         .execute(&self.db.pool)
         .await?;
+
+        // An agent that worked and said nothing leaves the next turn guessing. Its
+        // closing message is the handover, so it is shown where a person reads the
+        // task and handed to whoever works it next.
+        if run.role_enum() != AgentRole::Reviewer && final_status == RunStatus::Succeeded {
+            if let Some(text) = summary.as_deref() {
+                self.comment(
+                    run.issue_id,
+                    hulahoop_core::AuthorType::Agent,
+                    Some(&run.agent_id.to_string()),
+                    text,
+                    false,
+                )
+                .await?;
+            }
+        }
 
         if let Some(question) = payload.question.as_deref().filter(|q| !q.trim().is_empty()) {
             self.comment(
@@ -1385,67 +1570,7 @@ impl Engine {
                 // The turn is spent. If the status names another agent who has
                 // not worked it yet, the task stays here and the queue moves on;
                 // only a status nobody is owed a turn in hands the task over.
-                let _ = self.mark_served(&issue, run.agent_id).await;
-                let issue = self.issue(issue.id).await?;
-
-                // "Ask for changes" is how a second agent hands the work back
-                // without a move of its own: the round starts again with the same
-                // team, and the turn cap keeps counting so it cannot spin.
-                if payload.verdict.as_deref() == Some("changes_requested") {
-                    sqlx::query("update issues set turn_served = '[]' where id = ?")
-                        .bind(issue.id)
-                        .execute(&self.db.pool)
-                        .await?;
-                    let issue = self.issue(issue.id).await?;
-                    if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
-                        let _ = self
-                            .comment(
-                                issue.id,
-                                hulahoop_core::AuthorType::Server,
-                                None,
-                                &format!("the next agent could not start: {error}"),
-                                false,
-                            )
-                            .await;
-                    }
-                    return self.run(run_id).await;
-                }
-                if self.next_turn_agent(&issue).await?.is_some() {
-                    if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
-                        let _ = self
-                            .comment(
-                                issue.id,
-                                hulahoop_core::AuthorType::Server,
-                                None,
-                                &format!("the next agent could not start: {error}"),
-                                false,
-                            )
-                            .await;
-                    }
-                    return self.run(run_id).await;
-                }
-
-                let target = self
-                    .workflow_handoff(issue.workspace_id, issue.status_enum())
-                    .await?
-                    .unwrap_or(IssueStatus::InReview);
-                if target == IssueStatus::InReview {
-                    sqlx::query("update issues set current_run_id = ? where id = ?")
-                        .bind(run.id)
-                        .bind(issue.id)
-                        .execute(&self.db.pool)
-                        .await?;
-                }
-                let issue = self.move_to(run.issue_id, target).await?;
-                if issue.status_enum() == IssueStatus::InReview {
-                    self.queue_job(
-                        issue.repo_id,
-                        Some(issue.id),
-                        "open_pr",
-                        serde_json::json!({ "run_id": run_id }),
-                    )
-                    .await?;
-                }
+                self.advance_after_turn(run.issue_id, run.agent_id).await?;
             }
             (AgentRole::Implementer, _) => {
                 // A failed attempt leaves the task where it is so the human, or a
@@ -1453,7 +1578,10 @@ impl Engine {
                 let _ = self.transition(run.issue_id, IssueEvent::CancelRun).await;
             }
             (AgentRole::Reviewer, _) => {
-                self.record_review(&issue, &run, &payload).await?;
+                let verdict = self.record_review(&issue, &run, &payload).await?;
+                if verdict == "approved" {
+                    self.advance_after_turn(run.issue_id, run.agent_id).await?;
+                }
             }
             (AgentRole::TestAuthor, _) => {
                 let _ = self.transition(run.issue_id, IssueEvent::CancelRun).await;
@@ -1463,16 +1591,71 @@ impl Engine {
         self.run(run_id).await
     }
 
-    async fn record_review(&self, issue: &Issue, run: &Run, payload: &RunCompletion) -> Result<()> {
+    /// What happens when a turn is spent and the work is not blocked: the status
+    /// hands over to the next agent it names, or to the first move the document
+    /// declares out of it. A handover into review is what earns a pull request,
+    /// and the reviewer is shown the run that put it there.
+    async fn advance_after_turn(&self, issue_id: Uuid, agent_id: Uuid) -> Result<()> {
+        let issue = self.issue(issue_id).await?;
+        let _ = self.mark_served(&issue, agent_id).await;
+        let issue = self.issue(issue_id).await?;
+        if self.next_turn_agent(&issue).await?.is_some() {
+            if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+                let _ = self
+                    .comment(
+                        issue.id,
+                        hulahoop_core::AuthorType::Server,
+                        None,
+                        &format!("the next agent could not start: {error}"),
+                        false,
+                    )
+                    .await;
+            }
+            return Ok(());
+        }
+        let target = self
+            .workflow_handoff(issue.workspace_id, issue.status_enum())
+            .await?
+            .unwrap_or(IssueStatus::InReview);
+        if target == IssueStatus::InReview {
+            sqlx::query("update issues set current_run_id = (select id from runs where issue_id = ? and status = 'succeeded' order by created_at desc limit 1) where id = ?")
+                .bind(issue_id)
+                .bind(issue_id)
+                .execute(&self.db.pool)
+                .await?;
+        }
+        let issue = self.move_to(issue_id, target).await?;
+        if issue.status_enum() == IssueStatus::InReview {
+            let newest: Option<Uuid> = sqlx::query_scalar(
+                "select id from runs where issue_id = ? and status = 'succeeded' order by created_at desc limit 1",
+            )
+            .bind(issue_id)
+            .fetch_optional(&self.db.pool)
+            .await?;
+            self.queue_job(
+                issue.repo_id,
+                Some(issue.id),
+                "open_pr",
+                serde_json::json!({ "run_id": newest }),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn record_review(
+        &self,
+        issue: &Issue,
+        run: &Run,
+        payload: &RunCompletion,
+    ) -> Result<String> {
         // A reviewer that says nothing reviewed nothing; treat silence as a
         // request for changes so the issue cannot advance on a missing verdict.
         let verdict = payload
             .verdict
             .clone()
             .unwrap_or_else(|| "changes_requested".to_string());
-        let reviewed_run_id = issue
-            .current_run_id
-            .ok_or_else(|| anyhow!("a reviewer finished on an issue with no run under review"))?;
+        let reviewed_run_id = self.run_under_review(issue).await?;
 
         sqlx::query(
             "insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at)
@@ -1517,7 +1700,7 @@ impl Engine {
             .await?;
             let _ = self.transition(issue.id, IssueEvent::RequestChanges).await;
         }
-        Ok(())
+        Ok(verdict)
     }
 
     /// Runs the base replay again for the current candidate suite.
@@ -1553,223 +1736,6 @@ impl Engine {
             .await?;
 
         match job.kind.as_str() {
-            "merge_verify" => {
-                if let Some(issue_id) = job.issue_id {
-                    let ancestry = payload
-                        .get("ancestry_ok")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    // A squash merge carries the landing tree in a new commit, so an
-                    // equal tree is the same proof as a contained revision.
-                    let same_tree = payload
-                        .get("same_tree")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    if ancestry || same_tree {
-                        let merge_revision = payload
-                            .get("merge_revision")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        sqlx::query("update issues set merge_revision = ?, merged_at = ?, updated_at = ? where id = ?")
-                            .bind(&merge_revision)
-                            .bind(crate::db::now_rfc3339())
-                            .bind(crate::db::now_rfc3339())
-                            .bind(issue_id)
-                            .execute(&self.db.pool)
-                            .await?;
-                        if let Ok(issue) = self.issue(issue_id).await {
-                            sqlx::query("update repos set base_revision = ? where id = ?")
-                                .bind(&merge_revision)
-                                .bind(issue.repo_id)
-                                .execute(&self.db.pool)
-                                .await?;
-                        }
-                        let _ = self.transition(issue_id, IssueEvent::Merge).await;
-                    } else {
-                        let body = if let Some(reason) =
-                            payload.get("error").and_then(|v| v.as_str())
-                        {
-                            format!(
-                                "The merge could not be verified: {reason}. The commit has to exist in this repository, so fetch it first, or paste the revision the landing replay verified."
-                            )
-                        } else {
-                            format!(
-                            "`{}` neither contains the landing revision `{}` nor has its tree, so the merge was not recorded. Merge the revision the landing replay verified, or squash it to that tree.",
-                            payload
-                                .get("merge_revision")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default(),
-                            payload
-                                .get("landing_bookmark")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or_default()
-                            )
-                        };
-                        self.comment(
-                            issue_id,
-                            hulahoop_core::AuthorType::Server,
-                            None,
-                            &body,
-                            false,
-                        )
-                        .await?;
-                    }
-                }
-            }
-            "open_pr" => {
-                let run_id = payload
-                    .get("run_id")
-                    .and_then(|v| v.as_str())
-                    .and_then(|id| Uuid::parse_str(id).ok());
-                let url = payload.get("pr_url").and_then(|v| v.as_str());
-                match (url, job.issue_id) {
-                    (Some(url), Some(issue_id)) if !url.is_empty() => {
-                        sqlx::query(
-                            "update issues set pr_url = ?, pr_number = ?, pr_branch = ?, updated_at = ? where id = ?",
-                        )
-                        .bind(url)
-                        .bind(payload.get("pr_number").and_then(|v| v.as_i64()))
-                        .bind(payload.get("pr_branch").and_then(|v| v.as_str()))
-                        .bind(crate::db::now_rfc3339())
-                        .bind(issue_id)
-                        .execute(&self.db.pool)
-                        .await?;
-                        if let Some(issue_id) = job.issue_id {
-                            // A pull request is only ready once its checks are green
-                            // and nobody on the team is still asking for changes. The
-                            // runner reports no revision for a pull request, so the
-                            // head comes from the run that produced it.
-                            let head: Option<String> = match run_id {
-                                Some(run_id) => sqlx::query_scalar::<_, Option<String>>(
-                                    "select head_revision from runs where id = ?",
-                                )
-                                .bind(run_id)
-                                .fetch_optional(&self.db.pool)
-                                .await?
-                                .flatten(),
-                                None => None,
-                            };
-                            self.queue_job(
-                                job.repo_id,
-                                Some(issue_id),
-                                "watch_checks",
-                                serde_json::json!({
-                                    "number": payload.get("pr_number").and_then(|v| v.as_i64()),
-                                    "sha": head,
-                                }),
-                            )
-                            .await?;
-                        }
-                        if let Some(run_id) = run_id {
-                            sqlx::query(
-                                "update runs set pr_url = ?, pr_number = ?, pr_branch = ? where id = ?",
-                            )
-                            .bind(url)
-                            .bind(payload.get("pr_number").and_then(|v| v.as_i64()))
-                            .bind(payload.get("pr_branch").and_then(|v| v.as_str()))
-                            .bind(run_id)
-                            .execute(&self.db.pool)
-                            .await?;
-                        }
-                    }
-                    _ => {
-                        let reason = error
-                            .as_deref()
-                            .or_else(|| payload.get("error").and_then(|v| v.as_str()))
-                            .unwrap_or("it reported no pull request");
-                        if let Some(issue_id) = job.issue_id {
-                            self.comment(
-                                issue_id,
-                                hulahoop_core::AuthorType::Server,
-                                None,
-                                &format!(
-                                    "The pull request could not be opened: {reason}. There is nothing on GitHub to check, so the issue moves to review the way it did before pull requests existed."
-                                ),
-                                false,
-                            )
-                            .await?;
-                            // No pull request means no checks and no team review to
-                            // wait for, and a repository without a remote still has to
-                            // run the loop.
-                            // The task is already in review; nothing to move.
-                        }
-                    }
-                }
-            }
-            "watch_checks" => {
-                let conclusion = payload
-                    .get("conclusion")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("unknown");
-                let sha = payload.get("sha").and_then(|v| v.as_str()).unwrap_or("");
-                if let Some(issue_id) = job.issue_id {
-                    if conclusion == "success" {
-                        // Green checks and no outstanding change requests: the pull
-                        // request is now something a human can be asked to read.
-                        self.comment(
-                            issue_id,
-                            hulahoop_core::AuthorType::Server,
-                            None,
-                            &format!(
-                                "The pull request checks are green on {} and no change request is open. The head replay and the house rules passed, so the issue moved to review.",
-                                short_revision(sha)
-                            ),
-                            false,
-                        )
-                        .await?;
-                        // The task is already in review; nothing to move.
-                    } else {
-                        let failing = payload
-                            .get("failing")
-                            .and_then(|v| v.as_array())
-                            .map(|names| {
-                                names
-                                    .iter()
-                                    .filter_map(|name| name.as_str())
-                                    .map(|name| format!("- {name}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_default();
-                        let requests = payload
-                            .get("change_requests")
-                            .and_then(|v| v.as_array())
-                            .map(|names| {
-                                names
-                                    .iter()
-                                    .filter_map(|name| name.as_str())
-                                    .map(|name| format!("- {name}"))
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_default();
-                        let mut body = format!(
-                            "The pull request is not ready to review: {conclusion} on {}.",
-                            short_revision(sha)
-                        );
-                        if !failing.is_empty() {
-                            body.push_str(&format!("\n\nFailing checks:\n\n{failing}"));
-                        }
-                        if !requests.is_empty() {
-                            body.push_str(&format!(
-                                "\n\nChange requests still open:\n\n{requests}"
-                            ));
-                        }
-                        body.push_str(
-                            "\n\nThe issue stays in progress: start another attempt to fix it, or resolve it on the pull request and check again.",
-                        );
-                        self.comment(
-                            issue_id,
-                            hulahoop_core::AuthorType::Server,
-                            None,
-                            &body,
-                            false,
-                        )
-                        .await?;
-                    }
-                }
-            }
             "fetch" => {
                 if let (Some(revision), Some(job_repo)) = (
                     payload.get("base_revision").and_then(|v| v.as_str()),
@@ -1804,6 +1770,12 @@ impl Engine {
                     .bind(crate::db::now_rfc3339())
                     .execute(&self.db.pool)
                     .await?;
+                    // A task that was waiting on this probe can start now. Without
+                    // this, an agent saved a minute after a task was planned leaves
+                    // that task sitting in a status it is supposed to work.
+                    if ok {
+                        self.retry_owed_turns(job.repo_id, agent_id).await?;
+                    }
                 }
             }
             _ => {}
@@ -1946,12 +1918,12 @@ pub struct ReplayCompletion {
 }
 
 /// Twelve characters of a revision, which is what a human reads in a comment.
-fn short_revision(sha: &str) -> String {
-    sha.chars().take(12).collect()
-}
-
 /// The prompt files are embedded so a run never depends on the checkout's
 /// contents, and the revision is a hash of exactly what was sent.
+/// How much of a closing message is kept. Enough for a plan; small enough that a
+/// runaway transcript cannot become the task's record.
+const SUMMARY_CHARS: usize = 8_000;
+
 const TEST_AUTHOR_PROMPT: &str = include_str!("../../../prompts/test_author.md");
 const IMPLEMENTER_PROMPT: &str = include_str!("../../../prompts/implementer.md");
 const REVIEWER_PROMPT: &str = include_str!("../../../prompts/reviewer.md");

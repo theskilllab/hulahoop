@@ -206,10 +206,15 @@ impl Executor {
         // the human's name is worse than a failed run, because nothing shows it.
         // The address decides whether GitHub links the commit to the app's bot
         // user, so it is built from the app id and slug when both are known.
-        let author_name = role.app_commit_name(spec["commit_app_slug"].as_str());
-        let author_email = role.app_commit_email(
+        // The team is named in the workflow, so the commit carries the agent's
+        // own name: `Test Author` becomes `hulahoop-dev-test-author`, not the
+        // role the old pipeline used.
+        let agent_name = spec["commit_agent_name"].as_str();
+        let author_name = role.app_commit_name_for(spec["commit_app_slug"].as_str(), agent_name);
+        let author_email = role.app_commit_email_for(
             spec["commit_app_id"].as_str(),
             spec["commit_app_slug"].as_str(),
+            agent_name,
         );
         vcs.set_working_copy_author(&checkout, &author_name, &author_email)
             .with_context(|| {
@@ -337,7 +342,6 @@ impl Executor {
         let result = match kind.as_str() {
             "fetch" => self.job_fetch(&repo_path, spec).await,
             "preflight" => self.job_preflight(&repo_path, spec).await,
-            "merge_verify" => self.job_merge_verify(&repo_path, spec).await,
             "bookmark" => self.job_bookmark(&repo_path, spec).await,
             "open_pr" => self.job_open_pr(&repo_path, spec).await,
             "review_pr" => job_review_pr(spec).await,
@@ -452,59 +456,6 @@ impl Executor {
         }))
     }
 
-    async fn job_merge_verify(&self, repo_path: &Path, span: &Value) -> Result<Value> {
-        let payload = &span["payload"];
-        let merge_revision = payload["merge_revision"]
-            .as_str()
-            .context("merge_verify needs a merge revision")?;
-        // The landing bookmark is the rebased commit the human merges; the
-        // approval's own head is history by then, rewritten by the rebase.
-        let landing = payload["landing_bookmark"]
-            .as_str()
-            .or_else(|| payload["head_bookmark"].as_str())
-            .context("merge_verify needs the landing bookmark")?;
-        let vcs = Vcs::detect(repo_path)?;
-        // The merge commit is always new to this repository, so the verify fetches
-        // before it resolves: without the fetch every merge looked like a revision
-        // that does not exist.
-        let _ = run_command(
-            repo_path,
-            &["jj", "git", "fetch"],
-            hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
-            None,
-        );
-        if vcs.resolve(merge_revision).is_err() {
-            let _ = run_command(
-                repo_path,
-                &["git", "fetch", "--all"],
-                hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
-                None,
-            );
-        }
-        let contained = vcs.contains(merge_revision, landing)?;
-        // A squash merge does not contain the landing commit: GitHub builds a new
-        // commit with the same tree. That is still the change the replay proved, so
-        // an empty diff between the merge and the landing is evidence too.
-        let same_tree = if contained {
-            false
-        } else {
-            vcs.changed_paths_between(merge_revision, landing)
-                .map(|paths| paths.is_empty())
-                .unwrap_or(false)
-        };
-        Ok(json!({
-            "merge_revision": merge_revision,
-            "landing_bookmark": landing,
-            "ancestry_ok": contained,
-            "same_tree": same_tree,
-        }))
-    }
-
-    /// Push the approved commit and open the pull request a human reviews.
-    ///
-    /// The push is the runner's job, not the agent's: an agent runs with the
-    /// network blocked, and a commit that was approved is the only thing that
-    /// should ever reach the remote.
     async fn job_open_pr(&self, repo_path: &Path, spec: &Value) -> Result<Value> {
         let pull = &spec["pull_request"];
         let run_id = pull["run_id"]
@@ -961,16 +912,18 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     // The commit this role produces has to say who wrote it. jj reads its
     // identity from the environment, so the agent commits under the role's name
     // even where the runner's own identity is the machine's.
+    let agent_name = spec["commit_agent_name"].as_str();
     if let Some(role) = AgentRole::parse(role) {
         env.push((
             "JJ_USER".into(),
-            role.app_commit_name(spec["commit_app_slug"].as_str()),
+            role.app_commit_name_for(spec["commit_app_slug"].as_str(), agent_name),
         ));
         env.push((
             "JJ_EMAIL".into(),
-            role.app_commit_email(
+            role.app_commit_email_for(
                 spec["commit_app_id"].as_str(),
                 spec["commit_app_slug"].as_str(),
+                agent_name,
             ),
         ));
     }

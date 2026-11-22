@@ -779,6 +779,9 @@ impl Mutation {
         .bind(&now)
         .execute(&engine(ctx).db.pool)
         .await?;
+        // Probe straight away: an agent that has never been used should not make
+        // the first task that names it wait for a probe.
+        let _ = engine(ctx).probe_everywhere(id).await;
         Ok(sqlx::query_as("select * from agents where id = ?")
             .bind(id)
             .fetch_one(&engine(ctx).db.pool)
@@ -837,11 +840,9 @@ impl Mutation {
             }
         }
         // A changed adapter or model makes the old probe meaningless: it answered a
-        // question about a command line that no longer exists.
-        sqlx::query("delete from agent_preflight where agent_id = ?")
-            .bind(id)
-            .execute(&engine.db.pool)
-            .await?;
+        // question about a command line that no longer exists. Ask it again now,
+        // so an agent nobody has used yet is ready before work arrives.
+        engine.probe_everywhere(id).await?;
         Ok(sqlx::query_as("select * from agents where id = ?")
             .bind(id)
             .fetch_one(&engine.db.pool)
@@ -1080,10 +1081,10 @@ impl Mutation {
     }
 
     /// The pull request merged, which is what closes a task.
+    /// Reads the merge from GitHub and records it: the revision a merge produced
+    /// is GitHub's fact, so pressing the button asks GitHub rather than a person.
     async fn merge_issue(&self, ctx: &Context<'_>, issue_id: Uuid) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx)
-            .transition(issue_id, hulahoop_core::IssueEvent::Merge)
-            .await?)
+        Ok(engine(ctx).merge_issue(issue_id).await?)
     }
 
     /// Back to To do, for work that is queued again after a merge or an abandon.

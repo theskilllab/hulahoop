@@ -392,3 +392,52 @@ mod tests {
         .is_err());
     }
 }
+
+/// What GitHub says about a pull request's merge.
+#[derive(Debug, Clone)]
+pub struct MergeState {
+    pub merged: bool,
+    pub merge_commit_sha: Option<String>,
+    pub merged_at: Option<String>,
+    pub state: String,
+}
+
+/// The pull request's own account of whether it was merged, and into what.
+///
+/// The revision a merge produced is a fact GitHub holds; asking the person who
+/// pressed the button to paste it back invites a typo and a record that lies.
+pub async fn pull_request(
+    http: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: i64,
+) -> Result<MergeState> {
+    let response = http
+        .get(format!(
+            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+        ))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "hulahoop")
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("asking github about {owner}/{repo}#{number}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        bail!(
+            "github would not describe {owner}/{repo}#{number} ({status}): {}",
+            body["message"].as_str().unwrap_or("no reason given")
+        );
+    }
+    Ok(MergeState {
+        merged: body["merged"].as_bool().unwrap_or(false),
+        merge_commit_sha: body["merge_commit_sha"]
+            .as_str()
+            .filter(|sha| sha.len() >= 7)
+            .map(str::to_string),
+        merged_at: body["merged_at"].as_str().map(str::to_string),
+        state: body["state"].as_str().unwrap_or("unknown").to_string(),
+    })
+}
