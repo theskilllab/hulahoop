@@ -71,7 +71,7 @@ fn is_mirror(repo: &Repo) -> bool {
 async fn clone_token(engine: &Engine, repo: &Repo) -> Option<String> {
     let (owner, name) = crate::github::split_remote(repo.remote_url.as_deref()?)?;
     let app = engine
-        .stored_app(crate::github::PROVIDER)
+        .stored_app(crate::github::PROVIDER, crate::connectors::KIND_GITHUB_APP)
         .await
         .ok()
         .flatten()?;
@@ -466,7 +466,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let credential = {
         let adapter =
             hulahoop_core::Adapter::parse(&agent.adapter).unwrap_or(hulahoop_core::Adapter::Pi);
-        let credential = engine.agent_credential(adapter).await?;
+        let credential = engine
+            .agent_credential(adapter, agent.connector.as_deref())
+            .await?;
         serde_json::json!({
             "env": credential.env,
             "files": credential.files,

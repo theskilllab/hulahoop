@@ -594,32 +594,39 @@ impl Mutation {
     /// because it predates the general form and a stored app is the one case where
     /// "disconnect" also changes how commits are authored.
     async fn disconnect_github_app(&self, ctx: &Context<'_>) -> async_graphql::Result<Connection> {
-        Ok(engine(ctx)
-            .clear_connection(crate::github::PROVIDER)
-            .await?)
+        Ok(engine(ctx).clear_connection("github").await?)
     }
 
-    /// Store an API key for an agent CLI. One mutation for every provider, because
-    /// the screen renders one row per provider and the difference is the payload.
+    /// Store an API key for an agent CLI. The id names the entry, because Claude
+    /// Code has two: a plan login and a billed key are separate purchases.
     async fn set_agent_key(
         &self,
         ctx: &Context<'_>,
-        provider: String,
+        id: String,
         key: String,
     ) -> async_graphql::Result<Connection> {
-        Ok(engine(ctx).set_agent_key(&provider, &key).await?)
+        Ok(engine(ctx).set_agent_key(&id, &key).await?)
     }
 
     /// Store the credentials file a CLI wrote when it logged in.
     async fn set_agent_subscription(
         &self,
         ctx: &Context<'_>,
-        provider: String,
+        id: String,
         contents: String,
     ) -> async_graphql::Result<Connection> {
-        Ok(engine(ctx)
-            .set_agent_subscription(&provider, &contents)
-            .await?)
+        Ok(engine(ctx).set_agent_subscription(&id, &contents).await?)
+    }
+
+    /// Store a token a login minted (`claude setup-token`), which travels to a run
+    /// as `CLAUDE_CODE_OAUTH_TOKEN` instead of a session file that expires hourly.
+    async fn set_agent_token(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        token: String,
+    ) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx).set_agent_token(&id, &token).await?)
     }
 
     /// Forget a credential. Commits go back to the human's identity and a run falls
@@ -628,9 +635,9 @@ impl Mutation {
     async fn disconnect_connection(
         &self,
         ctx: &Context<'_>,
-        provider: String,
+        id: String,
     ) -> async_graphql::Result<Connection> {
-        Ok(engine(ctx).clear_connection(&provider).await?)
+        Ok(engine(ctx).clear_connection(&id).await?)
     }
 
     /// Attach a repository either from a checkout on this machine or from the
@@ -808,9 +815,16 @@ impl Mutation {
         name: Option<String>,
         adapter: Option<String>,
         model: Option<String>,
+        // Which connector the agent signs in with, where its harness offers two.
+        connector: Option<String>,
     ) -> async_graphql::Result<Agent> {
         let engine = engine(ctx);
-        for (column, value) in [("name", name), ("adapter", adapter), ("model", model)] {
+        for (column, value) in [
+            ("name", name),
+            ("adapter", adapter),
+            ("model", model),
+            ("connector", connector),
+        ] {
             if let Some(value) = value {
                 sqlx::query(&format!(
                     "update agents set {column} = ?, updated_at = ? where id = ?"

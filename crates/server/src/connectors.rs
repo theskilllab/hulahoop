@@ -1,10 +1,10 @@
 //! Every credential the loop can act with, in one place.
 //!
-//! A GitHub app is an app id and a private key. An agent CLI authenticates with an
-//! API key or with the file its own `login` command wrote. The payloads differ; the
-//! shape does not: a provider, a kind, and a secret that is sealed before it is
-//! stored. Keeping them in one table means the screen has one list, and adding the
-//! next provider is a match arm rather than a migration.
+//! An *entry* is one thing a person connects: a GitHub app, a Claude subscription,
+//! a Claude API key, a Pi login. Two entries can share a provider — Claude Code
+//! accepts a plan login or a billed key, and they are separate rows because they
+//! are separate purchases. Keeping them in one table means the screen has one
+//! list, and adding the next entry is a match arm rather than a migration.
 
 use hulahoop_core::Adapter;
 
@@ -12,23 +12,101 @@ pub const GITHUB: &str = "github";
 pub const CLAUDE_CODE: &str = "claude_code";
 pub const PI: &str = "pi";
 
-/// Every provider the screen offers, stored or not: "available" and "connected"
-/// are two different answers, and only a complete list can show the first.
-pub const ALL: [&str; 3] = [GITHUB, CLAUDE_CODE, PI];
-
 /// What the secret is. The kind decides which field the payload carries.
 pub const KIND_GITHUB_APP: &str = "github_app";
 pub const KIND_API_KEY: &str = "api_key";
 pub const KIND_SUBSCRIPTION: &str = "subscription";
 
-/// The connector a run of this adapter authenticates with. `None` for the fake
-/// adapter, which talks to a script and needs nothing.
-pub fn for_adapter(adapter: Adapter) -> Option<&'static str> {
-    match adapter {
-        Adapter::Pi => Some(PI),
-        Adapter::ClaudeCode => Some(CLAUDE_CODE),
-        Adapter::Fake => None,
-    }
+/// One thing a person connects, and what it unlocks.
+#[derive(Debug, Clone, Copy)]
+pub struct Entry {
+    /// Stable id the screen and the API use: `claude-api`, not `claude_code/api_key`.
+    pub id: &'static str,
+    /// Which CLI or service the secret is for.
+    pub provider: &'static str,
+    /// What the secret is, which decides how it travels to a run.
+    pub kind: &'static str,
+    /// The heading this entry sits under.
+    pub group: &'static str,
+    pub name: &'static str,
+    /// An icon name the desktop knows.
+    pub icon: &'static str,
+    pub desc: &'static str,
+    /// The line under the description: what this makes possible.
+    pub enables: &'static str,
+}
+
+pub const GROUP_SOURCE: &str = "Source control";
+pub const GROUP_AGENT: &str = "Agent access";
+
+/// Every entry the screen offers, connected or not: "available" and "connected"
+/// are two different answers, and only a complete list can show the first.
+pub const ENTRIES: [Entry; 4] = [
+    Entry {
+        id: "github",
+        provider: GITHUB,
+        kind: KIND_GITHUB_APP,
+        group: GROUP_SOURCE,
+        name: "GitHub",
+        icon: "pr",
+        desc: "Connect with a GitHub App or a personal access token.",
+        enables: "Pull requests and repositories",
+    },
+    Entry {
+        id: "claude-sub",
+        provider: CLAUDE_CODE,
+        kind: KIND_SUBSCRIPTION,
+        group: GROUP_AGENT,
+        name: "Claude Code subscription",
+        icon: "bot",
+        desc: "Sign in with your Claude Pro or Max plan.",
+        enables: "Enables Claude Code",
+    },
+    Entry {
+        id: "claude-api",
+        provider: CLAUDE_CODE,
+        kind: KIND_API_KEY,
+        group: GROUP_AGENT,
+        name: "Claude API key",
+        icon: "key",
+        desc: "Pay per token with an Anthropic API key.",
+        enables: "Enables Claude Code",
+    },
+    Entry {
+        id: "pi",
+        provider: PI,
+        kind: KIND_SUBSCRIPTION,
+        group: GROUP_AGENT,
+        name: "Pi login",
+        icon: "bot",
+        desc: "Sign in to a provider through Pi, for example OpenCode Go.",
+        enables: "Enables Pi",
+    },
+];
+
+/// The entry a screen id names.
+pub fn entry(id: &str) -> Option<&'static Entry> {
+    ENTRIES.iter().find(|entry| entry.id == id)
+}
+
+/// The entry a stored row belongs to.
+pub fn find(provider: &str, kind: &str) -> Option<&'static Entry> {
+    ENTRIES
+        .iter()
+        .find(|entry| entry.provider == provider && entry.kind == kind)
+}
+
+/// The entries that can power an adapter — what an agent picks from.
+pub fn for_adapter(adapter: Adapter) -> Vec<&'static Entry> {
+    let provider = match adapter {
+        Adapter::Pi => PI,
+        Adapter::ClaudeCode => CLAUDE_CODE,
+        Adapter::Fake => return Vec::new(),
+    };
+    ENTRIES
+        .iter()
+        .filter(|entry| entry.provider == provider)
+        .collect()
 }
 
 /// The environment variable an API key travels in. A subscription does not use it:
@@ -70,26 +148,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_adapter_names_its_connector() {
-        assert_eq!(for_adapter(Adapter::Pi), Some(PI));
-        assert_eq!(for_adapter(Adapter::ClaudeCode), Some(CLAUDE_CODE));
-        assert_eq!(for_adapter(Adapter::Fake), None);
-    }
-
-    #[test]
-    fn every_agent_connector_has_a_home_for_its_secret() {
-        for provider in [CLAUDE_CODE, PI] {
+    fn every_entry_has_a_unique_id_and_a_known_group() {
+        let mut ids = std::collections::HashSet::new();
+        for entry in ENTRIES {
+            assert!(ids.insert(entry.id), "duplicate id {}", entry.id);
             assert!(
-                api_key_env(provider).is_some() || credentials_file(provider).is_some(),
-                "{provider} has nowhere to put a credential"
+                entry.group == GROUP_SOURCE || entry.group == GROUP_AGENT,
+                "{} has an unknown group",
+                entry.id
             );
-            assert!(ALL.contains(&provider));
         }
     }
 
     #[test]
-    fn github_takes_neither_a_key_nor_a_file() {
-        assert!(api_key_env(GITHUB).is_none());
-        assert!(credentials_file(GITHUB).is_none());
+    fn claude_offers_two_ways_to_pay() {
+        let kinds: Vec<_> = for_adapter(Adapter::ClaudeCode)
+            .iter()
+            .map(|entry| entry.kind)
+            .collect();
+        assert_eq!(kinds, vec![KIND_SUBSCRIPTION, KIND_API_KEY]);
+    }
+
+    #[test]
+    fn an_entry_is_found_by_id_and_by_row() {
+        assert_eq!(
+            entry("claude-api").map(|entry| entry.kind),
+            Some(KIND_API_KEY)
+        );
+        assert_eq!(
+            find(CLAUDE_CODE, KIND_API_KEY).map(|entry| entry.id),
+            Some("claude-api")
+        );
+        assert!(entry("codex").is_none());
     }
 }

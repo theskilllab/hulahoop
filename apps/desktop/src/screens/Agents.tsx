@@ -2,11 +2,13 @@ import { useEffect, useMemo, useState } from "react";
 
 import {
   gql,
+  loadConnections,
   loadModels,
   setAgentInstructions,
   setAgentSkills,
   type Agent,
   type Issue,
+  type ConnectorRow,
   type ModelOption,
   type Skill,
 } from "../api";
@@ -344,6 +346,9 @@ function AgentDialog({
   const [name, setName] = useState(agent?.name ?? "");
   const [adapter, setAdapter] = useState(agent?.adapter ?? HARNESSES[0].adapter);
   const [model, setModel] = useState(agent?.model ?? "");
+  // A harness with two ways to pay needs to know which one this agent uses.
+  const [connector, setConnector] = useState(agent?.connector ?? "");
+  const [connectors, setConnectors] = useState<ConnectorRow[]>([]);
   const [md, setMd] = useState(agent?.agentsMd ?? "");
   const [picked, setPicked] = useState<string[]>(agent?.skills.map((skill) => skill.id) ?? []);
   const [busy, setBusy] = useState<string | null>(null);
@@ -375,6 +380,16 @@ function AgentDialog({
     return [...groups.entries()];
   }, [models]);
 
+  useEffect(() => {
+    void loadConnections()
+      .then(setConnectors)
+      .catch(() => setConnectors([]));
+  }, []);
+
+  const offered = connectors.filter(
+    (row) => row.connected && (adapter === "claude_code" ? row.provider === "claude_code" : row.provider === adapter),
+  );
+
   async function save() {
     setBusy("save");
     onError(null);
@@ -382,10 +397,10 @@ function AgentDialog({
       let id = agent?.id ?? null;
       if (agent) {
         await gql(
-          `mutation ($id: UUID!, $name: String!, $adapter: String!, $model: String) {
-             updateAgent(id: $id, name: $name, adapter: $adapter, model: $model) { id }
+          `mutation ($id: UUID!, $name: String!, $adapter: String!, $model: String, $connector: String) {
+             updateAgent(id: $id, name: $name, adapter: $adapter, model: $model, connector: $connector) { id }
            }`,
-          { id: agent.id, name, adapter, model },
+          { id: agent.id, name, adapter, model, connector: connector || null },
         );
       } else {
         const data = await gql<{ createAgent: { id: string } }>(
@@ -486,6 +501,30 @@ function AgentDialog({
             ? `${models.length} models from ${harness.name}'s own catalogue.`
             : `${harness.name} did not report a catalogue, so type the model it takes.`}
         </p>
+
+        {offered.length > 1 ? (
+          <div className="field">
+            <span className="field-label">Signs in with</span>
+            <div className="seg" role="group" aria-label="Connector">
+              {offered.map((entry) => (
+                <button
+                  key={entry.id}
+                  type="button"
+                  aria-pressed={connector === entry.id}
+                  onClick={() => setConnector(entry.id)}
+                >
+                  {entry.name}
+                </button>
+              ))}
+            </div>
+            <span className="dim small">
+              {harness.name} can act on a plan login or a billed key. This chooses which.
+            </span>
+          </div>
+        ) : null}
+        {offered.length === 1 && connector !== offered[0].id ? (
+          <p className="dim small">{harness.name} will sign in with {offered[0].name}.</p>
+        ) : null}
 
         <label>
           AGENTS.md

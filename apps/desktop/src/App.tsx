@@ -36,7 +36,8 @@ import Skills from "./screens/Skills";
 import WorkflowScreen from "./screens/Workflow";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
-import { Activity, Connectors, Cost, Inbox, Projects, PullRequests } from "./screens/Misc";
+import { Connectors } from "./screens/Connectors";
+import { Activity, Cost, Inbox, Projects, PullRequests } from "./screens/Misc";
 
 type View =
   | { name: "inbox" }
@@ -458,7 +459,7 @@ export default function App() {
           />
         )}
 
-        {view.name === "connectors" && <Connectors onOpenSettings={() => setView({ name: "settings" })} />}
+        {view.name === "connectors" && <Connectors />}
 
         {view.name === "cost" && <Cost runners={runners} agents={agents} />}
 

@@ -17,7 +17,7 @@ impl Engine {
     /// because an installation token is already narrowed to one repository.
     pub async fn github_repositories(&self) -> Result<Vec<crate::github::GithubRepo>> {
         let app = self
-            .stored_app(crate::github::PROVIDER)
+            .stored_app(crate::github::PROVIDER, crate::connectors::KIND_GITHUB_APP)
             .await?
             .ok_or_else(|| {
                 // Two very different situations reach this line, and the user's fix
