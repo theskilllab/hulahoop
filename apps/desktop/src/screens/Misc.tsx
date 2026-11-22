@@ -1,7 +1,6 @@
 import { useEffect, useState } from "react";
 
 import {
-  gql,
   loadModels,
   loadRecentRuns,
   type Agent,
@@ -152,65 +151,6 @@ export function Projects({
         })}
         {projects.length === 0 ? <p className="dim">No projects yet. Create one in Settings.</p> : null}
       </div>
-    </section>
-  );
-}
-
-/* ----------------------------------------------------------- Connectors --- */
-
-type Connection = { provider: string; kind: string; connected: boolean; label: string | null };
-
-export function Connectors({ onOpenSettings }: { onOpenSettings: () => void }) {
-  const [rows, setRows] = useState<Connection[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [loaded, setLoaded] = useState(false);
-
-  if (!loaded) {
-    setLoaded(true);
-    void gql<{ connections: Connection[] }>(
-      `query { connections { provider kind connected label } }`,
-    )
-      .then((data) => setRows(data.connections))
-      .catch((problem) => setError(String(problem instanceof Error ? problem.message : problem)));
-  }
-
-  const known = ["github", "claude_code", "pi"];
-  const shown = known.map((provider) => rows.find((row) => row.provider === provider) ?? {
-    provider,
-    kind: "—",
-    connected: false,
-    label: null,
-  });
-
-  return (
-    <section className="screen connectors">
-      <PageHeader
-        title="Connectors"
-        subtitle="What the agents sign in with. A connector is sealed on the host and handed to a run of that harness only."
-        actions={
-          <button className="primary" onClick={onOpenSettings}>
-            Connect
-          </button>
-        }
-      />
-
-      {error ? <p className="error">{error}</p> : null}
-
-      <ul className="connector-list">
-        {shown.map((row) => (
-          <li key={row.provider}>
-            <Icon name={row.provider === "github" ? "branch" : "bot"} size={16} />
-            <div>
-              <strong>{row.provider}</strong>
-              <span className="dim">{row.kind === "—" ? "nothing stored" : row.kind.replaceAll("_", " ")}</span>
-            </div>
-            <span className={row.connected ? "ok" : "dim"}>
-              {row.connected ? "connected" : "not connected"}
-            </span>
-            <span className="dim mono">{row.label ?? ""}</span>
-          </li>
-        ))}
-      </ul>
     </section>
   );
 }

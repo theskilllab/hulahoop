@@ -141,6 +141,8 @@ export interface Repo {
 }
 
 export interface Agent {
+  /** Which connector this agent signs in with, where its harness offers two. */
+  connector: string | null;
   id: string;
   name: string;
   adapter: string;
@@ -645,7 +647,7 @@ export async function loadWorkspace(workspaceId?: string | null): Promise<Worksp
   );
   const agents = await gql<{ agents: Agent[] }>(
     `query ($id: UUID!) { agents(workspaceId: $id) {
-      id name adapter model agentsMd
+      id name adapter model agentsMd connector
       skills { ${SKILL_FIELDS} }
     } }`,
     { id: workspace.id },
@@ -738,4 +740,32 @@ export async function loadModels(harness: string): Promise<ModelOption[]> {
     { h: harness },
   );
   return data.models;
+}
+
+/** One thing a person connects. Two entries can share a provider: Claude Code
+ *  accepts a plan login or a billed key, and they are separate purchases. */
+export type ConnectorRow = {
+  id: string;
+  provider: string;
+  kind: string;
+  group: string;
+  name: string;
+  icon: string;
+  desc: string;
+  enables: string;
+  connected: boolean;
+  label: string | null;
+  appId: string | null;
+  connectedAt: string | null;
+};
+
+export const CONNECTION_FIELDS = `
+  id provider kind group name icon desc enables connected label appId connectedAt
+`;
+
+export async function loadConnections(): Promise<ConnectorRow[]> {
+  const data = await gql<{ connections: ConnectorRow[] }>(
+    `query { connections { ${CONNECTION_FIELDS} } }`,
+  );
+  return data.connections;
 }

@@ -302,19 +302,20 @@ impl Engine {
 
     /// Every provider the screen offers, stored or not. "Available" and
     /// "connected" are two different answers, and only a complete list shows both.
-    pub const PROVIDERS: [&'static str; 3] = crate::connectors::ALL;
+    pub const ENTRIES: [crate::connectors::Entry; 4] = crate::connectors::ENTRIES;
 
     fn vault(&self) -> Result<crate::vault::Vault> {
         crate::vault::Vault::open(&self.db.data_dir)
     }
 
-    async fn connector_row(&self, provider: &str) -> Result<Option<ConnectorRow>> {
-        Ok(
-            sqlx::query_as::<_, ConnectorRow>("select * from connectors where provider = ?")
-                .bind(provider)
-                .fetch_optional(&self.db.pool)
-                .await?,
+    async fn connector_row(&self, provider: &str, kind: &str) -> Result<Option<ConnectorRow>> {
+        Ok(sqlx::query_as::<_, ConnectorRow>(
+            "select * from connectors where provider = ? and kind = ?",
         )
+        .bind(provider)
+        .bind(kind)
+        .fetch_optional(&self.db.pool)
+        .await?)
     }
 
     /// One field out of the stored payload. Each field is sealed on its own, so
@@ -357,8 +358,8 @@ impl Engine {
     /// The stored app's credentials, or `None` when nothing is stored or the
     /// vault cannot open what is stored. An unreadable credential is a reason to
     /// refuse work, not a reason to guess.
-    pub(crate) async fn stored_app(&self, provider: &str) -> Result<Option<StoredApp>> {
-        let Some(row) = self.connector_row(provider).await? else {
+    pub(crate) async fn stored_app(&self, provider: &str, kind: &str) -> Result<Option<StoredApp>> {
+        let Some(row) = self.connector_row(provider, kind).await? else {
             return Ok(None);
         };
         let vault = self.vault()?;
@@ -377,66 +378,94 @@ impl Engine {
     }
 
     /// What a run of this adapter authenticates with: a key in the environment, or
-    /// the credentials file the CLI wrote, copied into the run's scratch home.
-    pub async fn agent_credential(&self, adapter: hulahoop_core::Adapter) -> Result<Credential> {
-        let Some(provider) = crate::connectors::for_adapter(adapter) else {
-            return Ok(Credential::default());
+    /// the file a login wrote. `connector` is the entry the agent chose, which
+    /// matters where a harness offers two ways to pay; an empty one takes whatever
+    /// is connected, subscription first.
+    pub async fn agent_credential(
+        &self,
+        adapter: hulahoop_core::Adapter,
+        connector: Option<&str>,
+    ) -> Result<Credential> {
+        let entries = crate::connectors::for_adapter(adapter);
+        let chosen = match connector {
+            Some(id) if !id.is_empty() => entries.iter().find(|entry| entry.id == id).copied(),
+            _ => None,
         };
-        let Some(row) = self.connector_row(provider).await? else {
-            return Ok(Credential::default());
+        let candidates: Vec<&crate::connectors::Entry> = match chosen {
+            Some(entry) => vec![entry],
+            None => entries,
         };
-        let vault = self.vault()?;
-        let mut credential = Credential::default();
-        if let Some(secret) = Self::open_field(&vault, &row.secret_ciphertext, "secret") {
-            if let Some(name) = crate::connectors::api_key_env(provider) {
-                credential.env.push((name.to_string(), secret));
+        for entry in candidates {
+            let Some(row) = self.connector_row(entry.provider, entry.kind).await? else {
+                continue;
+            };
+            let vault = self.vault()?;
+            let mut credential = Credential::default();
+            if let Some(secret) = Self::open_field(&vault, &row.secret_ciphertext, "secret") {
+                if let Some(name) = crate::connectors::api_key_env(entry.provider) {
+                    credential.env.push((name.to_string(), secret));
+                }
+            }
+            if let Some(token) = Self::open_field(&vault, &row.secret_ciphertext, "token") {
+                credential
+                    .env
+                    .push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
+            }
+            if let Some(contents) = Self::open_field(&vault, &row.secret_ciphertext, "contents") {
+                if let Some(path) = crate::connectors::credentials_file(entry.provider) {
+                    credential.files.push((path.to_string(), contents));
+                }
+            }
+            if !credential.is_empty() {
+                return Ok(credential);
             }
         }
-        if let Some(contents) = Self::open_field(&vault, &row.secret_ciphertext, "contents") {
-            if let Some(path) = crate::connectors::credentials_file(provider) {
-                credential.files.push((path.to_string(), contents));
-            }
-        }
-        Ok(credential)
+        Ok(Credential::default())
     }
 
     /// Whether a stored secret can still act is the only honest definition of
     /// "connected": an app whose key cannot sign is not the app it claims to be,
     /// and a key the CLI would reject is not a login.
     pub async fn connections(&self) -> Result<Vec<Connection>> {
-        let mut connections = Vec::with_capacity(Self::PROVIDERS.len());
-        for provider in Self::PROVIDERS {
-            let row = self.connector_row(provider).await?;
+        let mut connections = Vec::with_capacity(Self::ENTRIES.len());
+        for entry in Self::ENTRIES {
+            let row = self.connector_row(entry.provider, entry.kind).await?;
+            let connected_at = row.as_ref().map(|row| row.updated_at);
             let vault = self.vault()?;
-            let (connected, app_id, slug, label) = match &row {
-                None => (false, None, None, None),
+            let (connected, app_id, label) = match &row {
+                None => (false, None, None),
                 Some(row) => {
                     let app_id = Self::open_field(&vault, &row.secret_ciphertext, "app_id");
                     let private_key =
                         Self::open_field(&vault, &row.secret_ciphertext, "private_key");
-                    // Sealed and openable is what every provider can prove locally;
+                    // Sealed and openable is what every entry can prove locally;
                     // a github app has one more answer, whether the key parses.
                     let openable = app_id.is_some()
                         || private_key.is_some()
                         || Self::open_field(&vault, &row.secret_ciphertext, "secret").is_some()
+                        || Self::open_field(&vault, &row.secret_ciphertext, "token").is_some()
                         || Self::open_field(&vault, &row.secret_ciphertext, "contents").is_some();
                     let signs = private_key.as_deref().is_none_or(crate::github::can_sign);
                     (
                         openable && signs,
                         if openable { app_id } else { None },
-                        if openable { row.label.clone() } else { None },
                         row.label.clone(),
                     )
                 }
             };
             connections.push(Connection {
-                provider: provider.to_string(),
-                kind: row.as_ref().map(|row| row.kind.clone()).unwrap_or_default(),
+                id: entry.id.to_string(),
+                provider: entry.provider.to_string(),
+                kind: entry.kind.to_string(),
+                group: entry.group.to_string(),
+                name: entry.name.to_string(),
+                icon: entry.icon.to_string(),
+                desc: entry.desc.to_string(),
+                enables: entry.enables.to_string(),
                 connected,
                 app_id,
-                slug,
-                label,
-                connected_at: row.map(|row| row.updated_at),
+                label: label.clone(),
+                connected_at,
             });
         }
         Ok(connections)
@@ -444,20 +473,26 @@ impl Engine {
 
     /// Forget a stored credential. The loop stops acting as that provider, so the
     /// next attempt goes back to what the machine has until one is stored again.
-    pub async fn clear_connection(&self, provider: &str) -> Result<Connection> {
-        if !Self::PROVIDERS.contains(&provider) {
-            bail!("unknown provider `{provider}`");
-        }
-        sqlx::query("delete from connectors where provider = ?")
-            .bind(provider)
+    pub async fn clear_connection(&self, id: &str) -> Result<Connection> {
+        let entry = crate::connectors::entry(id)
+            .ok_or_else(|| anyhow!("unknown connector `{id}`"))?
+            .to_owned();
+        sqlx::query("delete from connectors where provider = ? and kind = ?")
+            .bind(entry.provider)
+            .bind(entry.kind)
             .execute(&self.db.pool)
             .await?;
         Ok(Connection {
-            provider: provider.to_string(),
-            kind: String::new(),
+            id: entry.id.to_string(),
+            provider: entry.provider.to_string(),
+            kind: entry.kind.to_string(),
+            group: entry.group.to_string(),
+            name: entry.name.to_string(),
+            icon: entry.icon.to_string(),
+            desc: entry.desc.to_string(),
+            enables: entry.enables.to_string(),
             connected: false,
             app_id: None,
-            slug: None,
             label: None,
             connected_at: None,
         })
@@ -474,8 +509,7 @@ impl Engine {
         sqlx::query(
             "insert into connectors (id, provider, kind, secret_ciphertext, label, created_at, updated_at)
              values (?, ?, ?, ?, ?, ?, ?)
-             on conflict(provider) do update set
-                 kind = excluded.kind,
+             on conflict(provider, kind) do update set
                  secret_ciphertext = excluded.secret_ciphertext,
                  label = excluded.label,
                  updated_at = excluded.updated_at",
@@ -517,64 +551,83 @@ impl Engine {
         )
         .await?;
         self.refresh_slug(app_id, private_key).await;
-        self.connection(crate::github::PROVIDER).await
+        self.connection("github").await
     }
 
     /// Store an API key for an agent CLI. The key is sealed like every other
     /// secret, and the adapter it belongs to decides where it goes.
-    pub async fn set_agent_key(&self, provider: &str, key: &str) -> Result<Connection> {
+    pub async fn set_agent_key(&self, id: &str, key: &str) -> Result<Connection> {
+        let entry = crate::connectors::entry(id)
+            .ok_or_else(|| anyhow!("unknown connector `{id}`"))?
+            .to_owned();
         let key = key.trim();
         if key.is_empty() {
-            bail!("a key is required; the CLI uses it as {provider} credentials");
+            bail!(
+                "a key is required; the CLI uses it as {} credentials",
+                entry.provider
+            );
         }
-        if crate::connectors::api_key_env(provider).is_none() {
-            bail!("`{provider}` takes a subscription file, not an API key");
+        if entry.kind != crate::connectors::KIND_API_KEY {
+            bail!("`{}` takes a login, not an API key", entry.name);
         }
         let vault = self.vault()?;
         let payload = Self::sealed_payload(&[("secret", vault.seal_string(key)?)]);
-        self.write_connector(
-            provider,
-            crate::connectors::KIND_API_KEY,
-            &payload,
-            Some("api key"),
-        )
-        .await?;
-        self.connection(provider).await
+        self.write_connector(entry.provider, entry.kind, &payload, Some("api key"))
+            .await?;
+        self.connection(entry.id).await
     }
 
     /// Store the credentials file a CLI wrote when it logged in. The contents are
     /// copied into every run's scratch home, so a subscription is used by a run and
     /// never by the host.
-    pub async fn set_agent_subscription(
-        &self,
-        provider: &str,
-        contents: &str,
-    ) -> Result<Connection> {
+    pub async fn set_agent_subscription(&self, id: &str, contents: &str) -> Result<Connection> {
+        let entry = crate::connectors::entry(id)
+            .ok_or_else(|| anyhow!("unknown connector `{id}`"))?
+            .to_owned();
         let contents = contents.trim();
         if !contents.starts_with('{') {
             bail!("paste the contents of the credentials file, which is JSON starting with `{{`");
         }
-        let Some(path) = crate::connectors::credentials_file(provider) else {
-            bail!("`{provider}` does not take a subscription file");
+        if entry.kind != crate::connectors::KIND_SUBSCRIPTION {
+            bail!("`{}` takes an API key, not a login", entry.name);
+        }
+        let Some(path) = crate::connectors::credentials_file(entry.provider) else {
+            bail!("`{}` does not take a credentials file", entry.name);
         };
         let vault = self.vault()?;
         let payload = Self::sealed_payload(&[("contents", vault.seal_string(contents)?)]);
-        self.write_connector(
-            provider,
-            crate::connectors::KIND_SUBSCRIPTION,
-            &payload,
-            Some(path),
-        )
-        .await?;
-        self.connection(provider).await
+        self.write_connector(entry.provider, entry.kind, &payload, Some(path))
+            .await?;
+        self.connection(entry.id).await
     }
 
-    /// One provider as the screen sees it.
-    pub async fn connection(&self, provider: &str) -> Result<Connection> {
+    /// Store a token a login minted, for the CLIs that accept one in the
+    /// environment. `claude setup-token` is the case this exists for: a token that
+    /// lasts a year and rotates nothing, unlike the session file it replaces.
+    pub async fn set_agent_token(&self, id: &str, token: &str) -> Result<Connection> {
+        let entry = crate::connectors::entry(id)
+            .ok_or_else(|| anyhow!("unknown connector `{id}`"))?
+            .to_owned();
+        let token = token.trim();
+        if token.len() < 20 {
+            bail!("that does not look like a token; `claude setup-token` prints one line");
+        }
+        if entry.kind != crate::connectors::KIND_SUBSCRIPTION {
+            bail!("`{}` takes an API key, not a token", entry.name);
+        }
+        let vault = self.vault()?;
+        let payload = Self::sealed_payload(&[("token", vault.seal_string(token)?)]);
+        self.write_connector(entry.provider, entry.kind, &payload, Some("oauth token"))
+            .await?;
+        self.connection(entry.id).await
+    }
+
+    /// One entry as the screen sees it.
+    pub async fn connection(&self, id: &str) -> Result<Connection> {
         let all = self.connections().await?;
         all.into_iter()
-            .find(|connection| connection.provider == provider)
-            .ok_or_else(|| anyhow!("unknown provider `{provider}`"))
+            .find(|connection| connection.id == id)
+            .ok_or_else(|| anyhow!("unknown connector `{id}`"))
     }
 
     /// Ask GitHub which app this key belongs to and remember the slug. Best
@@ -595,9 +648,10 @@ impl Engine {
         match crate::github::fetch_slug(&http, &jwt).await {
             Ok(slug) => {
                 if let Err(error) =
-                    sqlx::query("update connectors set label = ? where provider = ?")
+                    sqlx::query("update connectors set label = ? where provider = ? and kind = ?")
                         .bind(&slug)
                         .bind(crate::github::PROVIDER)
+                        .bind(crate::connectors::KIND_GITHUB_APP)
                         .execute(&self.db.pool)
                         .await
                 {
@@ -611,7 +665,10 @@ impl Engine {
     }
 
     pub async fn commit_identity(&self) -> Result<(Option<String>, Option<String>)> {
-        let Some(app) = self.stored_app(crate::github::PROVIDER).await? else {
+        let Some(app) = self
+            .stored_app(crate::github::PROVIDER, crate::connectors::KIND_GITHUB_APP)
+            .await?
+        else {
             return Ok((None, None));
         };
         if !crate::github::can_sign(&app.private_key) {
@@ -623,7 +680,7 @@ impl Engine {
             // commit address a GitHub bot instead of an unlinked string.
             None => {
                 self.refresh_slug(&app.app_id, &app.private_key).await;
-                self.stored_app(crate::github::PROVIDER)
+                self.stored_app(crate::github::PROVIDER, crate::connectors::KIND_GITHUB_APP)
                     .await?
                     .and_then(|app| app.slug)
             }
@@ -635,7 +692,10 @@ impl Engine {
     /// stored key cannot sign, because handing out a token nobody can verify is
     /// worse than handing out nothing.
     pub async fn github_token(&self) -> Result<Option<String>> {
-        let Some(app) = self.stored_app(crate::github::PROVIDER).await? else {
+        let Some(app) = self
+            .stored_app(crate::github::PROVIDER, crate::connectors::KIND_GITHUB_APP)
+            .await?
+        else {
             return Ok(None);
         };
         if !crate::github::can_sign(&app.private_key) {

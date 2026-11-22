@@ -56,6 +56,9 @@ pub struct Agent {
     pub model: String,
     /// How this agent should behave, written by the person who knows it best.
     pub agents_md: String,
+    /// Which connector this agent authenticates with, where its harness offers a
+    /// choice: `claude-sub` or `claude-api`. Empty means "whichever is connected".
+    pub connector: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -330,21 +333,20 @@ pub struct RunnerJob {
 /// this is, whether the stored credential still works, and which app it names.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject)]
 pub struct Connection {
+    /// The screen's id for this entry: `github`, `claude-sub`, `claude-api`, `pi`.
+    pub id: String,
     pub provider: String,
-    /// `github_app`, `api_key` or `subscription` — what the stored secret is.
     pub kind: String,
+    /// `Source control` or `Agent access`.
+    pub group: String,
+    pub name: String,
+    pub icon: String,
+    pub desc: String,
+    /// The line under the description: what connecting this makes possible.
+    pub enables: String,
     pub connected: bool,
-    /// The app id the stored key belongs to, once that key can sign. Two apps on
-    /// one machine are otherwise indistinguishable, so this is the name the
-    /// screen shows. `None` when no app is stored or its key cannot act.
     pub app_id: Option<String>,
-    /// GitHub's slug for the app, learned from `GET /app` when the key is stored.
-    /// `None` until that call succeeds, or when no app is stored.
-    pub slug: Option<String>,
-    /// What the screen shows beside the provider: an app id, an account name, or
-    /// the kind of secret. Never the secret itself.
     pub label: Option<String>,
-    /// When the stored secret was last written, so a stale one is visible.
     pub connected_at: Option<DateTime<Utc>>,
 }
 
