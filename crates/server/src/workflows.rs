@@ -21,6 +21,8 @@ pub struct WorkflowSection {
     pub agent: Option<String>,
     /// Every agent named for this status, in the order the document lists them.
     pub agents: Vec<String>,
+    /// `Agent: any idle agent` — the project's binding decides.
+    pub any_agent: bool,
     /// The first status this one leads to, if it leads anywhere.
     pub next: Option<String>,
     /// Every status this one leads to: a document may branch.
@@ -60,6 +62,7 @@ fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
             owner: section.owner.as_str().to_string(),
             agent: section.agents.first().cloned(),
             agents: section.agents.clone(),
+            any_agent: section.any_agent,
             next: section
                 .transitions
                 .first()

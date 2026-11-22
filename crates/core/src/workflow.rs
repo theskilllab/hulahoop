@@ -50,6 +50,8 @@ pub struct StatusSection {
     pub owner: Owner,
     /// The agents named for this status. Empty means the project's binding decides.
     pub agents: Vec<String>,
+    /// `Agent: any idle agent` — nobody specific, the project's binding decides.
+    pub any_agent: bool,
     /// Every move out of this status, in the order the document lists them.
     pub transitions: Vec<Transition>,
     /// Why the move happens. `When:` is what the diagram writes on the arrow and
@@ -128,6 +130,11 @@ fn names_in(value: &str) -> Vec<String> {
         })
         .map(|token| token.to_string())
         .collect()
+}
+
+/// `any`, `any agent`, `any idle agent`: whoever the project binds to this column.
+fn is_any(token: &str) -> bool {
+    token.trim().to_ascii_lowercase().starts_with("any")
 }
 
 /// The words people use for themselves.
@@ -217,6 +224,7 @@ pub fn parse(source: &str) -> Workflow {
                         title: heading.trim().to_string(),
                         owner: Owner::Human,
                         agents: Vec::new(),
+                        any_agent: false,
                         transitions: Vec::new(),
                         when: None,
                         body: String::new(),
@@ -262,8 +270,10 @@ pub fn parse(source: &str) -> Workflow {
             for token in names_in(value) {
                 if is_person(&token) {
                     people = true;
+                } else if is_any(&token) {
+                    section.any_agent = true;
                 } else {
-                    section.agents.push(token);
+                    section.agents.push(strip_reason(&token).to_string());
                 }
             }
             section.owner = if section.agents.is_empty() {
@@ -279,7 +289,12 @@ pub fn parse(source: &str) -> Workflow {
             // People write `@TestAuthor`, `Test Author`, `@Implementer, @Reviewer`
             // and `any`. Only real names survive: the rest is the project's call.
             for token in names_in(value) {
-                section.agents.push(token);
+                if is_any(&token) {
+                    // `Agent: any idle agent` is a policy, not a colleague.
+                    section.any_agent = true;
+                } else {
+                    section.agents.push(strip_reason(&token).to_string());
+                }
             }
         } else if let Some(value) = line.strip_prefix("Next:") {
             // A `Next:` line may name several places and may carry the reason
@@ -336,13 +351,20 @@ pub fn parse(source: &str) -> Workflow {
             None => workflow
                 .errors
                 .push(format!("`{}` has no section.", status.title())),
-            Some(section) if section.owner == Owner::Agent && section.agents.is_empty() => {
+            Some(section)
+                if section.owner == Owner::Agent
+                    && section.agents.is_empty()
+                    && !section.any_agent =>
+            {
                 workflow.errors.push(format!(
                     "`{}` is worked by an agent, but names none. Write `Agent: <agent name>`.",
                     section.title
                 ))
             }
-            Some(section) if section.owner == Owner::Human && !section.agents.is_empty() => {
+            Some(section)
+                if section.owner == Owner::Human
+                    && (!section.agents.is_empty() || section.any_agent) =>
+            {
                 // A section that names agents is agent-owned; saying so twice is
                 // noise, so the names win and the line is corrected silently.
                 let index = workflow

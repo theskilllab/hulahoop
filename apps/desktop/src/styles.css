@@ -598,6 +598,20 @@ button.link:hover {
   background: var(--warn);
 }
 
+/* ---------- Utilities the prototype spells out ---------- */
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+}
+
+/* A chip hugs its text; inside a card's grid it must not stretch to the column. */
+.od-stack > .chip,
+.wf-iss > li > .chip {
+  justify-self: start;
+  align-self: start;
+}
+
 /* ---------- Chips and pills ---------- */
 
 .chip,
@@ -609,10 +623,10 @@ button.link:hover {
   height: var(--h-chip);
   padding: 0 var(--s2);
   border-radius: var(--r-pill);
-  font-size: var(--fs-2xs);
+  font-size: var(--fs-xs);
   font-weight: 600;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
+  letter-spacing: 0;
+  text-transform: none;
   background: var(--bg-3);
   color: var(--text-2);
   white-space: nowrap;
@@ -2502,66 +2516,6 @@ table.transitions td {
   color: var(--ok);
 }
 
-/* ---- the workflow screen: the document and the picture of it ---- */
-.wf {
-  display: grid;
-  gap: var(--s4);
-  min-height: 0;
-  flex: 1;
-  align-items: stretch;
-}
-
-.wf.both {
-  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
-}
-
-.wf.markdown,
-.wf.diagram {
-  grid-template-columns: minmax(0, 1fr);
-}
-
-.wf-src {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-height: 0;
-  min-width: 0;
-  position: relative;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg);
-  overflow: hidden;
-}
-
-.wf-src .head {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  padding: var(--s1) var(--s3);
-  border-bottom: 1px solid var(--line);
-}
-
-.wf-src textarea {
-  width: 100%;
-  height: 100%;
-  min-height: 0;
-  padding: var(--s4);
-  border: 0;
-  background: var(--bg);
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: var(--fs-sm);
-  line-height: 1.6;
-  resize: none;
-  white-space: pre;
-  overflow: auto;
-  tab-size: 2;
-}
-
-.wf-src textarea:focus {
-  outline: none;
-  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
-}
-
 .mention-pop {
   position: absolute;
   left: var(--s4);
@@ -2590,149 +2544,6 @@ table.transitions td {
 .mention-pop button:hover {
   background: var(--bg-3);
   color: var(--text);
-}
-
-.wf-diagram {
-  display: grid;
-  gap: var(--s3);
-  min-height: 0;
-  min-width: 0;
-  align-content: start;
-  overflow: auto;
-}
-
-.wf-guide {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  flex-wrap: wrap;
-  min-height: 36px;
-  padding: var(--s1) var(--s2);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg-2);
-}
-
-.wf-canvas {
-  position: relative;
-  height: 360px;
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg);
-  overflow: auto;
-}
-
-.wf-canvas svg {
-  position: absolute;
-  inset: 0;
-  width: 1180px;
-  height: 360px;
-  pointer-events: none;
-}
-
-.wf-edge {
-  pointer-events: all;
-  cursor: pointer;
-}
-
-.wf-edge path {
-  fill: none;
-  stroke: var(--line-strong);
-  stroke-width: 1.5;
-}
-
-.wf-edge text {
-  font-size: 10px;
-  fill: var(--muted);
-}
-
-.wf-edge:hover path {
-  stroke: var(--accent);
-  stroke-width: 2;
-}
-
-.wf-edge:hover text {
-  fill: var(--text);
-}
-
-.wf-node {
-  position: absolute;
-  display: grid;
-  align-content: center;
-  gap: 2px;
-  padding: 0 var(--s3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg);
-  text-align: left;
-  cursor: pointer;
-}
-
-.wf-node .n-name {
-  font-size: var(--fs-sm);
-  font-weight: 600;
-  color: var(--text);
-}
-
-.wf-node .n-who {
-  font-size: var(--fs-2xs);
-  color: var(--muted);
-}
-
-.wf-node.agent {
-  border-color: color-mix(in srgb, var(--accent) 55%, var(--line));
-}
-
-.wf-node.human {
-  border-style: dashed;
-}
-
-.wf-node.final {
-  background: var(--bg-2);
-}
-
-.wf-node.on {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 55%, transparent);
-}
-
-.wf-legend {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  font-size: var(--fs-xs);
-  color: var(--muted);
-}
-
-.wf-legend .sw {
-  width: 10px;
-  height: 10px;
-  border-radius: 3px;
-  border: 1px solid var(--line-strong);
-  margin-left: var(--s3);
-}
-
-.wf-legend .sw:first-child {
-  margin-left: 0;
-}
-
-.wf-legend .sw.agent {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 22%, transparent);
-}
-
-.wf-legend .sw.human {
-  border-style: dashed;
-}
-
-.wf-legend .sw.final {
-  background: var(--bg-3);
-}
-
-.wf-ok {
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  margin: 0;
 }
 
 /* ---- corrections measured against the prototype ---- */
@@ -2800,65 +2611,6 @@ table.transitions td {
 .screen.fill {
   flex: 1 1 auto;
   overflow: hidden;
-}
-
-/* --- one panel for the workflow document ---------------------------------- */
-/* The prototype draws a single framed panel: a header row across the whole
- * width, then the editor and the diagram inside it, split by a rule. */
-
-.wf {
-  border: 1px solid var(--line);
-  border-radius: var(--r-lg);
-  background: var(--bg);
-  overflow: hidden;
-  gap: 0;
-}
-
-.wf.both {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
-}
-
-.wf-head {
-  grid-column: 1 / -1;
-  display: flex;
-  align-items: center;
-  gap: var(--s2);
-  height: var(--h-control-6);
-  padding: 0 var(--s3);
-  border-bottom: 1px solid var(--line);
-  background: var(--bg-2);
-}
-
-.wf-head-right {
-  margin-left: auto;
-}
-
-.wf-src {
-  border-right: 1px solid var(--line);
-}
-
-.wf.diagram .wf-src,
-.wf.markdown .wf-src {
-  border-right: 0;
-}
-
-.wf-src textarea {
-  border: 0;
-  border-radius: 0;
-  background: var(--bg);
-  padding: var(--s4);
-  font-family: var(--font-mono);
-  font-size: var(--fs-sm);
-  line-height: 1.6;
-  resize: none;
-}
-
-.wf-src textarea:focus {
-  box-shadow: none;
-}
-
-.wf-diagram {
-  padding: var(--s4);
 }
 
 /* --- no scrollbars, anywhere ---------------------------------------------- */
@@ -3001,6 +2753,41 @@ table.transitions td {
 .rail .brand {
   border-bottom: 0;
 }
+
+.vals {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.vals th {
+  text-align: left;
+  font-weight: 500;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--line);
+}
+
+.vals td {
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--line);
+  color: var(--text-2);
+}
+
+.vals tr:last-child td {
+  border-bottom: 0;
+}
+
+.vals th {
+  font-weight: 600;
+  padding: 6px var(--s2);
+}
+
+.vals td {
+  padding: 6px var(--s2);
+  vertical-align: top;
+}
 /* --- connectors: one column of decisions, never a wide table -------------- */
 /* Sizes from the handoff (index.html:252-259): a 32px tile, a 32px/minmax/auto/auto
  * row, --s3/--s4 padding, hairlines between rows and none after the last. */
@@ -3089,3 +2876,163 @@ table.transitions td {
 .cn-advanced > summary {
   cursor: pointer;
 }
+
+/* --- the workflow screen, exactly as the prototype draws it ------------------ */
+.wf-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.wf { display: grid; height: 100%; min-height: 0; }
+.wf-both { grid-template-columns: minmax(320px, 5fr) minmax(0, 7fr); }
+.wf-md, .wf-diagram { grid-template-columns: minmax(0, 1fr); }
+.wf-md .wf-out, .wf-diagram .wf-src { display: none; }
+
+.wf-src {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  border-right: 1px solid var(--line);
+  min-height: 0;
+  min-width: 0;
+}
+.wf-diagram .wf-src { border-right: 0; }
+
+.wf-h {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: 0 var(--s4);
+  min-height: var(--h-row);
+  border-bottom: 1px solid var(--line);
+  font-size: var(--fs-sm);
+}
+
+.wf-src .textarea {
+  border: 0;
+  border-radius: 0;
+  resize: none;
+  height: 100%;
+  min-height: 0;
+  padding: var(--s4);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  white-space: pre;
+  overflow: auto;
+  background: var(--bg);
+  color: var(--text);
+}
+.wf-src .textarea:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 45%, transparent);
+}
+
+.wf-out {
+  overflow: auto;
+  padding: var(--s4);
+  display: grid;
+  gap: var(--s4);
+  align-content: start;
+  min-width: 0;
+}
+
+.wf-svgwrap {
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  padding: var(--s2);
+}
+.wf-svg { display: block; color: var(--muted); }
+.wf-node rect { fill: var(--bg); stroke: var(--muted); stroke-width: 1.25; }
+.wf-node.ag rect { fill: var(--accent-soft); stroke: var(--accent); }
+.wf-node.end rect { fill: var(--ok-soft); stroke: var(--ok); }
+.wf-node .t { font-size: var(--fs-md); font-weight: 600; fill: var(--text); }
+.wf-node .s { font-size: var(--fs-xs); fill: var(--text-2); }
+.wf-edge { fill: none; stroke: var(--muted); stroke-width: 1.5; stroke-linejoin: round; }
+.wf-lab {
+  font-size: var(--fs-xs);
+  fill: var(--text-2);
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 4px;
+  stroke-linejoin: round;
+}
+.wf-key { display: flex; flex-wrap: wrap; gap: var(--s3); font-size: var(--fs-xs); color: var(--text-2); }
+.wf-key i {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  border: 1.5px solid var(--muted);
+  vertical-align: -2px;
+  margin-right: 6px;
+  background: var(--bg);
+}
+.wf-key i.ag { background: var(--accent-soft); border-color: var(--accent); }
+.wf-key i.end { background: var(--ok-soft); border-color: var(--ok); }
+.wf-iss { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s2); font-size: var(--fs-sm); }
+.wf-iss li { display: flex; gap: var(--s2); align-items: baseline; }
+.wf-table { width: 100%; border-collapse: collapse; font-size: var(--fs-sm); }
+.wf-table th {
+  text-align: left;
+  font-size: var(--fs-xs);
+  color: var(--muted);
+  font-weight: 600;
+  padding: 6px var(--s2);
+  border-bottom: 1px solid var(--line);
+}
+.wf-table td { padding: 6px var(--s2); border-bottom: 1px solid var(--line); vertical-align: top; }
+.wf-insp {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: var(--s4);
+  display: grid;
+  gap: var(--s3);
+  background: var(--bg-2);
+}
+.wf-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) auto; gap: var(--s2); align-items: center; }
+.wf-node, .wf-hit { cursor: pointer; }
+.wf-node.sel rect { stroke: var(--accent); stroke-width: 2.5; }
+.wf-node:focus-visible rect { stroke: var(--accent); stroke-width: 2.5; }
+.wf-node:focus { outline: none; }
+.wf-edge.sel { stroke: var(--accent); stroke-width: 2.5; }
+.wf-hit { fill: none; stroke: transparent; stroke-width: 14; pointer-events: stroke; }
+
+@media (max-width: 900px) {
+  .wf-both { grid-template-columns: minmax(0, 1fr); }
+  .wf-both .wf-src { border-right: 0; border-bottom: 1px solid var(--line); min-height: 300px; }
+}
+
+/* the row and chip shapes this screen shares with the rest of the app */
+.od-stack { display: grid; gap: var(--s3); align-content: start; }
+.od-stack.tight { gap: 8px; }
+.od-row { display: flex; align-items: center; gap: var(--s2); }
+.od-fill { flex: 1 1 auto; min-width: 0; }
+.field-label { font-size: var(--fs-xs); color: var(--muted); font-weight: 600; }
+.tgl-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.tgl {
+  height: 24px;
+  padding: 0 10px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--text-2);
+  font-size: var(--fs-xs);
+}
+.tgl.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.icon-btn {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  border-radius: var(--r-sm);
+}
+.icon-btn:hover { background: var(--bg-2); color: var(--text); }
+.md-tablewrap { overflow-x: auto; }
+
+

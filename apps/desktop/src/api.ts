@@ -196,6 +196,7 @@ export type WorkflowSection = {
   owner: string;
   agent: string | null;
   agents: string[];
+  anyAgent: boolean;
   next: IssueStatus | null;
   nexts: IssueStatus[];
   /// Each move with its own reason: what the arrows and the table print.
