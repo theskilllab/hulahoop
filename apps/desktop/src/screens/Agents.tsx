@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 
+import RichText from "../RichText";
+
 import {
   gql,
   loadConnections,
@@ -528,7 +530,13 @@ function AgentDialog({
 
         <label>
           AGENTS.md
-          <textarea rows={8} value={md} onChange={(event) => setMd(event.target.value)} />
+          <RichText
+            value={md}
+            onChange={setMd}
+            placeholder="How this agent works. Markdown, no toolbar: # headings, - lists, **bold**."
+            minHeight={150}
+            ariaLabel="AGENTS.md"
+          />
         </label>
         <p className="dim small">Read on every run, before the skills. Keep it short: how this agent works.</p>
 

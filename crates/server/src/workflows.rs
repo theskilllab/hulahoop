@@ -19,6 +19,8 @@ pub struct WorkflowSection {
     pub owner: String,
     /// The first agent named for this status, or `any` when the binding decides.
     pub agent: Option<String>,
+    /// The `Users:` line as written: `human`, `@Implementer`, `any`.
+    pub users: Vec<String>,
     /// Every agent named for this status, in the order the document lists them.
     pub agents: Vec<String>,
     /// `Agent: any idle agent` — the project's binding decides.
@@ -61,6 +63,7 @@ fn shape(parsed: &Workflow) -> Vec<WorkflowSection> {
             title: section.title.clone(),
             owner: section.owner.as_str().to_string(),
             agent: section.agents.first().cloned(),
+            users: section.users.clone(),
             agents: section.agents.clone(),
             any_agent: section.any_agent,
             next: section

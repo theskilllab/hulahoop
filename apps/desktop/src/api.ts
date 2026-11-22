@@ -195,6 +195,8 @@ export type WorkflowSection = {
   title: string;
   owner: string;
   agent: string | null;
+  /// The `Users:` line as written: `human`, `@Implementer`, `any`.
+  users: string[];
   agents: string[];
   anyAgent: boolean;
   next: IssueStatus | null;
@@ -532,12 +534,13 @@ export async function loadRecentRuns(workspaceId: string, limit = 120): Promise<
   return data.recentRuns;
 }
 
+const WORKFLOW_FIELDS = `source updatedAt errors
+      sections { status title owner agent users agents anyAgent next nexts when body
+        transitions { to title when } }`;
+
 export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
   const data = await gql<{ workflow: WorkflowDoc }>(
-    `query ($w: UUID!) { workflow(workspaceId: $w) {
-      source updatedAt errors
-      sections { status title owner agent next body }
-    } }`,
+    `query ($w: UUID!) { workflow(workspaceId: $w) { ${WORKFLOW_FIELDS} } }`,
     { w: workspaceId },
   );
   return data.workflow;
@@ -545,10 +548,7 @@ export async function loadWorkflow(workspaceId: string): Promise<WorkflowDoc> {
 
 export async function saveWorkflow(workspaceId: string, source: string): Promise<WorkflowDoc> {
   const data = await gql<{ setWorkflow: WorkflowDoc }>(
-    `mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) {
-      source updatedAt errors
-      sections { status title owner agent next body }
-    } }`,
+    `mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) { ${WORKFLOW_FIELDS} } }`,
     { w: workspaceId, s: source },
   );
   return data.setWorkflow;

@@ -1616,21 +1616,30 @@ Six statuses, and nothing else:
 | Done | person | the pull request merged |
 
 The workflow is a document. `WORKFLOWS.md` in the workspace, one `## Status`
-heading per column, and three lines under each:
+heading per column, and two kinds of line under each:
 
 ```markdown
 ## To do
 
-Owner: agent
-Agent: any
-Next: In progress
+Users: @TestAuthor
+Next: In progress - when the criteria are written
+Next: Blocked - when a decision is needed, and the agent cannot make it
+
+Ready for the team. Anything here is body text.
 ```
 
-`Owner` says whether a person or an agent works the column. `Agent` names one, or
-`any` to use the project's binding. `Next` is where the column leads. The parser
-refuses a document that names an unknown status, omits a column, or leaves a
-`Next` pointing nowhere, because a board that silently drops a column lies about
-where work can go.
+`Users` is the only line about people: `human` (or `you`) for a column a person
+works, an agent's name for a column an agent works, `any` for whichever agent the
+project binds to the column, and a mix when both may act. One line, comma
+separated, `@` optional. A column with no `Users` line belongs to a person, so a
+half-written document never dispatches an agent nobody named.
+
+Each `Next:` is one move and its reason, written `Next: <status> - <when>`. The
+reason may contain commas; only the part before the dash is a status. A column may
+have as many moves as the team needs, including back to itself, and a column with
+no `Next:` is final. The parser refuses a document that names an unknown status,
+omits a column, or leaves a `Next` pointing nowhere, because a board that silently
+drops a column lies about where work can go.
 
 An agent is a role plus its own knowledge: a role prompt, its `AGENTS.md`, and the
 skills attached to it. Skills are workspace knowledge — a convention, a checklist,

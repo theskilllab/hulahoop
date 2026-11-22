@@ -16,12 +16,43 @@ type View = "both" | "md" | "diagram";
 /** One status as this screen edits it, before it is written back into the text. */
 interface Editable {
   owner: "human" | "agent";
+  /** A person is named on the `Users:` line, alongside any agents. */
+  people: boolean;
   agents: string[];
   any: boolean;
   moves: { to: string; when: string }[];
 }
 
-const KEYWORDS = /^(owner|user|users|agent|agents|next|when)\s*:/i;
+const KEYWORDS = /^(users|user|next|when)\s*:/i;
+
+/** Where the caret sits inside a textarea, in the textarea's own coordinates. */
+function caretPoint(area: HTMLTextAreaElement, index: number): { x: number; y: number } {
+  const style = window.getComputedStyle(area);
+  const mirror = document.createElement("div");
+  mirror.style.position = "absolute";
+  mirror.style.visibility = "hidden";
+  mirror.style.whiteSpace = "pre-wrap";
+  mirror.style.width = `${area.clientWidth}px`;
+  mirror.style.fontFamily = style.fontFamily;
+  mirror.style.fontSize = style.fontSize;
+  mirror.style.fontWeight = style.fontWeight;
+  mirror.style.lineHeight = style.lineHeight;
+  mirror.style.letterSpacing = style.letterSpacing;
+  mirror.style.padding = style.padding;
+  mirror.style.border = style.border;
+  mirror.style.boxSizing = style.boxSizing;
+  mirror.textContent = area.value.slice(0, index);
+  const marker = document.createElement("span");
+  marker.textContent = "\u200b";
+  mirror.appendChild(marker);
+  document.body.appendChild(mirror);
+  const point = {
+    x: marker.offsetLeft - area.scrollLeft,
+    y: marker.offsetTop - area.scrollTop + Number.parseFloat(style.lineHeight || "18"),
+  };
+  mirror.remove();
+  return point;
+}
 
 function sectionOf(sections: WorkflowSection[], title: string): WorkflowSection | undefined {
   return sections.find((section) => section.title === title);
@@ -39,13 +70,18 @@ function block(source: string, title: string): { heading: number; start: number;
   return { heading, start: heading + 1, end };
 }
 
-/** What the owner lines for one section look like: one for people, one for agents. */
-function ownerLines(state: Editable): string[] {
-  const agents = state.any ? ["any"] : state.agents;
-  if (state.owner === "human" || agents.length === 0) return ["Owner: human"];
-  // "Agent:" reads as the prototype writes it: one line, names separated by commas,
-  // the first name being the one that picks the status up.
-  return [`Agent: ${agents.map((name) => (name === "any" ? "any" : `@${name}`)).join(", ")}`];
+/**
+ * The `Users:` line: who handles the status, in one sentence. `human` means a
+ * person, a name means that agent, `any` means whichever agent the project binds
+ * to the column. A status with no agents is a person's column.
+ */
+function usersLine(state: Editable): string[] {
+  if (state.any) return ["Users: any"];
+  const names = [
+    ...(state.people ? ["human"] : []),
+    ...state.agents.map((name) => `@${name}`),
+  ];
+  return [`Users: ${names.length ? names.join(", ") : "human"}`];
 }
 
 function nextLines(state: Editable): string[] {
@@ -58,16 +94,20 @@ function apply(source: string, title: string, state: Editable): string {
   const spot = block(source, title);
   if (!spot) return source;
   const lines = source.split("\n");
-  const written = [...ownerLines(state), ...nextLines(state)];
+  const written = [...usersLine(state), ...nextLines(state)];
   return [...lines.slice(0, spot.start), ...written, ...lines.slice(spot.end)].join("\n");
 }
 
+const PEOPLE = new Set(["human", "you", "me", "i", "person", "people", "user", "us"]);
+
 function editable(section: WorkflowSection): Editable {
-  const any = section.agents.some((name) => name.toLowerCase() === "any");
+  const named = section.agents ?? [];
+  const line = section.users ?? [];
   return {
     owner: section.owner === "agent" ? "agent" : "human",
-    agents: section.agents.filter((name) => name.toLowerCase() !== "any"),
-    any: any || (section.owner === "agent" && section.agents.length === 0),
+    people: line.some((entry) => PEOPLE.has(entry.toLowerCase())),
+    agents: named.filter((name) => name.toLowerCase() !== "any"),
+    any: section.anyAgent ?? named.some((name) => name.toLowerCase() === "any"),
     moves: (section.transitions ?? []).map((move) => ({
       to: sectionOfTitle(move.title),
       when: move.when ?? "",
@@ -253,12 +293,6 @@ export default function Workflow({
       message,
     }));
     for (const section of sections) {
-      if (section.owner === "agent" && (section.agents ?? []).length === 0 && !section.anyAgent) {
-        list.push({
-          level: "bad",
-          message: `\`${section.title}\` is worked by an agent, but names none. Write \`Agent: <agent name>\` or \`Agent: any\`.`,
-        });
-      }
       for (const name of section.agents ?? []) {
         if (name.toLowerCase() !== "any" && !names.some((known) => known.toLowerCase() === name.toLowerCase())) {
           list.push({
@@ -305,6 +339,42 @@ export default function Workflow({
       setBusy(false);
     }
   }
+
+  const [mention, setMention] = useState<
+    { start: number; query: string; x: number; y: number; index: number } | null
+  >(null);
+
+  /** `@` at the caret opens the team up: type to filter, arrows and Enter to pick. */
+  function trackMention(value: string, caret: number) {
+    const before = value.slice(0, caret);
+    const match = /(?:^|\s)@([\w -]*)$/.exec(before);
+    if (!match || !area.current) return setMention(null);
+    const point = caretPoint(area.current, caret);
+    setMention({
+      start: caret - match[1].length - 1,
+      query: match[1],
+      x: point.x,
+      y: point.y,
+      index: 0,
+    });
+  }
+
+  function pick(name: string) {
+    if (!mention || !area.current) return;
+    const caret = area.current.selectionStart;
+    const next = `${source.slice(0, mention.start)}@${name} ${source.slice(caret)}`;
+    setMention(null);
+    change(next);
+    requestAnimationFrame(() => {
+      const at = mention.start + name.length + 2;
+      area.current?.focus();
+      area.current?.setSelectionRange(at, at);
+    });
+  }
+
+  const candidates = mention
+    ? names.filter((name) => name.toLowerCase().includes(mention.query.trim().toLowerCase())).slice(0, 8)
+    : [];
 
   const shown = selected ? sectionOf(sections, selected) : undefined;
   const diagram = useMemo(() => layout(sections), [sections]);
@@ -365,14 +435,56 @@ export default function Workflow({
                 </button>
               ) : null}
             </div>
-            <textarea
-              ref={area}
-              className="textarea mono"
-              spellCheck={false}
-              value={source}
-              onChange={(event) => change(event.target.value)}
-              aria-label="WORKFLOWS.md contents"
-            />
+            <div className="wf-edit">
+              <textarea
+                ref={area}
+                className="textarea mono"
+                spellCheck={false}
+                value={source}
+                onChange={(event) => {
+                  change(event.target.value);
+                  trackMention(event.target.value, event.target.selectionStart ?? 0);
+                }}
+                onKeyDown={(event) => {
+                  if (!mention || candidates.length === 0) return;
+                  if (event.key === "ArrowDown") {
+                    event.preventDefault();
+                    setMention({ ...mention, index: (mention.index + 1) % candidates.length });
+                  } else if (event.key === "ArrowUp") {
+                    event.preventDefault();
+                    setMention({
+                      ...mention,
+                      index: (mention.index - 1 + candidates.length) % candidates.length,
+                    });
+                  } else if (event.key === "Enter" || event.key === "Tab") {
+                    event.preventDefault();
+                    pick(candidates[mention.index] ?? candidates[0]);
+                  } else if (event.key === "Escape") {
+                    setMention(null);
+                  }
+                }}
+                onBlur={() => window.setTimeout(() => setMention(null), 120)}
+                aria-label="WORKFLOWS.md contents"
+              />
+              {mention && candidates.length > 0 ? (
+                <ul className="wf-at" style={{ left: mention.x, top: mention.y }} role="listbox">
+                  {candidates.map((name, index) => (
+                    <li key={name}>
+                      <button
+                        type="button"
+                        role="option"
+                        aria-selected={index === mention.index}
+                        className={index === mention.index ? "on" : undefined}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => pick(name)}
+                      >
+                        <Icon name="bot" /> {name}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
           </section>
 
           <section className="wf-out" aria-label="Diagram preview">
@@ -383,13 +495,17 @@ export default function Workflow({
                 onToggle={(label) =>
                   edit(shown.title, (state) => {
                     const any = label === "Any agent" || label === "Any idle agent";
-                    if (state.owner === "human") {
-                      return { ...state, owner: "agent", agents: [], any, moves: state.moves };
+                    if (any) return { ...state, any: !state.any, people: false };
+                    if (label === "You" || label === "human") {
+                      return { ...state, people: !state.people };
                     }
                     const named = state.agents.filter((name) => name.toLowerCase() !== label.toLowerCase());
-                    const next = { ...state, agents: named, any: any ? !state.any : state.any };
-                    const empty = next.agents.length === 0 && !next.any;
-                    return { ...next, owner: empty ? "human" : "agent" };
+                    const has = named.length !== state.agents.length;
+                    return {
+                      ...state,
+                      agents: has ? named : [...state.agents, label],
+                      any: has ? state.any : false,
+                    };
                   })
                 }
                 onMove={(index, patch) =>
@@ -467,10 +583,12 @@ export default function Workflow({
                         </g>
                       ))}
                       {diagram.nodes.map((node) => {
-                        const agent = node.owner === "agent";
+                        const held = sectionOf(sections, node.key);
+                        const agent =
+                          (held?.agents ?? []).length > 0 || Boolean(held?.anyAgent);
                         const final = !(sectionOf(sections, node.key)?.transitions ?? []).length;
                         const sub = agent
-                          ? (node.agents ?? []).join(", ").replace(/@/g, "") || "any agent"
+                          ? (held?.agents ?? []).join(", ").replace(/@/g, "") || "any agent"
                           : "You";
                         return (
                           <g
@@ -589,9 +707,8 @@ export default function Workflow({
 /** Who works a status, as the table prints it. */
 function who(section: WorkflowSection): string {
   const agents = (section.agents ?? []).map((name) => name.replace(/@/g, ""));
-  if (section.owner !== "agent") return "You";
-  if (agents.length === 0) return section.anyAgent ? "Any agent" : "—";
-  return agents.join(", ");
+  if (agents.length > 0) return agents.join(", ");
+  return section.anyAgent ? "Any agent" : "You";
 }
 
 /* ----------------------------------------------------------------- inspector --- */
@@ -616,10 +733,11 @@ function Inspector({
   onClose: () => void;
 }) {
   const state = editable(section);
-  const on = (label: string) =>
-    label === "Any agent" || label === "Any idle agent"
-      ? state.any
-      : state.agents.some((name) => name.toLowerCase() === label.toLowerCase());
+  const on = (label: string) => {
+    if (label === "Any agent" || label === "Any idle agent") return state.any;
+    if (label === "You" || label === "human") return state.people;
+    return state.agents.some((name) => name.toLowerCase() === label.toLowerCase());
+  };
   const chips = ["You", "Any agent", ...names];
 
   return (
