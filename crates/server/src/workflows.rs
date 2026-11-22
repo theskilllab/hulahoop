@@ -156,6 +156,30 @@ impl Engine {
             .and_then(|section| section.transitions.first().map(|m| m.to)))
     }
 
+    /// Where a finished run hands the task over.
+    ///
+    /// A section may list moves back into itself — "the reviewer asks for changes"
+    /// is a move inside `In progress` — so the handover is the first move that
+    /// actually leaves the status, and a self-move only counts when there is
+    /// nothing else.
+    pub async fn workflow_handoff(
+        &self,
+        workspace_id: Uuid,
+        status: IssueStatus,
+    ) -> anyhow::Result<Option<IssueStatus>> {
+        let doc = self.workflow(workspace_id).await?;
+        let parsed = workflow::parse(&doc.source);
+        let Some(section) = parsed.section(status) else {
+            return Ok(None);
+        };
+        Ok(section
+            .transitions
+            .iter()
+            .find(|m| m.to != status)
+            .or_else(|| section.transitions.first())
+            .map(|m| m.to))
+    }
+
     /// The agent name a status dispatches to, when the document names one.
     pub async fn workflow_agent(
         &self,

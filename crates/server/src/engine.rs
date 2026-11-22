@@ -146,21 +146,56 @@ impl Engine {
         self.issue(issue_id).await
     }
 
-    /// Which role works a status. `To do` and `In progress` are the implementer's,
-    /// `In review` the reviewer's; every other status belongs to a person.
-    fn role_for_status(status: IssueStatus) -> Option<AgentRole> {
+    /// Move a task to a status by name.
+    ///
+    /// The state machine only knows the shapes it was born with; a workflow is
+    /// what decides where a task goes next. Everything a transition does besides
+    /// the shape — clearing a block, dispatching whoever owns the new status —
+    /// happens here too, because the workflow is the source of truth.
+    pub async fn move_to(&self, issue_id: Uuid, target: IssueStatus) -> Result<Issue> {
+        let issue = self.issue(issue_id).await?;
+        if issue.status_enum() == target {
+            return Ok(issue);
+        }
+        sqlx::query(
+            "update issues set status = ?, status_before_blocked = null, updated_at = ? where id = ?",
+        )
+        .bind(target.as_str())
+        .bind(Utc::now().to_rfc3339())
+        .bind(issue_id)
+        .execute(&self.db.pool)
+        .await?;
+
+        let issue = self.issue(issue_id).await?;
+        if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+            let _ = self
+                .comment(
+                    issue_id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!("the workflow wants an agent here, but none could start: {error}"),
+                    false,
+                )
+                .await;
+        }
+        self.issue(issue_id).await
+    }
+
+    /// What a run on this status *is*, for the record: a review, or work.
+    ///
+    /// It no longer decides who may run — the workflow names the agent. It only
+    /// tells the engine which shape of completion to expect, because a review
+    /// writes a verdict and work opens a pull request.
+    fn role_for_status(status: IssueStatus) -> AgentRole {
         match status {
-            IssueStatus::Todo | IssueStatus::InProgress => Some(AgentRole::Implementer),
-            IssueStatus::InReview => Some(AgentRole::Reviewer),
-            _ => None,
+            IssueStatus::InReview => AgentRole::Reviewer,
+            _ => AgentRole::Implementer,
         }
     }
 
     /// Start a run when the workflow says an agent owns this status.
     async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
-        let Some(role) = Self::role_for_status(issue.status_enum()) else {
-            return Ok(());
-        };
+        let role = Self::role_for_status(issue.status_enum());
         if issue.status_enum() == IssueStatus::Blocked || issue.project_id.is_none() {
             return Ok(());
         }
@@ -758,21 +793,11 @@ impl Engine {
             .fetch_one(&self.db.pool)
             .await?;
 
+        // The workflow decides who works a status. When it names an agent, that
+        // agent runs — the role bindings are only the fallback for `Any agent`,
+        // which is the case below where nobody was named.
         let agent_id = match agent_id {
-            Some(id) => {
-                let bound = self.agent_role_binding(project_id, role).await?;
-                if bound != Some(id) {
-                    let bound_name = match bound {
-                        Some(other) => other.to_string(),
-                        None => "none".to_string(),
-                    };
-                    bail!(
-                        "agent {id} is not bound to the {} role in this project (bound: {bound_name}). Assign it on the project screen first.",
-                        role.as_str()
-                    );
-                }
-                id
-            }
+            Some(id) => id,
             None => self
                 .agent_role_binding(project_id, role)
                 .await?
@@ -1256,14 +1281,32 @@ impl Engine {
                     .bind(run_id)
                     .execute(&self.db.pool)
                     .await?;
-                self.transition(run.issue_id, IssueEvent::Submit).await?;
-                self.queue_job(
-                    issue.repo_id,
-                    Some(issue.id),
-                    "open_pr",
-                    serde_json::json!({ "run_id": run_id }),
-                )
-                .await?;
+                // Where the work goes next is the document's decision, not a
+                // constant in here: take the status's first move. A move into
+                // review is what earns a pull request — everything else is just
+                // the next step of the flow, and the run that lands there is the
+                // one a reviewer will be shown.
+                let target = self
+                    .workflow_handoff(issue.workspace_id, issue.status_enum())
+                    .await?
+                    .unwrap_or(IssueStatus::InReview);
+                if target == IssueStatus::InReview {
+                    sqlx::query("update issues set current_run_id = ? where id = ?")
+                        .bind(run.id)
+                        .bind(issue.id)
+                        .execute(&self.db.pool)
+                        .await?;
+                }
+                let issue = self.move_to(run.issue_id, target).await?;
+                if issue.status_enum() == IssueStatus::InReview {
+                    self.queue_job(
+                        issue.repo_id,
+                        Some(issue.id),
+                        "open_pr",
+                        serde_json::json!({ "run_id": run_id }),
+                    )
+                    .await?;
+                }
             }
             (AgentRole::Implementer, _) => {
                 // A failed attempt leaves the task where it is so the human, or a
