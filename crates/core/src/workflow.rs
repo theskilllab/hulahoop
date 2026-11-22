@@ -132,6 +132,20 @@ fn strip_reason(token: &str) -> &str {
     token[..cut].trim()
 }
 
+/// The sentence after ` - ` on a `Next:` line, when there is one.
+fn reason_in(token: &str) -> Option<String> {
+    let lower = token.to_lowercase();
+    for marker in [" - ", " — ", " – "] {
+        if let Some(at) = lower.find(marker) {
+            let reason = token[at + marker.len()..].trim();
+            if !reason.is_empty() {
+                return Some(reason.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Parse `WORKFLOWS.md`.
 ///
 /// The format is deliberately plain: `## To do` starts a section, and the three
@@ -255,6 +269,13 @@ pub fn parse(source: &str) -> Workflow {
             // inline (`Next: To do - when it is ready`). Only the names are read.
             for token in names_in(value) {
                 let name = strip_reason(&token);
+                // `Next: To do - when it is ready` says the move *and* its reason.
+                // The reason belongs on `When:`, which is what the arrow shows.
+                if section.when.is_none() {
+                    if let Some(reason) = reason_in(&token) {
+                        section.when = Some(reason);
+                    }
+                }
                 match status_by_title(name) {
                     Some(next) => {
                         if !section.next.contains(&next) {
