@@ -115,7 +115,7 @@ main() {
   local first
   first="$(head -1 "$WORK/agents")"
   echo "bindings: $(gql 'mutation ($p: UUID!, $b: [RoleBinding!]!) { setProjectAgents(projectId: $p, bindings: $b) { role agentId } }' \
-    "{\"p\":\"$project\",\"b\":[{\"role\":\"implementer\",\"agentId\":\"$first\"},{\"role\":\"reviewer\",\"agentId\":\"$first\"}]}" | jq -c '.data.setProjectAgents // .errors')"
+    "{\"p\":\"$project\",\"b\":[{\"role\":\"worker\",\"agentId\":\"$first\"},{\"role\":\"reviewer\",\"agentId\":\"$first\"}]}" | jq -c '.data.setProjectAgents // .errors')"
 
   local issue
   issue="$(gql 'mutation ($w: UUID!, $p: UUID!, $r: UUID!) { createIssue(workspaceId: $w, projectId: $p, repoId: $r, title: "subtract two numbers", body: "add subtract", criteria: ["subtract(5, 3) returns 2"]) { id status } }' \

@@ -1019,7 +1019,10 @@ impl Engine {
     /// them.
     pub async fn bound_agent(&self, project_id: Uuid) -> Result<Option<Uuid>> {
         let row: Option<(Uuid,)> = sqlx::query_as(
-            "select agent_id from project_agents where project_id = ? order by role limit 1",
+            // A status that names nobody is asking for work, so the worker comes
+            // first; a reviewer is reached by name or not at all.
+            "select agent_id from project_agents where project_id = ? \
+             order by case role when 'worker' then 0 else 1 end limit 1",
         )
         .bind(project_id)
         .fetch_optional(&self.db.pool)
