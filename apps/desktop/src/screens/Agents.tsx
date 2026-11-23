@@ -57,6 +57,7 @@ export default function Agents({
   repoId,
   projectId,
   onChanged,
+  onOpenSkills,
 }: {
   workspaceId: string;
   agents: Agent[];
@@ -65,6 +66,7 @@ export default function Agents({
   repoId: string | null;
   projectId: string | null;
   onChanged: () => Promise<void>;
+  onOpenSkills: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(agents[0]?.id ?? null);
   const [connections, setConnections] = useState<Connection[]>([]);
@@ -314,6 +316,7 @@ export default function Agents({
           agent={editing === "new" ? null : (agents.find((entry) => entry.id === editing) ?? null)}
           skills={skills}
           connected={connected}
+          onOpenSkills={onOpenSkills}
           onClose={() => setEditing(null)}
           onError={setError}
           onSaved={async (id) => {
@@ -333,6 +336,7 @@ function AgentDialog({
   agent,
   skills,
   connected,
+  onOpenSkills,
   onClose,
   onSaved,
   onError,
@@ -341,6 +345,7 @@ function AgentDialog({
   agent: Agent | null;
   skills: Skill[];
   connected: (harness: string) => boolean;
+  onOpenSkills: () => void;
   onClose: () => void;
   onSaved: (id: string | null) => Promise<void>;
   onError: (message: string | null) => void;
@@ -538,11 +543,20 @@ function AgentDialog({
             ariaLabel="AGENTS.md"
           />
         </label>
-        <p className="dim small">Read on every run, before the skills. Keep it short: how this agent works.</p>
+        <p className="dim small">
+          Read on every run, after the run contract and before the skills. This is where an
+          agent that plans differs from one that implements.
+        </p>
 
         <div className="skills-pick">
           {skills.length === 0 ? (
-            <p className="dim small">No skills in this workspace yet. Create one on the Skills screen.</p>
+            <p className="dim small">
+              No skills in this workspace yet.{" "}
+              <button type="button" className="link" onClick={onOpenSkills}>
+                Write the first one
+              </button>
+              .
+            </p>
           ) : (
             skills.map((skill) => {
               const on = picked.includes(skill.id);

@@ -83,12 +83,17 @@ pub fn invocation(
     Ok(Invocation { program, args })
 }
 
-/// The message the agent receives. Everything it must know is in `input.json`,
-/// so the message stays short and the prompt file carries the role.
-pub fn message_for(role: hulahoop_core::AgentRole, input_path: &Path, checkout: &Path) -> String {
+/// The message the agent receives. Everything it must know is in `input.json`
+/// and in the instructions it was started with, so the message only says where to
+/// look and how to end the turn.
+pub fn message_for(agent_name: &str, input_path: &Path, checkout: &Path) -> String {
+    let who = if agent_name.trim().is_empty() {
+        "one task"
+    } else {
+        agent_name.trim()
+    };
     format!(
-        "You are the {} for one issue.\n\nRead {} first; it carries the issue, the criteria, the replay rows, and the limits.\nWork in the checkout at {}.\n\nWhen you are done, end your final message with the verdict line the prompt file asks for.",
-        role.as_str(),
+        "You are {who} for one task.\n\nRead {} first; it carries the task, the criteria, the parent turn, and the limits.\nWork in the checkout at {}.\n\nWhen you are done, end your final message with the line your instructions ask for.",
         input_path.display(),
         checkout.display(),
     )

@@ -71,7 +71,10 @@ pub struct Skill {
     pub workspace_id: Uuid,
     pub name: String,
     pub description: String,
+    /// The whole `SKILL.md`, front matter included.
     pub source: String,
+    /// 1 for the skills a workspace is born with. They are read, never edited.
+    pub builtin: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -251,7 +254,8 @@ impl Run {
     }
 
     pub fn role_enum(&self) -> hulahoop_core::AgentRole {
-        hulahoop_core::AgentRole::parse(&self.role).unwrap_or(hulahoop_core::AgentRole::Implementer)
+        hulahoop_core::AgentRole::from_stored(&self.role)
+            .unwrap_or(hulahoop_core::AgentRole::Worker)
     }
 
     pub fn flags_enum(&self) -> Vec<hulahoop_core::RunFlag> {
@@ -400,4 +404,13 @@ pub struct Artifact {
     pub size: i64,
     pub sha256: String,
     pub created_at: DateTime<Utc>,
+}
+
+/// Which agents carry one skill. The library shows this so a person can see where
+/// a piece of knowledge is already loaded before writing another.
+#[derive(async_graphql::SimpleObject, Clone)]
+pub struct SkillUsage {
+    pub skill_id: Uuid,
+    pub agent_ids: Vec<Uuid>,
+    pub agent_names: Vec<String>,
 }

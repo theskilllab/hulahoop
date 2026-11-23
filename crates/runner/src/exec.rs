@@ -4,7 +4,7 @@ use crate::adapter;
 use crate::client::Client;
 use crate::vcs::{Kind, Vcs};
 use anyhow::{anyhow, bail, Context, Result};
-use hulahoop_core::{contract, Adapter, AgentRole};
+use hulahoop_core::{contract, slugify, Adapter, AgentRole};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -85,7 +85,7 @@ impl Executor {
     }
 
     async fn execute_run(&self, run_id: &str, spec: &Value) -> Result<()> {
-        let role = AgentRole::parse(spec["role"].as_str().unwrap_or_default())
+        let role = AgentRole::from_stored(spec["role"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown role in spec"))?;
         let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
@@ -148,7 +148,9 @@ impl Executor {
         }
 
         let env = agent_env(spec, &checkout, &self.data_dir)?;
-        let message = adapter::message_for(role, &input_path, &checkout);
+        self.write_skills(spec, &checkout)?;
+        let agent_name = spec["agent_name"].as_str().unwrap_or_default();
+        let message = adapter::message_for(agent_name, &input_path, &checkout);
 
         // Every adapter goes through the same spawn path, the fake one included:
         // a test that does not exercise the real plumbing proves nothing about it.
@@ -179,13 +181,8 @@ impl Executor {
                     .collect()
             })
             .unwrap_or_default();
-        // A Test Author is the one role that writes tests, so it is exempt.
         let mut restored = Vec::new();
-        let before = if role == AgentRole::TestAuthor {
-            Vec::new()
-        } else {
-            vcs.changed_paths(&checkout, &base).unwrap_or_default()
-        };
+        let before = vcs.changed_paths(&checkout, &base).unwrap_or_default();
         for path in &frozen {
             if before.contains(path) {
                 vcs.restore_from(&checkout, &base, std::slice::from_ref(path))?;
@@ -223,26 +220,29 @@ impl Executor {
                     author_name
                 )
             })?;
+        // Did this turn change anything? A turn that read, answered and left the
+        // checkout alone produced no commit, so it publishes no head: the next turn
+        // in line still starts from the last head that carried a change.
+        let changed = !vcs
+            .changed_paths(&checkout, &base)
+            .unwrap_or_default()
+            .is_empty();
         // A commit with no message cannot be pushed and reads as noise in `jj log`.
-        // The role says who, the issue says what.
-        if role != AgentRole::Reviewer {
-            let prefix = match role {
-                AgentRole::TestAuthor => "tests",
-                _ => "implement",
-            };
+        // The author says who, the issue says what.
+        if changed {
             let title = spec["issue"]["title"].as_str().unwrap_or("the issue");
             vcs.describe_as(
                 &checkout,
-                &format!("{prefix}: {title}"),
+                &format!("implement: {title}"),
                 &author_name,
                 &author_email,
             )
-            .with_context(|| format!("describing the {prefix} commit"))?;
+            .with_context(|| "describing the commit")?;
         }
         // The suite the gate freezes has to be formatted, or every head built on it
         // fails `fmt-check` in CI and no agent may touch the frozen file to fix it.
         // The loop formats what it is about to freeze.
-        if role != AgentRole::Reviewer {
+        {
             let frozen: Vec<String> = spec["frozen_paths"]
                 .as_array()
                 .map(|paths| {
@@ -266,18 +266,12 @@ impl Executor {
 
         // The bookmark the server will resolve later. It is created here because
         // only the checkout knows the commit id.
-        let published: Vec<String> = match role {
-            AgentRole::TestAuthor => {
-                let name = format!("tests/{issue_id}/cand/{run_id}");
-                let _ = vcs.set_bookmark_here(&checkout, &name);
-                vec![name]
-            }
-            AgentRole::Implementer => {
-                let name = format!("issue/{issue_id}/head/{attempt}");
-                let _ = vcs.set_bookmark_here(&checkout, &name);
-                vec![name]
-            }
-            AgentRole::Reviewer => Vec::new(),
+        let published: Vec<String> = if changed {
+            let name = format!("issue/{issue_id}/head/{attempt}");
+            let _ = vcs.set_bookmark_here(&checkout, &name);
+            vec![name]
+        } else {
+            Vec::new()
         };
         // A workspace shares the loop's repository, so the bookmark set above is
         // already visible to the replay that has to prove the work; nothing to push.
@@ -302,7 +296,7 @@ impl Executor {
                     "error": outcome.error,
                     "diff": diff,
                     "changed_paths": changed_paths,
-                    "commit": commit,
+                    "commit": if changed { Some(commit) } else { None },
                     "question": outcome.question,
                     "verdict": outcome.verdict,
                     "body": outcome.final_text,
@@ -559,6 +553,16 @@ impl Executor {
         let vcs = Vcs::detect(repo_path)?;
         let resolved = vcs.set_bookmark(name, revision)?;
         Ok(json!({ "revision": resolved }))
+    }
+
+    /// Write the agent's skills into the checkout, where the harness can open the
+    /// one its description calls for.
+    ///
+    /// They live under `.hulahoop/`, which every repository the loop works in
+    /// ignores: a file the agent was given to read is not part of the change it is
+    /// making, so it must not show up in the diff, in the commit, or in a review.
+    fn write_skills(&self, spec: &Value, checkout: &Path) -> Result<()> {
+        write_skills(spec, checkout)
     }
 
     /// `just setup` is the only recipe allowed to need the network, and it is
@@ -913,7 +917,7 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     // identity from the environment, so the agent commits under the role's name
     // even where the runner's own identity is the machine's.
     let agent_name = spec["commit_agent_name"].as_str();
-    if let Some(role) = AgentRole::parse(role) {
+    if let Some(role) = AgentRole::from_stored(role) {
         env.push((
             "JJ_USER".into(),
             role.app_commit_name_for(spec["commit_app_slug"].as_str(), agent_name),
@@ -1949,6 +1953,67 @@ async fn open_pull_request(http: &reqwest::Client, pull: PullRequest<'_>) -> Res
         .to_string();
     let number = answer["number"].as_i64().unwrap_or_default();
     Ok((url, number))
+}
+
+/// Write the agent's skills into the checkout, where the harness can open the one
+/// its description calls for.
+///
+/// They live under `.hulahoop/`, which every repository the loop works in ignores:
+/// a file the agent was given to read is not part of the change it is making, so it
+/// must not show up in the diff, in the commit, or in a review.
+fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
+    let Some(skills) = spec["skills"].as_array() else {
+        return Ok(());
+    };
+    for skill in skills {
+        let name = skill["name"].as_str().unwrap_or_default().trim();
+        let body = skill["body"].as_str().unwrap_or_default();
+        if name.is_empty() || body.trim().is_empty() {
+            continue;
+        }
+        let dir = checkout
+            .join(".hulahoop")
+            .join("skills")
+            .join(slugify(name));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("SKILL.md"), body)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod write_skills_tests {
+    use super::write_skills;
+
+    /// The prompt names a skill by its path, so the file has to land exactly
+    /// there: a slug rule that differs between server and runner sends the agent
+    /// to a file that does not exist.
+    #[test]
+    fn a_skill_lands_where_the_prompt_says_it_does() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-skills-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("checkout");
+        let spec = serde_json::json!({ "skills": [
+            { "name": "House Style", "description": "how we write", "body": "# House Style\nUse sentences." },
+            { "name": "", "description": "no name", "body": "ignored" },
+        ]});
+        write_skills(&spec, &dir).expect("write skills");
+        let path = dir.join(".hulahoop/skills/house-style/SKILL.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("skill file"),
+            "# House Style\nUse sentences."
+        );
+        assert!(dir.join(".hulahoop/skills").read_dir().unwrap().count() == 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_agent_with_no_skills_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-no-skills-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).expect("checkout");
+        write_skills(&serde_json::json!({}), &dir).expect("no skills");
+        assert!(!dir.join(".hulahoop").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[cfg(test)]

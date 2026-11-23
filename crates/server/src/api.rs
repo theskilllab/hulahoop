@@ -8,10 +8,10 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use hulahoop_core::junit;
 use hulahoop_core::runspec::{
     CheckoutInput, CriterionInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
 };
-use hulahoop_core::{junit, AgentRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -491,10 +491,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             "files": credential.files,
         })
     };
-    let github_token = match run.role_enum() {
-        AgentRole::Implementer => engine.github_token().await?,
-        AgentRole::TestAuthor | AgentRole::Reviewer => None,
-    };
+    // Committing is the app's act, so every turn gets the app's token: a turn that
+    // changed nothing pushes nothing, and nothing else may decide that in advance.
+    let github_token = engine.github_token().await?;
 
     let replays: Vec<Replay> =
         sqlx::query_as("select * from replays where issue_id = ? order by created_at desc limit 4")
@@ -516,6 +515,8 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             }
         })
         .collect();
+
+    let skills = engine.skill_inputs(agent.id).await?;
 
     let spec = RunSpec {
         run_id: run.id,
@@ -549,13 +550,14 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         blocked_answer,
         replays: replay_inputs,
         limits: Limits::default(),
+        skills,
     }
     .truncate_text();
 
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    let prompt = engine.compose_prompt(run.role_enum(), &agent).await?;
+    let prompt = engine.compose_prompt(&agent).await?;
     std::fs::write(&prompt_path, &prompt)?;
 
     Ok(json!({
@@ -565,6 +567,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "role": run.role_enum().as_str(),
         "adapter": agent.adapter,
         "model": agent.model,
+        "agent_name": agent.name,
         "prompt": prompt,
         "prompt_path": prompt_path,
         "input_path": input_path,

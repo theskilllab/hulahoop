@@ -147,34 +147,42 @@ string_enum!(ReplayStatus {
     TimedOut => "timed_out",
 });
 
+// What the server does with a finished run. The old pipeline had three roles
+// because it had three stages. A team named in the workflow does not work that
+// way: an architect, a test author and a developer are all people the task
+// passes through, and the server treats each of their turns the same way —
+// record the work, advance the task. Only a review turn is different, because
+// its result is a verdict rather than a work product.
 string_enum!(AgentRole {
-    TestAuthor => "test_author",
-    Implementer => "implementer",
+    Worker => "worker",
     Reviewer => "reviewer",
 });
 
 impl AgentRole {
-    pub const ALL: [AgentRole; 3] = [
-        AgentRole::TestAuthor,
-        AgentRole::Implementer,
-        AgentRole::Reviewer,
-    ];
+    pub const ALL: [AgentRole; 2] = [AgentRole::Worker, AgentRole::Reviewer];
+
+    /// A role read back from a row. Turns recorded before the enum shrank still
+    /// name the stage they ran in; all of them were workers.
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "test_author" | "implementer" => Some(AgentRole::Worker),
+            other => AgentRole::parse(other),
+        }
+    }
 
     /// The author name a commit made by this role carries. One name per role is
     /// what makes "who wrote this" answerable from `jj log` alone, and the
     /// `.invalid` domain keeps the address obviously non-routable.
     pub fn commit_name(self) -> &'static str {
         match self {
-            AgentRole::TestAuthor => "hulahoop-test-author",
-            AgentRole::Implementer => "hulahoop-implementer",
+            AgentRole::Worker => "hulahoop-worker",
             AgentRole::Reviewer => "hulahoop-reviewer",
         }
     }
 
     pub fn commit_email(self) -> &'static str {
         match self {
-            AgentRole::TestAuthor => "hulahoop-test-author@hulahoop.invalid",
-            AgentRole::Implementer => "hulahoop-implementer@hulahoop.invalid",
+            AgentRole::Worker => "hulahoop-worker@hulahoop.invalid",
             AgentRole::Reviewer => "hulahoop-reviewer@hulahoop.invalid",
         }
     }
@@ -182,8 +190,7 @@ impl AgentRole {
     /// The role's half of a name, so one app can still write as three roles.
     pub fn name_suffix(self) -> &'static str {
         match self {
-            AgentRole::TestAuthor => "test-author",
-            AgentRole::Implementer => "implementer",
+            AgentRole::Worker => "worker",
             AgentRole::Reviewer => "reviewer",
         }
     }
@@ -464,7 +471,7 @@ mod identity_tests {
 
     #[test]
     fn the_commit_is_named_after_the_agent_not_the_role() {
-        let role = AgentRole::Implementer;
+        let role = AgentRole::Worker;
         assert_eq!(
             role.app_commit_name_for(Some("hulahoop-dev"), Some("Test Author")),
             "hulahoop-dev-test-author"

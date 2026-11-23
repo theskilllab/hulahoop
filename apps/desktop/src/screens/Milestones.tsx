@@ -78,7 +78,7 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
     <section className="screen page">
       <PageHeader
         title="Milestones"
-        subtitle="A name for a body of work. Issues point at one; nothing about the loop depends on it."
+        subtitle={`${milestones.filter((entry) => entry.status !== "done").length} open`}
         actions={
           <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
             {creating ? "Cancel" : "New milestone"}

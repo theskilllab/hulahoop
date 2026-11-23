@@ -24,6 +24,7 @@ export default function RichText({
   minHeight = 120,
   ariaLabel,
   autoFocus = false,
+  editable = true,
   extensions = [],
 }: {
   /** Markdown in. */
@@ -34,6 +35,9 @@ export default function RichText({
   minHeight?: number;
   ariaLabel?: string;
   autoFocus?: boolean;
+  /** Read-only renders the same formatted text: viewing a document is not a
+   *  different screen from writing it, only the same one with the caret off. */
+  editable?: boolean;
   /** Extra nodes this field needs, e.g. the workflow's metadata lines. */
   extensions?: Extensions;
 }) {
@@ -50,6 +54,7 @@ export default function RichText({
     ],
     content: value,
     autofocus: autoFocus,
+    editable,
     editorProps: {
       attributes: {
         class: "richtext-prose",
@@ -69,6 +74,12 @@ export default function RichText({
 
   // A value from outside (a reload, another record) replaces the document; a
   // value that is just our own last emission is left alone.
+  // `useEditor` reads `editable` once, so a card that opens for editing has to
+  // flip it here.
+  useEffect(() => {
+    editor?.setEditable(editable);
+  }, [editor, editable]);
+
   useEffect(() => {
     if (!editor) return;
     if (value === emitted.current) return;

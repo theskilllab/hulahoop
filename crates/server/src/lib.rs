@@ -75,6 +75,14 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
     // The token lives with the data, so restarting the server — a rebuild, a crash, a
     // laptop that woke up — does not sign every client out of its own workspace.
     let engine = Arc::new(engine::Engine::new(database));
+    // Every workspace reads the same contract, and an agent created before it
+    // existed still has to have it. Startup is the one place that sees them all.
+    let workspaces: Vec<(uuid::Uuid,)> = sqlx::query_as("select id from workspaces")
+        .fetch_all(&engine.db.pool)
+        .await?;
+    for (id,) in workspaces {
+        engine.seed_builtin_skills(id).await?;
+    }
     let token = match stored_token(&engine).await? {
         Some(token) => token,
         None => {

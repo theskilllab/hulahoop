@@ -224,6 +224,15 @@ impl Query {
     }
 
     /// The workspace's reusable knowledge.
+    /// Where each of the workspace's skills is loaded.
+    async fn skill_usage(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<crate::model::SkillUsage>> {
+        Ok(engine(ctx).skill_usage(workspace_id).await?)
+    }
+
     async fn skills(
         &self,
         ctx: &Context<'_>,
@@ -779,6 +788,8 @@ impl Mutation {
         .bind(&now)
         .execute(&engine(ctx).db.pool)
         .await?;
+        // A new agent reads the workspace's built-in skills from its first turn.
+        let _ = engine(ctx).seed_builtin_skills(workspace_id).await;
         // Probe straight away: an agent that has never been used should not make
         // the first task that names it wait for a probe.
         let _ = engine(ctx).probe_everywhere(id).await;
@@ -1137,18 +1148,18 @@ impl Mutation {
         .await?)
     }
 
+    /// Start a turn on a task. `agentId` names who works it; without one the
+    /// workflow's queue decides, and only a workflow naming `Any agent` falls back
+    /// to the project's bindings.
     async fn start_run(
         &self,
         ctx: &Context<'_>,
         issue_id: Uuid,
         agent_id: Option<Uuid>,
-        role: String,
         parent_run_id: Option<Uuid>,
     ) -> async_graphql::Result<Run> {
-        let role = AgentRole::parse(&role)
-            .ok_or_else(|| async_graphql::Error::new(format!("unknown role {role}")))?;
         Ok(engine(ctx)
-            .start_run(issue_id, agent_id, role, parent_run_id)
+            .start_run(issue_id, agent_id, parent_run_id)
             .await?)
     }
 

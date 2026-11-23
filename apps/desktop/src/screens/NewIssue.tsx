@@ -118,7 +118,7 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
 
   return (
     <section className="detail narrow">
-      <PageHeader subtitle="A title, and the behaviour you want to be true when it works." title="New issue" />
+      <PageHeader title="New issue" subtitle={project ? project.name : "no project"} />
       {error && <p className="error">{error}</p>}
       <label>
         Project
