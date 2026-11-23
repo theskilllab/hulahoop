@@ -474,7 +474,7 @@ The server owns every transition. A mutation or a run completion event fires it;
 | `in_progress` | implementer run fails | `runs.error` records why; the issue stays put so the human can start another attempt | `in_progress` |
 | `in_review` | `startRun(agentId)` | `current_run_id` set and that run has a head bookmark | `in_review` |
 | `in_review` | reviewer verdict `changes_requested` | review row written, body quotes the failing tests | `in_progress` |
-| `in_review` | reviewer verdict `approved` | review row written, the approval still needs a human | `in_review` |
+| `in_review` | reviewer verdict `approved` | review row written, `open_pr` queued for the newest run that published a head, the approval still needs a human | `in_review` |
 | `in_review` | `requestChanges(body)` | human, comment recorded | `in_progress` |
 | `in_review` | `approveIssue(runId, reviewedHead, diffSha, acknowledgeFlags)` | `runId` is `current_run_id`, that run has an `approved` review, head and diff match it, every flag acknowledged | `merging` |
 | `merging` | landing replay turns red or times out | failing test names in the replay report, the approval is voided | `in_progress` |
@@ -488,7 +488,7 @@ The server owns every transition. A mutation or a run completion event fires it;
 
 Two events can arrive for one run, so precedence is explicit: a run whose final message is a question fires the `blocked` row and does **not** fire the completion row, because "completes" in that table means a run that finished without a question. A base replay queued before a block still lands while the issue is `blocked` and leaves it `blocked`.
 
-The Reviewer works while the issue sits in `in_review`, so its own row leaves the status alone until a verdict lands; an `approved` verdict still waits for the human, which is what the independence in §3 buys. An agent asks a question by ending its run with that question, so `blocked` never holds a live process: the run completes, `pinned_comment_id` points at the question, and the next run's prompt carries the human's answer. A question asked while the issue is already blocked leaves `status_before_blocked` alone, so `resumeIssue` cannot land back on `blocked`.
+The Reviewer works while the issue sits in `in_review`, so its own row leaves the status alone until a verdict lands; an `approved` verdict still waits for the human, which is what the independence in §3 buys. An approving verdict opens the pull request at once, naming the newest turn that published a head, so the work sits on GitHub before the person reads the verdict; a reviewer's own turn publishes no head, and naming one asks the runner to push a branch that does not exist. An agent asks a question by ending its run with that question, so `blocked` never holds a live process: the run completes, `pinned_comment_id` points at the question, and the next run's prompt carries the human's answer. A question asked while the issue is already blocked leaves `status_before_blocked` alone, so `resumeIssue` cannot land back on `blocked`.
 
 The rework loop is the same `startRun` reached from `in_progress` with `parentRunId`, which is why a rejected diff, a changes-requested verdict, and a red landing replay all converge on `in_progress` instead of forking into their own states.
 

@@ -16,6 +16,16 @@ mkdir -p "$REPO" "$DATA"
 echo "work dir: $WORK"
 
 CONN="$DATA/connection.json"
+# Reads the server's own tables. The dev shell carries sqlite3 and prints a banner,
+# so the banner is dropped rather than shown inside a value.
+sql() {
+  if command -v sqlite3 >/dev/null 2>&1; then
+    sqlite3 "$DATA/hulahoop.sqlite" "$1"
+  else
+    nix develop --command sqlite3 "$DATA/hulahoop.sqlite" "$1" 2>/dev/null \
+      | sed '/^hulahoop dev shell:/d'
+  fi
+}
 port() { jq -r .port "$CONN"; }
 token() { jq -r .token "$CONN"; }
 gql() {
@@ -215,6 +225,20 @@ DOC
     *) echo "the review has no head revision: '$head'" >&2; return 1 ;;
   esac
   echo "head $head"
+
+  # The pull request names a turn that published a head. A reviewer publishes
+  # none, and naming one asks the runner to push a branch that does not exist.
+  local pr_run pr_head
+  pr_run="$(sql "select json_extract(payload, '$.run_id') from runner_jobs where kind = 'open_pr' order by created_at desc limit 1;")"
+  case "${#pr_run}" in
+    36) ;;
+    *) echo "no pull request was asked for: '$pr_run'" >&2; return 1 ;;
+  esac
+  pr_head="$(sql "select coalesce(head_bookmark, '') from runs where lower(hex(id)) = lower(replace('$pr_run', '-', ''));")"
+  case "$pr_head" in
+    ?*) echo "pull request from run $pr_run at $pr_head" ;;
+    *) echo "the pull request names a turn with no head: '$pr_run'" >&2; return 1 ;;
+  esac
 
   gql 'mutation ($id: UUID!) { mergeIssue(issueId: $id) { status } }' "{\"id\":\"$issue\"}" | jq -c '.data.mergeIssue.status'
   wait_status "$issue" "done" 60
