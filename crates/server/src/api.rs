@@ -593,6 +593,10 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         .collect();
 
     let skills = engine.skill_inputs(agent.id).await?;
+    // The runner writes these into the checkout before the agent starts; a skill
+    // that only exists inside input.json is advertised in the prompt but absent
+    // from the path the prompt names.
+    let skill_files = serde_json::to_value(&skills)?;
 
     let spec = RunSpec {
         run_id: run.id,
@@ -664,6 +668,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "credential": credential,
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
+        "skills": skill_files,
         // The connector, opened server-side, travels only on this authenticated
         // channel: the runner needs it to act, the desktop never sees it.
         "caller_role": "run",
@@ -872,4 +877,82 @@ async fn artifact_bytes(
         headers.insert(header::CONTENT_DISPOSITION, value);
     }
     response
+}
+
+#[cfg(test)]
+mod claim_spec_tests {
+    use super::build_run_spec;
+    use crate::db::Db;
+    use crate::engine::Engine;
+    use crate::model::Run;
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    /// The runner writes skill files from the claim spec, not from input.json:
+    /// a skill missing there is advertised in the prompt but absent on disk.
+    #[tokio::test]
+    async fn claim_spec_carries_the_agent_skills() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-claim-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, agent, issue, run_id) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Claim',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'CLM-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo)
+            .bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("claim-artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,?,?,1,'main','prompt',?,'running','model-x',?)")
+            .bind(run_id).bind(issue).bind(repo).bind(agent)
+            .bind(artifacts.to_string_lossy().to_string()).bind(now)
+            .execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        let skill = engine
+            .create_skill(
+                workspace,
+                "hulahoop-context",
+                "Read at the start of every run.",
+                "# Hulahoop context\nThe product's objects, explained.",
+            )
+            .await
+            .unwrap();
+        engine.set_agent_skills(agent, &[skill.id]).await.unwrap();
+
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        let spec = build_run_spec(&engine, &run).await.unwrap();
+
+        let skills = spec["skills"].as_array().expect("claim spec names skills");
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0]["name"], "hulahoop-context");
+        assert!(skills[0]["body"]
+            .as_str()
+            .unwrap()
+            .contains("Hulahoop context"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }

@@ -67,8 +67,8 @@ export default function ProjectManager({ workspace, project, onChanged, onClose 
       </div>
       <p className="dim small">A project owns its task prefix and repositories. The first repository is used for runs.</p>
       <div className="grid-2">
-        <label><span>Project name</span><input ref={nameInput} value={name} onChange={(event) => setName(event.target.value)} /></label>
-        <label><span>Task prefix</span><input maxLength={5} value={prefix}
+        <label><span>Project name</span><input type="text" ref={nameInput} value={name} onChange={(event) => setName(event.target.value)} /></label>
+        <label><span>Task prefix</span><input type="text" maxLength={5} value={prefix}
           onChange={(event) => setPrefix(event.target.value.toUpperCase())} /></label>
       </div>
       {project ? (
@@ -115,7 +115,7 @@ export default function ProjectManager({ workspace, project, onChanged, onClose 
           </div>}
           {githubError && <p className="dim small">{githubError}</p>}
           <div className="row">
-            <input aria-label="Local repository path" placeholder="/absolute/path/to/repo"
+            <input type="text" aria-label="Local repository path" placeholder="/absolute/path/to/repo"
               value={repoPath} onChange={(event) => setRepoPath(event.target.value)} />
             <button disabled={busy || repoPath.trim().length < 2} onClick={() => void action(async () => {
               await gql(
@@ -127,7 +127,7 @@ export default function ProjectManager({ workspace, project, onChanged, onClose 
           </div>
           {project.repos[0] && <div className="row">
             <label><span>Base bookmark · {project.repos[0].name}</span>
-              <input value={base} onChange={(event) => setBase(event.target.value)} /></label>
+              <input type="text" value={base} onChange={(event) => setBase(event.target.value)} /></label>
             <button disabled={busy || !base.trim()} onClick={() => void action(() => gql(
               `mutation ($id: UUID!, $bookmark: String!) { updateRepo(id: $id, baseBookmark: $bookmark) { id } }`,
               { id: project.repos[0].id, bookmark: base.trim() },

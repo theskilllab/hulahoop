@@ -349,11 +349,12 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
               <>
                 <div className="field">
                   <span className="field-label">Name</span>
-                  <input value={skill.name} onChange={(event) => edit({ name: event.target.value })} />
+                  <input type="text" value={skill.name} onChange={(event) => edit({ name: event.target.value })} />
                 </div>
                 <div className="field">
-                  <span className="field-label">When is it loaded</span>
+                  <span className="field-label">Description</span>
                   <input
+                    type="text"
                     placeholder="one line: the task it fits"
                     value={skill.description}
                     onChange={(event) => edit({ description: event.target.value })}
