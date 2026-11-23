@@ -1912,6 +1912,25 @@ impl Engine {
                     }
                 }
             }
+            "open_pr" => {
+                // The pull request exists on GitHub's side, so its number comes back
+                // from the runner: without it the task cannot link the pull request a
+                // person reads, and a merge has to fall back to the run's own head.
+                if let (Some(number), Some(issue_id)) = (
+                    payload.get("pr_number").and_then(|v| v.as_i64()),
+                    job.issue_id,
+                ) {
+                    sqlx::query(
+                        "update issues set pr_number = ?, pr_url = ?, pr_branch = ? where id = ?",
+                    )
+                    .bind(number)
+                    .bind(payload.get("pr_url").and_then(|v| v.as_str()))
+                    .bind(payload.get("pr_branch").and_then(|v| v.as_str()))
+                    .bind(issue_id)
+                    .execute(&self.db.pool)
+                    .await?;
+                }
+            }
             _ => {}
         }
         Ok(())

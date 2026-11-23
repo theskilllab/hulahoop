@@ -322,7 +322,12 @@ issues
   status_before_blocked, pinned_comment_id, run_cap_cleared_at,
   attempt, suite_seq, run_count, current_run_id, tests_revision,
   tests_bookmark, frozen_paths, tests_frozen_at,
-  merge_revision, merged_at, created_at, updated_at
+  merge_revision, merged_at, created_at, updated_at,
+  pr_number, pr_url, pr_branch
+                        pr_number: written when the runner reports the pull
+                          request it opened, so the issue links it and a merge
+                          reads GitHub instead of falling back to the run's head
+                        pr_branch: the branch the pull request carries
                         status_before_blocked: where resumeIssue returns the issue
                         pinned_comment_id: the agent's open question while blocked
                         run_cap_cleared_at: human override for the runs-per-issue cap
