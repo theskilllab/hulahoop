@@ -127,6 +127,271 @@
   --shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
 }
 
+/* The named palettes from the prototype. Each one restates the same tokens the
+   two defaults define, so every screen is painted from the same vocabulary; the
+   rail's own tokens are derived the way the defaults derive them — surfaces
+   from the raised backgrounds, the active row from the page (light) or the
+   deepest surface (dark). */
+
+[data-palette="rose-dawn"] {
+  --bg: #faf4ed;
+  --bg-2: #f4ede8;
+  --bg-3: #ebe3dd;
+  --line: #dfdad9;
+  --text: #575279;
+  --text-2: #625e7f;
+  --muted: #6e6a8a;
+
+  --side-bg: #f4ede8;
+  --side-bg-2: #ebe3dd;
+  --side-line: #dfdad9;
+  --side-text: #625e7f;
+  --side-muted: #6e6a8a;
+  --side-active: #faf4ed;
+  --side-active-text: #575279;
+
+  --accent: #286983;
+  --accent-fg: #ffffff;
+  --accent-soft: #e1ebee;
+  --accent-text: #286983;
+
+  --ok: #2f6d78;
+  --ok-soft: #e0ecee;
+  --warn: #9a5f0a;
+  --warn-soft: #f6e7cc;
+  --bad: #a3475f;
+  --bad-soft: #f5e0e3;
+
+  --add-bg: #e1eeea;
+  --add-fg: #1f5b4a;
+  --del-bg: #f6e0e4;
+  --del-fg: #8f3a52;
+
+  --shadow: 0 8px 28px rgba(87, 82, 121, 0.18);
+}
+
+[data-palette="rose"] {
+  --bg: #191724;
+  --bg-2: #1f1d2e;
+  --bg-3: #26233a;
+  --line: #2e2b42;
+  --text: #e0def4;
+  --text-2: #b9b5d3;
+  --muted: #908caa;
+
+  --side-bg: #1f1d2e;
+  --side-bg-2: #26233a;
+  --side-line: #2e2b42;
+  --side-text: #b9b5d3;
+  --side-muted: #908caa;
+  --side-active: #26233a;
+  --side-active-text: #e0def4;
+
+  --accent: #2f7e9c;
+  --accent-fg: #ffffff;
+  --accent-soft: #1c2b3a;
+  --accent-text: #9ccfd8;
+
+  --ok: #9ccfd8;
+  --ok-soft: #1c3138;
+  --warn: #f6c177;
+  --warn-soft: #3b3025;
+  --bad: #eb6f92;
+  --bad-soft: #3a2330;
+
+  --add-bg: #1b3436;
+  --add-fg: #b8e3e8;
+  --del-bg: #3b2230;
+  --del-fg: #f5b5c8;
+
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
+[data-palette="rose-moon"] {
+  --bg: #232136;
+  --bg-2: #2a273f;
+  --bg-3: #393552;
+  --line: #3a3750;
+  --text: #e0def4;
+  --text-2: #b9b5d3;
+  --muted: #908caa;
+
+  --side-bg: #2a273f;
+  --side-bg-2: #393552;
+  --side-line: #3a3750;
+  --side-text: #b9b5d3;
+  --side-muted: #908caa;
+  --side-active: #393552;
+  --side-active-text: #e0def4;
+
+  --accent: #31748f;
+  --accent-fg: #ffffff;
+  --accent-soft: #263248;
+  --accent-text: #9ccfd8;
+
+  --ok: #9ccfd8;
+  --ok-soft: #28384a;
+  --warn: #f6c177;
+  --warn-soft: #3d3548;
+  --bad: #eb6f92;
+  --bad-soft: #3f2a41;
+
+  --add-bg: #243c45;
+  --add-fg: #b8e3e8;
+  --del-bg: #402b43;
+  --del-fg: #f5b5c8;
+
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+
+[data-palette="latte"] {
+  --bg: #eff1f5;
+  --bg-2: #e6e9ef;
+  --bg-3: #dce0e8;
+  --line: #ccd0da;
+  --text: #4c4f69;
+  --text-2: #5c5f77;
+  --muted: #666a80;
+
+  --side-bg: #e6e9ef;
+  --side-bg-2: #dce0e8;
+  --side-line: #ccd0da;
+  --side-text: #5c5f77;
+  --side-muted: #666a80;
+  --side-active: #eff1f5;
+  --side-active-text: #4c4f69;
+
+  --accent: #1e66f5;
+  --accent-fg: #ffffff;
+  --accent-soft: #dbe5fc;
+  --accent-text: #1e66f5;
+
+  --ok: #2e7d1c;
+  --ok-soft: #dcefd8;
+  --warn: #9a5c00;
+  --warn-soft: #f6e8cf;
+  --bad: #d20f39;
+  --bad-soft: #f8dbe1;
+
+  --add-bg: #dcefd8;
+  --add-fg: #256b17;
+  --del-bg: #f8dbe1;
+  --del-fg: #a30c2d;
+
+  --shadow: 0 8px 28px rgba(76, 79, 105, 0.2);
+}
+
+[data-palette="frappe"] {
+  --bg: #303446;
+  --bg-2: #292c3c;
+  --bg-3: #414559;
+  --line: #3a3e52;
+  --text: #c6d0f5;
+  --text-2: #b5bfe2;
+  --muted: #a5adce;
+
+  --side-bg: #292c3c;
+  --side-bg-2: #414559;
+  --side-line: #3a3e52;
+  --side-text: #b5bfe2;
+  --side-muted: #a5adce;
+  --side-active: #414559;
+  --side-active-text: #c6d0f5;
+
+  --accent: #8caaee;
+  --accent-fg: #232634;
+  --accent-soft: #414964;
+  --accent-text: #8caaee;
+
+  --ok: #a6d189;
+  --ok-soft: #424c50;
+  --warn: #e5c890;
+  --warn-soft: #4b4a51;
+  --bad: #e78284;
+  --bad-soft: #4c404f;
+
+  --add-bg: #424c50;
+  --add-fg: #c9e6b6;
+  --del-bg: #4c404f;
+  --del-fg: #f2b4b6;
+
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+
+[data-palette="macchiato"] {
+  --bg: #24273a;
+  --bg-2: #1e2030;
+  --bg-3: #363a4f;
+  --line: #2f3348;
+  --text: #cad3f5;
+  --text-2: #b8c0e0;
+  --muted: #939ab7;
+
+  --side-bg: #1e2030;
+  --side-bg-2: #363a4f;
+  --side-line: #2f3348;
+  --side-text: #b8c0e0;
+  --side-muted: #939ab7;
+  --side-active: #363a4f;
+  --side-active-text: #cad3f5;
+
+  --accent: #8aadf4;
+  --accent-fg: #181926;
+  --accent-soft: #363f5c;
+  --accent-text: #8aadf4;
+
+  --ok: #a6da95;
+  --ok-soft: #384248;
+  --warn: #eed49f;
+  --warn-soft: #424149;
+  --bad: #ed8796;
+  --bad-soft: #423648;
+
+  --add-bg: #384248;
+  --add-fg: #c4ecb8;
+  --del-bg: #423648;
+  --del-fg: #f4b9c3;
+
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
+[data-palette="mocha"] {
+  --bg: #1e1e2e;
+  --bg-2: #181825;
+  --bg-3: #313244;
+  --line: #363748;
+  --text: #cdd6f4;
+  --text-2: #bac2de;
+  --muted: #9399b2;
+
+  --side-bg: #181825;
+  --side-bg-2: #313244;
+  --side-line: #363748;
+  --side-text: #bac2de;
+  --side-muted: #9399b2;
+  --side-active: #313244;
+  --side-active-text: #cdd6f4;
+
+  --accent: #89b4fa;
+  --accent-fg: #11111b;
+  --accent-soft: #2e354d;
+  --accent-text: #89b4fa;
+
+  --ok: #a6e3a1;
+  --ok-soft: #26352f;
+  --warn: #f9e2af;
+  --warn-soft: #3a3629;
+  --bad: #f38ba8;
+  --bad-soft: #3b2a35;
+
+  --add-bg: #26352f;
+  --add-fg: #c6f0c1;
+  --del-bg: #3b2a35;
+  --del-fg: #f7b7c9;
+
+  --shadow: 0 8px 28px rgba(0, 0, 0, 0.55);
+}
+
 * {
   box-sizing: border-box;
 }
@@ -3635,4 +3900,137 @@ table.transitions td {
     bottom: 8px;
     height: calc(100vh - 16px);
   }
+}
+
+/* ---------- Settings: the Personal | Workspace tabs and the theme cards ---------- */
+
+/* The tablist reuses the segmented control; tabs select rather than press. */
+.seg button[aria-selected="true"] {
+  background: var(--bg);
+  color: var(--text);
+  font-weight: 500;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+}
+
+/* A radio option with a sentence under it: the prototype's run-opt, used for
+   every choice that deserves a word of explanation. */
+.run-opts {
+  display: grid;
+  gap: var(--s2);
+}
+
+.run-opt {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s3);
+  padding: var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  cursor: default;
+  transition: background var(--t-fast), border-color var(--t-fast);
+}
+
+@media (hover: hover) {
+  .run-opt:hover {
+    background: var(--bg-2);
+  }
+}
+
+.run-opt.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.run-opt input {
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.run-opt:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Theme cards: grouped by family, each with its six swatch dots. */
+.th-group {
+  display: grid;
+  gap: var(--s2);
+}
+
+.th-gh {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--muted);
+}
+
+.th-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--s2);
+}
+
+.th-card {
+  padding: var(--s2) var(--s3);
+}
+
+.th-card .stack {
+  flex: 1 1 0;
+  min-width: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.th-card .row {
+  flex-wrap: nowrap;
+}
+
+.th-sw {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.th-sw i {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid rgba(128, 128, 140, 0.4);
+  display: block;
+}
+
+/* The member list on the workspace tab: a bordered list, one person a row. */
+.mem-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+}
+
+.mem {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: 6px var(--s3);
+  min-height: var(--h-row);
+  border-bottom: 0.5px solid var(--line);
+  font-size: var(--fs-md);
+}
+
+.mem:last-child {
+  border-bottom: 0;
+}
+
+.mem .av {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--bg-3);
+  color: var(--text-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  flex: none;
 }
