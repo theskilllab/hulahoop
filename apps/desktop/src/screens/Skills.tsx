@@ -73,6 +73,18 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
   const [confirmDelete, setConfirmDelete] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // "Saves as you type" is a promise the pane keeps: a pause in typing writes,
+  // and so does leaving the skill for another one.
+  const [status, setStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
+  // The write reads what is on screen rather than what the last render closed
+  // over, so `latest` mirrors the list.
+  const latest = useRef<Skill[]>([]);
+  const timer = useRef<number | null>(null);
+  const unsaved = useRef<string | null>(null);
+
+  useEffect(() => {
+    latest.current = skills;
+  }, [skills]);
 
   const skill = skills.find((entry) => entry.id === selected) ?? null;
   const carried = (id: string) => usage[id] ?? [];
@@ -89,7 +101,10 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
       setUsage(who);
       setRoster(carriers);
       if (select) setSelected(select);
-      else if (!loaded.some((entry) => entry.id === selected)) setSelected(loaded[0]?.id ?? null);
+      else if (!loaded.some((entry) => entry.id === selected))
+        // The contract ships with every workspace, so land on something the
+        // workspace wrote when there is one.
+        setSelected((loaded.find((entry) => !entry.builtin) ?? loaded[0])?.id ?? null);
       setError(null);
     } catch (problem) {
       setError(problem instanceof Error ? problem.message : String(problem));
@@ -102,42 +117,108 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
   }, [workspaceId]);
 
   /// Attach or detach a skill from one agent. The whole set is sent because that
-  /// is what the server replaces.
+  /// is what the server replaces. The chips answer before the request does: a
+  /// row that greys out mid-click reads as a failure.
   async function toggle(agentId: string, skillId: string) {
     const agent = roster.find((entry) => entry.id === agentId);
-    if (!agent) return;
+    const picked = skills.find((entry) => entry.id === skillId);
+    if (!agent || !picked) return;
     const carries = agent.skills.some((entry) => entry.id === skillId);
     const next = carries
       ? agent.skills.filter((entry) => entry.id !== skillId).map((entry) => entry.id)
       : [...agent.skills.map((entry) => entry.id), skillId];
-    setBusy(true);
+    const before = { roster, usage };
+    setRoster((all) =>
+      all.map((entry) =>
+        entry.id !== agentId
+          ? entry
+          : {
+              ...entry,
+              skills: carries
+                ? entry.skills.filter((row) => row.id !== skillId)
+                : [...entry.skills, picked],
+            },
+      ),
+    );
+    setUsage((all) => ({
+      ...all,
+      [skillId]: carries
+        ? (all[skillId] ?? []).filter((name) => name !== agent.name)
+        : [...(all[skillId] ?? []), agent.name],
+    }));
     try {
       await setAgentSkills(agentId, next);
-      await reload();
+      setError(null);
     } catch (problem) {
+      setRoster(before.roster);
+      setUsage(before.usage);
       setError(problem instanceof Error ? problem.message : String(problem));
-    } finally {
-      setBusy(false);
     }
   }
 
-  async function save(skill: Skill) {
-    setBusy(true);
+  /// Write one skill back. A broken name stops the write and leaves the reason
+  /// under the field, so the badge says "not saved" instead of failing silently.
+  async function persist(id: string) {
+    const entry = latest.current.find((row) => row.id === id);
+    unsaved.current = null;
+    if (!entry || entry.builtin) return;
+    // The name is the skill's directory, so it is normalised the way the server
+    // normalises it and nothing else is gated: a missing description is a note
+    // under the field, not a reason to hold back the body.
+    const name = entry.name.trim().toLowerCase().replace(/\s+/g, "-");
+    if (!NAME_RULE.test(name)) {
+      setStatus("idle");
+      return;
+    }
+    setStatus("saving");
     try {
-      await updateSkill(skill.id, {
-        name: skill.name,
-        description: skill.description,
-        source: skill.source,
+      await updateSkill(id, {
+        name,
+        description: entry.description,
+        source: entry.source,
       });
-      await reload(skill.id);
+      setStatus("saved");
+      setError(null);
     } catch (problem) {
+      setStatus("error");
       setError(problem instanceof Error ? problem.message : String(problem));
-    } finally {
-      setBusy(false);
     }
   }
+
+  function schedule(id: string) {
+    unsaved.current = id;
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => {
+      timer.current = null;
+      void persist(id);
+    }, 700);
+  }
+
+  /// Write now, because the pane is about to show another skill.
+  function flush() {
+    if (timer.current) {
+      window.clearTimeout(timer.current);
+      timer.current = null;
+    }
+    const pending = unsaved.current;
+    if (pending) void persist(pending);
+  }
+
+  // A closed window is not a reason to lose the last thing typed.
+  useEffect(() => {
+    return () => {
+      if (timer.current) window.clearTimeout(timer.current);
+      const pending = unsaved.current;
+      if (pending) void persist(pending);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function remove(skill: Skill) {
+    // A pending write would land on a row that is about to be gone.
+    if (timer.current) window.clearTimeout(timer.current);
+    timer.current = null;
+    unsaved.current = null;
     setBusy(true);
     try {
       await deleteSkill(skill.id);
@@ -154,6 +235,8 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
   function edit(change: Partial<Skill>) {
     if (!skill) return;
     setSkills((all) => all.map((entry) => (entry.id === skill.id ? { ...entry, ...change } : entry)));
+    setStatus("idle");
+    schedule(skill.id);
   }
 
   return (
@@ -173,7 +256,7 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
 
       <div className="skills-body">
         <div className="skills-roster">
-          <p className="dim small">
+          <p className="skill-meta">
             Skills are shared. Put one on as many agents as you like. AGENTS.md is read on every
             run, a skill is loaded only when its description fits the task.
           </p>
@@ -184,15 +267,16 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
               className="skill"
               aria-selected={selected === entry.id}
               onClick={() => {
+                flush();
                 setSelected(entry.id);
                 setConfirmDelete(null);
               }}
             >
               <strong className="truncate">{entry.name}</strong>
-              <span className="clamp-2 dim small">
+              <span className="skill-desc clamp-2">
                 {entry.description || "No description yet"}
               </span>
-              <span className="dim small truncate">
+              <span className="skill-meta truncate">
                 {carried(entry.id).length ? `Used by ${carried(entry.id).join(", ")}` : "No agent uses it yet"}
               </span>
             </button>
@@ -202,8 +286,11 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
         {skill ? (
           <div className="skills-pane">
             <div>
-              <h2>{skill.name}</h2>
-              {skill.description ? <p className="dim small">{skill.description}</p> : null}
+              <div className="row spread">
+                <h2>{skill.name}</h2>
+                {skill.builtin ? <span className="chip">built in</span> : null}
+              </div>
+              {skill.description ? <p className="skill-desc title">{skill.description}</p> : null}
               {issues.length ? (
                 <ul className="skill-issues" role="alert">
                   {issues.map((issue) => (
@@ -215,12 +302,14 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
 
             <div className="field">
               <div className="row spread">
-                <span className="field-label">Used by</span>
-                <span className="dim small">
+                <span className="field-label" id={`skill-used-${skill.id}`}>
+                  Used by
+                </span>
+                <span className="skill-meta">
                   {carried(skill.id).length} of {roster.length} agents
                 </span>
               </div>
-              <div className="row">
+              <div className="tgl-group" role="group" aria-labelledby={`skill-used-${skill.id}`}>
                 {roster.map((agent) => {
                   const carries = agent.skills.some((picked) => picked.id === skill.id);
                   return (
@@ -229,7 +318,6 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
                       type="button"
                       className="tgl"
                       aria-pressed={carries}
-                      disabled={busy}
                       onClick={() => void toggle(agent.id, skill.id)}
                     >
                       {agent.name}
@@ -237,7 +325,7 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
                   );
                 })}
               </div>
-              <p className="dim small">
+              <p className="skill-meta">
                 Edit the text once and every agent that uses this skill gets the change.
               </p>
             </div>
@@ -245,9 +333,9 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
             {skill.builtin ? (
               <div className="field">
                 <span className="field-label">The contract every turn reads</span>
-                <p className="dim small">
+                <p className="skill-meta">
                   The server writes this text and reads the markers in it, so it is shown here and
-                  never edited.
+                  never edited. A skill you write saves as you type, in this same pane.
                 </p>
                 <RichText
                   value={skill.source}
@@ -272,7 +360,18 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
                   />
                 </div>
                 <div className="field">
-                  <span className="field-label">SKILL.md</span>
+                  <div className="row spread">
+                    <span className="field-label">SKILL.md</span>
+                    <span className={status === "error" ? "skill-meta bad" : "skill-meta"}>
+                      {status === "saving"
+                        ? "Saving…"
+                        : status === "saved"
+                          ? "Saved"
+                          : status === "error"
+                            ? "Not saved"
+                            : "Saves as you type"}
+                    </span>
+                  </div>
                   <RichText
                     value={skill.source}
                     ariaLabel={`${skill.name} body`}
@@ -282,9 +381,6 @@ export default function Skills({ workspaceId }: { workspaceId: string }) {
                   />
                 </div>
                 <div className="row">
-                  <button className="primary" disabled={busy || issues.length > 0} onClick={() => void save(skill)}>
-                    Save
-                  </button>
                   {confirmDelete === skill.id ? null : (
                     <button className="ghost" disabled={busy} onClick={() => setConfirmDelete(skill.id)}>
                       Delete skill
@@ -437,8 +533,10 @@ function NewSkill({
         )}
 
         <div className="field">
-          <span className="field-label">Give it to</span>
-          <div className="row">
+          <span className="field-label" id="skill-give">
+            Give it to
+          </span>
+          <div className="tgl-group" role="group" aria-labelledby="skill-give">
             {roster.map((agent) => {
               const on = agents.includes(agent.id);
               return (
