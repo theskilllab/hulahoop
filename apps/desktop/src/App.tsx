@@ -23,7 +23,7 @@ import {
   type WorkflowDoc,
 } from "./api";
 import { invoke, WORKSPACE_KEY } from "./api";
-import { applyTheme } from "./theme";
+import { applyTheme, resolvedTheme, savedPalette, themeOf, THEMES } from "./theme";
 import Artifacts from "./screens/Artifacts";
 import Agents from "./screens/Agents";
 import Icon from "./Icon";
@@ -427,8 +427,17 @@ export default function App() {
                 role="menuitem"
                 onClick={() => {
                   setWsMenu(false);
-                  const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
-                  applyTheme(next as "light" | "dark");
+                  // Hop to the other side of the current theme's family; the
+                  // full choice of themes lives under Settings → Personal.
+                  const current = themeOf(savedPalette());
+                  const wantDark = resolvedTheme() === "light";
+                  const next =
+                    THEMES.find(
+                      (theme) =>
+                        theme.group === current.group &&
+                        theme.kind === (wantDark ? "dark" : "light"),
+                    ) ?? themeOf(wantDark ? "default-dark" : "default-light");
+                  applyTheme(next.id);
                 }}
               >
                 <span className="fill">Switch appearance</span>

@@ -19,6 +19,84 @@ import {
   type Workspace,
   type WorkspaceMember,
 } from "../api";
+import {
+  applyTheme,
+  resolvedTheme,
+  savedPalette,
+  THEME_GROUPS,
+  THEMES,
+} from "../theme";
+
+type Tab = "personal" | "workspace";
+
+/** The personal tab: the theme choice, grouped like the prototype. */
+function Themes() {
+  const [palette, setPalette] = useState(savedPalette());
+  const painted = resolvedTheme(palette);
+
+  function pick(id: string) {
+    setPalette(id);
+    applyTheme(id);
+  }
+
+  return (
+    <div className="settings-block">
+      <span className="field-label">Theme</span>
+      <div className="run-opts" role="radiogroup" aria-label="Theme">
+        {THEME_GROUPS.map((group) => (
+          <div className="th-group" key={group}>
+            <div className="th-gh">{group}</div>
+            <div className="th-grid">
+              {THEMES.filter((theme) => theme.group === group).map((theme) => {
+                const on = palette === theme.id;
+                const swatch =
+                  theme.kind === "auto" &&
+                  painted === "dark" &&
+                  theme.darkSwatch
+                    ? theme.darkSwatch
+                    : theme.swatch;
+                return (
+                  <label
+                    className={on ? "run-opt th-card on" : "run-opt th-card"}
+                    key={theme.id}
+                  >
+                    <input
+                      checked={on}
+                      name="theme"
+                      onChange={() => pick(theme.id)}
+                      type="radio"
+                      value={theme.id}
+                    />
+                    <span className="stack">
+                      <span className="row">
+                        <strong className="fill">{theme.name}</strong>
+                        {theme.kind !== "auto" && (
+                          <span className="chip">
+                            {theme.kind === "light" ? "Light" : "Dark"}
+                          </span>
+                        )}
+                        <span aria-hidden="true" className="th-sw">
+                          {swatch.map((color) => (
+                            <i key={color} style={{ background: color }} />
+                          ))}
+                        </span>
+                      </span>
+                      <span className="dim small">{theme.blurb}</span>
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="dim small">
+        These settings are just for you. Each theme is either light or dark, so
+        pick the one you want, or choose Match system to follow your Mac.
+      </p>
+    </div>
+  );
+}
 
 export default function Settings({
   workspace,
@@ -38,6 +116,7 @@ export default function Settings({
   onChanged: () => Promise<void>;
   onSwitchWorkspace: (id: string) => Promise<void>;
 }) {
+  const [tab, setTab] = useState<Tab>("personal");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string>(active?.id ?? "");
@@ -58,7 +137,11 @@ export default function Settings({
   const [newWorkspacePrefix, setNewWorkspacePrefix] = useState("");
   const [projectName, setProjectName] = useState("");
 
-  const project = projects.find((entry) => entry.id === chosen) ?? active ?? projects[0] ?? null;
+  const project =
+    projects.find((entry) => entry.id === chosen) ??
+    active ??
+    projects[0] ??
+    null;
   const repo: Repo | undefined = project?.repos[0];
 
   useEffect(() => {
@@ -75,8 +158,16 @@ export default function Settings({
     setWsPrefix(workspace.defaultPrefix);
     setLumiHarness(workspace.lumiHarness ?? "pi");
     setLumiModel(workspace.lumiModel ?? "");
-    void loadWorkspaceMembers(workspace.id).then(setMembers).catch(() => setMembers([]));
-  }, [workspace.id, workspace.name, workspace.defaultPrefix, workspace.lumiHarness, workspace.lumiModel]);
+    void loadWorkspaceMembers(workspace.id)
+      .then(setMembers)
+      .catch(() => setMembers([]));
+  }, [
+    workspace.id,
+    workspace.name,
+    workspace.defaultPrefix,
+    workspace.lumiHarness,
+    workspace.lumiModel,
+  ]);
 
   // The model list is the harness's own catalogue, so it follows the picker.
   useEffect(() => {
@@ -162,344 +253,447 @@ export default function Settings({
   return (
     <section className="detail">
       <PageHeader
-        subtitle={`${workspaces.length === 1 ? "one workspace" : `${workspaces.length} workspaces`} · ${agents.length} agents`}
+        actions={
+          <div aria-label="Settings section" className="seg" role="tablist">
+            <button
+              aria-selected={tab === "personal"}
+              onClick={() => setTab("personal")}
+              role="tab"
+            >
+              Personal
+            </button>
+            <button
+              aria-selected={tab === "workspace"}
+              onClick={() => setTab("workspace")}
+              role="tab"
+            >
+              Workspace
+            </button>
+          </div>
+        }
+        subtitle={
+          tab === "personal"
+            ? "just for you, saved on this machine"
+            : `${workspaces.length === 1 ? "one workspace" : `${workspaces.length} workspaces`} · ${agents.length} agents`
+        }
         title="Settings"
       />
 
-      <div className="settings-block">
-        <div className="row spread">
-          <strong>{workspace.name}</strong>
-          <span className="dim small">{workspace.slug} · workspace</span>
-        </div>
-        <p className="dim small">
-          Issues filed with no project are keyed by this prefix — {workspace.defaultPrefix}-1, {workspace.defaultPrefix}-2.
-          Projects in this workspace must use a different one.
-        </p>
-        <div className="grid-2">
-          <label>
-            <span>name</span>
-            <input value={wsName} onChange={(event) => setWsName(event.target.value)} />
-          </label>
-          <label>
-            <span>issue prefix (2–5)</span>
-            <input
-              value={wsPrefix}
-              maxLength={5}
-              onChange={(event) => setWsPrefix(event.target.value.toUpperCase())}
-            />
-          </label>
-        </div>
-        <div className="row">
-          <button
-            className="primary"
-            disabled={busy === "workspace"}
-            onClick={() => void saveWorkspace(wsName, wsPrefix)}
-          >
-            Save workspace
-          </button>
-          <span className="dim small">
-            {members.length === 0
-              ? "one member"
-              : members.map((member) => `${member.name} (${member.role})`).join(", ")}
-          </span>
-        </div>
-        <div className="row">
-          <input
-            placeholder="new workspace name"
-            value={newWorkspace}
-            onChange={(event) => setNewWorkspace(event.target.value)}
-          />
-          <input
-            placeholder="prefix"
-            value={newWorkspacePrefix}
-            maxLength={5}
-            onChange={(event) => setNewWorkspacePrefix(event.target.value.toUpperCase())}
-          />
-          <button
-            className="ghost"
-            disabled={busy === "new-workspace" || newWorkspace.trim().length < 2}
-            onClick={() => void addWorkspace()}
-          >
-            Add workspace
-          </button>
-        </div>
-        {workspaces.length > 1 && (
-          <p className="dim small">
-            {workspaces.length} workspaces on this server:{" "}
-            {workspaces.map((entry) => entry.name).join(", ")}.
-          </p>
-        )}
-      </div>
-      {error && <p className="error">{error}</p>}
+      {tab === "personal" && <Themes />}
 
-      <h2 className="section">Lumi</h2>
-      <p className="dim small">
-        Lumi is the workspace's assistant — the pill in the corner (⌘J). It answers with the
-        harness and model picked here, and only changes things after you press Apply.
-      </p>
-      <div className="settings-block">
-        <div className="grid-2">
-          <label>
-            <span>harness</span>
-            <select value={lumiHarness} onChange={(event) => setLumiHarness(event.target.value)}>
-              <option value="pi">Pi</option>
-              <option value="claude_code">Claude Code</option>
-              <option value="fake">Fake (development)</option>
-            </select>
-          </label>
-          <label>
-            <span>model</span>
-            {lumiModels.length ? (
-              <select value={lumiModel} onChange={(event) => setLumiModel(event.target.value)}>
-                {lumiModels.map((entry) => (
+      {tab === "workspace" && (
+        <>
+          <div className="settings-block">
+            <div className="row spread">
+              <strong>{workspace.name}</strong>
+              <span className="dim small">{workspace.slug} · workspace</span>
+            </div>
+            <p className="dim small">
+              Issues filed with no project are keyed by this prefix —{" "}
+              {workspace.defaultPrefix}-1, {workspace.defaultPrefix}-2. Projects
+              in this workspace must use a different one.
+            </p>
+            <div className="grid-2">
+              <label>
+                <span>name</span>
+                <input
+                  value={wsName}
+                  onChange={(event) => setWsName(event.target.value)}
+                />
+              </label>
+              <label>
+                <span>issue prefix (2–5)</span>
+                <input
+                  value={wsPrefix}
+                  maxLength={5}
+                  onChange={(event) =>
+                    setWsPrefix(event.target.value.toUpperCase())
+                  }
+                />
+              </label>
+            </div>
+            <div className="row">
+              <button
+                className="primary"
+                disabled={busy === "workspace"}
+                onClick={() => void saveWorkspace(wsName, wsPrefix)}
+              >
+                Save workspace
+              </button>
+            </div>
+            {members.length > 0 && (
+              <ul className="mem-list">
+                {members.map((member) => (
+                  <li className="mem" key={member.userId}>
+                    <span className="av">
+                      {(member.name[0] ?? "?").toUpperCase()}
+                    </span>
+                    <span className="fill">{member.name}</span>
+                    <span className="dim small">
+                      {member.role[0]?.toUpperCase() + member.role.slice(1)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <div className="row">
+              <input
+                placeholder="new workspace name"
+                value={newWorkspace}
+                onChange={(event) => setNewWorkspace(event.target.value)}
+              />
+              <input
+                placeholder="prefix"
+                value={newWorkspacePrefix}
+                maxLength={5}
+                onChange={(event) =>
+                  setNewWorkspacePrefix(event.target.value.toUpperCase())
+                }
+              />
+              <button
+                className="ghost"
+                disabled={
+                  busy === "new-workspace" || newWorkspace.trim().length < 2
+                }
+                onClick={() => void addWorkspace()}
+              >
+                Add workspace
+              </button>
+            </div>
+            {workspaces.length > 1 && (
+              <p className="dim small">
+                {workspaces.length} workspaces on this server:{" "}
+                {workspaces.map((entry) => entry.name).join(", ")}.
+              </p>
+            )}
+          </div>
+
+          <h2 className="section">Lumi</h2>
+          <p className="dim small">
+            Lumi is the workspace's assistant — the pill in the corner (⌘J). It answers with the
+            harness and model picked here, and only changes things after you press Apply.
+          </p>
+          <div className="settings-block">
+            <div className="grid-2">
+              <label>
+                <span>harness</span>
+                <select
+                  value={lumiHarness}
+                  onChange={(event) => setLumiHarness(event.target.value)}
+                >
+                  <option value="pi">Pi</option>
+                  <option value="claude_code">Claude Code</option>
+                  <option value="fake">Fake (development)</option>
+                </select>
+              </label>
+              <label>
+                <span>model</span>
+                {lumiModels.length ? (
+                  <select
+                    value={lumiModel}
+                    onChange={(event) => setLumiModel(event.target.value)}
+                  >
+                    {lumiModels.map((entry) => (
+                      <option key={entry.id} value={entry.id}>
+                        {entry.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    value={lumiModel}
+                    placeholder="model id"
+                    onChange={(event) => setLumiModel(event.target.value)}
+                  />
+                )}
+              </label>
+            </div>
+            <div className="row">
+              <button
+                className="primary"
+                disabled={busy === "lumi" || !lumiModel.trim()}
+                onClick={() =>
+                  void action("lumi", () =>
+                    setWorkspaceLumi(workspace.id, lumiHarness, lumiModel),
+                  )
+                }
+              >
+                Save Lumi
+              </button>
+              <span className="dim small">
+                {workspace.lumiHarness
+                  ? `answering with ${workspace.lumiHarness} · ${workspace.lumiModel}`
+                  : "no harness picked yet — the pill will say so"}
+              </span>
+            </div>
+          </div>
+
+          <h2 className="section">Projects</h2>
+          <p className="dim small">
+            A project carries the prefix its issues are named by —{" "}
+            {workspace.defaultPrefix} is the workspace's own, for issues with no
+            project. Several repositories may hang off one project; the first is
+            the one a run clones.
+          </p>
+          <div className="settings-block">
+            <div className="row">
+              <select
+                value={chosen}
+                onChange={(event) => setChosen(event.target.value)}
+              >
+                {projects.map((entry) => (
                   <option key={entry.id} value={entry.id}>
-                    {entry.label}
+                    {entry.prefix
+                      ? `${entry.prefix} · ${entry.name}`
+                      : entry.name}
                   </option>
                 ))}
               </select>
-            ) : (
-              <input
-                value={lumiModel}
-                placeholder="model id"
-                onChange={(event) => setLumiModel(event.target.value)}
-              />
-            )}
-          </label>
-        </div>
-        <div className="row">
-          <button
-            className="primary"
-            disabled={busy === "lumi" || !lumiModel.trim()}
-            onClick={() =>
-              void action("lumi", () => setWorkspaceLumi(workspace.id, lumiHarness, lumiModel))
-            }
-          >
-            Save Lumi
-          </button>
-          <span className="dim small">
-            {workspace.lumiHarness
-              ? `answering with ${workspace.lumiHarness} · ${workspace.lumiModel}`
-              : "no harness picked yet — the pill will say so"}
-          </span>
-        </div>
-      </div>
-
-      <h2 className="section">Projects</h2>
-      <p className="dim small">
-        A project carries the prefix its issues are named by — {workspace.defaultPrefix} is the workspace's own, for issues
-        with no project. Several repositories may hang off one project; the first is the one a run clones.
-      </p>
-      <div className="settings-block">
-        <div className="row">
-          <select value={chosen} onChange={(event) => setChosen(event.target.value)}>
-            {projects.map((entry) => (
-              <option key={entry.id} value={entry.id}>
-                {entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name}
-              </option>
-            ))}
-          </select>
-          {project && (
-            <>
-              <input
-                className="narrow-input"
-                value={projectName}
-                placeholder={project.name}
-                onChange={(event) => setProjectName(event.target.value)}
-                onBlur={() => {
-                  if (projectName.trim() && projectName.trim() !== project.name) {
-                    void saveProjectName();
-                  }
-                }}
-              />
-              <input
-                className="narrow-input"
-                value={prefix}
-                placeholder={project.prefix ?? "PREFIX"}
-                onChange={(event) => setPrefix(event.target.value)}
-              />
-              <button
-                disabled={busy !== null || prefix.trim().length < 2}
-                onClick={() =>
-                  action("prefix", () =>
-                    gql(`mutation ($id: UUID!, $prefix: String!) { setProjectPrefix(projectId: $id, prefix: $prefix) { id prefix } }`, {
-                      id: project.id,
-                      prefix: prefix.trim(),
-                    }),
-                  )
-                }
-              >
-                Set prefix
-              </button>
-            </>
-          )}
-        </div>
-        <div className="row">
-          <input value={newProject} onChange={(event) => setNewProject(event.target.value)} placeholder="new project name" />
-          <input
-            className="narrow-input"
-            value={newPrefix}
-            onChange={(event) => setNewPrefix(event.target.value)}
-            placeholder="BAL"
-          />
-          <button
-            disabled={busy !== null || newProject.trim().length < 2}
-            onClick={() =>
-              action("project", async () => {
-                await gql(
-                  `mutation ($workspaceId: UUID!, $name: String!, $prefix: String) { createProject(workspaceId: $workspaceId, name: $name, prefix: $prefix) { id } }`,
-                  {
-                    workspaceId: workspace.id,
-                    name: newProject.trim(),
-                    prefix: newPrefix.trim() || null,
-                  },
-                );
-                setNewProject("");
-                setNewPrefix("");
-              })
-            }
-          >
-            Create project
-          </button>
-        </div>
-      </div>
-
-      <h2 className="section">Repositories</h2>
-      {project ? (
-        <div className="settings-block">
-          <ul className="repos">
-            {project.repos.map((entry) => (
-              <li key={entry.id}>
-                <strong>{entry.name}</strong>{" "}
-                <span className="dim">{entry.path ?? "mirror, cloned on the first run"}</span>
-                {entry.remoteUrl && <div className="dim small">{entry.remoteUrl}</div>}
-                <div className="dim small">
-                  {entry.vcs} · contract v{entry.contractVersion} · base {entry.baseBookmark} · fetched{" "}
-                  {entry.fetchedAt ? new Date(entry.fetchedAt).toLocaleString() : "never"}
-                </div>
-              </li>
-            ))}
-            {project.repos.length === 0 && <li className="dim">No repository attached yet.</li>}
-          </ul>
-          {githubRepos.length > 0 && (
-            <div className="row">
-              <select
-                value={githubChoice}
-                onChange={(event) => setGithubChoice(event.target.value)}
-              >
-                <option value="">pick a repository the app can reach…</option>
-                {githubRepos
-                  .filter(
-                    (entry) =>
-                      !project.repos.some((attached) => attached.remoteUrl === entry.cloneUrl),
-                  )
-                  .map((entry) => (
-                    <option key={entry.cloneUrl} value={entry.cloneUrl}>
-                      {entry.fullName}
-                      {entry.private ? " (private)" : ""}
-                      {entry.archived ? " (archived)" : ""}
-                    </option>
-                  ))}
-              </select>
-              <button
-                disabled={busy !== null || githubChoice === ""}
-                onClick={() =>
-                  action("github-repo", async () => {
-                    const chosen = githubRepos.find((entry) => entry.cloneUrl === githubChoice);
-                    if (!chosen) {
-                      return;
+              {project && (
+                <>
+                  <input
+                    className="narrow-input"
+                    value={projectName}
+                    placeholder={project.name}
+                    onChange={(event) => setProjectName(event.target.value)}
+                    onBlur={() => {
+                      if (
+                        projectName.trim() &&
+                        projectName.trim() !== project.name
+                      ) {
+                        void saveProjectName();
+                      }
+                    }}
+                  />
+                  <input
+                    className="narrow-input"
+                    value={prefix}
+                    placeholder={project.prefix ?? "PREFIX"}
+                    onChange={(event) => setPrefix(event.target.value)}
+                  />
+                  <button
+                    disabled={busy !== null || prefix.trim().length < 2}
+                    onClick={() =>
+                      action("prefix", () =>
+                        gql(
+                          `mutation ($id: UUID!, $prefix: String!) { setProjectPrefix(projectId: $id, prefix: $prefix) { id prefix } }`,
+                          {
+                            id: project.id,
+                            prefix: prefix.trim(),
+                          },
+                        ),
+                      )
                     }
-                    await attachGithubRepo(project.id, chosen);
-                    setGithubChoice("");
+                  >
+                    Set prefix
+                  </button>
+                </>
+              )}
+            </div>
+            <div className="row">
+              <input
+                value={newProject}
+                onChange={(event) => setNewProject(event.target.value)}
+                placeholder="new project name"
+              />
+              <input
+                className="narrow-input"
+                value={newPrefix}
+                onChange={(event) => setNewPrefix(event.target.value)}
+                placeholder="BAL"
+              />
+              <button
+                disabled={busy !== null || newProject.trim().length < 2}
+                onClick={() =>
+                  action("project", async () => {
+                    await gql(
+                      `mutation ($workspaceId: UUID!, $name: String!, $prefix: String) { createProject(workspaceId: $workspaceId, name: $name, prefix: $prefix) { id } }`,
+                      {
+                        workspaceId: workspace.id,
+                        name: newProject.trim(),
+                        prefix: newPrefix.trim() || null,
+                      },
+                    );
+                    setNewProject("");
+                    setNewPrefix("");
                   })
                 }
               >
-                Attach from GitHub
+                Create project
               </button>
             </div>
+          </div>
+
+          <h2 className="section">Repositories</h2>
+          {project ? (
+            <div className="settings-block">
+              <ul className="repos">
+                {project.repos.map((entry) => (
+                  <li key={entry.id}>
+                    <strong>{entry.name}</strong>{" "}
+                    <span className="dim">
+                      {entry.path ?? "mirror, cloned on the first run"}
+                    </span>
+                    {entry.remoteUrl && (
+                      <div className="dim small">{entry.remoteUrl}</div>
+                    )}
+                    <div className="dim small">
+                      {entry.vcs} · contract v{entry.contractVersion} · base{" "}
+                      {entry.baseBookmark} · fetched{" "}
+                      {entry.fetchedAt
+                        ? new Date(entry.fetchedAt).toLocaleString()
+                        : "never"}
+                    </div>
+                  </li>
+                ))}
+                {project.repos.length === 0 && (
+                  <li className="dim">No repository attached yet.</li>
+                )}
+              </ul>
+              {githubRepos.length > 0 && (
+                <div className="row">
+                  <select
+                    value={githubChoice}
+                    onChange={(event) => setGithubChoice(event.target.value)}
+                  >
+                    <option value="">
+                      pick a repository the app can reach…
+                    </option>
+                    {githubRepos
+                      .filter(
+                        (entry) =>
+                          !project.repos.some(
+                            (attached) => attached.remoteUrl === entry.cloneUrl,
+                          ),
+                      )
+                      .map((entry) => (
+                        <option key={entry.cloneUrl} value={entry.cloneUrl}>
+                          {entry.fullName}
+                          {entry.private ? " (private)" : ""}
+                          {entry.archived ? " (archived)" : ""}
+                        </option>
+                      ))}
+                  </select>
+                  <button
+                    disabled={busy !== null || githubChoice === ""}
+                    onClick={() =>
+                      action("github-repo", async () => {
+                        const chosen = githubRepos.find(
+                          (entry) => entry.cloneUrl === githubChoice,
+                        );
+                        if (!chosen) {
+                          return;
+                        }
+                        await attachGithubRepo(project.id, chosen);
+                        setGithubChoice("");
+                      })
+                    }
+                  >
+                    Attach from GitHub
+                  </button>
+                </div>
+              )}
+              {githubError && <p className="dim small">{githubError}</p>}
+              <div className="row">
+                <input
+                  value={repoPath}
+                  onChange={(event) => setRepoPath(event.target.value)}
+                  placeholder="/absolute/path/to/another/repo"
+                />
+                <button
+                  disabled={busy !== null || repoPath.trim().length < 2}
+                  onClick={() =>
+                    action("repo", async () => {
+                      await gql(
+                        `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id } }`,
+                        {
+                          projectId: project.id,
+                          name:
+                            repoPath.trim().split("/").filter(Boolean).pop() ??
+                            "repo",
+                          path: repoPath.trim(),
+                        },
+                      );
+                      setRepoPath("");
+                    })
+                  }
+                >
+                  Add repository
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="dim">Create a project first.</p>
           )}
-          {githubError && <p className="dim small">{githubError}</p>}
-          <div className="row">
-            <input
-              value={repoPath}
-              onChange={(event) => setRepoPath(event.target.value)}
-              placeholder="/absolute/path/to/another/repo"
-            />
-            <button
-              disabled={busy !== null || repoPath.trim().length < 2}
-              onClick={() =>
-                action("repo", async () => {
-                  await gql(
-                    `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id } }`,
-                    {
-                      projectId: project.id,
-                      name: repoPath.trim().split("/").filter(Boolean).pop() ?? "repo",
-                      path: repoPath.trim(),
-                    },
-                  );
-                  setRepoPath("");
-                })
-              }
-            >
-              Add repository
-            </button>
-          </div>
-        </div>
-      ) : (
-        <p className="dim">Create a project first.</p>
-      )}
 
-      <h2 className="section">Repository</h2>
-      {repo ? (
-        <div className="settings-block">
-          <p>
-            <strong>{repo.name}</strong> <span className="dim">{repo.path}</span>
-          </p>
+          <h2 className="section">Repository</h2>
+          {repo ? (
+            <div className="settings-block">
+              <p>
+                <strong>{repo.name}</strong>{" "}
+                <span className="dim">{repo.path}</span>
+              </p>
+              <p className="dim small">
+                {repo.vcs} · contract v{repo.contractVersion} · base{" "}
+                {repo.baseBookmark} · fetched{" "}
+                {repo.fetchedAt
+                  ? new Date(repo.fetchedAt).toLocaleString()
+                  : "never"}
+              </p>
+              <div className="row">
+                <button
+                  disabled={busy !== null}
+                  onClick={() =>
+                    action("fetch", () =>
+                      gql(
+                        `mutation ($id: UUID!) { fetchRepo(id: $id) { id } }`,
+                        { id: repo.id },
+                      ),
+                    )
+                  }
+                >
+                  Fetch base
+                </button>
+                <button
+                  disabled={busy !== null}
+                  onClick={() =>
+                    action("bearings", () =>
+                      gql(
+                        `mutation ($id: UUID!, $bookmark: String!) { updateRepo(id: $id, baseBookmark: $bookmark) { id } }`,
+                        {
+                          id: repo.id,
+                          bookmark: "main",
+                        },
+                      ),
+                    )
+                  }
+                >
+                  Set base to main
+                </button>
+              </div>
+            </div>
+          ) : (
+            <p className="dim">No repository attached yet.</p>
+          )}
+
+          <h2 className="section">Connectors</h2>
           <p className="dim small">
-            {repo.vcs} · contract v{repo.contractVersion} · base {repo.baseBookmark} · fetched{" "}
-            {repo.fetchedAt ? new Date(repo.fetchedAt).toLocaleString() : "never"}
+            GitHub, the Claude sign-ins and the Pi login live on the{" "}
+            <strong>Connectors</strong> screen, so there is one place that
+            answers "what can the loop act as?".
           </p>
-          <div className="row">
-            <button
-              disabled={busy !== null}
-              onClick={() =>
-                action("fetch", () =>
-                  gql(`mutation ($id: UUID!) { fetchRepo(id: $id) { id } }`, { id: repo.id }),
-                )
-              }
-            >
-              Fetch base
-            </button>
-            <button
-              disabled={busy !== null}
-              onClick={() =>
-                action("bearings", () =>
-                  gql(`mutation ($id: UUID!, $bookmark: String!) { updateRepo(id: $id, baseBookmark: $bookmark) { id } }`, {
-                    id: repo.id,
-                    bookmark: "main",
-                  }),
-                )
-              }
-            >
-              Set base to main
-            </button>
-          </div>
-        </div>
-      ) : (
-        <p className="dim">No repository attached yet.</p>
+
+          <h2 className="section">Agents</h2>
+          <p className="dim small">
+            Agents are created and edited on the <strong>Agents</strong> screen:
+            harness, model, its own AGENTS.md and the skills it carries. Which
+            of them a status calls is the workflow's decision, written down once
+            in WORKFLOWS.md.
+          </p>
+        </>
       )}
 
-      <h2 className="section">Connectors</h2>
-      <p className="dim small">
-        GitHub, the Claude sign-ins and the Pi login live on the <strong>Connectors</strong> screen,
-        so there is one place that answers "what can the loop act as?".
-      </p>
-
-      <h2 className="section">Agents</h2>
-      <p className="dim small">
-        Agents are created and edited on the <strong>Agents</strong> screen: harness, model, its own
-        AGENTS.md and the skills it carries. Which of them a status calls is the workflow's
-        decision, written down once in WORKFLOWS.md.
-      </p>
+      {error && <p className="error">{error}</p>}
     </section>
   );
 }
