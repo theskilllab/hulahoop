@@ -1655,7 +1655,9 @@ Ready for the team. Anything here is body text.
 works, an agent's name for a column an agent works, `any` for the agent whose last
 run is oldest, and a mix when both may act. One line, comma separated, `@`
 optional. A column with no `Users` line belongs to a person, so a half-written
-document never dispatches an agent nobody named.
+document never dispatches an agent nobody named. A blocked column and a finished
+one start nothing whatever they name: the first waits for a person, and the second
+is over.
 
 Each `Next:` is one move and its reason, written `Next: <status> - <when>`. The
 reason may contain commas; only the part before the dash is a status. A column may

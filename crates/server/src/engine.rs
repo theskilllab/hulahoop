@@ -316,9 +316,13 @@ impl Engine {
     /// It no longer decides who may run — the workflow names the agent. It only
     /// tells the engine which shape of completion to expect, because a review
     /// writes a verdict and work opens a pull request.
-    /// Start a run when the workflow says an agent owns this status.
+    /// Start a run when the workflow says an agent owns this status, and only
+    /// while the task can still move: a blocked task waits for a person, and a
+    /// finished one is done. A section that names an agent in either place would
+    /// otherwise start turns on a task nobody can advance.
     async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
-        if issue.status_enum() == IssueStatus::Blocked || issue.project_id.is_none() {
+        let status = issue.status_enum();
+        if status == IssueStatus::Blocked || status.is_terminal() || issue.project_id.is_none() {
             return Ok(());
         }
         let workspace = issue.workspace_id;

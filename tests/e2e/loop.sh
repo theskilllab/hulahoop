@@ -157,9 +157,11 @@ Somebody reads the work and merges it.
 
 ## Done
 
-Users: human
+Users: ada
 
-The work landed. Nothing is dispatched from here.
+The work landed. This document names an agent even here, which is the shape that
+used to start a turn on a finished task: nothing is dispatched from a finished
+column, whatever it names.
 DOC
 )
   echo "workflow: $(gql 'mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) { errors } }' \
@@ -216,6 +218,17 @@ DOC
 
   gql 'mutation ($id: UUID!) { mergeIssue(issueId: $id) { status } }' "{\"id\":\"$issue\"}" | jq -c '.data.mergeIssue.status'
   wait_status "$issue" "done" 60
+  # A finished task starts nothing, whatever its section names: a merge that
+  # dispatched a turn would run an agent against work nobody can advance.
+  local settled before
+  settled="$(gql 'query ($id: UUID!) { issue(id: $id) { runs { status } } }' "{\"id\":\"$issue\"}" | jq -c '[.data.issue.runs[].status]')"
+  sleep 6
+  before="$settled"
+  settled="$(gql 'query ($id: UUID!) { issue(id: $id) { runs { status } } }' "{\"id\":\"$issue\"}" | jq -c '[.data.issue.runs[].status]')"
+  if [ "$before" != "$settled" ]; then
+    echo "a finished task started another run: $before then $settled" >&2
+    return 1
+  fi
   echo "done: $(gql 'query ($id: UUID!) { issue(id: $id) { status runs { status } reviews { verdict } } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue')"
 }
 
