@@ -254,6 +254,40 @@ DOC
     return 1
   fi
   echo "done: $(gql 'query ($id: UUID!) { issue(id: $id) { status runs { status } reviews { verdict } } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue')"
+
+  # Lumi: a question goes through the runner like any job, the answer may carry
+  # a proposal, and Apply is the only thing that changes the board.
+  echo "lumi: $(gql 'mutation ($w: UUID!, $h: String!, $m: String!) { setWorkspaceLumi(workspaceId: $w, harness: $h, model: $m) { lumiHarness lumiModel } }' \
+    "{\"w\":\"$workspace\",\"h\":\"fake\",\"m\":\"fake\"}" | jq -c '.data.setWorkspaceLumi // .errors')"
+  echo "asked: $(gql 'mutation ($w: UUID!, $t: String!, $c: String) { askLumi(workspaceId: $w, text: $t, context: $c) { role } }' \
+    "{\"w\":\"$workspace\",\"t\":\"file a follow-up task for subtract\",\"c\":\"the board\"}" | jq -c '.data.askLumi // .errors')"
+  local answer=""
+  for _ in $(seq 1 120); do
+    answer="$(gql 'query ($w: UUID!) { lumiMessages(workspaceId: $w) { role body proposal proposalState } }' "{\"w\":\"$workspace\"}" \
+      | jq -c '[.data.lumiMessages[] | select(.role == "lumi")] | last // empty')"
+    [ -n "$answer" ] && break
+    sleep 1
+  done
+  case "$answer" in
+    *"nothing says what subtract does"*) echo "lumi answered" ;;
+    *) echo "lumi never answered: '$answer'" >&2; return 1 ;;
+  esac
+  case "$answer" in
+    *below\ zero*) ;;
+    *) echo "the answer carries no proposal: '$answer'" >&2; return 1 ;;
+  esac
+  local lumi_msg
+  lumi_msg="$(gql 'query ($w: UUID!) { lumiMessages(workspaceId: $w) { id role proposalState } }' "{\"w\":\"$workspace\"}" \
+    | jq -r '[.data.lumiMessages[] | select(.role == "lumi" and .proposalState == "open")] | last | .id')"
+  echo "applied: $(gql 'mutation ($id: UUID!) { applyLumiProposal(messageId: $id, items: [0]) { proposalState } }' \
+    "{\"id\":\"$lumi_msg\"}" | jq -c '.data.applyLumiProposal // .errors')"
+  local filed
+  filed="$(gql 'query ($w: UUID!) { issues(workspaceId: $w) { title status } }' "{\"w\":\"$workspace\"}" \
+    | jq -r '[.data.issues[] | select(.title | test("below zero"))] | length')"
+  case "$filed" in
+    1) echo "lumi filed the follow-up" ;;
+    *) echo "apply did not create the task (found $filed)" >&2; return 1 ;;
+  esac
 }
 
 main "$@"

@@ -56,6 +56,15 @@ impl Query {
         )
     }
 
+    /// The Lumi conversation of one workspace, oldest first.
+    async fn lumi_messages(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<LumiMessage>> {
+        Ok(engine(ctx).lumi_messages(workspace_id).await?)
+    }
+
     /// Every provider the loop can act as, with whether the stored credential
     /// still works. This is the connections screen's one read.
     async fn connections(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Connection>> {
@@ -344,6 +353,61 @@ impl Mutation {
     ) -> async_graphql::Result<Workspace> {
         engine(ctx)
             .update_workspace(id, name, default_prefix)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// The harness and model Lumi answers with, a workspace setting.
+    async fn set_workspace_lumi(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        harness: String,
+        model: String,
+    ) -> async_graphql::Result<Workspace> {
+        engine(ctx)
+            .set_workspace_lumi(workspace_id, &harness, &model)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Ask Lumi. The question is stored at once; the answer arrives as its own
+    /// message when the runner finishes, so the panel polls `lumiMessages`.
+    async fn ask_lumi(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        text: String,
+        context: Option<String>,
+    ) -> async_graphql::Result<LumiMessage> {
+        engine(ctx)
+            .ask_lumi(workspace_id, &text, context.as_deref())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Run the ticked items of a proposal. Indexes are positions in the
+    /// proposal's `items` array.
+    async fn apply_lumi_proposal(
+        &self,
+        ctx: &Context<'_>,
+        message_id: Uuid,
+        items: Vec<i32>,
+    ) -> async_graphql::Result<LumiMessage> {
+        let items: Vec<usize> = items.iter().map(|i| *i as usize).collect();
+        engine(ctx)
+            .apply_lumi_proposal(message_id, &items)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    async fn dismiss_lumi_proposal(
+        &self,
+        ctx: &Context<'_>,
+        message_id: Uuid,
+    ) -> async_graphql::Result<LumiMessage> {
+        engine(ctx)
+            .dismiss_lumi_proposal(message_id)
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))
     }

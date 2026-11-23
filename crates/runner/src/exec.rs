@@ -330,6 +330,7 @@ impl Executor {
             "open_pr" => self.job_open_pr(&repo_path, spec).await,
             "review_pr" => job_review_pr(spec).await,
             "watch_checks" => job_watch_checks(spec).await,
+            "lumi" => self.job_lumi(&repo_path, spec).await,
             other => Err(anyhow!("unknown job kind {other}")),
         };
 
@@ -438,6 +439,136 @@ impl Executor {
             "ok": ok,
             "detail": detail,
         }))
+    }
+
+    /// One Lumi answer: the workspace's harness, run once with the question and
+    /// the snapshot the server packed. The process works from an empty scratch
+    /// directory — Lumi reads a snapshot and writes a reply, never the repo —
+    /// while the repo's dev shell supplies the PATH the CLI lives on.
+    async fn job_lumi(&self, repo_path: &Path, spec: &Value) -> Result<Value> {
+        let payload = &spec["payload"];
+        let adapter = Adapter::parse(payload["adapter"].as_str().unwrap_or_default())
+            .ok_or_else(|| anyhow!("unknown adapter"))?;
+        let model = payload["model"].as_str().unwrap_or_default();
+        let system_prompt = payload["system_prompt"].as_str().unwrap_or_default();
+        let mut message = payload["message"].as_str().unwrap_or_default().to_string();
+        if let Some(history) = payload["history"].as_array().filter(|h| !h.is_empty()) {
+            let lines: Vec<String> = history
+                .iter()
+                .map(|turn| {
+                    format!(
+                        "{}: {}",
+                        turn["role"].as_str().unwrap_or("user"),
+                        turn["text"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect();
+            message = format!(
+                "Earlier in this conversation:\n\n{}\n\n---\n\n{message}",
+                lines.join("\n\n")
+            );
+        }
+
+        let workdir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
+        std::fs::create_dir_all(&workdir)?;
+
+        let has_envrc = repo_path.join(".envrc").exists();
+        let direnv_home = self.data_dir.join("direnv");
+        if has_envrc {
+            std::fs::create_dir_all(&direnv_home).ok();
+            let _ = Command::new("direnv")
+                .arg("allow")
+                .arg(repo_path)
+                .env("XDG_DATA_HOME", &direnv_home)
+                .env("NO_COLOR", "1")
+                .output();
+        }
+        let home = contract::scratch_home(&self.data_dir, adapter);
+        std::fs::create_dir_all(&home)?;
+        seed_home(&home);
+        let home = std::fs::canonicalize(&home).unwrap_or(home);
+        let path = if adapter == Adapter::Fake {
+            std::env::var("PATH").unwrap_or_default()
+        } else {
+            dev_shell_path(repo_path).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+        };
+        let env: Vec<(String, String)> = vec![
+            ("PATH".into(), path),
+            ("HOME".into(), home.to_string_lossy().to_string()),
+            (
+                "TMPDIR".into(),
+                std::env::temp_dir().to_string_lossy().to_string(),
+            ),
+            ("NO_COLOR".into(), "1".into()),
+            (
+                "XDG_DATA_HOME".into(),
+                direnv_home.to_string_lossy().to_string(),
+            ),
+        ];
+
+        let invocation = adapter::invocation(adapter, model, system_prompt, &message)?;
+        let mut child = adapter::spawn(&invocation, &workdir, &env)?;
+        let pid = child.id() as i64;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("the harness has no stdout"))?;
+        let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let _ = line_tx.send(line);
+            }
+        });
+
+        let mut transcript = Transcript {
+            forbidden: vec![system_prompt.to_string(), message.clone()],
+            ..Default::default()
+        };
+        let wall_clock = Duration::from_secs((hulahoop_core::LUMI_WALL_CLOCK_MINUTES as u64) * 60);
+        let started = Instant::now();
+        let mut timed_out = false;
+        loop {
+            let left = wall_clock.saturating_sub(started.elapsed());
+            if left.is_zero() {
+                timed_out = true;
+                kill_group(pid);
+                break;
+            }
+            tokio::select! {
+                line = line_rx.recv() => {
+                    match line {
+                        Some(line) => transcript.feed(&line),
+                        None => break,
+                    }
+                }
+                _ = tokio::time::sleep(left) => {
+                    timed_out = true;
+                    kill_group(pid);
+                    break;
+                }
+            }
+        }
+        let status = loop {
+            match child.try_wait()? {
+                Some(status) => break status,
+                None => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        };
+        if timed_out {
+            bail!(
+                "the harness did not answer within {} minutes",
+                hulahoop_core::LUMI_WALL_CLOCK_MINUTES
+            );
+        }
+        if !status.success() {
+            bail!("the harness exited with {:?}", status.code());
+        }
+
+        let text = transcript.final_text();
+        if text.trim().is_empty() {
+            bail!("the harness answered with nothing");
+        }
+        Ok(parse_lumi_reply(&text))
     }
 
     async fn job_open_pr(&self, repo_path: &Path, spec: &Value) -> Result<Value> {
@@ -1216,6 +1347,36 @@ fn seed_home(home: &Path) {
             }
         }
     }
+}
+
+/// Lumi's output contract is one JSON object `{reply, proposal?}`. A model
+/// that wrapped it in a fence, or answered in prose, still gets through: the
+/// words become the reply and there is simply no proposal.
+fn parse_lumi_reply(text: &str) -> Value {
+    let trimmed = text.trim();
+    let candidate = if trimmed.starts_with("```") {
+        trimmed
+            .trim_start_matches("```json")
+            .trim_start_matches("```")
+            .trim_end_matches("```")
+            .trim()
+    } else {
+        trimmed
+    };
+    // The object may sit inside prose; take the outermost braces.
+    let sliced = match (candidate.find('{'), candidate.rfind('}')) {
+        (Some(start), Some(end)) if start < end => &candidate[start..=end],
+        _ => candidate,
+    };
+    if let Ok(value) = serde_json::from_str::<Value>(sliced) {
+        if value["reply"].is_string() {
+            return json!({
+                "reply": value["reply"],
+                "proposal": value.get("proposal").cloned().unwrap_or(Value::Null),
+            });
+        }
+    }
+    json!({ "reply": trimmed, "proposal": Value::Null })
 }
 
 #[derive(Default)]

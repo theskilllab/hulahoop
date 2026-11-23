@@ -34,6 +34,7 @@ import IssueDetail from "./screens/IssueDetail";
 import Milestones from "./screens/Milestones";
 import Skills from "./screens/Skills";
 import WorkflowScreen from "./screens/Workflow";
+import Lumi from "./screens/Lumi";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
 import { Connectors } from "./screens/Connectors";
@@ -95,6 +96,7 @@ export default function App() {
   }, [collapsed]);
   const [wsMenu, setWsMenu] = useState(false);
   const [palette, setPalette] = useState(false);
+  const [lumi, setLumi] = useState(false);
 
   // The page header's search field is the same door as ⌘K.
   useEffect(() => {
@@ -197,6 +199,10 @@ export default function App() {
         event.preventDefault();
         setView({ name: "new" });
       }
+      if (meta && event.key.toLowerCase() === "j") {
+        event.preventDefault();
+        setLumi((was) => !was);
+      }
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -289,6 +295,14 @@ export default function App() {
   ];
 
   const initial = workspaces.find((entry) => entry.id === workspace.id)?.name?.[0] ?? "H";
+
+  /** What Lumi is told the person is looking at. */
+  const lumiContext =
+    view.name === "issue" && openIssue
+      ? `Task ${openIssue.key} — ${openIssue.title}`
+      : view.name === "tasks"
+        ? "the board"
+        : view.name;
 
   return (
     <div className={collapsed ? "shell collapsed" : "shell"}>
@@ -587,6 +601,15 @@ export default function App() {
           />
         )}
       </main>
+
+      <Lumi
+        workspace={workspace}
+        context={lumiContext}
+        open={lumi}
+        onToggle={setLumi}
+        onApplied={() => void refresh()}
+        onOpenSettings={() => setView({ name: "settings" })}
+      />
     </div>
   );
 }

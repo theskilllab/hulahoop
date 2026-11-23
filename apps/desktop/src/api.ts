@@ -177,6 +177,34 @@ export interface Workspace {
   slug: string;
   /** What an issue with no project is called by. */
   defaultPrefix: string;
+  /** The harness and model Lumi answers with. Null until somebody picks one. */
+  lumiHarness: string | null;
+  lumiModel: string | null;
+}
+
+/** One checkbox of a Lumi proposal: what will happen, in words and in action. */
+export interface LumiProposalItem {
+  group: string;
+  text: string;
+  action: string;
+  args: Record<string, unknown>;
+}
+
+export interface LumiProposal {
+  title: string;
+  items: LumiProposalItem[];
+}
+
+/** One turn of the Lumi conversation. A `lumi` row may carry a proposal. */
+export interface LumiMessage {
+  id: string;
+  role: "user" | "lumi";
+  body: string;
+  context: string | null;
+  /** JSON text of a LumiProposal, or null. */
+  proposal: string | null;
+  proposalState: "open" | "applied" | "dismissed" | null;
+  createdAt: string;
 }
 
 export interface WorkspaceMember {
@@ -657,7 +685,7 @@ export interface WorkspaceSnapshot {
  */
 export async function loadWorkspace(workspaceId?: string | null): Promise<WorkspaceSnapshot> {
   const data = await gql<{ workspaces: Workspace[] }>(
-    `{ workspaces { id name slug defaultPrefix } }`,
+    `{ workspaces { id name slug defaultPrefix lumiHarness lumiModel } }`,
   );
   const workspace =
     data.workspaces.find((entry) => entry.id === workspaceId) ?? data.workspaces[0];
@@ -701,6 +729,68 @@ export async function updateWorkspace(
     { id, name: name ?? null, defaultPrefix: defaultPrefix ?? null },
   );
   return data.updateWorkspace;
+}
+
+const LUMI_FIELDS = `id role body context proposal proposalState createdAt`;
+
+export async function loadLumiMessages(workspaceId: string): Promise<LumiMessage[]> {
+  const data = await gql<{ lumiMessages: LumiMessage[] }>(
+    `query ($id: UUID!) { lumiMessages(workspaceId: $id) { ${LUMI_FIELDS} } }`,
+    { id: workspaceId },
+  );
+  return data.lumiMessages;
+}
+
+/** The question lands at once; the answer arrives as its own message later. */
+export async function askLumi(
+  workspaceId: string,
+  text: string,
+  context?: string,
+): Promise<LumiMessage> {
+  const data = await gql<{ askLumi: LumiMessage }>(
+    `mutation ($id: UUID!, $text: String!, $context: String) {
+       askLumi(workspaceId: $id, text: $text, context: $context) { ${LUMI_FIELDS} }
+     }`,
+    { id: workspaceId, text, context: context ?? null },
+  );
+  return data.askLumi;
+}
+
+export async function applyLumiProposal(
+  messageId: string,
+  items: number[],
+): Promise<LumiMessage> {
+  const data = await gql<{ applyLumiProposal: LumiMessage }>(
+    `mutation ($id: UUID!, $items: [Int!]!) {
+       applyLumiProposal(messageId: $id, items: $items) { ${LUMI_FIELDS} }
+     }`,
+    { id: messageId, items },
+  );
+  return data.applyLumiProposal;
+}
+
+export async function dismissLumiProposal(messageId: string): Promise<LumiMessage> {
+  const data = await gql<{ dismissLumiProposal: LumiMessage }>(
+    `mutation ($id: UUID!) { dismissLumiProposal(messageId: $id) { ${LUMI_FIELDS} } }`,
+    { id: messageId },
+  );
+  return data.dismissLumiProposal;
+}
+
+export async function setWorkspaceLumi(
+  workspaceId: string,
+  harness: string,
+  model: string,
+): Promise<Workspace> {
+  const data = await gql<{ setWorkspaceLumi: Workspace }>(
+    `mutation ($id: UUID!, $harness: String!, $model: String!) {
+       setWorkspaceLumi(workspaceId: $id, harness: $harness, model: $model) {
+         id name slug defaultPrefix lumiHarness lumiModel
+       }
+     }`,
+    { id: workspaceId, harness, model },
+  );
+  return data.setWorkspaceLumi;
 }
 
 export async function renameProject(id: string, name: string): Promise<Project> {
