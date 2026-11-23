@@ -213,6 +213,9 @@ async fn get_spec(
         .run(id)
         .await
         .map_err(|e| fail(StatusCode::NOT_FOUND, e))?;
+    if !run.status_enum().is_live() {
+        return Err(fail(StatusCode::CONFLICT, "run has already finished"));
+    }
     let spec = build_run_spec(&state.engine, &run)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
@@ -403,10 +406,15 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         .bind(run.repo_id)
         .fetch_one(&engine.db.pool)
         .await?;
-    let agent: Agent = sqlx::query_as("select * from agents where id = ?")
+    let mut agent: Agent = sqlx::query_as("select * from agents where id = ?")
         .bind(run.agent_id)
         .fetch_one(&engine.db.pool)
         .await?;
+    // The queued run owns the execution identity and its price snapshot.
+    // Agent edits after dispatch affect only future runs.
+    agent.adapter = run.adapter_snapshot.clone().unwrap_or(agent.adapter);
+    agent.model = run.model.clone();
+    agent.connector = run.connector_id.clone();
     let criteria = engine.criteria(run.issue_id).await?;
     let project: Project = sqlx::query_as("select * from projects where id = ?")
         .bind(issue.project_id)
@@ -497,6 +505,40 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         let credential = engine
             .agent_credential(adapter, agent.connector.as_deref())
             .await?;
+        let has_api_key = credential
+            .env
+            .iter()
+            .any(|(key, _)| key == "ANTHROPIC_API_KEY" || key == "PI_API_KEY");
+        let source = if has_api_key {
+            "api"
+        } else if !credential.is_empty() && adapter == hulahoop_core::Adapter::ClaudeCode {
+            "subscription"
+        } else {
+            // Pi login may bill a provider directly; inherited runner credentials
+            // can also supersede a supplied login. Preserve this uncertainty.
+            "unknown"
+        };
+        let selected = match (adapter, source) {
+            (hulahoop_core::Adapter::ClaudeCode, "api") => Some("claude-api"),
+            (hulahoop_core::Adapter::ClaudeCode, "subscription") => Some("claude-sub"),
+            (hulahoop_core::Adapter::Pi, "api") => Some("pi"),
+            _ => None,
+        };
+        if run
+            .billing_source
+            .as_deref()
+            .is_some_and(|previous| previous != source)
+        {
+            anyhow::bail!("run credential billing source changed after claim");
+        }
+        if run.billing_source.is_none() {
+            sqlx::query("update runs set billing_source = ?, connector_id = coalesce(connector_id, ?) where id = ? and status = 'running' and billing_source is null")
+                .bind(source)
+                .bind(selected)
+                .bind(run.id)
+                .execute(&engine.db.pool)
+                .await?;
+        }
         serde_json::json!({
             "env": credential.env,
             "files": credential.files,

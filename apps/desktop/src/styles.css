@@ -4063,3 +4063,90 @@ table.transitions td {
   font-weight: 600;
   flex: none;
 }
+
+/* Cost control: compact ledger cards and chart/table twins from the prototype. */
+.cost-control .cost-body {
+  overflow: auto;
+  min-height: 0;
+  padding-top: var(--s4);
+  padding-bottom: var(--s6);
+  display: grid;
+  gap: var(--s4);
+}
+
+.cost-filters, .cost-panel-head, .cost-actions, .cost-edit, .cost-legend,
+.cost-reasons, .cost-plans {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  flex-wrap: wrap;
+}
+
+.cost-filters { font-size: var(--fs-xs); }
+.cost-filters label, .cost-edit label { display: grid; gap: var(--s1); color: var(--text-2); }
+.cost-filters select, .cost-edit select, .cost-edit input {
+  min-width: 120px;
+  height: var(--h-control);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--text);
+  padding: 0 var(--s2);
+}
+.cost-filters > .dim { margin-left: auto; }
+.cost-error { color: var(--bad); }
+.cost-section-heading { display: flex; align-items: baseline; gap: var(--s3); flex-wrap: wrap; }
+.cost-section-heading h2, .cost-panel h2 { font-size: var(--fs-md); margin: 0; }
+.cost-section-heading span, .cost-panel-head p { font-size: var(--fs-xs); color: var(--muted); margin: 0; }
+.cost-kpis { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--s2); }
+.cost-tile, .cost-panel {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+.cost-tile { padding: var(--s3); display: grid; gap: var(--s1); min-width: 0; }
+.cost-tile .label, .cost-budget .label { color: var(--muted); text-transform: uppercase; letter-spacing: .04em; font-size: var(--fs-xs); }
+.cost-tile strong { font-size: var(--fs-stat); font-variant-numeric: tabular-nums; line-height: 1.15; }
+.cost-tile .dim { font-size: var(--fs-xs); }
+.cost-note { color: var(--muted); font-size: var(--fs-xs); margin: 0; }
+.cost-panel { padding: var(--s4); min-width: 0; display: grid; gap: var(--s3); }
+.cost-panel-head { justify-content: space-between; }
+.cost-panel h3 { font-size: var(--fs-sm); margin: var(--s2) 0 0; }
+.cost-two-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--s3); }
+.cost-scroll { overflow-x: auto; }
+.cost-scroll .table { width: 100%; min-width: 480px; }
+.cost-scroll .table td, .cost-scroll .table th { white-space: nowrap; }
+.cost-bars { display: flex; align-items: end; gap: var(--s2); height: 170px; overflow-x: auto; padding-top: var(--s2); }
+.cost-bar-col { display: flex; flex: 1 0 22px; flex-direction: column; align-items: center; gap: var(--s1); min-width: 22px; height: 100%; font-size: var(--fs-2xs); color: var(--muted); }
+.cost-bar-track { display: flex; flex-direction: column-reverse; width: min(100%, 26px); height: 140px; align-items: stretch; justify-content: flex-start; background: var(--bg-2); border-radius: var(--r-xs); overflow: hidden; }
+.cost-bar-track > span { display: block; flex: none; min-height: 0; }
+.cost-legend { font-size: var(--fs-xs); color: var(--text-2); }
+.cost-legend > span { display: inline-flex; align-items: center; gap: var(--s1); }
+.cost-legend i { width: 8px; height: 8px; border-radius: 2px; }
+.cost-reasons, .cost-plans { font-size: var(--fs-xs); color: var(--text-2); }
+.cost-reasons > span, .cost-plans > span { background: var(--bg-2); border-radius: var(--r-sm); padding: var(--s1) var(--s2); }
+.cost-budget { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--s4); }
+.cost-budget > div { min-width: 0; }
+.cost-budget strong { display: block; font-size: var(--fs-lg); font-variant-numeric: tabular-nums; }
+.cost-budget p { font-size: var(--fs-xs); margin: var(--s1) 0; }
+.cost-edit { align-items: end; }
+.cost-edit button { height: var(--h-control); }
+.cost-scatter { height: 175px; position: relative; background: linear-gradient(transparent 49.8%, var(--line) 50%, transparent 50.2%), linear-gradient(90deg, transparent 49.8%, var(--line) 50%, transparent 50.2%); border: 1px solid var(--line); border-radius: var(--r-sm); margin: var(--s2) 0; }
+.cost-scatter > span { border-radius: 50%; opacity: .8; position: absolute; transform: translate(-50%, 50%); border: 1px solid var(--bg); }
+.cost-scatter small { position: absolute; color: var(--muted); font-size: var(--fs-xs); }
+.cost-scatter-y { left: var(--s2); top: var(--s1); }
+.cost-scatter-x { right: var(--s2); bottom: var(--s1); }
+.cost-verdict { margin: 0; font-size: var(--fs-xs); }
+.cost-task-link { border: 0; background: transparent; color: var(--accent); padding: 0; font: inherit; cursor: pointer; text-align: left; }
+.cost-task-link:hover { text-decoration: underline; }
+.cost-task-link:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+@media (max-width: 1050px) {
+  .cost-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .cost-two-columns { grid-template-columns: minmax(0, 1fr); }
+}
+@media (max-width: 600px) {
+  .cost-kpis, .cost-budget { grid-template-columns: minmax(0, 1fr); }
+  .cost-filters > .dim { margin-left: 0; }
+  .cost-panel-head { align-items: start; }
+}

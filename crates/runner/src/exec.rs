@@ -1003,9 +1003,21 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
         env.push(("HULAHOOP_FAKE_SCRIPT".into(), script));
     }
     // Model credentials travel in the environment, never in a file in the repo.
-    for key in contract::CREDENTIAL_ENV {
-        if let Ok(value) = std::env::var(key) {
-            env.push((key.into(), value));
+    // A stored connector is the entire credential context. Inheriting an API
+    // key beside a subscription login can silently bill the API instead.
+    let supplied_credential = spec.get("credential").is_some_and(|credential| {
+        credential["env"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty())
+            || credential["files"]
+                .as_array()
+                .is_some_and(|entries| !entries.is_empty())
+    });
+    if !supplied_credential {
+        for key in contract::CREDENTIAL_ENV {
+            if let Ok(value) = std::env::var(key) {
+                env.push((key.into(), value));
+            }
         }
     }
     // A connector the user pasted wins over the machine's own login: the run acts

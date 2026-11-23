@@ -38,7 +38,8 @@ import Lumi from "./screens/Lumi";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
 import { Connectors } from "./screens/Connectors";
-import { Activity, Cost, Inbox, Projects, PullRequests } from "./screens/Misc";
+import { Activity, Inbox, Projects, PullRequests } from "./screens/Misc";
+import Cost from "./screens/Cost";
 
 type View =
   | { name: "inbox" }
@@ -484,7 +485,7 @@ export default function App() {
 
         {view.name === "connectors" && <Connectors />}
 
-        {view.name === "cost" && <Cost runners={runners} agents={agents} />}
+        {view.name === "cost" && <Cost workspaceId={workspace.id} agents={agents} onOpen={(id) => setView({ name: "issue", id })} />}
 
         {view.name === "prs" && (
           <PullRequests issues={issues} onOpen={(id) => setView({ name: "issue", id })} />

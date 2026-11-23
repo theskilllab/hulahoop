@@ -1,7 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import {
-  loadModels,
   loadRecentRuns,
   type Agent,
   type Artifact,
@@ -150,120 +149,6 @@ export function Projects({
         })}
         {projects.length === 0 ? <p className="dim">No projects yet. Create one in Settings.</p> : null}
       </div>
-    </section>
-  );
-}
-
-/* ----------------------------------------------------------------- Cost --- */
-
-export function Cost({ runners, agents }: { runners: RecentRun[]; agents: Agent[] }) {
-  const [prices, setPrices] = useState<Map<string, { input: number; output: number }>>(new Map());
-
-  // Prices come from the harness catalogue, not from a table in the app: pi
-  // publishes dollars per million tokens next to each model.
-  useEffect(() => {
-    const harnesses = [...new Set(agents.map((agent) => agent.adapter))];
-    let live = true;
-    Promise.all(harnesses.map((harness) => loadModels(harness).catch(() => [])))
-      .then((lists) => {
-        if (!live) return;
-        const next = new Map<string, { input: number; output: number }>();
-        for (const entry of lists.flat()) {
-          if (entry.costIn !== null && entry.costOut !== null) {
-            next.set(entry.id, { input: entry.costIn, output: entry.costOut });
-          }
-        }
-        setPrices(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      live = false;
-    };
-  }, [agents]);
-
-  const spend = (run: RecentRun) => {
-    const price = prices.get(run.model);
-    if (!price) return null;
-    return (run.tokensIn * price.input + run.tokensOut * price.output) / 1_000_000;
-  };
-
-  const byAgent = new Map<string, { input: number; output: number; runs: number }>();
-  for (const run of runners) {
-    const entry = byAgent.get(run.agentId) ?? { input: 0, output: 0, runs: 0 };
-    entry.input += run.tokensIn;
-    entry.output += run.tokensOut;
-    entry.runs += 1;
-    byAgent.set(run.agentId, entry);
-  }
-  const totals = runners.reduce(
-    (sum, run) => ({ input: sum.input + run.tokensIn, output: sum.output + run.tokensOut }),
-    { input: 0, output: 0 },
-  );
-  const biggest = Math.max(1, ...[...byAgent.values()].map((entry) => entry.input + entry.output));
-  const failed = runners.filter((run) => run.status === "failed").length;
-  const priced = runners.map(spend).filter((value): value is number => value !== null);
-  const spent = priced.reduce((sum, value) => sum + value, 0);
-
-  return (
-    <section className="screen cost">
-      <PageHeader title="Cost control" subtitle={`${runners.length} recent runs`} />
-
-      <div className="stat-row">
-        <div className="stat">
-          <span className="label">input</span>
-          <strong>{number(totals.input)}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">output</span>
-          <strong>{number(totals.output)}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">runs</span>
-          <strong>{runners.length}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">failed</span>
-          <strong>{failed}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">estimated spend</span>
-          <strong>{priced.length ? `$${spent.toFixed(4)}` : "—"}</strong>
-        </div>
-      </div>
-
-      <table className="table">
-        <thead>
-          <tr>
-            <th>agent</th>
-            <th>runs</th>
-            <th>input</th>
-            <th>output</th>
-            <th>share</th>
-          </tr>
-        </thead>
-        <tbody>
-          {[...byAgent.entries()]
-            .sort((a, b) => b[1].input + b[1].output - (a[1].input + a[1].output))
-            .map(([agentId, entry]) => {
-              const agent = agents.find((candidate) => candidate.id === agentId);
-              const total = entry.input + entry.output;
-              return (
-                <tr key={agentId}>
-                  <td>{agent?.name ?? agentId.slice(0, 8)}</td>
-                  <td>{entry.runs}</td>
-                  <td className="mono">{number(entry.input)}</td>
-                  <td className="mono">{number(entry.output)}</td>
-                  <td>
-                    <span className="meter">
-                      <span style={{ width: `${Math.round((total / biggest) * 100)}%` }} />
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-        </tbody>
-      </table>
-      {byAgent.size === 0 ? <p className="dim">No runs yet, so nothing spent.</p> : null}
     </section>
   );
 }
