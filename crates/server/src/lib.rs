@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod connectors;
+pub mod cost;
 pub mod db;
 pub mod engine;
 pub mod github;
@@ -107,7 +108,25 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         )
         .route("/health", axum::routing::get(|| async { "ok" }))
         .merge(api::router(api_state))
-        .layer(tower_http::cors::CorsLayer::very_permissive())
+        // The desktop runs from the Tauri origin (or Vite's fixed dev port).
+        // Multi-user deployment also requires identity-aware GraphQL authorization.
+        // An arbitrary website must not read workspace reports or mutate budgets
+        // through the local GraphQL endpoint.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin([
+                    axum::http::HeaderValue::from_static("tauri://localhost"),
+                    axum::http::HeaderValue::from_static("http://tauri.localhost"),
+                    axum::http::HeaderValue::from_static("https://tauri.localhost"),
+                    axum::http::HeaderValue::from_static("http://localhost:5183"),
+                    axum::http::HeaderValue::from_static("http://127.0.0.1:5183"),
+                ])
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ]),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http());
 
     let socket = SocketAddr::from((listen, port));
@@ -159,6 +178,9 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
             ticker.tick().await;
             if let Err(error) = reaper.reap_dead_runs().await {
                 tracing::warn!(%error, "reaping runs failed");
+            }
+            if let Err(error) = reaper.reap_lumi_jobs().await {
+                tracing::warn!(%error, "reaping Lumi jobs failed");
             }
         }
     });

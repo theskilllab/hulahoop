@@ -6,39 +6,52 @@
 //! would roughly double the bill, which is why a message is added once, when it
 //! finishes.
 //!
-//! claude writes one `assistant` record per finished message and puts the
-//! usage on that record's message, so the same rule applies: each record is a
-//! finished message and its own final number. Its usage carries the provider's
-//! snake_case names, which is why the field lookup accepts both spellings.
+//! claude can write repeated `assistant` snapshots for one message ID. Keep the
+//! latest per ID during interrupted streams; a final `result.usage` supplies
+//! authoritative totals. Its usage has provider snake_case counter names.
+
+use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
-/// One usage snapshot. The cache counters are part of the provider's report but
-/// the run row only carries the two numbers the desktop shows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A provider's final usage for one response.
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct Usage {
     input: i64,
     output: i64,
+    cache_read: i64,
+    cache_write: i64,
+    cost_usd: Option<f64>,
 }
 
-/// The input and output tokens a stream spent, summed over its messages.
-///
-/// A message contributes its final snapshot: the `message_end` usage when the
-/// adapter writes one, otherwise the last `message_update` seen for it. A
-/// message the stream never finished still spent its last snapshot, so a run
-/// killed mid-answer reports what it used. claude's `assistant` records are
-/// finished messages already, so each contributes its own usage once.
-pub fn totals(stream: &str) -> (i64, i64) {
-    let mut input = 0i64;
-    let mut output = 0i64;
+/// Nullable metrics distinguish an unmetered stream from a measured zero.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct Metrics {
+    pub input: i64,
+    pub output: i64,
+    pub cache_read: Option<i64>,
+    pub cache_write: Option<i64>,
+    pub turns: Option<i64>,
+    pub tool_calls: Option<i64>,
+    pub reported_cost_usd: Option<f64>,
+    pub actual_model: Option<String>,
+    pub measured: bool,
+}
+
+/// Sum Pi's final assistant snapshots; Claude's result record overrides its
+/// repeated assistant events when present. Interrupted streams retain partial
+/// distinct-message usage, with no invented provider-reported cost.
+pub fn metrics(stream: &str) -> Metrics {
+    let mut result = Metrics::default();
     let mut open: Option<Usage> = None;
+    let mut seen_messages = HashSet::new();
+    let mut claude_snapshots: HashMap<String, Usage> = HashMap::new();
+    let mut seen_tools = HashSet::new();
+    let mut claude_result: Option<Usage> = None;
+    let mut claude_cost: Option<f64> = None;
 
     for line in stream.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
+        let Ok(event) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
         match event.get("type").and_then(Value::as_str) {
@@ -49,34 +62,121 @@ pub fn totals(stream: &str) -> (i64, i64) {
                 }
             }
             Some("message_end") => {
-                if let Some(usage) = event.get("message").and_then(usage_of) {
-                    input += usage.input;
-                    output += usage.output;
-                } else if let Some(usage) = open {
-                    input += usage.input;
-                    output += usage.output;
+                let message = event.get("message");
+                if let Some(message) = message {
+                    if message.get("role").and_then(Value::as_str) == Some("assistant") {
+                        result.turns = Some(result.turns.unwrap_or(0) + 1);
+                        count_tools(&mut result, &mut seen_tools, message);
+                        model_of(&mut result, message);
+                    }
+                }
+                if let Some(usage) = message.and_then(usage_of).or(open) {
+                    add_usage(&mut result, usage);
                 }
                 open = None;
             }
-            // claude's answer to `message_end`: one record per finished message,
-            // usage on the message. There is no `message_update` stream to
-            // defer to, so the record is the message's final value.
             Some("assistant") => {
-                if let Some(usage) = event.get("message").and_then(usage_of) {
-                    input += usage.input;
-                    output += usage.output;
+                if let Some(message) = event.get("message") {
+                    let id = message.get("id").and_then(Value::as_str);
+                    count_tools(&mut result, &mut seen_tools, message);
+                    model_of(&mut result, message);
+                    if id.is_none() || seen_messages.insert(id.unwrap().to_owned()) {
+                        result.turns = Some(result.turns.unwrap_or(0) + 1);
+                    }
+                    if let Some(usage) = usage_of(message) {
+                        if let Some(id) = id {
+                            claude_snapshots.insert(id.to_owned(), usage);
+                        } else {
+                            add_usage(&mut result, usage);
+                        }
+                    }
                 }
+            }
+            Some("result") => {
+                claude_result = usage_of(&event);
+                claude_cost = event.get("total_cost_usd").and_then(Value::as_f64);
             }
             _ => {}
         }
     }
-
     if let Some(usage) = open {
-        input += usage.input;
-        output += usage.output;
+        add_usage(&mut result, usage);
     }
+    for usage in claude_snapshots.into_values() {
+        add_usage(&mut result, usage);
+    }
+    if let Some(usage) = claude_result {
+        result.input = usage.input;
+        result.output = usage.output;
+        result.cache_read = Some(usage.cache_read);
+        result.cache_write = Some(usage.cache_write);
+        result.measured = true;
+    }
+    if let Some(cost) = claude_cost.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+        result.reported_cost_usd = Some(cost);
+    }
+    result
+}
 
-    (input, output)
+pub fn totals(stream: &str) -> (i64, i64) {
+    let usage = metrics(stream);
+    (usage.input, usage.output)
+}
+
+fn add_usage(result: &mut Metrics, usage: Usage) {
+    result.measured = true;
+    result.input = result.input.saturating_add(usage.input);
+    result.output = result.output.saturating_add(usage.output);
+    result.cache_read = Some(
+        result
+            .cache_read
+            .unwrap_or(0)
+            .saturating_add(usage.cache_read),
+    );
+    result.cache_write = Some(
+        result
+            .cache_write
+            .unwrap_or(0)
+            .saturating_add(usage.cache_write),
+    );
+    if let Some(cost) = usage
+        .cost_usd
+        .filter(|cost| cost.is_finite() && *cost >= 0.0)
+    {
+        result.reported_cost_usd = Some(result.reported_cost_usd.unwrap_or(0.0) + cost);
+    }
+}
+
+fn model_of(result: &mut Metrics, message: &Value) {
+    if let Some(model) = message.get("model").and_then(Value::as_str) {
+        match &result.actual_model {
+            None => result.actual_model = Some(model.to_owned()),
+            Some(previous) if previous != model => result.actual_model = Some("mixed".to_owned()),
+            _ => {}
+        }
+    }
+}
+
+fn count_tools(result: &mut Metrics, seen: &mut HashSet<String>, message: &Value) {
+    result.tool_calls.get_or_insert(0);
+    for block in message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = block.get("type").and_then(Value::as_str);
+        if kind != Some("toolCall") && kind != Some("tool_use") {
+            continue;
+        }
+        let id = block
+            .get("id")
+            .or_else(|| block.get("toolCallId"))
+            .and_then(Value::as_str);
+        if id.is_none() || seen.insert(id.unwrap().to_owned()) {
+            result.tool_calls = Some(result.tool_calls.unwrap_or(0) + 1);
+        }
+    }
 }
 
 fn usage_of(value: &Value) -> Option<Usage> {
@@ -86,6 +186,21 @@ fn usage_of(value: &Value) -> Option<Usage> {
     Some(Usage {
         input: counter(usage, "input", "input_tokens"),
         output: counter(usage, "output", "output_tokens"),
+        cache_read: counter(usage, "cacheRead", "cache_read_input_tokens"),
+        cache_write: usage
+            .get("cacheWrite")
+            .and_then(Value::as_i64)
+            .unwrap_or_else(|| {
+                counter(
+                    usage,
+                    "cache_creation_input_tokens",
+                    "cache_creation_input_tokens",
+                )
+            }),
+        cost_usd: usage
+            .get("cost")
+            .and_then(|cost| cost.get("total"))
+            .and_then(Value::as_f64),
     })
 }
 
@@ -101,7 +216,77 @@ fn counter(usage: &Value, camel: &str, snake: &str) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::totals;
+    use super::{metrics, totals};
+
+    #[test]
+    fn claude_repeated_snapshot_counts_new_tools_once() {
+        let got = metrics(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tool1\"}]}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"a\",\"content\":[{\"type\":\"tool_use\",\"id\":\"tool1\"},{\"type\":\"tool_use\",\"id\":\"tool2\"}]}}"
+        ));
+        assert_eq!(got.turns, Some(1));
+        assert_eq!(got.tool_calls, Some(2));
+    }
+
+    #[test]
+    fn measured_assistant_with_no_tools_reports_zero_calls() {
+        let got = metrics(
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":1,"output":2}}}"#,
+        );
+        assert_eq!(got.tool_calls, Some(0));
+    }
+
+    #[test]
+    fn pi_counts_final_usage_cache_cost_and_effort_once() {
+        let stream = [
+            r#"{"type":"message_update","usage":{"input":5,"output":2}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","model":"test","content":[{"type":"toolCall","id":"a"}],"usage":{"input":10,"output":4,"cacheRead":12,"cacheWrite":3,"cost":{"total":0.04}}}}"#,
+            r#"{"type":"message_end","message":{"role":"assistant","content":[],"usage":{"input":7,"output":2,"cost":{"total":0.02}}}}"#,
+        ].join("\n");
+        let got = metrics(&stream);
+        assert_eq!(
+            (got.input, got.output, got.cache_read, got.cache_write),
+            (17, 6, Some(12), Some(3))
+        );
+        assert_eq!((got.turns, got.tool_calls), (Some(2), Some(1)));
+        assert!((got.reported_cost_usd.unwrap() - 0.06).abs() < 0.000001);
+        assert_eq!(got.actual_model.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn interrupted_claude_stream_keeps_latest_usage_per_message() {
+        let stream = [
+            r#"{"type":"assistant","message":{"id":"one","usage":{"input_tokens":5,"output_tokens":12}}}"#,
+            r#"{"type":"assistant","message":{"id":"one","usage":{"input_tokens":5,"output_tokens":23}}}"#,
+            r#"{"type":"assistant","message":{"id":"two","usage":{"input_tokens":9,"output_tokens":4}}}"#,
+        ].join("\n");
+        let got = metrics(&stream);
+        assert_eq!((got.input, got.output), (14, 27));
+        assert_eq!(got.turns, Some(2));
+    }
+
+    #[test]
+    fn claude_result_overrides_repeated_message_snapshots() {
+        let stream = [
+            r#"{"type":"assistant","message":{"id":"same","content":[{"type":"tool_use","id":"call"}],"usage":{"input_tokens":2,"output_tokens":10}}}"#,
+            r#"{"type":"assistant","message":{"id":"same","content":[{"type":"tool_use","id":"call"}],"usage":{"input_tokens":2,"output_tokens":15}}}"#,
+            r#"{"type":"result","usage":{"input_tokens":3,"output_tokens":50,"cache_read_input_tokens":9,"cache_creation_input_tokens":7},"total_cost_usd":0.12}"#,
+        ].join("\n");
+        let got = metrics(&stream);
+        assert_eq!(
+            (got.input, got.output, got.cache_read, got.cache_write),
+            (3, 50, Some(9), Some(7))
+        );
+        assert_eq!((got.turns, got.tool_calls), (Some(1), Some(1)));
+        assert_eq!(got.reported_cost_usd, Some(0.12));
+    }
+
+    #[test]
+    fn missing_usage_is_unknown() {
+        let got = metrics("{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\"}}");
+        assert!(!got.measured);
+        assert_eq!(got.reported_cost_usd, None);
+    }
 
     #[test]
     fn a_repeated_snapshot_is_one_message_not_a_sum() {

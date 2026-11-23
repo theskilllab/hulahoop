@@ -1,7 +1,6 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 
 import {
-  loadModels,
   loadRecentRuns,
   type Agent,
   type Artifact,
@@ -12,6 +11,8 @@ import {
 } from "../api";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
+import ProjectManager from "./ProjectManager";
+import type { Workspace } from "../api";
 
 function when(iso: string | null): string {
   if (!iso) return "—";
@@ -76,24 +77,25 @@ export function Inbox({ issues, onOpen }: { issues: Issue[]; onOpen: (id: string
 export function Projects({
   projects,
   issues,
-  agents,
-  onOpenSettings,
+  workspace,
+  onChanged,
   onOpen,
 }: {
   projects: Project[];
   issues: Issue[];
-  agents: Agent[];
-  onOpenSettings: () => void;
+  workspace: Workspace;
+  onChanged: () => Promise<void>;
   onOpen: (id: string) => void;
 }) {
+  const [managing, setManaging] = useState<string | null>(null);
   return (
     <section className="screen projects">
       <PageHeader
         title="Projects"
         subtitle={`${projects.length} projects`}
         actions={
-          <button className="ghost" onClick={onOpenSettings}>
-            Manage in settings
+          <button className="ghost" onClick={() => setManaging("new")}>
+            New project
           </button>
         }
       />
@@ -138,132 +140,27 @@ export function Projects({
                   onClick={() => {
                     const first = own[0];
                     if (first) onOpen(first.id);
-                    else onOpenSettings();
+                    else setManaging(project.id);
                   }}
                 >
                   {own[0] ? `Open ${own[0].key}` : "Attach a repository"}
                 </button>
-                <span className="dim">{agents.length} agents in this workspace</span>
+                <button className="link" onClick={() => setManaging(project.id)}>Project settings</button>
               </footer>
             </article>
           );
         })}
-        {projects.length === 0 ? <p className="dim">No projects yet. Create one in Settings.</p> : null}
+        {projects.length === 0 ? <p className="dim">No projects yet. Create one here.</p> : null}
       </div>
-    </section>
-  );
-}
-
-/* ----------------------------------------------------------------- Cost --- */
-
-export function Cost({ runners, agents }: { runners: RecentRun[]; agents: Agent[] }) {
-  const [prices, setPrices] = useState<Map<string, { input: number; output: number }>>(new Map());
-
-  // Prices come from the harness catalogue, not from a table in the app: pi
-  // publishes dollars per million tokens next to each model.
-  useEffect(() => {
-    const harnesses = [...new Set(agents.map((agent) => agent.adapter))];
-    let live = true;
-    Promise.all(harnesses.map((harness) => loadModels(harness).catch(() => [])))
-      .then((lists) => {
-        if (!live) return;
-        const next = new Map<string, { input: number; output: number }>();
-        for (const entry of lists.flat()) {
-          if (entry.costIn !== null && entry.costOut !== null) {
-            next.set(entry.id, { input: entry.costIn, output: entry.costOut });
-          }
-        }
-        setPrices(next);
-      })
-      .catch(() => undefined);
-    return () => {
-      live = false;
-    };
-  }, [agents]);
-
-  const spend = (run: RecentRun) => {
-    const price = prices.get(run.model);
-    if (!price) return null;
-    return (run.tokensIn * price.input + run.tokensOut * price.output) / 1_000_000;
-  };
-
-  const byAgent = new Map<string, { input: number; output: number; runs: number }>();
-  for (const run of runners) {
-    const entry = byAgent.get(run.agentId) ?? { input: 0, output: 0, runs: 0 };
-    entry.input += run.tokensIn;
-    entry.output += run.tokensOut;
-    entry.runs += 1;
-    byAgent.set(run.agentId, entry);
-  }
-  const totals = runners.reduce(
-    (sum, run) => ({ input: sum.input + run.tokensIn, output: sum.output + run.tokensOut }),
-    { input: 0, output: 0 },
-  );
-  const biggest = Math.max(1, ...[...byAgent.values()].map((entry) => entry.input + entry.output));
-  const failed = runners.filter((run) => run.status === "failed").length;
-  const priced = runners.map(spend).filter((value): value is number => value !== null);
-  const spent = priced.reduce((sum, value) => sum + value, 0);
-
-  return (
-    <section className="screen cost">
-      <PageHeader title="Cost control" subtitle={`${runners.length} recent runs`} />
-
-      <div className="stat-row">
-        <div className="stat">
-          <span className="label">input</span>
-          <strong>{number(totals.input)}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">output</span>
-          <strong>{number(totals.output)}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">runs</span>
-          <strong>{runners.length}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">failed</span>
-          <strong>{failed}</strong>
-        </div>
-        <div className="stat">
-          <span className="label">estimated spend</span>
-          <strong>{priced.length ? `$${spent.toFixed(4)}` : "—"}</strong>
-        </div>
-      </div>
-
-      <table className="table">
-        <thead>
-          <tr>
-            <th>agent</th>
-            <th>runs</th>
-            <th>input</th>
-            <th>output</th>
-            <th>share</th>
-          </tr>
-        </thead>
-        <tbody>
-          {[...byAgent.entries()]
-            .sort((a, b) => b[1].input + b[1].output - (a[1].input + a[1].output))
-            .map(([agentId, entry]) => {
-              const agent = agents.find((candidate) => candidate.id === agentId);
-              const total = entry.input + entry.output;
-              return (
-                <tr key={agentId}>
-                  <td>{agent?.name ?? agentId.slice(0, 8)}</td>
-                  <td>{entry.runs}</td>
-                  <td className="mono">{number(entry.input)}</td>
-                  <td className="mono">{number(entry.output)}</td>
-                  <td>
-                    <span className="meter">
-                      <span style={{ width: `${Math.round((total / biggest) * 100)}%` }} />
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-        </tbody>
-      </table>
-      {byAgent.size === 0 ? <p className="dim">No runs yet, so nothing spent.</p> : null}
+      {managing && (
+        <ProjectManager
+          key={managing}
+          workspace={workspace}
+          project={projects.find((entry) => entry.id === managing) ?? null}
+          onChanged={onChanged}
+          onClose={() => setManaging(null)}
+        />
+      )}
     </section>
   );
 }

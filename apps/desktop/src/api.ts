@@ -582,6 +582,91 @@ export async function loadRecentRuns(workspaceId: string, limit = 120): Promise<
   return data.recentRuns;
 }
 
+export interface CostTotals {
+  runs: number;
+  succeeded: number;
+  failed: number;
+  cancelled: number;
+  tokensIn: number;
+  tokensOut: number;
+  cacheRead: number;
+  cacheWrite: number;
+  knownCostRuns: number;
+  equivalentUsd: number;
+  knownCashRuns: number;
+  cashUsd: number;
+  activeRuns: number;
+  activeMinutes: number;
+  knownTurnRuns: number;
+  turns: number;
+  knownToolRuns: number;
+  tools: number;
+}
+
+export interface CostCohort {
+  tasks: number;
+  runs: number;
+  failedRuns: number;
+  elapsedMinutes: number;
+  activeRuns: number;
+  activeMinutes: number;
+  knownCostRuns: number;
+  equivalentUsd: number;
+  knownCashRuns: number;
+  cashUsd: number;
+  knownTurnRuns: number;
+  turns: number;
+  knownToolRuns: number;
+  tools: number;
+}
+
+export interface CostReport {
+  period: "7d" | "30d" | "mtd";
+  start: string;
+  end: string;
+  priorStart: string;
+  current: CostTotals;
+  previous: CostTotals;
+  tasks: CostCohort;
+  priorTasks: CostCohort;
+  month: CostTotals;
+  planUsage: (CostTotals & { label: string })[];
+  monthElapsedDays: number;
+  monthTotalDays: number;
+  unsuccessfulTasks: number;
+  daily: (CostTotals & { label: string })[];
+  dailyModels: (CostTotals & { day: string; model: string })[];
+  agents: (CostTotals & { label: string })[];
+  models: (CostTotals & { label: string })[];
+  failureReasons: (CostTotals & { label: string })[];
+  failures: { id: string; issueId: string; issueKey: string; issueTitle: string;
+    agent: string; model: string; reason: string; finishedAt: string; apiEquivalentUsd: number | null }[];
+  settings: { apiBudgetUsd: number | null; successTargetPercent: number | null };
+  plans: { connectorId: string; label: string; monthlyFeeUsd: number; allowanceTokens: number | null }[];
+}
+
+export async function loadCostReport(workspaceId: string, period: CostReport["period"], agentId: string | null, model: string | null): Promise<CostReport> {
+  const data = await gql<{ costReport: CostReport }>(
+    `query ($w: UUID!, $p: String!, $a: UUID, $m: String) {
+      costReport(workspaceId: $w, period: $p, agentId: $a, model: $m)
+    }`,
+    { w: workspaceId, p: period, a: agentId, m: model },
+  );
+  return data.costReport;
+}
+
+export async function saveCostSettings(workspaceId: string, budget: number | null, target: number | null): Promise<void> {
+  await gql(`mutation ($w: UUID!, $b: Float, $t: Float) {
+    saveCostSettings(workspaceId: $w, apiBudgetUsd: $b, successTargetPercent: $t)
+  }`, { w: workspaceId, b: budget, t: target });
+}
+
+export async function saveCostPlan(workspaceId: string, connector: string, label: string, fee: number, allowance: number | null): Promise<void> {
+  await gql(`mutation ($w: UUID!, $c: String!, $l: String!, $f: Float!, $a: Int) {
+    saveCostPlan(workspaceId: $w, connectorId: $c, label: $l, monthlyFeeUsd: $f, allowanceTokens: $a)
+  }`, { w: workspaceId, c: connector, l: label, f: fee, a: allowance });
+}
+
 const WORKFLOW_FIELDS = `source updatedAt errors
       sections { status title owner agent users agents anyAgent next nexts when body
         transitions { to title when } }`;

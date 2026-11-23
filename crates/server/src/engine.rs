@@ -446,12 +446,15 @@ impl Engine {
         run_id: Uuid,
     ) -> Result<()> {
         let message = format!("the server could not finish this run: {error}");
+        let run = self.run(run_id).await?;
+        let usage = spent_metrics(std::path::Path::new(&run.artifact_dir), None).await;
         sqlx::query("update runs set status = 'failed', error = ?, finished_at = ? where id = ?")
             .bind(&message)
             .bind(crate::db::now_rfc3339())
             .bind(run_id)
             .execute(&self.db.pool)
             .await?;
+        persist_run_metrics(&self.db, &run, &usage, Some(&message)).await?;
         self.comment(
             issue_id,
             hulahoop_core::AuthorType::Server,
@@ -1245,16 +1248,22 @@ impl Engine {
             sha256_hex(run_agent.agents_md.as_bytes())
         );
 
+        let price = crate::models::price_per_token(&run_agent.model);
         sqlx::query(
-            "insert into runs (id, issue_id, repo_id, agent_id, model, attempt, base_bookmark, base_revision,
+            "insert into runs (id, issue_id, repo_id, agent_id, model, adapter_snapshot, connector_id,
+                price_in_per_million, price_out_per_million, attempt, base_bookmark, base_revision,
                 prompt_revision, artifact_dir, status, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
         )
         .bind(run_id)
         .bind(issue_id)
         .bind(issue.repo_id)
         .bind(agent_id)
         .bind(&run_agent.model)
+        .bind(&run_agent.adapter)
+        .bind(&run_agent.connector)
+        .bind(price.map(|(input, _)| input * 1_000_000.0))
+        .bind(price.map(|(_, output)| output * 1_000_000.0))
         .bind(attempt)
         .bind(&base_bookmark)
         // The base is a revision expression, not a frozen hash: a turn starts on the
@@ -1311,8 +1320,8 @@ impl Engine {
         }
         // The stream the run already wrote is the only record of what it spent. A
         // cancelled run reports it instead of reading as a run that spent nothing.
-        let (tokens_in, tokens_out) =
-            spent_tokens(std::path::Path::new(&run.artifact_dir), None).await;
+        let usage = spent_metrics(std::path::Path::new(&run.artifact_dir), None).await;
+        let (tokens_in, tokens_out) = (usage.input, usage.output);
         sqlx::query("update runs set status = 'cancelled', finished_at = ?, error = 'cancelled by a human', tokens_in = ?, tokens_out = ? where id = ?")
             .bind(crate::db::now_rfc3339())
             .bind(tokens_in)
@@ -1320,6 +1329,7 @@ impl Engine {
             .bind(run_id)
             .execute(&self.db.pool)
             .await?;
+        persist_run_metrics(&self.db, &run, &usage, Some("cancelled by a human")).await?;
         // Cancelling a run leaves the issue where it was: a misclick costs one
         // run, never the issue.
         self.transition(run.issue_id, IssueEvent::CancelRun)
@@ -1516,8 +1526,8 @@ impl Engine {
         let artifact_dir = std::path::Path::new(&run.artifact_dir);
         std::fs::create_dir_all(artifact_dir)?;
         std::fs::write(artifact_dir.join("diff.patch"), &payload.diff)?;
-        let (tokens_in, tokens_out) =
-            spent_tokens(artifact_dir, payload.transcript.as_deref()).await;
+        let usage = spent_metrics(artifact_dir, payload.transcript.as_deref()).await;
+        let (tokens_in, tokens_out) = (usage.input, usage.output);
 
         let mut flags = verdict.flags.clone();
         if payload.artifact_limit_hit {
@@ -1590,6 +1600,12 @@ impl Engine {
         .bind(run_id)
         .execute(&self.db.pool)
         .await?;
+        let category_reason = if final_status == RunStatus::TimedOut {
+            Some("timed out")
+        } else {
+            error.as_deref()
+        };
+        persist_run_metrics(&self.db, &run, &usage, category_reason).await?;
 
         // What a turn *was* is read from what it did. A closing message that
         // carries a verdict judged the work before it; anything else is work, and
@@ -1860,14 +1876,25 @@ impl Engine {
         } else {
             "succeeded"
         };
-        sqlx::query("update runner_jobs set status = ?, result = ?, error = ?, finished_at = ? where id = ?")
+        let mut tx = self.db.pool.begin().await?;
+        let updated = sqlx::query("update runner_jobs set status = ?, result = ?, error = ?, finished_at = ? where id = ? and status = 'running'")
             .bind(status)
             .bind(payload.to_string())
             .bind(&error)
             .bind(crate::db::now_rfc3339())
             .bind(job_id)
-            .execute(&self.db.pool)
+            .execute(&mut *tx)
             .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
+        if job.kind == "lumi" {
+            let job_payload: serde_json::Value =
+                serde_json::from_str(&job.payload).unwrap_or(serde_json::Value::Null);
+            self.lumi_complete(job_id, &job_payload, &payload, error.as_deref(), &mut tx)
+                .await?;
+        }
+        tx.commit().await?;
 
         match job.kind.as_str() {
             "fetch" => {
@@ -1931,23 +1958,16 @@ impl Engine {
                     .await?;
                 }
             }
-            "lumi" => {
-                // The answer lands even when the harness died: a panel that
-                // waits forever is worse than one that says what went wrong.
-                let job_payload: serde_json::Value =
-                    serde_json::from_str(&job.payload).unwrap_or(serde_json::Value::Null);
-                self.lumi_complete(&job_payload, &payload, error.as_deref())
-                    .await?;
-            }
             _ => {}
         }
         Ok(())
     }
 
-    pub async fn claim_job(&self) -> Result<Option<RunnerJob>> {
+    pub async fn claim_job(&self, lumi: bool) -> Result<Option<RunnerJob>> {
         let candidate: Option<RunnerJob> = sqlx::query_as(
-            "select * from runner_jobs where status = 'queued' order by created_at limit 1",
+            "select * from runner_jobs where status = 'queued' and (kind = 'lumi') = ? order by created_at limit 1",
         )
+        .bind(lumi)
         .fetch_optional(&self.db.pool)
         .await?;
         let Some(job) = candidate else {
@@ -1972,6 +1992,27 @@ impl Engine {
 
     // ------------------------------------------------------------ housekeeping
 
+    /// A crashed runner cannot acknowledge its claimed question. Allow the
+    /// harness's ten-minute wall clock plus two minutes for setup and transport.
+    pub async fn reap_lumi_jobs(&self) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::minutes(12)).to_rfc3339();
+        let stale: Vec<(Uuid,)> = sqlx::query_as(
+            "select id from runner_jobs where kind = 'lumi' and status = 'running' and claimed_at < ?",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.db.pool)
+        .await?;
+        for (id,) in stale {
+            self.complete_job(
+                id,
+                serde_json::Value::Null,
+                Some("the runner stopped before Lumi finished answering".into()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// A runner that stops heartbeating leaves runs `running` forever. The server
     /// is the one process that sees every heartbeat, so it declares them dead.
     pub async fn reap_dead_runs(&self) -> Result<Vec<Run>> {
@@ -1988,8 +2029,8 @@ impl Engine {
             }
             // A runner that died after streaming its transcript still spent what
             // the stream says, so the row carries those tokens rather than zero.
-            let (tokens_in, tokens_out) =
-                spent_tokens(std::path::Path::new(&run.artifact_dir), None).await;
+            let usage = spent_metrics(std::path::Path::new(&run.artifact_dir), None).await;
+            let (tokens_in, tokens_out) = (usage.input, usage.output);
             sqlx::query("update runs set status = 'failed', finished_at = ?, error = 'the runner stopped heartbeating, so the run was declared dead', tokens_in = ?, tokens_out = ? where id = ?")
                 .bind(crate::db::now_rfc3339())
                 .bind(tokens_in)
@@ -1997,6 +2038,13 @@ impl Engine {
                 .bind(run.id)
                 .execute(&self.db.pool)
                 .await?;
+            persist_run_metrics(
+                &self.db,
+                run,
+                &usage,
+                Some("the runner stopped heartbeating"),
+            )
+            .await?;
         }
         Ok(dead)
     }
@@ -2008,7 +2056,84 @@ impl Engine {
 /// file; an `agent.jsonl` the runner opened but never filled falls back to that
 /// tail. Every path that finishes a run reads through here, so a cancelled or
 /// reaped run reports what it spent too.
+#[cfg(test)]
+mod lumi_claim_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lumi_lane_claims_questions_while_normal_job_is_queued() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-claims-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let project = Uuid::now_v7();
+        let repo = Uuid::now_v7();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Claims',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(crate::db::now_rfc3339())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(crate::db::now_rfc3339())
+            .execute(&db.pool).await.unwrap();
+        let engine = Engine::new(db);
+        let normal = engine
+            .queue_job(repo, None, "fetch", serde_json::json!({}))
+            .await
+            .unwrap();
+        let lumi = engine
+            .queue_job(
+                repo,
+                None,
+                "lumi",
+                serde_json::json!({"workspace_id": workspace.to_string()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.claim_job(true).await.unwrap().unwrap().id, lumi);
+        assert_eq!(engine.claim_job(false).await.unwrap().unwrap().id, normal);
+        assert!(engine.claim_job(true).await.unwrap().is_none());
+        sqlx::query("update runner_jobs set claimed_at = ? where id = ?")
+            .bind((Utc::now() - chrono::Duration::minutes(13)).to_rfc3339())
+            .bind(lumi)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        engine.reap_lumi_jobs().await.unwrap();
+        engine
+            .complete_job(lumi, serde_json::json!({"reply": "late reply"}), None)
+            .await
+            .unwrap();
+        let (count,): (i64,) =
+            sqlx::query_as("select count(*) from lumi_messages where job_id = ?")
+                .bind(lumi)
+                .fetch_one(&engine.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let (status,): (String,) = sqlx::query_as("select status from runner_jobs where id = ?")
+            .bind(lumi)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
 async fn spent_tokens(artifact_dir: &std::path::Path, tail: Option<&str>) -> (i64, i64) {
+    let usage = spent_metrics(artifact_dir, tail).await;
+    (usage.input, usage.output)
+}
+
+async fn spent_metrics(
+    artifact_dir: &std::path::Path,
+    tail: Option<&str>,
+) -> hulahoop_core::usage::Metrics {
     let written = tokio::fs::read_to_string(artifact_dir.join("agent.jsonl"))
         .await
         .unwrap_or_default();
@@ -2017,11 +2142,80 @@ async fn spent_tokens(artifact_dir: &std::path::Path, tail: Option<&str>) -> (i6
     } else {
         written
     };
-    // The file is capped at the artifact limit, so parsing it is real CPU work and
-    // belongs on the blocking pool rather than on a runtime worker.
-    tokio::task::spawn_blocking(move || hulahoop_core::usage::totals(&stream))
+    tokio::task::spawn_blocking(move || hulahoop_core::usage::metrics(&stream))
         .await
-        .unwrap_or((0, 0))
+        .unwrap_or_default()
+}
+
+async fn persist_run_metrics(
+    db: &Db,
+    run: &Run,
+    usage: &hulahoop_core::usage::Metrics,
+    error: Option<&str>,
+) -> Result<()> {
+    let estimated = if usage.measured
+        && usage
+            .actual_model
+            .as_deref()
+            .is_none_or(|actual| actual == run.model)
+    {
+        run.price_in_per_million
+            .zip(run.price_out_per_million)
+            .map(|(input, output)| {
+                (usage.input as f64 * input + usage.output as f64 * output) / 1_000_000.0
+            })
+    } else {
+        None
+    };
+    let never_started = run.started_at.is_none() && !usage.measured;
+    let cost = if never_started {
+        Some(0.0)
+    } else {
+        usage.reported_cost_usd.or(estimated)
+    };
+    let source = if never_started {
+        Some("never_started")
+    } else if usage.reported_cost_usd.is_some() {
+        Some("reported")
+    } else if estimated.is_some() {
+        Some("catalogue_estimate_excludes_cache")
+    } else {
+        None
+    };
+    let cash = if never_started {
+        Some(0.0)
+    } else {
+        match run.billing_source.as_deref() {
+            // Only an adapter-reported charge is actual API cash. Catalogue
+            // estimates remain API-equivalent until the provider confirms them.
+            Some("api") => usage.reported_cost_usd,
+            Some("subscription") => Some(0.0),
+            _ => None,
+        }
+    };
+    let failure = error.map(|reason| {
+        if reason.contains("timed out") {
+            "timeout"
+        } else if reason.contains("heartbeating") {
+            "runner"
+        } else if reason.contains("frozen test") {
+            "frozen_tests"
+        } else if reason.contains("provider") || reason.contains("model") {
+            "provider"
+        } else if reason.contains("artifact") {
+            "artifact_limit"
+        } else {
+            "other"
+        }
+    });
+    sqlx::query("update runs set tokens_in = ?, tokens_out = ?, cache_read_tokens = ?, cache_write_tokens = ?, model_turns = ?, tool_calls = ?, actual_model = ?, api_equivalent_usd = ?, actual_cost_usd = ?, cost_source = ?, failure_category = ? where id = ?")
+        .bind(usage.input).bind(usage.output)
+        .bind(usage.measured.then_some(usage.cache_read.unwrap_or(0)))
+        .bind(usage.measured.then_some(usage.cache_write.unwrap_or(0)))
+        .bind(usage.turns).bind(usage.tool_calls).bind(&usage.actual_model)
+        .bind(cost).bind(cash).bind(source).bind(failure).bind(run.id)
+        .execute(&db.pool).await?;
+    Ok(())
 }
 
 /// The completion payload a runner posts. `diff` is the unified diff the runner

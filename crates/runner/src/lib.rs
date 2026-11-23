@@ -101,6 +101,26 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     let data_dir = absolute(data_dir);
     let client = client::Client::new(&connection)?;
     let executor = exec::Executor::new(client, data_dir.clone());
+    let lumi_executor = exec::Executor::new(client::Client::new(&connection)?, data_dir.clone());
+    tokio::spawn(async move {
+        let mut idle = Duration::from_millis(250);
+        loop {
+            match lumi_executor.tick_lumi().await {
+                Ok(did_work) => {
+                    idle = if did_work {
+                        Duration::from_millis(50)
+                    } else {
+                        (idle * 2).min(Duration::from_secs(2))
+                    };
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "Lumi lane failed");
+                    idle = Duration::from_secs(2);
+                }
+            }
+            tokio::time::sleep(idle).await;
+        }
+    });
     let runner_id = std::env::var("HULAHOOP_RUNNER_ID")
         .unwrap_or_else(|_| format!("runner-{}", std::process::id()));
 

@@ -297,6 +297,26 @@ impl Query {
         .await?)
     }
 
+    /// Full workspace period aggregates and completed-task cohorts; never capped
+    /// to the Activity feed's most recent 500 runs.
+    async fn cost_report(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        period: String,
+        agent_id: Option<Uuid>,
+        model: Option<String>,
+    ) -> async_graphql::Result<async_graphql::Json<serde_json::Value>> {
+        crate::cost::report(
+            &engine(ctx).db,
+            workspace_id,
+            &period,
+            agent_id,
+            model.as_deref(),
+        )
+        .await
+    }
+
     /// Live tail of the newest run on an issue, so the desktop can poll without
     /// re-reading the log file.
     async fn run_events(
@@ -330,6 +350,42 @@ pub struct Mutation;
 
 #[Object]
 impl Mutation {
+    async fn save_cost_settings(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        api_budget_usd: Option<f64>,
+        success_target_percent: Option<f64>,
+    ) -> async_graphql::Result<bool> {
+        crate::cost::save_settings(
+            &engine(ctx).db,
+            workspace_id,
+            api_budget_usd,
+            success_target_percent,
+        )
+        .await
+    }
+
+    async fn save_cost_plan(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        connector_id: String,
+        label: String,
+        monthly_fee_usd: f64,
+        allowance_tokens: Option<i64>,
+    ) -> async_graphql::Result<bool> {
+        crate::cost::save_plan(
+            &engine(ctx).db,
+            workspace_id,
+            &connector_id,
+            &label,
+            monthly_fee_usd,
+            allowance_tokens,
+        )
+        .await
+    }
+
     async fn create_workspace(
         &self,
         ctx: &Context<'_>,
@@ -1528,6 +1584,9 @@ impl Run {
     /// Which adapter ran the turn, so a run list can say `pi` or `claude_code`
     /// without a second round trip to the agent.
     async fn adapter(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
+        if let Some(adapter) = &self.adapter_snapshot {
+            return Ok(adapter.clone());
+        }
         let adapter: Option<String> = sqlx::query_scalar("select adapter from agents where id = ?")
             .bind(self.agent_id)
             .fetch_optional(&engine(ctx).db.pool)

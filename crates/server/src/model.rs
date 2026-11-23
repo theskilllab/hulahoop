@@ -242,6 +242,21 @@ pub struct Run {
     /// The model this run was given, frozen at spawn: the agent's model may
     /// change later and a cost report must not rewrite history.
     pub model: String,
+    /// Frozen execution context and measured effort; legacy rows remain unknown.
+    pub adapter_snapshot: Option<String>,
+    pub connector_id: Option<String>,
+    pub billing_source: Option<String>,
+    pub actual_model: Option<String>,
+    pub cache_read_tokens: Option<i64>,
+    pub cache_write_tokens: Option<i64>,
+    pub model_turns: Option<i64>,
+    pub tool_calls: Option<i64>,
+    pub api_equivalent_usd: Option<f64>,
+    pub actual_cost_usd: Option<f64>,
+    pub cost_source: Option<String>,
+    pub failure_category: Option<String>,
+    pub price_in_per_million: Option<f64>,
+    pub price_out_per_million: Option<f64>,
     /// Where the loop opened a pull request for this run, when it did.
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
