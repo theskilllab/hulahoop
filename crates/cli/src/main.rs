@@ -23,7 +23,7 @@ async fn main() -> Result<()> {
         Some("serve") => hulahoop_server::serve(args[1..].to_vec()).await,
         Some("runner") => hulahoop_runner::run(args[1..].to_vec()).await,
         Some("up") => up(&args[1..]).await,
-        Some("doctor") => doctor(),
+        Some("doctor") => doctor().await,
         Some("seed") => seed(&args[1..]).await,
         Some("help") | Some("--help") | Some("-h") | None => {
             println!(
@@ -279,7 +279,7 @@ fn platform_data_dir() -> Result<PathBuf> {
     bail!("cannot locate a data directory; pass --data-dir or set HULAHOOP_DATA")
 }
 
-fn doctor() -> Result<()> {
+async fn doctor() -> Result<()> {
     let mut ok = true;
     let probes: [(&str, &[&str]); 6] = [
         ("nix", &["--version"]),
@@ -317,11 +317,41 @@ fn doctor() -> Result<()> {
             }
         }
     }
+    let schema = report_schema().await?;
     if !ok {
         bail!("some prerequisites are missing");
     }
+    schema?;
     println!("\nall prerequisites present");
     Ok(())
+}
+
+/// Prints the schema line. A database from a newer binary is a failure, returned
+/// rather than raised so the prerequisite verdict still prints first.
+async fn report_schema() -> Result<Result<()>> {
+    let data_dir = platform_data_dir()?;
+    let Some(schema) = hulahoop_server::db::schema_version(&data_dir).await? else {
+        println!("ok    schema   no database yet");
+        return Ok(Ok(()));
+    };
+    let newest_applied = schema.newest_applied.unwrap_or(0);
+    if schema.ahead {
+        println!(
+            "fail  schema   {} migrations applied, newest {newest_applied}; this binary knows up to {}",
+            schema.applied, schema.newest_known
+        );
+        return Ok(Err(anyhow::anyhow!(
+            "the data directory holds a migration this binary does not have: \
+             {} applied, newest {newest_applied}, but this binary's newest is {}",
+            schema.applied,
+            schema.newest_known
+        )));
+    }
+    println!(
+        "ok    schema   {} migrations applied; newest migration known is {}",
+        schema.applied, schema.newest_known
+    );
+    Ok(Ok(()))
 }
 
 async fn seed(args: &[String]) -> Result<()> {

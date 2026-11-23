@@ -68,6 +68,57 @@ fn prune_backups(dir: &Path, keep: usize) {
     }
 }
 
+/// What a data directory's database says about its schema, next to what this
+/// binary ships.
+pub struct SchemaVersion {
+    /// Migrations the database has applied.
+    pub applied: i64,
+    /// The highest version among them, if any.
+    pub newest_applied: Option<i64>,
+    /// The highest migration this binary knows.
+    pub newest_known: i64,
+    /// Whether the database holds a migration this binary does not have.
+    pub ahead: bool,
+}
+
+/// Reads the schema version without opening the database for writing and without
+/// migrating it, so a database from a newer binary can be reported on. `None`
+/// when the data directory has no database yet.
+pub async fn schema_version(data_dir: &Path) -> anyhow::Result<Option<SchemaVersion>> {
+    let file = contract::database_file(data_dir);
+    if !file.exists() {
+        return Ok(None);
+    }
+    let options =
+        SqliteConnectOptions::from_str(&format!("sqlite://{}", file.display()))?.read_only(true);
+    let pool = SqlitePool::connect_with(options)
+        .await
+        .context("opening the SQLite database")?;
+    let table: Option<(String,)> =
+        sqlx::query_as("select name from sqlite_master where name = '_sqlx_migrations'")
+            .fetch_optional(&pool)
+            .await?;
+    let versions: Vec<i64> = if table.is_some() {
+        sqlx::query_scalar("select version from _sqlx_migrations")
+            .fetch_all(&pool)
+            .await?
+    } else {
+        Vec::new()
+    };
+    pool.close().await;
+
+    let known: Vec<i64> = sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version)
+        .collect();
+    Ok(Some(SchemaVersion {
+        applied: versions.len() as i64,
+        newest_applied: versions.iter().copied().max(),
+        newest_known: known.iter().copied().max().unwrap_or(0),
+        ahead: versions.iter().any(|version| !known.contains(version)),
+    }))
+}
+
 pub struct Db {
     pub pool: SqlitePool,
     pub data_dir: PathBuf,
