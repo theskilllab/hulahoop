@@ -23,6 +23,8 @@ pub const HEARTBEAT_DEAD_SECS: i64 = 30;
 pub const AGENT_WALL_CLOCK_MINUTES: i64 = 30;
 pub const SETUP_WALL_CLOCK_MINUTES: i64 = 20;
 pub const REPLAY_WALL_CLOCK_MINUTES: i64 = 15;
+/// A Lumi answer is one model call, not a work session.
+pub const LUMI_WALL_CLOCK_MINUTES: i64 = 10;
 pub const RUNS_PER_ISSUE: i64 = 12;
 pub const ARTIFACT_LIMIT_BYTES: u64 = 500 * 1024 * 1024;
 pub const DIFF_LINE_LIMIT: i64 = 2000;

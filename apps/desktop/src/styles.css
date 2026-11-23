@@ -3395,3 +3395,244 @@ table.transitions td {
 .chip[aria-pressed="false"]:hover {
   color: var(--text);
 }
+
+/* ---- Lumi, the corner assistant ---------------------------------------- */
+
+.as-pill {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  z-index: 40;
+  height: 44px;
+  padding: 0 14px 0 4px;
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  border-radius: var(--r-pill);
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--line);
+  font-weight: 600;
+  font-size: var(--fs-sm);
+  box-shadow: var(--shadow);
+  transition: transform var(--t-fast), border-color var(--t-fast);
+}
+
+.as-pill:hover {
+  transform: translateY(-1px);
+  border-color: var(--accent);
+}
+
+.as-pill kbd {
+  color: var(--muted);
+}
+
+.as-ic {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: grid;
+  place-items: center;
+}
+
+.as-panel {
+  position: fixed;
+  z-index: 40;
+  right: 20px;
+  bottom: 20px;
+  width: 400px;
+  height: min(640px, calc(100vh - 40px));
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  animation: pop var(--t-med) cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.as-panel.wide {
+  width: min(760px, calc(100vw - 40px));
+  height: calc(100vh - 40px);
+}
+
+.as-h {
+  display: flex;
+  align-items: center;
+  gap: var(--s2);
+  padding: var(--s3) var(--s3) var(--s3) var(--s4);
+  border-bottom: 1px solid var(--line);
+}
+
+.as-panel .av.bot {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--accent-fg);
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.as-ctx {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.as-body {
+  overflow-y: auto;
+  padding: var(--s4);
+  display: grid;
+  gap: var(--s4);
+  align-content: start;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.as-m {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: var(--s3);
+  align-items: start;
+}
+
+.as-m.user {
+  grid-template-columns: minmax(0, 1fr);
+  justify-items: end;
+}
+
+.as-m.user .as-c {
+  background: var(--accent-soft);
+  color: var(--text);
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-lg) var(--r-lg) 4px var(--r-lg);
+  max-width: 85%;
+  font-size: var(--fs-sm);
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.as-c {
+  min-width: 0;
+  display: grid;
+  gap: var(--s3);
+  font-size: var(--fs-sm);
+}
+
+.as-md {
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.as-prop {
+  display: grid;
+  gap: var(--s3);
+  padding: var(--s3);
+  background: var(--bg-2);
+  border-radius: var(--r-md);
+}
+
+.as-g {
+  display: grid;
+  gap: 2px;
+}
+
+.as-gh {
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.as-it {
+  display: flex;
+  gap: var(--s2);
+  align-items: flex-start;
+  font-size: var(--fs-sm);
+  line-height: 1.45;
+  padding: 3px 0;
+}
+
+.as-it input {
+  width: 14px;
+  height: 14px;
+  margin: 3px 0 0;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+.as-row {
+  display: flex;
+  gap: var(--s2);
+}
+
+.as-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s2);
+}
+
+.as-chip {
+  height: var(--h-control);
+  padding: 0 var(--s3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-pill);
+  font-size: var(--fs-sm);
+  color: var(--text);
+  background: var(--bg);
+}
+
+.as-chip:hover {
+  background: var(--bg-2);
+  border-color: var(--muted);
+}
+
+.as-in {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--s2);
+  align-items: end;
+  padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--line);
+}
+
+.as-in textarea {
+  height: var(--h-control);
+  min-height: var(--h-control);
+  max-height: 108px;
+  padding-top: 4px;
+  padding-bottom: 4px;
+  line-height: 18px;
+  resize: none;
+  overflow-y: auto;
+}
+
+.as-badge {
+  min-width: var(--h-chip);
+  height: var(--h-chip);
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: var(--fs-xs);
+  display: grid;
+  place-items: center;
+}
+
+@media (max-width: 768px) {
+  .as-panel,
+  .as-panel.wide {
+    left: 8px;
+    right: 8px;
+    width: auto;
+    bottom: 8px;
+    height: calc(100vh - 16px);
+  }
+}

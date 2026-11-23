@@ -1931,6 +1931,14 @@ impl Engine {
                     .await?;
                 }
             }
+            "lumi" => {
+                // The answer lands even when the harness died: a panel that
+                // waits forever is worse than one that says what went wrong.
+                let job_payload: serde_json::Value =
+                    serde_json::from_str(&job.payload).unwrap_or(serde_json::Value::Null);
+                self.lumi_complete(&job_payload, &payload, error.as_deref())
+                    .await?;
+            }
             _ => {}
         }
         Ok(())

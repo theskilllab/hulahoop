@@ -5,9 +5,12 @@ import {
   createWorkspace,
   gql,
   loadGithubRepos,
+  loadModels,
   loadWorkspaceMembers,
   renameProject,
+  setWorkspaceLumi,
   updateWorkspace,
+  type ModelOption,
   type Agent,
   type GithubRepo,
   type Project,
@@ -47,6 +50,9 @@ export default function Settings({
   const [githubError, setGithubError] = useState<string | null>(null);
   const [wsName, setWsName] = useState(workspace.name);
   const [wsPrefix, setWsPrefix] = useState(workspace.defaultPrefix);
+  const [lumiHarness, setLumiHarness] = useState(workspace.lumiHarness ?? "pi");
+  const [lumiModel, setLumiModel] = useState(workspace.lumiModel ?? "");
+  const [lumiModels, setLumiModels] = useState<ModelOption[]>([]);
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [newWorkspace, setNewWorkspace] = useState("");
   const [newWorkspacePrefix, setNewWorkspacePrefix] = useState("");
@@ -67,8 +73,27 @@ export default function Settings({
   useEffect(() => {
     setWsName(workspace.name);
     setWsPrefix(workspace.defaultPrefix);
+    setLumiHarness(workspace.lumiHarness ?? "pi");
+    setLumiModel(workspace.lumiModel ?? "");
     void loadWorkspaceMembers(workspace.id).then(setMembers).catch(() => setMembers([]));
-  }, [workspace.id, workspace.name, workspace.defaultPrefix]);
+  }, [workspace.id, workspace.name, workspace.defaultPrefix, workspace.lumiHarness, workspace.lumiModel]);
+
+  // The model list is the harness's own catalogue, so it follows the picker.
+  useEffect(() => {
+    let live = true;
+    loadModels(lumiHarness)
+      .then((next) => {
+        if (!live) return;
+        setLumiModels(next);
+        setLumiModel((was) =>
+          next.length && !next.some((entry) => entry.id === was) ? next[0].id : was,
+        );
+      })
+      .catch(() => live && setLumiModels([]));
+    return () => {
+      live = false;
+    };
+  }, [lumiHarness]);
 
   useEffect(() => {
     setProjectName(project?.name ?? "");
@@ -206,6 +231,58 @@ export default function Settings({
         )}
       </div>
       {error && <p className="error">{error}</p>}
+
+      <h2 className="section">Lumi</h2>
+      <p className="dim small">
+        Lumi is the workspace's assistant — the pill in the corner (⌘J). It answers with the
+        harness and model picked here, and only changes things after you press Apply.
+      </p>
+      <div className="settings-block">
+        <div className="grid-2">
+          <label>
+            <span>harness</span>
+            <select value={lumiHarness} onChange={(event) => setLumiHarness(event.target.value)}>
+              <option value="pi">Pi</option>
+              <option value="claude_code">Claude Code</option>
+              <option value="fake">Fake (development)</option>
+            </select>
+          </label>
+          <label>
+            <span>model</span>
+            {lumiModels.length ? (
+              <select value={lumiModel} onChange={(event) => setLumiModel(event.target.value)}>
+                {lumiModels.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.label}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                value={lumiModel}
+                placeholder="model id"
+                onChange={(event) => setLumiModel(event.target.value)}
+              />
+            )}
+          </label>
+        </div>
+        <div className="row">
+          <button
+            className="primary"
+            disabled={busy === "lumi" || !lumiModel.trim()}
+            onClick={() =>
+              void action("lumi", () => setWorkspaceLumi(workspace.id, lumiHarness, lumiModel))
+            }
+          >
+            Save Lumi
+          </button>
+          <span className="dim small">
+            {workspace.lumiHarness
+              ? `answering with ${workspace.lumiHarness} · ${workspace.lumiModel}`
+              : "no harness picked yet — the pill will say so"}
+          </span>
+        </div>
+      </div>
 
       <h2 className="section">Projects</h2>
       <p className="dim small">

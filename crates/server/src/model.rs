@@ -12,6 +12,27 @@ pub struct Workspace {
     pub slug: String,
     /// What an issue is called when it belongs to no project.
     pub default_prefix: String,
+    /// The harness and model Lumi answers with. Null means Lumi is not set up.
+    pub lumi_harness: Option<String>,
+    pub lumi_model: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One turn of the Lumi conversation. A `user` row is the question; a `lumi`
+/// row is the answer, optionally carrying a proposal that waits for Apply.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct LumiMessage {
+    pub id: Uuid,
+    pub workspace_id: Uuid,
+    pub role: String,
+    pub body: String,
+    /// What the asker was looking at, e.g. "Task HUL-3".
+    pub context: Option<String>,
+    /// JSON: `{title, items:[{group, text, action, args}]}`. Nothing in it runs
+    /// until a person applies it.
+    pub proposal: Option<String>,
+    /// `open`, `applied` or `dismissed`; null when there is no proposal.
+    pub proposal_state: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

@@ -3,6 +3,28 @@
 # loop moves, and the assertions in the test prove the loop is honest.
 set -euo pipefail
 
+# A Lumi turn carries no agent name and no checkout: the question arrives as
+# `--message`, and the answer is one JSON object on a plain line. The line is
+# prefixed so the transcript keeps it as text rather than as an unknown event.
+if [ -z "${HULAHOOP_AGENT:-}" ]; then
+  message=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --message) message="${2:-}"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+  case "$message" in
+    *follow-up*)
+      echo 'LUMI {"reply":"One thing is missing: nothing says what subtract does below zero.","proposal":{"title":"File the follow-up","items":[{"group":"Tasks","text":"Create a task to decide what subtract does below zero","action":"create_issue","args":{"title":"decide what subtract does below zero","project":"Bali","criteria":["subtract(3, 5) has a decided answer"]}}]}}'
+      ;;
+    *)
+      echo 'LUMI {"reply":"The board looks healthy."}'
+      ;;
+  esac
+  exit 0
+fi
+
 AGENT="${HULAHOOP_AGENT:?HULAHOOP_AGENT is not set}"
 cd "$HULAHOOP_CHECKOUT"
 

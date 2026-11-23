@@ -58,6 +58,10 @@ The first version exists to answer one question:
 - One repo contract: `flake.nix` and `justfile` with `setup` and `test` recipes, plus the `.envrc` the runner generates. No per-repo command settings.
 - A per-run sandbox: a scratch `HOME` and a clean environment in v0, extended to a read-only host outside the checkout in M1.
 - Local notifications when an issue needs a human: `in_review`, `blocked`, and `merging`.
+- Lumi, the workspace's assistant: a pill in the corner of every screen (⌘J). It answers
+  with the harness and model picked in Settings, reads a snapshot of the board, and
+  proposes changes as checkboxes that run only when the person presses Apply. A question
+  travels through the runner like any job, so the server never talks to a model itself.
 - SQLite database.
 - One server that owns the work, on `127.0.0.1` by default and on any address with `--listen`. The desktop is a client: it points at a server, and the server's host runs the agents.
 
@@ -292,7 +296,9 @@ users
   id, name, email, created_at
 
 workspaces              top-level container; one local row in v0
-  id, name, slug, created_at
+  id, name, slug, lumi_harness, lumi_model, created_at
+                        lumi_harness, lumi_model: what Lumi answers with;
+                          null until somebody picks one in Settings
 
 workspace_members
   workspace_id, user_id, role
@@ -404,6 +410,16 @@ reviews
 
 comments
   id, issue_id, author_type, author_id, body, created_at
+
+lumi_messages         the workspace's conversation with Lumi, oldest first
+  id, workspace_id, role, body, context, proposal, proposal_state, created_at
+                        role: user | lumi; the user row lands at once, the lumi
+                          row arrives when the runner's job completes
+                        context: what the person was looking at when they asked
+                        proposal: JSON {title, items:[{group,text,action,args}]},
+                          the checkboxes; null when the answer is only words
+                        proposal_state: open | applied | dismissed — Apply runs
+                          the ticked items, and nothing changes before that
 
 approvals             bound to the exact diff the human reviewed
   id, issue_id, run_id, head_revision, diff_sha, landing_bookmark,
@@ -800,6 +816,7 @@ type Query {
   runs(issueId: ID!): [Run!]!
   run(id: ID!): Run
   replays(issueId: ID!): [Replay!]!
+  lumiMessages(workspaceId: ID!): [LumiMessage!]!
 }
 
 enum IssueStatus {
@@ -848,6 +865,15 @@ type Mutation {
                         them, which is what the drawer's Move panel shows
   requestChanges(issueId: ID!, body: String!): Issue!
   addComment(issueId: ID!, body: String!): Comment!
+
+  setWorkspaceLumi(workspaceId: ID!, harness: String!, model: String!): Workspace!
+  askLumi(workspaceId: ID!, text: String!, context: String): LumiMessage!
+                        stores the question and queues a `lumi` job; the answer
+                        arrives as its own message when the runner finishes
+  applyLumiProposal(messageId: ID!, items: [Int!]!): LumiMessage!
+                        runs the ticked items of an open proposal, in order,
+                        stopping at the first failure with a count of what landed
+  dismissLumiProposal(messageId: ID!): LumiMessage!
 }
 
 type Subscription {
