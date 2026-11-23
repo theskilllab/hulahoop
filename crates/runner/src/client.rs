@@ -125,8 +125,10 @@ impl Client {
         Ok(())
     }
 
-    pub async fn claim_job(&self) -> Result<Option<Value>> {
-        let value = self.post("/internal/jobs/claim", json!({})).await?;
+    pub async fn claim_job(&self, lumi: bool) -> Result<Option<Value>> {
+        let value = self
+            .post("/internal/jobs/claim", json!({ "lumi": lumi }))
+            .await?;
         Ok(if value.is_object() { Some(value) } else { None })
     }
 

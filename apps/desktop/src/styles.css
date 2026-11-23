@@ -4027,6 +4027,64 @@ table.transitions td {
   display: block;
 }
 
+/* Settings is a native modal: its top layer traps focus and Escape is handled
+   by the dialog. Keep the tab bar and footer visible while the content scrolls. */
+.settings-dialog {
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  background: var(--bg);
+  color: var(--text);
+  box-shadow: var(--shadow);
+  padding: 0;
+  width: min(600px, calc(100vw - 2 * var(--s4)));
+  max-width: 100%;
+  max-height: min(720px, calc(100dvh - 2 * var(--s4)));
+  margin: auto;
+  overflow: hidden;
+}
+
+.settings-dialog::backdrop {
+  background: rgba(12, 12, 18, 0.42);
+}
+
+.settings-dialog[open] {
+  display: flex;
+  flex-direction: column;
+}
+
+.settings-head,
+.settings-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s2);
+  padding: var(--s3) var(--s4);
+}
+
+.settings-head h2 { font-size: var(--fs-lg); }
+.settings-tabs { margin: 0 var(--s4); align-self: flex-start; }
+.settings-content {
+  display: grid;
+  gap: var(--s3);
+  overflow-y: auto;
+  min-height: 0;
+  padding: var(--s3) var(--s4);
+}
+.settings-content .settings-block { gap: var(--s3); }
+.settings-actions {
+  justify-content: flex-end;
+  border-top: 1px solid var(--line);
+}
+.settings-content .grid-2 { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.settings-content .row { flex-wrap: wrap; }
+.settings-content input, .settings-content select { min-width: 0; }
+
+.project-manager { margin-top: var(--s4); }
+.project-manager .grid-2 { grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); }
+.project-manager .row { flex-wrap: wrap; }
+.project-manager .row input, .project-manager .row select { min-width: 0; }
+.project-card > footer { flex-wrap: wrap; }
+
 /* The member list on the workspace tab: a bordered list, one person a row. */
 .mem-list {
   list-style: none;

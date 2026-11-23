@@ -38,12 +38,22 @@ impl Executor {
     /// Claim at most one piece of work per tick, so a slow run cannot starve the
     /// heartbeats of another.
     pub async fn tick(&self, runner_id: &str) -> Result<bool> {
-        if let Some(job) = self.client.claim_job().await? {
+        if let Some(job) = self.client.claim_job(false).await? {
             self.run_job(job).await?;
             return Ok(true);
         }
         if let Some(run) = self.client.claim_run(runner_id).await? {
             self.run_run(run).await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// A second runner lane answers questions while a long agent run is active.
+    /// Lumi never edits a checkout, so it can share the data directory safely.
+    pub async fn tick_lumi(&self) -> Result<bool> {
+        if let Some(job) = self.client.claim_job(true).await? {
+            self.run_job(job).await?;
             return Ok(true);
         }
         Ok(false)
@@ -330,10 +340,16 @@ impl Executor {
             "open_pr" => self.job_open_pr(&repo_path, spec).await,
             "review_pr" => job_review_pr(spec).await,
             "watch_checks" => job_watch_checks(spec).await,
-            "lumi" => self.job_lumi(&repo_path, spec).await,
+            "lumi" => self.job_lumi(&repo_path, spec, &job_id).await,
             other => Err(anyhow!("unknown job kind {other}")),
         };
 
+        if kind == "lumi" {
+            if let Ok(id) = uuid::Uuid::parse_str(&job_id) {
+                let _ =
+                    std::fs::remove_dir_all(self.data_dir.join("home/lumi").join(id.to_string()));
+            }
+        }
         match result {
             Ok(value) => self.client.complete_job(&job_id, value, None).await?,
             Err(error) => {
@@ -445,7 +461,7 @@ impl Executor {
     /// the snapshot the server packed. The process works from an empty scratch
     /// directory — Lumi reads a snapshot and writes a reply, never the repo —
     /// while the repo's dev shell supplies the PATH the CLI lives on.
-    async fn job_lumi(&self, repo_path: &Path, spec: &Value) -> Result<Value> {
+    async fn job_lumi(&self, repo_path: &Path, spec: &Value, job_id: &str) -> Result<Value> {
         let payload = &spec["payload"];
         let adapter = Adapter::parse(payload["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter"))?;
@@ -483,7 +499,10 @@ impl Executor {
                 .env("NO_COLOR", "1")
                 .output();
         }
-        let home = contract::scratch_home(&self.data_dir, adapter);
+        // Each question has a private home: concurrent runners and credential
+        // changes cannot replace another question's live login files.
+        let id = uuid::Uuid::parse_str(job_id).context("invalid Lumi job id")?;
+        let home = self.data_dir.join("home/lumi").join(id.to_string());
         std::fs::create_dir_all(&home)?;
         seed_home(&home);
         let home = std::fs::canonicalize(&home).unwrap_or(home);
@@ -492,7 +511,7 @@ impl Executor {
         } else {
             dev_shell_path(repo_path).unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
         };
-        let env: Vec<(String, String)> = vec![
+        let mut env: Vec<(String, String)> = vec![
             ("PATH".into(), path),
             ("HOME".into(), home.to_string_lossy().to_string()),
             (
@@ -506,6 +525,7 @@ impl Executor {
             ),
         ];
 
+        apply_credential(&mut env, spec, &home)?;
         let invocation = adapter::invocation(adapter, model, system_prompt, &message)?;
         let mut child = adapter::spawn(&invocation, &workdir, &env)?;
         let pid = child.id() as i64;
@@ -513,6 +533,29 @@ impl Executor {
             .stdout
             .take()
             .ok_or_else(|| anyhow!("the harness has no stdout"))?;
+        // The harness writes auth and model errors to stderr. Drain it while
+        // stdout streams to prevent a full pipe from blocking the process.
+        // Keep only a bounded in-memory sample for a safe category on failure.
+        let stderr = child.stderr.take().context("the harness has no stderr")?;
+        let stderr_task = std::thread::spawn(move || {
+            let mut sample = String::new();
+            let mut reader = BufReader::new(stderr);
+            let mut chunk = [0u8; 4096];
+            loop {
+                use std::io::Read;
+                let Ok(size) = reader.read(&mut chunk) else {
+                    break;
+                };
+                if size == 0 {
+                    break;
+                }
+                if sample.len() < 16_384 {
+                    let remaining = 16_384 - sample.len();
+                    sample.push_str(&String::from_utf8_lossy(&chunk[..size.min(remaining)]));
+                }
+            }
+            sample
+        });
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<String>();
         std::thread::spawn(move || {
             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
@@ -560,8 +603,10 @@ impl Executor {
                 hulahoop_core::LUMI_WALL_CLOCK_MINUTES
             );
         }
+        let stderr = stderr_task.join().unwrap_or_default();
         if !status.success() {
-            bail!("the harness exited with {:?}", status.code());
+            let category = lumi_failure_category(&stderr, &transcript.haystack());
+            bail!("the harness exited with {:?}: {category}", status.code());
         }
 
         let text = transcript.final_text();
@@ -1002,52 +1047,7 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     if let Ok(script) = std::env::var("HULAHOOP_FAKE_SCRIPT") {
         env.push(("HULAHOOP_FAKE_SCRIPT".into(), script));
     }
-    // Model credentials travel in the environment, never in a file in the repo.
-    // A stored connector is the entire credential context. Inheriting an API
-    // key beside a subscription login can silently bill the API instead.
-    let supplied_credential = spec.get("credential").is_some_and(|credential| {
-        credential["env"]
-            .as_array()
-            .is_some_and(|entries| !entries.is_empty())
-            || credential["files"]
-                .as_array()
-                .is_some_and(|entries| !entries.is_empty())
-    });
-    if !supplied_credential {
-        for key in contract::CREDENTIAL_ENV {
-            if let Ok(value) = std::env::var(key) {
-                env.push((key.into(), value));
-            }
-        }
-    }
-    // A connector the user pasted wins over the machine's own login: the run acts
-    // as the credential it was given, not as whoever started the runner. Files land
-    // in the scratch home, so a subscription is used by a run and never by the host.
-    if let Some(credential) = spec.get("credential") {
-        for entry in credential["env"].as_array().into_iter().flatten() {
-            let (Some(name), Some(value)) = (
-                entry.get(0).and_then(|v| v.as_str()),
-                entry.get(1).and_then(|v| v.as_str()),
-            ) else {
-                continue;
-            };
-            env.push((name.to_string(), value.to_string()));
-        }
-        for entry in credential["files"].as_array().into_iter().flatten() {
-            let (Some(relative), Some(contents)) = (
-                entry.get(0).and_then(|v| v.as_str()),
-                entry.get(1).and_then(|v| v.as_str()),
-            ) else {
-                continue;
-            };
-            let path = home.join(relative);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            write_private_file(&path, contents)
-                .with_context(|| format!("writing {relative} into the run's home"))?;
-        }
-    }
+    apply_credential(&mut env, spec, &home)?;
     // The commit says who wrote it. jj reads its identity from the environment,
     // so the agent commits under its own name even where the runner's identity is
     // the machine's. The team is named in the workflow, so the commit carries the
@@ -1076,15 +1076,91 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     Ok(env)
 }
 
-/// A credentials file the CLI will read. Owner-only, because the directory is
-/// shared with the next run and a mode that drifts is a leak nobody notices.
+/// Agent runs and Lumi use the same credential boundary. A stored connector
+/// wins over inherited host keys, particularly when it represents a subscription.
+fn apply_credential(env: &mut Vec<(String, String)>, spec: &Value, home: &Path) -> Result<()> {
+    let supplied = spec.get("credential").is_some_and(|credential| {
+        credential["env"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+            || credential["files"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+    });
+    if supplied {
+        // A chosen connector must not silently fall back to a different host
+        // subscription when the CLI sees an old login in this reused home.
+        for relative in [".pi/agent/auth.json", ".claude/.credentials.json"] {
+            let path = home.join(relative);
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+        }
+    } else {
+        for key in contract::CREDENTIAL_ENV {
+            if let Ok(value) = std::env::var(key) {
+                env.push((key.into(), value));
+            }
+        }
+    }
+    if let Some(credential) = spec.get("credential") {
+        for entry in credential["env"].as_array().into_iter().flatten() {
+            if let (Some(name), Some(value)) = (
+                entry.get(0).and_then(Value::as_str),
+                entry.get(1).and_then(Value::as_str),
+            ) {
+                env.push((name.to_string(), value.to_string()));
+            }
+        }
+        for entry in credential["files"].as_array().into_iter().flatten() {
+            if let (Some(relative), Some(contents)) = (
+                entry.get(0).and_then(Value::as_str),
+                entry.get(1).and_then(Value::as_str),
+            ) {
+                if ![".pi/agent/auth.json", ".claude/.credentials.json"].contains(&relative) {
+                    bail!("invalid credential destination");
+                }
+                let path = safe_home_path(home, relative)?;
+                write_private_file(&path, contents)
+                    .with_context(|| format!("writing {relative} into the run's home"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A CLI-writable home can contain symlinks left by an earlier run. Keep host
+/// credentials under the canonical scratch root and reject symlinked parents.
+fn safe_home_path(home: &Path, relative: &str) -> Result<PathBuf> {
+    let root = home.canonicalize()?;
+    let path = home.join(relative);
+    let mut component = home.to_path_buf();
+    for part in Path::new(relative).components() {
+        if !matches!(part, std::path::Component::Normal(_)) {
+            bail!("invalid home path");
+        }
+        component.push(part);
+        if std::fs::symlink_metadata(&component).is_ok_and(|meta| meta.file_type().is_symlink()) {
+            bail!("symlink in credential path");
+        }
+    }
+    let parent = path.parent().context("credential path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    if !parent.canonicalize()?.starts_with(&root) {
+        bail!("credential path left scratch home");
+    }
+    Ok(path)
+}
+
+/// A credentials file the CLI will read. Owner-only and created exclusively,
+/// so a stale hardlink or symlink cannot redirect a host login into the checkout.
 fn write_private_file(path: &Path, contents: &str) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
         .mode(0o600)
         .open(path)?;
     file.write_all(contents.as_bytes())?;
@@ -1318,8 +1394,8 @@ fn dev_shell_path(checkout: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Copy the agent's own login into the scratch home once. Both CLIs store their
-/// credentials under `$HOME`, and a scratch home would otherwise log out.
+/// Refresh the host login in a scratch home before each invocation. Both CLIs
+/// store credentials under `$HOME`, and subscriptions can rotate their tokens.
 fn seed_home(home: &Path) {
     let real_home = match std::env::var_os("HOME") {
         Some(home) => PathBuf::from(home),
@@ -1327,14 +1403,17 @@ fn seed_home(home: &Path) {
     };
     let pi_src = real_home.join(".pi/agent");
     let pi_dst = home.join(".pi/agent");
-    if pi_src.exists() && !pi_dst.exists() {
+    if pi_src.exists() {
+        let fresh = !pi_dst.exists();
         let _ = std::fs::create_dir_all(&pi_dst);
         for name in ["auth.json", "models-store.json", "settings.json"] {
             let from = pi_src.join(name);
-            if from.exists() {
-                let _ = std::fs::copy(&from, pi_dst.join(name));
+            if fresh || name == "auth.json" {
+                refresh_login(&from, &pi_dst.join(name), home);
             }
         }
+    } else {
+        let _ = std::fs::remove_file(pi_dst.join("auth.json"));
     }
     // `nix-direnv` lives in the user's direnv config; without it the agent's fresh
     // home re-evaluates every flake and hammers the GitHub API instead of reusing the
@@ -1350,20 +1429,93 @@ fn seed_home(home: &Path) {
     }
     let claude_src = real_home.join(".claude");
     let claude_dst = home.join(".claude");
-    if claude_src.exists() && !claude_dst.exists() {
+    if claude_src.exists() {
+        let fresh = !claude_dst.exists();
         let _ = std::fs::create_dir_all(&claude_dst);
         for name in [".credentials.json", "settings.json", ".claude.json"] {
             let from = claude_src.join(name);
-            if from.exists() {
-                let _ = std::fs::copy(&from, claude_dst.join(name));
+            if fresh || name == ".credentials.json" {
+                refresh_login(&from, &claude_dst.join(name), home);
             }
         }
+    } else {
+        let _ = std::fs::remove_file(claude_dst.join(".credentials.json"));
+    }
+}
+
+fn refresh_login(source: &Path, destination: &Path, home: &Path) {
+    let Ok(relative) = destination.strip_prefix(home) else {
+        return;
+    };
+    let Some(relative) = relative.to_str() else {
+        return;
+    };
+    let Ok(path) = safe_home_path(home, relative) else {
+        return;
+    };
+    if !source.exists() {
+        let _ = std::fs::remove_file(path);
+        return;
+    }
+    let host_newer = match (std::fs::metadata(source), std::fs::metadata(&path)) {
+        (Ok(host), Ok(scratch)) => host.modified().ok() >= scratch.modified().ok(),
+        _ => true,
+    };
+    if !host_newer {
+        return;
+    }
+    if let Ok(contents) = std::fs::read_to_string(source) {
+        if path.exists() && std::fs::remove_file(&path).is_err() {
+            return;
+        }
+        let _ = write_private_file(&path, &contents);
     }
 }
 
 /// Lumi's output contract is one JSON object `{reply, proposal?}`. A model
 /// that wrapped it in a fence, or answered in prose, still gets through: the
 /// words become the reply and there is simply no proposal.
+/// Never send raw CLI diagnostics to chat: they may contain keys or prompt text.
+fn lumi_failure_category(stderr: &str, stdout: &str) -> &'static str {
+    let text = format!("{stderr}\n{stdout}").to_lowercase();
+    if [
+        "unauthorized",
+        "authentication",
+        "login",
+        "invalid api key",
+        "api key",
+        "oauth",
+        "credentials",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+    {
+        "authentication failed; check the model connector or renew its login"
+    } else if ["rate limit", "too many requests", "429"]
+        .iter()
+        .any(|word| text.contains(word))
+    {
+        "provider rate limit; try again later"
+    } else if ["insufficient quota", "billing", "credit balance"]
+        .iter()
+        .any(|word| text.contains(word))
+    {
+        "provider quota or billing issue"
+    } else if [
+        "model not found",
+        "unknown model",
+        "invalid model",
+        "model is not available",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+    {
+        "model unavailable; check the selected model"
+    } else {
+        "the harness reported an error; check its model and connector setup"
+    }
+}
+
 fn parse_lumi_reply(text: &str) -> Value {
     let trimmed = text.trim();
     let candidate = if trimmed.starts_with("```") {
@@ -2143,6 +2295,92 @@ fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
         std::fs::write(dir.join("SKILL.md"), body)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod lumi_auth_tests {
+    use super::{apply_credential, lumi_failure_category, refresh_login};
+    use serde_json::json;
+
+    #[test]
+    fn stored_connector_replaces_host_login_and_passes_its_secret() {
+        let home = std::env::temp_dir().join(format!("hulahoop-lumi-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(home.join(".pi/agent/auth.json"), "stale-host-login").unwrap();
+        let mut env = Vec::new();
+        apply_credential(
+            &mut env,
+            &json!({ "credential": {
+                "env": [["ANTHROPIC_API_KEY", "connector-secret"]],
+                "files": []
+            }}),
+            &home,
+        )
+        .unwrap();
+        assert!(!home.join(".pi/agent/auth.json").exists());
+        assert!(env.contains(&("ANTHROPIC_API_KEY".into(), "connector-secret".into())));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn next_question_uses_rotated_login() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-login-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        std::fs::write(&source, "first").unwrap();
+        refresh_login(&source, &destination, &dir);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&source, "rotated").unwrap();
+        refresh_login(&source, &destination, &dir);
+        assert_eq!(std::fs::read_to_string(destination).unwrap(), "rotated");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cli_refreshed_login_survives_older_host_file() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-login-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let destination = dir.join("destination");
+        std::fs::write(&source, "expired").unwrap();
+        refresh_login(&source, &destination, &dir);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&destination, "cli-rotated").unwrap();
+        refresh_login(&source, &destination, &dir);
+        assert_eq!(
+            std::fs::read_to_string(&destination).unwrap(),
+            "cli-rotated"
+        );
+        std::fs::remove_file(&source).unwrap();
+        refresh_login(&source, &destination, &dir);
+        assert!(!destination.exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn login_refresh_rejects_symlinked_destination() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-login-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source");
+        let target = dir.join("checkout-file");
+        let destination = dir.join("destination");
+        std::fs::write(&source, "host-secret").unwrap();
+        std::fs::write(&target, "untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &destination).unwrap();
+        refresh_login(&source, &destination, &dir);
+        assert_eq!(std::fs::read_to_string(target).unwrap(), "untouched");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn diagnostics_expose_a_category_without_the_private_error() {
+        let error = lumi_failure_category("Invalid API key: secret-value", "");
+        assert!(error.contains("authentication"));
+        assert!(!error.contains("secret-value"));
+        assert!(lumi_failure_category("rate limit 429", "").contains("rate limit"));
+    }
 }
 
 #[cfg(test)]

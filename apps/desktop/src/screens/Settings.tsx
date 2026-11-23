@@ -1,43 +1,19 @@
-import { useEffect, useState } from "react";
-import PageHeader from "../PageHeader";
+import { useEffect, useRef, useState } from "react";
 import {
-  attachGithubRepo,
   createWorkspace,
-  gql,
-  loadGithubRepos,
   loadModels,
-  loadWorkspaceMembers,
-  renameProject,
   setWorkspaceLumi,
   updateWorkspace,
   type ModelOption,
-  type Agent,
-  type GithubRepo,
-  type Project,
-  type Repo,
-  type Skill,
   type Workspace,
-  type WorkspaceMember,
 } from "../api";
-import {
-  applyTheme,
-  resolvedTheme,
-  savedPalette,
-  THEME_GROUPS,
-  THEMES,
-} from "../theme";
+import { applyTheme, resolvedTheme, savedPalette, THEME_GROUPS, THEMES } from "../theme";
 
 type Tab = "personal" | "workspace";
 
-/** The personal tab: the theme choice, grouped like the prototype. */
 function Themes() {
   const [palette, setPalette] = useState(savedPalette());
   const painted = resolvedTheme(palette);
-
-  function pick(id: string) {
-    setPalette(id);
-    applyTheme(id);
-  }
 
   return (
     <div className="settings-block">
@@ -49,21 +25,14 @@ function Themes() {
             <div className="th-grid">
               {THEMES.filter((theme) => theme.group === group).map((theme) => {
                 const on = palette === theme.id;
-                const swatch =
-                  theme.kind === "auto" &&
-                  painted === "dark" &&
-                  theme.darkSwatch
-                    ? theme.darkSwatch
-                    : theme.swatch;
+                const swatch = theme.kind === "auto" && painted === "dark" && theme.darkSwatch
+                  ? theme.darkSwatch : theme.swatch;
                 return (
-                  <label
-                    className={on ? "run-opt th-card on" : "run-opt th-card"}
-                    key={theme.id}
-                  >
+                  <label className={on ? "run-opt th-card on" : "run-opt th-card"} key={theme.id}>
                     <input
                       checked={on}
                       name="theme"
-                      onChange={() => pick(theme.id)}
+                      onChange={() => { setPalette(theme.id); applyTheme(theme.id); }}
                       type="radio"
                       value={theme.id}
                     />
@@ -71,14 +40,10 @@ function Themes() {
                       <span className="row">
                         <strong className="fill">{theme.name}</strong>
                         {theme.kind !== "auto" && (
-                          <span className="chip">
-                            {theme.kind === "light" ? "Light" : "Dark"}
-                          </span>
+                          <span className="chip">{theme.kind === "light" ? "Light" : "Dark"}</span>
                         )}
                         <span aria-hidden="true" className="th-sw">
-                          {swatch.map((color) => (
-                            <i key={color} style={{ background: color }} />
-                          ))}
+                          {swatch.map((color) => <i key={color} style={{ background: color }} />)}
                         </span>
                       </span>
                       <span className="dim small">{theme.blurb}</span>
@@ -90,610 +55,163 @@ function Themes() {
           </div>
         ))}
       </div>
-      <p className="dim small">
-        These settings are just for you. Each theme is either light or dark, so
-        pick the one you want, or choose Match system to follow your Mac.
-      </p>
+      <p className="dim small">Saved on this Mac. Match system follows your appearance setting.</p>
     </div>
   );
 }
 
-export default function Settings({
-  workspace,
-  workspaces,
-  projects,
-  active,
-  agents,
-  onChanged,
-  onSwitchWorkspace,
-}: {
+export default function Settings({ workspace, initialTab, onChanged, onSwitchWorkspace, onClose }: {
   workspace: Workspace;
-  workspaces: Workspace[];
-  projects: Project[];
-  active: Project | null;
-  agents: Agent[];
-  skills?: Skill[];
+  initialTab: Tab;
   onChanged: () => Promise<void>;
   onSwitchWorkspace: (id: string) => Promise<void>;
+  onClose: () => void;
 }) {
-  const [tab, setTab] = useState<Tab>("personal");
+  const dialog = useRef<HTMLDialogElement>(null);
+  const firstTab = useRef<HTMLButtonElement>(null);
+  const workspaceTab = useRef<HTMLButtonElement>(null);
+  const [tab, setTab] = useState<Tab>(initialTab);
   const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<string | null>(null);
-  const [chosen, setChosen] = useState<string>(active?.id ?? "");
-  const [prefix, setPrefix] = useState<string>(active?.prefix ?? "");
-  const [newProject, setNewProject] = useState("");
-  const [newPrefix, setNewPrefix] = useState("");
-  const [repoPath, setRepoPath] = useState("");
-  const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
-  const [githubChoice, setGithubChoice] = useState("");
-  const [githubError, setGithubError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   const [wsName, setWsName] = useState(workspace.name);
   const [wsPrefix, setWsPrefix] = useState(workspace.defaultPrefix);
   const [lumiHarness, setLumiHarness] = useState(workspace.lumiHarness ?? "pi");
   const [lumiModel, setLumiModel] = useState(workspace.lumiModel ?? "");
   const [lumiModels, setLumiModels] = useState<ModelOption[]>([]);
-  const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [newWorkspace, setNewWorkspace] = useState("");
-  const [newWorkspacePrefix, setNewWorkspacePrefix] = useState("");
-  const [projectName, setProjectName] = useState("");
-
-  const project =
-    projects.find((entry) => entry.id === chosen) ??
-    active ??
-    projects[0] ??
-    null;
-  const repo: Repo | undefined = project?.repos[0];
+  const [newPrefix, setNewPrefix] = useState("");
 
   useEffect(() => {
-    loadGithubRepos()
-      .then(setGithubRepos)
-      .catch((cause: Error) => {
-        setGithubRepos([]);
-        setGithubError(cause.message);
-      });
+    dialog.current?.showModal();
+    (initialTab === "workspace" ? workspaceTab : firstTab).current?.focus();
+    return () => { dialog.current?.close(); };
   }, []);
 
   useEffect(() => {
-    setWsName(workspace.name);
-    setWsPrefix(workspace.defaultPrefix);
-    setLumiHarness(workspace.lumiHarness ?? "pi");
-    setLumiModel(workspace.lumiModel ?? "");
-    void loadWorkspaceMembers(workspace.id)
-      .then(setMembers)
-      .catch(() => setMembers([]));
-  }, [
-    workspace.id,
-    workspace.name,
-    workspace.defaultPrefix,
-    workspace.lumiHarness,
-    workspace.lumiModel,
-  ]);
-
-  // The model list is the harness's own catalogue, so it follows the picker.
-  useEffect(() => {
     let live = true;
     loadModels(lumiHarness)
-      .then((next) => {
+      .then((models) => {
         if (!live) return;
-        setLumiModels(next);
-        setLumiModel((was) =>
-          next.length && !next.some((entry) => entry.id === was) ? next[0].id : was,
-        );
+        setLumiModels(models);
       })
-      .catch(() => live && setLumiModels([]));
-    return () => {
-      live = false;
-    };
+      .catch(() => { if (live) setLumiModels([]); });
+    return () => { live = false; };
   }, [lumiHarness]);
 
-  useEffect(() => {
-    setProjectName(project?.name ?? "");
-    setPrefix(project?.prefix ?? "");
-  }, [project?.id, project?.name, project?.prefix]);
+  function switchTab(next: Tab) {
+    setTab(next);
+    (next === "workspace" ? workspaceTab : firstTab).current?.focus();
+  }
 
-  async function saveWorkspace(name: string, prefix: string) {
-    setBusy("workspace");
+  async function save() {
+    setBusy(true);
     setError(null);
     try {
-      await updateWorkspace(workspace.id, name.trim(), prefix.trim());
+      if (wsName.trim() !== workspace.name || wsPrefix.trim() !== workspace.defaultPrefix) {
+        await updateWorkspace(workspace.id, wsName.trim(), wsPrefix.trim());
+      }
+      if (lumiHarness !== (workspace.lumiHarness ?? "pi") || lumiModel.trim() !== (workspace.lumiModel ?? "")) {
+        await setWorkspaceLumi(workspace.id, lumiHarness, lumiModel.trim());
+      }
       await onChanged();
+      onClose();
     } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
+      await onChanged().catch(() => undefined);
+      setError(`Some settings may have saved. ${String(cause instanceof Error ? cause.message : cause)}`);
     } finally {
-      setBusy(null);
+      setBusy(false);
     }
   }
 
   async function addWorkspace() {
-    setBusy("new-workspace");
+    setBusy(true);
     setError(null);
     try {
-      const created = await createWorkspace(
-        newWorkspace.trim(),
-        newWorkspacePrefix.trim() || undefined,
-      );
-      setNewWorkspace("");
-      setNewWorkspacePrefix("");
+      const created = await createWorkspace(newWorkspace.trim(), newPrefix.trim() || undefined);
       await onSwitchWorkspace(created.id);
+      onClose();
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
     } finally {
-      setBusy(null);
-    }
-  }
-
-  async function saveProjectName() {
-    if (!project) return;
-    setBusy("project-name");
-    setError(null);
-    try {
-      await renameProject(project.id, projectName.trim());
-      await onChanged();
-    } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  /** A new harness or model invalidates its probe, so ask for a fresh one. */
-  async function action(label: string, work: () => Promise<unknown>) {
-    setBusy(label);
-    setError(null);
-    try {
-      await work();
-      await onChanged();
-    } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
-    } finally {
-      setBusy(null);
+      setBusy(false);
     }
   }
 
   return (
-    <section className="detail">
-      <PageHeader
-        actions={
-          <div aria-label="Settings section" className="seg" role="tablist">
-            <button
-              aria-selected={tab === "personal"}
-              onClick={() => setTab("personal")}
-              role="tab"
-            >
-              Personal
-            </button>
-            <button
-              aria-selected={tab === "workspace"}
-              onClick={() => setTab("workspace")}
-              role="tab"
-            >
-              Workspace
-            </button>
-          </div>
-        }
-        subtitle={
-          tab === "personal"
-            ? "just for you, saved on this machine"
-            : `${workspaces.length === 1 ? "one workspace" : `${workspaces.length} workspaces`} · ${agents.length} agents`
-        }
-        title="Settings"
-      />
-
-      {tab === "personal" && <Themes />}
-
-      {tab === "workspace" && (
-        <>
-          <div className="settings-block">
-            <div className="row spread">
-              <strong>{workspace.name}</strong>
-              <span className="dim small">{workspace.slug} · workspace</span>
+    <dialog
+      aria-labelledby="settings-title"
+      className="settings-dialog"
+      ref={dialog}
+      onCancel={(event) => { event.preventDefault(); if (!busy) onClose(); }}
+      onClick={(event) => { if (!busy && event.target === event.currentTarget) onClose(); }}
+    >
+      <div className="settings-head">
+        <h2 id="settings-title">Settings</h2>
+        <button className="icon-btn" aria-label="Close settings" disabled={busy} onClick={onClose}>×</button>
+      </div>
+      <div className="seg settings-tabs" role="tablist" aria-label="Settings section"
+        onKeyDown={(event) => {
+          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+            event.preventDefault();
+            switchTab(event.key === "Home" ? "personal" : event.key === "End" ? "workspace"
+              : tab === "personal" ? "workspace" : "personal");
+          }
+        }}>
+        <button ref={firstTab} id="settings-personal-tab" role="tab" aria-controls="settings-panel"
+          aria-selected={tab === "personal"} tabIndex={tab === "personal" ? 0 : -1}
+          onClick={() => switchTab("personal")}>Personal</button>
+        <button ref={workspaceTab} id="settings-workspace-tab" role="tab" aria-controls="settings-panel"
+          aria-selected={tab === "workspace"} tabIndex={tab === "workspace" ? 0 : -1}
+          onClick={() => switchTab("workspace")}>Workspace</button>
+      </div>
+      <div id="settings-panel" className="settings-content" role="tabpanel" aria-labelledby={tab === "personal" ? "settings-personal-tab" : "settings-workspace-tab"}>
+        {tab === "personal" ? <Themes /> : (
+          <>
+            <div className="settings-block">
+              <strong>Workspace</strong>
+              <label><span>Name</span><input value={wsName} onChange={(event) => setWsName(event.target.value)} /></label>
+              <label><span>Issue prefix (2–5)</span><input maxLength={5} value={wsPrefix}
+                onChange={(event) => setWsPrefix(event.target.value.toUpperCase())} /></label>
+              <p className="dim small">Tasks without a project use {workspace.defaultPrefix}-1, {workspace.defaultPrefix}-2…</p>
             </div>
-            <p className="dim small">
-              Issues filed with no project are keyed by this prefix —{" "}
-              {workspace.defaultPrefix}-1, {workspace.defaultPrefix}-2. Projects
-              in this workspace must use a different one.
-            </p>
-            <div className="grid-2">
-              <label>
-                <span>name</span>
-                <input
-                  value={wsName}
-                  onChange={(event) => setWsName(event.target.value)}
-                />
-              </label>
-              <label>
-                <span>issue prefix (2–5)</span>
-                <input
-                  value={wsPrefix}
-                  maxLength={5}
-                  onChange={(event) =>
-                    setWsPrefix(event.target.value.toUpperCase())
-                  }
-                />
-              </label>
-            </div>
-            <div className="row">
-              <button
-                className="primary"
-                disabled={busy === "workspace"}
-                onClick={() => void saveWorkspace(wsName, wsPrefix)}
-              >
-                Save workspace
-              </button>
-            </div>
-            {members.length > 0 && (
-              <ul className="mem-list">
-                {members.map((member) => (
-                  <li className="mem" key={member.userId}>
-                    <span className="av">
-                      {(member.name[0] ?? "?").toUpperCase()}
-                    </span>
-                    <span className="fill">{member.name}</span>
-                    <span className="dim small">
-                      {member.role[0]?.toUpperCase() + member.role.slice(1)}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            )}
-            <div className="row">
-              <input
-                placeholder="new workspace name"
-                value={newWorkspace}
-                onChange={(event) => setNewWorkspace(event.target.value)}
-              />
-              <input
-                placeholder="prefix"
-                value={newWorkspacePrefix}
-                maxLength={5}
-                onChange={(event) =>
-                  setNewWorkspacePrefix(event.target.value.toUpperCase())
-                }
-              />
-              <button
-                className="ghost"
-                disabled={
-                  busy === "new-workspace" || newWorkspace.trim().length < 2
-                }
-                onClick={() => void addWorkspace()}
-              >
-                Add workspace
-              </button>
-            </div>
-            {workspaces.length > 1 && (
-              <p className="dim small">
-                {workspaces.length} workspaces on this server:{" "}
-                {workspaces.map((entry) => entry.name).join(", ")}.
-              </p>
-            )}
-          </div>
-
-          <h2 className="section">Lumi</h2>
-          <p className="dim small">
-            Lumi is the workspace's assistant — the pill in the corner (⌘J). It answers with the
-            harness and model picked here, and only changes things after you press Apply.
-          </p>
-          <div className="settings-block">
-            <div className="grid-2">
-              <label>
-                <span>harness</span>
-                <select
-                  value={lumiHarness}
-                  onChange={(event) => setLumiHarness(event.target.value)}
-                >
-                  <option value="pi">Pi</option>
-                  <option value="claude_code">Claude Code</option>
+            <div className="settings-block">
+              <strong>Lumi</strong>
+              <p className="dim small">Choose the harness and model for Ask Lumi. Changes to tasks still require your approval.</p>
+              <div className="grid-2">
+                <label><span>Harness</span><select value={lumiHarness} onChange={(event) => setLumiHarness(event.target.value)}>
+                  <option value="pi">Pi</option><option value="claude_code">Claude Code</option>
                   <option value="fake">Fake (development)</option>
-                </select>
-              </label>
-              <label>
-                <span>model</span>
-                {lumiModels.length ? (
-                  <select
-                    value={lumiModel}
-                    onChange={(event) => setLumiModel(event.target.value)}
-                  >
-                    {lumiModels.map((entry) => (
-                      <option key={entry.id} value={entry.id}>
-                        {entry.label}
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <input
-                    value={lumiModel}
-                    placeholder="model id"
-                    onChange={(event) => setLumiModel(event.target.value)}
-                  />
-                )}
-              </label>
-            </div>
-            <div className="row">
-              <button
-                className="primary"
-                disabled={busy === "lumi" || !lumiModel.trim()}
-                onClick={() =>
-                  void action("lumi", () =>
-                    setWorkspaceLumi(workspace.id, lumiHarness, lumiModel),
-                  )
-                }
-              >
-                Save Lumi
-              </button>
-              <span className="dim small">
-                {workspace.lumiHarness
-                  ? `answering with ${workspace.lumiHarness} · ${workspace.lumiModel}`
-                  : "no harness picked yet — the pill will say so"}
-              </span>
-            </div>
-          </div>
-
-          <h2 className="section">Projects</h2>
-          <p className="dim small">
-            A project carries the prefix its issues are named by —{" "}
-            {workspace.defaultPrefix} is the workspace's own, for issues with no
-            project. Several repositories may hang off one project; the first is
-            the one a run clones.
-          </p>
-          <div className="settings-block">
-            <div className="row">
-              <select
-                value={chosen}
-                onChange={(event) => setChosen(event.target.value)}
-              >
-                {projects.map((entry) => (
-                  <option key={entry.id} value={entry.id}>
-                    {entry.prefix
-                      ? `${entry.prefix} · ${entry.name}`
-                      : entry.name}
-                  </option>
-                ))}
-              </select>
-              {project && (
-                <>
-                  <input
-                    className="narrow-input"
-                    value={projectName}
-                    placeholder={project.name}
-                    onChange={(event) => setProjectName(event.target.value)}
-                    onBlur={() => {
-                      if (
-                        projectName.trim() &&
-                        projectName.trim() !== project.name
-                      ) {
-                        void saveProjectName();
-                      }
-                    }}
-                  />
-                  <input
-                    className="narrow-input"
-                    value={prefix}
-                    placeholder={project.prefix ?? "PREFIX"}
-                    onChange={(event) => setPrefix(event.target.value)}
-                  />
-                  <button
-                    disabled={busy !== null || prefix.trim().length < 2}
-                    onClick={() =>
-                      action("prefix", () =>
-                        gql(
-                          `mutation ($id: UUID!, $prefix: String!) { setProjectPrefix(projectId: $id, prefix: $prefix) { id prefix } }`,
-                          {
-                            id: project.id,
-                            prefix: prefix.trim(),
-                          },
-                        ),
-                      )
-                    }
-                  >
-                    Set prefix
-                  </button>
-                </>
-              )}
-            </div>
-            <div className="row">
-              <input
-                value={newProject}
-                onChange={(event) => setNewProject(event.target.value)}
-                placeholder="new project name"
-              />
-              <input
-                className="narrow-input"
-                value={newPrefix}
-                onChange={(event) => setNewPrefix(event.target.value)}
-                placeholder="BAL"
-              />
-              <button
-                disabled={busy !== null || newProject.trim().length < 2}
-                onClick={() =>
-                  action("project", async () => {
-                    await gql(
-                      `mutation ($workspaceId: UUID!, $name: String!, $prefix: String) { createProject(workspaceId: $workspaceId, name: $name, prefix: $prefix) { id } }`,
-                      {
-                        workspaceId: workspace.id,
-                        name: newProject.trim(),
-                        prefix: newPrefix.trim() || null,
-                      },
-                    );
-                    setNewProject("");
-                    setNewPrefix("");
-                  })
-                }
-              >
-                Create project
-              </button>
-            </div>
-          </div>
-
-          <h2 className="section">Repositories</h2>
-          {project ? (
-            <div className="settings-block">
-              <ul className="repos">
-                {project.repos.map((entry) => (
-                  <li key={entry.id}>
-                    <strong>{entry.name}</strong>{" "}
-                    <span className="dim">
-                      {entry.path ?? "mirror, cloned on the first run"}
-                    </span>
-                    {entry.remoteUrl && (
-                      <div className="dim small">{entry.remoteUrl}</div>
+                </select></label>
+                <label><span>Model</span>{lumiModels.length ? (
+                  <select value={lumiModel} onChange={(event) => setLumiModel(event.target.value)}>
+                    {!lumiModels.some((model) => model.id === lumiModel) && (
+                      <option value={lumiModel}>{lumiModel || "Choose a model"}</option>
                     )}
-                    <div className="dim small">
-                      {entry.vcs} · contract v{entry.contractVersion} · base{" "}
-                      {entry.baseBookmark} · fetched{" "}
-                      {entry.fetchedAt
-                        ? new Date(entry.fetchedAt).toLocaleString()
-                        : "never"}
-                    </div>
-                  </li>
-                ))}
-                {project.repos.length === 0 && (
-                  <li className="dim">No repository attached yet.</li>
-                )}
-              </ul>
-              {githubRepos.length > 0 && (
-                <div className="row">
-                  <select
-                    value={githubChoice}
-                    onChange={(event) => setGithubChoice(event.target.value)}
-                  >
-                    <option value="">
-                      pick a repository the app can reach…
-                    </option>
-                    {githubRepos
-                      .filter(
-                        (entry) =>
-                          !project.repos.some(
-                            (attached) => attached.remoteUrl === entry.cloneUrl,
-                          ),
-                      )
-                      .map((entry) => (
-                        <option key={entry.cloneUrl} value={entry.cloneUrl}>
-                          {entry.fullName}
-                          {entry.private ? " (private)" : ""}
-                          {entry.archived ? " (archived)" : ""}
-                        </option>
-                      ))}
+                    {lumiModels.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
                   </select>
-                  <button
-                    disabled={busy !== null || githubChoice === ""}
-                    onClick={() =>
-                      action("github-repo", async () => {
-                        const chosen = githubRepos.find(
-                          (entry) => entry.cloneUrl === githubChoice,
-                        );
-                        if (!chosen) {
-                          return;
-                        }
-                        await attachGithubRepo(project.id, chosen);
-                        setGithubChoice("");
-                      })
-                    }
-                  >
-                    Attach from GitHub
-                  </button>
-                </div>
-              )}
-              {githubError && <p className="dim small">{githubError}</p>}
-              <div className="row">
-                <input
-                  value={repoPath}
-                  onChange={(event) => setRepoPath(event.target.value)}
-                  placeholder="/absolute/path/to/another/repo"
-                />
-                <button
-                  disabled={busy !== null || repoPath.trim().length < 2}
-                  onClick={() =>
-                    action("repo", async () => {
-                      await gql(
-                        `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id } }`,
-                        {
-                          projectId: project.id,
-                          name:
-                            repoPath.trim().split("/").filter(Boolean).pop() ??
-                            "repo",
-                          path: repoPath.trim(),
-                        },
-                      );
-                      setRepoPath("");
-                    })
-                  }
-                >
-                  Add repository
-                </button>
+                ) : <input value={lumiModel} placeholder="model id" onChange={(event) => setLumiModel(event.target.value)} />}</label>
               </div>
             </div>
-          ) : (
-            <p className="dim">Create a project first.</p>
-          )}
-
-          <h2 className="section">Repository</h2>
-          {repo ? (
             <div className="settings-block">
-              <p>
-                <strong>{repo.name}</strong>{" "}
-                <span className="dim">{repo.path}</span>
-              </p>
-              <p className="dim small">
-                {repo.vcs} · contract v{repo.contractVersion} · base{" "}
-                {repo.baseBookmark} · fetched{" "}
-                {repo.fetchedAt
-                  ? new Date(repo.fetchedAt).toLocaleString()
-                  : "never"}
-              </p>
+              <strong>New workspace</strong>
               <div className="row">
-                <button
-                  disabled={busy !== null}
-                  onClick={() =>
-                    action("fetch", () =>
-                      gql(
-                        `mutation ($id: UUID!) { fetchRepo(id: $id) { id } }`,
-                        { id: repo.id },
-                      ),
-                    )
-                  }
-                >
-                  Fetch base
-                </button>
-                <button
-                  disabled={busy !== null}
-                  onClick={() =>
-                    action("bearings", () =>
-                      gql(
-                        `mutation ($id: UUID!, $bookmark: String!) { updateRepo(id: $id, baseBookmark: $bookmark) { id } }`,
-                        {
-                          id: repo.id,
-                          bookmark: "main",
-                        },
-                      ),
-                    )
-                  }
-                >
-                  Set base to main
-                </button>
+                <input aria-label="New workspace name" placeholder="name" value={newWorkspace}
+                  onChange={(event) => setNewWorkspace(event.target.value)} />
+                <input className="narrow-input" aria-label="New workspace prefix" placeholder="prefix" maxLength={5}
+                  value={newPrefix} onChange={(event) => setNewPrefix(event.target.value.toUpperCase())} />
+                <button disabled={busy || newWorkspace.trim().length < 2} onClick={() => void addWorkspace()}>Create</button>
               </div>
             </div>
-          ) : (
-            <p className="dim">No repository attached yet.</p>
-          )}
-
-          <h2 className="section">Connectors</h2>
-          <p className="dim small">
-            GitHub, the Claude sign-ins and the Pi login live on the{" "}
-            <strong>Connectors</strong> screen, so there is one place that
-            answers "what can the loop act as?".
-          </p>
-
-          <h2 className="section">Agents</h2>
-          <p className="dim small">
-            Agents are created and edited on the <strong>Agents</strong> screen:
-            harness, model, its own AGENTS.md and the skills it carries. Which
-            of them a status calls is the workflow's decision, written down once
-            in WORKFLOWS.md.
-          </p>
-        </>
-      )}
-
-      {error && <p className="error">{error}</p>}
-    </section>
+          </>
+        )}
+        {error && <p className="error" role="alert">{error}</p>}
+      </div>
+      <div className="settings-actions">
+        {tab === "workspace" && <button onClick={onClose} disabled={busy}>Cancel</button>}
+        {tab === "personal" ? <button className="primary" onClick={onClose}>Done</button>
+          : <button className="primary" disabled={busy || !wsName.trim() || ((lumiHarness !== (workspace.lumiHarness ?? "pi") || lumiModel !== (workspace.lumiModel ?? "")) && !lumiModel.trim())}
+            onClick={() => void save()}>Save</button>}
+      </div>
+    </dialog>
   );
 }

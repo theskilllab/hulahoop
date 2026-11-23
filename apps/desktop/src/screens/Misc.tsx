@@ -11,6 +11,8 @@ import {
 } from "../api";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
+import ProjectManager from "./ProjectManager";
+import type { Workspace } from "../api";
 
 function when(iso: string | null): string {
   if (!iso) return "—";
@@ -75,24 +77,25 @@ export function Inbox({ issues, onOpen }: { issues: Issue[]; onOpen: (id: string
 export function Projects({
   projects,
   issues,
-  agents,
-  onOpenSettings,
+  workspace,
+  onChanged,
   onOpen,
 }: {
   projects: Project[];
   issues: Issue[];
-  agents: Agent[];
-  onOpenSettings: () => void;
+  workspace: Workspace;
+  onChanged: () => Promise<void>;
   onOpen: (id: string) => void;
 }) {
+  const [managing, setManaging] = useState<string | null>(null);
   return (
     <section className="screen projects">
       <PageHeader
         title="Projects"
         subtitle={`${projects.length} projects`}
         actions={
-          <button className="ghost" onClick={onOpenSettings}>
-            Manage in settings
+          <button className="ghost" onClick={() => setManaging("new")}>
+            New project
           </button>
         }
       />
@@ -137,18 +140,27 @@ export function Projects({
                   onClick={() => {
                     const first = own[0];
                     if (first) onOpen(first.id);
-                    else onOpenSettings();
+                    else setManaging(project.id);
                   }}
                 >
                   {own[0] ? `Open ${own[0].key}` : "Attach a repository"}
                 </button>
-                <span className="dim">{agents.length} agents in this workspace</span>
+                <button className="link" onClick={() => setManaging(project.id)}>Project settings</button>
               </footer>
             </article>
           );
         })}
-        {projects.length === 0 ? <p className="dim">No projects yet. Create one in Settings.</p> : null}
+        {projects.length === 0 ? <p className="dim">No projects yet. Create one here.</p> : null}
       </div>
+      {managing && (
+        <ProjectManager
+          key={managing}
+          workspace={workspace}
+          project={projects.find((entry) => entry.id === managing) ?? null}
+          onChanged={onChanged}
+          onClose={() => setManaging(null)}
+        />
+      )}
     </section>
   );
 }

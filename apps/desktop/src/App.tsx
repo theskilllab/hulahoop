@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   connect,
   gql,
@@ -54,7 +54,6 @@ type View =
   | { name: "cost" }
   | { name: "prs" }
   | { name: "activity" }
-  | { name: "settings" }
   | { name: "issue"; id: string }
   | { name: "new" }
   | { name: "connect" };
@@ -98,13 +97,28 @@ export default function App() {
   const [wsMenu, setWsMenu] = useState(false);
   const [palette, setPalette] = useState(false);
   const [lumi, setLumi] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"personal" | "workspace" | null>(null);
+  const settingsReturnFocus = useRef<HTMLElement | null>(null);
+  const openSettings = useCallback((tab: "personal" | "workspace" = "personal") => {
+    settingsReturnFocus.current = document.activeElement as HTMLElement | null;
+    setPalette(false);
+    setSettingsTab(tab);
+  }, []);
+  const closeSettings = () => {
+    setSettingsTab(null);
+    requestAnimationFrame(() => {
+      const target = settingsReturnFocus.current;
+      if (target?.isConnected) target.focus();
+      else document.querySelector<HTMLButtonElement>(".ws-btn")?.focus();
+    });
+  };
 
   // The page header's search field is the same door as ⌘K.
   useEffect(() => {
-    const open = () => setPalette(true);
+    const open = () => { if (!settingsTab) setPalette(true); };
     window.addEventListener("hulahoop:search", open);
     return () => window.removeEventListener("hulahoop:search", open);
-  }, []);
+  }, [settingsTab]);
 
   const refresh = useCallback(async () => {
     if (!workspace) return;
@@ -181,9 +195,13 @@ export default function App() {
   useEffect(() => {
     function onKey(event: KeyboardEvent) {
       const meta = event.metaKey || event.ctrlKey;
+      if (settingsTab) {
+        if (meta && [",", "k", "n", "j", "s"].includes(event.key.toLowerCase())) event.preventDefault();
+        return;
+      }
       if (meta && event.key === ",") {
         event.preventDefault();
-        setView({ name: "settings" });
+        openSettings();
       }
       if (meta && event.altKey && event.key.toLowerCase() === "s") {
         event.preventDefault();
@@ -207,7 +225,7 @@ export default function App() {
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [openSettings, settingsTab]);
 
   const reload = useCallback(async () => {
     const loaded = await loadWorkspace();
@@ -382,7 +400,7 @@ export default function App() {
                 role="menuitem"
                 onClick={() => {
                   setWsMenu(false);
-                  setView({ name: "settings" });
+                  openSettings();
                 }}
               >
                 <Icon name="gear" size={14} />
@@ -394,8 +412,7 @@ export default function App() {
                 role="menuitem"
                 onClick={() => {
                   setWsMenu(false);
-                  setView({ name: "settings" });
-                  setNotice("Create a workspace from the Workspace card in Settings.");
+                  openSettings("workspace");
                 }}
               >
                 <Icon name="plus" size={14} />
@@ -455,7 +472,10 @@ export default function App() {
           onClose={() => setPalette(false)}
           onPick={(target: PaletteTarget) => {
             setPalette(false);
-            if (target.kind === "view") setView({ name: target.id } as View);
+            if (target.kind === "view") {
+              if (target.id === "settings") openSettings();
+              else setView({ name: target.id } as View);
+            }
             if (target.kind === "issue") setView({ name: "issue", id: target.id });
             if (target.kind === "agent") setView({ name: "agents" });
           }}
@@ -477,8 +497,8 @@ export default function App() {
           <Projects
             projects={projects}
             issues={issues}
-            agents={agents}
-            onOpenSettings={() => setView({ name: "settings" })}
+            workspace={workspace}
+            onChanged={reload}
             onOpen={(id) => setView({ name: "issue", id })}
           />
         )}
@@ -596,21 +616,18 @@ export default function App() {
           />
         )}
 
-        {view.name === "settings" && (
-          <Settings
-            workspace={workspace}
-            workspaces={workspaces}
-            onSwitchWorkspace={switchWorkspace}
-            projects={projects}
-            active={project}
-            agents={agents}
-            skills={skills}
-            onChanged={async () => {
-              await reload();
-            }}
-          />
-        )}
       </main>
+
+      {settingsTab && (
+        <Settings
+          key={`${workspace.id}-${settingsTab}`}
+          workspace={workspace}
+          initialTab={settingsTab}
+          onSwitchWorkspace={switchWorkspace}
+          onChanged={reload}
+          onClose={closeSettings}
+        />
+      )}
 
       <Lumi
         workspace={workspace}
@@ -618,7 +635,7 @@ export default function App() {
         open={lumi}
         onToggle={setLumi}
         onApplied={() => void refresh()}
-        onOpenSettings={() => setView({ name: "settings" })}
+        onOpenSettings={() => openSettings("workspace")}
       />
     </div>
   );

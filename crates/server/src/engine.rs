@@ -1876,14 +1876,25 @@ impl Engine {
         } else {
             "succeeded"
         };
-        sqlx::query("update runner_jobs set status = ?, result = ?, error = ?, finished_at = ? where id = ?")
+        let mut tx = self.db.pool.begin().await?;
+        let updated = sqlx::query("update runner_jobs set status = ?, result = ?, error = ?, finished_at = ? where id = ? and status = 'running'")
             .bind(status)
             .bind(payload.to_string())
             .bind(&error)
             .bind(crate::db::now_rfc3339())
             .bind(job_id)
-            .execute(&self.db.pool)
+            .execute(&mut *tx)
             .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
+        if job.kind == "lumi" {
+            let job_payload: serde_json::Value =
+                serde_json::from_str(&job.payload).unwrap_or(serde_json::Value::Null);
+            self.lumi_complete(job_id, &job_payload, &payload, error.as_deref(), &mut tx)
+                .await?;
+        }
+        tx.commit().await?;
 
         match job.kind.as_str() {
             "fetch" => {
@@ -1947,23 +1958,16 @@ impl Engine {
                     .await?;
                 }
             }
-            "lumi" => {
-                // The answer lands even when the harness died: a panel that
-                // waits forever is worse than one that says what went wrong.
-                let job_payload: serde_json::Value =
-                    serde_json::from_str(&job.payload).unwrap_or(serde_json::Value::Null);
-                self.lumi_complete(&job_payload, &payload, error.as_deref())
-                    .await?;
-            }
             _ => {}
         }
         Ok(())
     }
 
-    pub async fn claim_job(&self) -> Result<Option<RunnerJob>> {
+    pub async fn claim_job(&self, lumi: bool) -> Result<Option<RunnerJob>> {
         let candidate: Option<RunnerJob> = sqlx::query_as(
-            "select * from runner_jobs where status = 'queued' order by created_at limit 1",
+            "select * from runner_jobs where status = 'queued' and (kind = 'lumi') = ? order by created_at limit 1",
         )
+        .bind(lumi)
         .fetch_optional(&self.db.pool)
         .await?;
         let Some(job) = candidate else {
@@ -1987,6 +1991,27 @@ impl Engine {
     }
 
     // ------------------------------------------------------------ housekeeping
+
+    /// A crashed runner cannot acknowledge its claimed question. Allow the
+    /// harness's ten-minute wall clock plus two minutes for setup and transport.
+    pub async fn reap_lumi_jobs(&self) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::minutes(12)).to_rfc3339();
+        let stale: Vec<(Uuid,)> = sqlx::query_as(
+            "select id from runner_jobs where kind = 'lumi' and status = 'running' and claimed_at < ?",
+        )
+        .bind(cutoff)
+        .fetch_all(&self.db.pool)
+        .await?;
+        for (id,) in stale {
+            self.complete_job(
+                id,
+                serde_json::Value::Null,
+                Some("the runner stopped before Lumi finished answering".into()),
+            )
+            .await?;
+        }
+        Ok(())
+    }
 
     /// A runner that stops heartbeating leaves runs `running` forever. The server
     /// is the one process that sees every heartbeat, so it declares them dead.
@@ -2031,6 +2056,74 @@ impl Engine {
 /// file; an `agent.jsonl` the runner opened but never filled falls back to that
 /// tail. Every path that finishes a run reads through here, so a cancelled or
 /// reaped run reports what it spent too.
+#[cfg(test)]
+mod lumi_claim_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lumi_lane_claims_questions_while_normal_job_is_queued() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-claims-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let project = Uuid::now_v7();
+        let repo = Uuid::now_v7();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Claims',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(crate::db::now_rfc3339())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(crate::db::now_rfc3339())
+            .execute(&db.pool).await.unwrap();
+        let engine = Engine::new(db);
+        let normal = engine
+            .queue_job(repo, None, "fetch", serde_json::json!({}))
+            .await
+            .unwrap();
+        let lumi = engine
+            .queue_job(
+                repo,
+                None,
+                "lumi",
+                serde_json::json!({"workspace_id": workspace.to_string()}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(engine.claim_job(true).await.unwrap().unwrap().id, lumi);
+        assert_eq!(engine.claim_job(false).await.unwrap().unwrap().id, normal);
+        assert!(engine.claim_job(true).await.unwrap().is_none());
+        sqlx::query("update runner_jobs set claimed_at = ? where id = ?")
+            .bind((Utc::now() - chrono::Duration::minutes(13)).to_rfc3339())
+            .bind(lumi)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        engine.reap_lumi_jobs().await.unwrap();
+        engine
+            .complete_job(lumi, serde_json::json!({"reply": "late reply"}), None)
+            .await
+            .unwrap();
+        let (count,): (i64,) =
+            sqlx::query_as("select count(*) from lumi_messages where job_id = ?")
+                .bind(lumi)
+                .fetch_one(&engine.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+        let (status,): (String,) = sqlx::query_as("select status from runner_jobs where id = ?")
+            .bind(lumi)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "failed");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
 #[cfg(test)]
 async fn spent_tokens(artifact_dir: &std::path::Path, tail: Option<&str>) -> (i64, i64) {
     let usage = spent_metrics(artifact_dir, tail).await;

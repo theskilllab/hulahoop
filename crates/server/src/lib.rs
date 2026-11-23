@@ -179,6 +179,9 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
             if let Err(error) = reaper.reap_dead_runs().await {
                 tracing::warn!(%error, "reaping runs failed");
             }
+            if let Err(error) = reaper.reap_lumi_jobs().await {
+                tracing::warn!(%error, "reaping Lumi jobs failed");
+            }
         }
     });
 

@@ -49,7 +49,7 @@ export default function Board({
         <h2>No repository yet</h2>
         <p>
           Hulahoop needs a repository that declares its commands: a <code>flake.nix</code> and a <code>justfile</code> with
-          <code> setup</code> and <code>test</code> recipes. Add one from Settings, then create your first issue.
+          <code> setup</code> and <code>test</code> recipes. Add one from Projects, then create your first issue.
         </p>
       </section>
     );

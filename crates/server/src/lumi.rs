@@ -207,9 +207,11 @@ impl Engine {
     /// none. Called from `complete_job`, so a dead harness still answers.
     pub async fn lumi_complete(
         &self,
+        job_id: Uuid,
         job_payload: &Value,
         result: &Value,
         error: Option<&str>,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     ) -> Result<()> {
         let Some(workspace_id) = job_payload["workspace_id"]
             .as_str()
@@ -230,8 +232,9 @@ impl Engine {
             }
         };
         sqlx::query(
-            "insert into lumi_messages (id, workspace_id, role, body, context, proposal, proposal_state, created_at)
-             values (?, ?, 'lumi', ?, null, ?, ?, ?)",
+            "insert into lumi_messages (id, workspace_id, role, body, context, proposal, proposal_state, created_at, job_id)
+             values (?, ?, 'lumi', ?, null, ?, ?, ?, ?)
+             on conflict do nothing",
         )
         .bind(Uuid::now_v7())
         .bind(workspace_id)
@@ -239,7 +242,8 @@ impl Engine {
         .bind(proposal.as_ref().map(|p| p.to_string()))
         .bind(proposal.as_ref().map(|_| "open"))
         .bind(crate::db::now_rfc3339())
-        .execute(&self.db.pool)
+        .bind(job_id)
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }

@@ -291,22 +291,45 @@ async fn complete_run(
     ))
 }
 
+#[derive(Deserialize)]
+struct ClaimJobRequest {
+    #[serde(default)]
+    lumi: bool,
+}
+
 async fn claim_job(
     State(state): State<Arc<ApiState>>,
     headers: HeaderMap,
+    Json(request): Json<ClaimJobRequest>,
 ) -> ApiResult<Option<JobEnvelope>> {
     authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
     let job = state
         .engine
-        .claim_job()
+        .claim_job(request.lumi)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     let Some(job) = job else {
         return Ok(Json(None));
     };
-    let spec = build_job_spec(&state.engine, &job)
-        .await
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let spec = match build_job_spec(&state.engine, &job).await {
+        Ok(spec) => spec,
+        Err(_) => {
+            // Claiming already moved the job to running. Complete it so Lumi's
+            // question gets an answer even when credential resolution fails.
+            state
+                .engine
+                .complete_job(
+                    job.id,
+                    Value::Null,
+                    Some(
+                        "Runner job setup failed; check the repository and model connector".into(),
+                    ),
+                )
+                .await
+                .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+            return Ok(Json(None));
+        }
+    };
     Ok(Json(Some(JobEnvelope { job, spec })))
 }
 
@@ -763,8 +786,22 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         None
     };
 
+    // Lumi uses the same stored connector resolution as a normal agent run.
+    // Credentials are added to the runner spec at claim time, never persisted in
+    // the job payload (which also contains the person's question).
+    let credential = if job.kind == "lumi" {
+        let adapter =
+            hulahoop_core::Adapter::parse(payload["adapter"].as_str().unwrap_or_default())
+                .ok_or_else(|| anyhow::anyhow!("unknown Lumi adapter"))?;
+        let credential = engine.agent_credential(adapter, None).await?;
+        Some(json!({ "env": credential.env, "files": credential.files }))
+    } else {
+        None
+    };
+
     Ok(json!({
         "job_id": job.id,
+        "credential": credential,
         "kind": job.kind,
         "payload": payload,
         "repo_path": host_path(&repo, &engine.db.data_dir),
