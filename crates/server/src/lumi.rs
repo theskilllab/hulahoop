@@ -37,6 +37,12 @@ impl Engine {
         if hulahoop_core::Adapter::parse(harness).is_none() {
             bail!("{harness} is not a harness this server knows");
         }
+        // A Pi model id names its provider with a slash; the Claude CLI has no such
+        // notion, so a saved pair like claude_code + anthropic/x can only fail at
+        // answer time. Refusing it here points at the real mistake instead.
+        if harness == "claude_code" && model.contains('/') {
+            bail!("{model} is not a Claude Code model; pick one from its own catalogue");
+        }
         sqlx::query("update workspaces set lumi_harness = ?, lumi_model = ? where id = ?")
             .bind(harness)
             .bind(model)
@@ -454,5 +460,40 @@ impl Engine {
             other => bail!("“{other}” is not an action Lumi may take"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod lumi_settings_tests {
+    use crate::db::Db;
+    use crate::engine::Engine;
+
+    #[tokio::test]
+    async fn claude_code_refuses_a_pi_model_id() {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-lumi-set-{}", uuid::Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let engine = Engine::new(db);
+
+        let refused = engine
+            .set_workspace_lumi(workspace, "claude_code", "anthropic/claude-fable-5-2")
+            .await;
+        assert!(refused.is_err());
+        assert!(refused.unwrap_err().to_string().contains("Claude Code"));
+
+        let saved = engine
+            .set_workspace_lumi(workspace, "claude_code", "sonnet")
+            .await
+            .unwrap();
+        assert_eq!(saved.lumi_model.as_deref(), Some("sonnet"));
+
+        let pi = engine
+            .set_workspace_lumi(workspace, "pi", "anthropic/claude-fable-5-2")
+            .await
+            .unwrap();
+        assert_eq!(pi.lumi_model.as_deref(), Some("anthropic/claude-fable-5-2"));
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

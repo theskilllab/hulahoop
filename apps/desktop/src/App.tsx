@@ -37,6 +37,7 @@ import WorkflowScreen from "./screens/Workflow";
 import Lumi from "./screens/Lumi";
 import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
+import CreateWorkspace from "./screens/CreateWorkspace";
 import { Connectors } from "./screens/Connectors";
 import { Activity, Inbox, Projects, PullRequests } from "./screens/Misc";
 import Cost from "./screens/Cost";
@@ -98,6 +99,7 @@ export default function App() {
   const [palette, setPalette] = useState(false);
   const [lumi, setLumi] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"personal" | "workspace" | null>(null);
+  const [creatingWorkspace, setCreatingWorkspace] = useState(false);
   const settingsReturnFocus = useRef<HTMLElement | null>(null);
   const openSettings = useCallback((tab: "personal" | "workspace" = "personal") => {
     settingsReturnFocus.current = document.activeElement as HTMLElement | null;
@@ -412,7 +414,8 @@ export default function App() {
                 role="menuitem"
                 onClick={() => {
                   setWsMenu(false);
-                  openSettings("workspace");
+                  setPalette(false);
+                  setCreatingWorkspace(true);
                 }}
               >
                 <Icon name="plus" size={14} />
@@ -623,9 +626,15 @@ export default function App() {
           key={`${workspace.id}-${settingsTab}`}
           workspace={workspace}
           initialTab={settingsTab}
-          onSwitchWorkspace={switchWorkspace}
           onChanged={reload}
           onClose={closeSettings}
+        />
+      )}
+
+      {creatingWorkspace && (
+        <CreateWorkspace
+          onCreated={switchWorkspace}
+          onClose={() => setCreatingWorkspace(false)}
         />
       )}
 

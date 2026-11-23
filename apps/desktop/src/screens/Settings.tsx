@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  createWorkspace,
   loadModels,
   setWorkspaceLumi,
   updateWorkspace,
@@ -60,11 +59,10 @@ function Themes() {
   );
 }
 
-export default function Settings({ workspace, initialTab, onChanged, onSwitchWorkspace, onClose }: {
+export default function Settings({ workspace, initialTab, onChanged, onClose }: {
   workspace: Workspace;
   initialTab: Tab;
   onChanged: () => Promise<void>;
-  onSwitchWorkspace: (id: string) => Promise<void>;
   onClose: () => void;
 }) {
   const dialog = useRef<HTMLDialogElement>(null);
@@ -78,8 +76,6 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
   const [lumiHarness, setLumiHarness] = useState(workspace.lumiHarness ?? "pi");
   const [lumiModel, setLumiModel] = useState(workspace.lumiModel ?? "");
   const [lumiModels, setLumiModels] = useState<ModelOption[]>([]);
-  const [newWorkspace, setNewWorkspace] = useState("");
-  const [newPrefix, setNewPrefix] = useState("");
 
   useEffect(() => {
     dialog.current?.showModal();
@@ -93,6 +89,11 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
       .then((models) => {
         if (!live) return;
         setLumiModels(models);
+        // A model saved for another harness is foreign to this catalogue; the
+        // first entry is a real choice, the stale id is a guaranteed failure.
+        setLumiModel((current) =>
+          models.length && !models.some((model) => model.id === current) ? models[0].id : current,
+        );
       })
       .catch(() => { if (live) setLumiModels([]); });
     return () => { live = false; };
@@ -123,20 +124,6 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
     }
   }
 
-  async function addWorkspace() {
-    setBusy(true);
-    setError(null);
-    try {
-      const created = await createWorkspace(newWorkspace.trim(), newPrefix.trim() || undefined);
-      await onSwitchWorkspace(created.id);
-      onClose();
-    } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
-    } finally {
-      setBusy(false);
-    }
-  }
-
   return (
     <dialog
       aria-labelledby="settings-title"
@@ -146,39 +133,46 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
       onClick={(event) => { if (!busy && event.target === event.currentTarget) onClose(); }}
     >
       <div className="settings-head">
-        <h2 id="settings-title">Settings</h2>
-        <button className="icon-btn" aria-label="Close settings" disabled={busy} onClick={onClose}>×</button>
-      </div>
-      <div className="seg settings-tabs" role="tablist" aria-label="Settings section"
-        onKeyDown={(event) => {
-          if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
-            event.preventDefault();
-            switchTab(event.key === "Home" ? "personal" : event.key === "End" ? "workspace"
-              : tab === "personal" ? "workspace" : "personal");
-          }
-        }}>
-        <button ref={firstTab} id="settings-personal-tab" role="tab" aria-controls="settings-panel"
-          aria-selected={tab === "personal"} tabIndex={tab === "personal" ? 0 : -1}
-          onClick={() => switchTab("personal")}>Personal</button>
-        <button ref={workspaceTab} id="settings-workspace-tab" role="tab" aria-controls="settings-panel"
-          aria-selected={tab === "workspace"} tabIndex={tab === "workspace" ? 0 : -1}
-          onClick={() => switchTab("workspace")}>Workspace</button>
+        <h2 id="settings-title" className="fill">Settings</h2>
+        <div className="seg settings-tabs" role="tablist" aria-label="Settings section"
+          onKeyDown={(event) => {
+            if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+              event.preventDefault();
+              switchTab(event.key === "Home" ? "personal" : event.key === "End" ? "workspace"
+                : tab === "personal" ? "workspace" : "personal");
+            }
+          }}>
+          <button ref={firstTab} id="settings-personal-tab" role="tab" aria-controls="settings-panel"
+            aria-selected={tab === "personal"} tabIndex={tab === "personal" ? 0 : -1}
+            onClick={() => switchTab("personal")}>Personal</button>
+          <button ref={workspaceTab} id="settings-workspace-tab" role="tab" aria-controls="settings-panel"
+            aria-selected={tab === "workspace"} tabIndex={tab === "workspace" ? 0 : -1}
+            onClick={() => switchTab("workspace")}>Workspace</button>
+        </div>
       </div>
       <div id="settings-panel" className="settings-content" role="tabpanel" aria-labelledby={tab === "personal" ? "settings-personal-tab" : "settings-workspace-tab"}>
         {tab === "personal" ? <Themes /> : (
           <>
             <div className="settings-block">
               <strong>Workspace</strong>
-              <label><span>Name</span><input value={wsName} onChange={(event) => setWsName(event.target.value)} /></label>
-              <label><span>Issue prefix (2–5)</span><input maxLength={5} value={wsPrefix}
-                onChange={(event) => setWsPrefix(event.target.value.toUpperCase())} /></label>
+              <div className="row">
+                <label className="field fill"><span className="field-label">Name</span>
+                  <input type="text" value={wsName} onChange={(event) => setWsName(event.target.value)} /></label>
+                <label className="field"><span className="field-label">Issue prefix</span>
+                  <input type="text" className="narrow-input" maxLength={5} value={wsPrefix}
+                    onChange={(event) => setWsPrefix(event.target.value.toUpperCase())} /></label>
+              </div>
               <p className="dim small">Tasks without a project use {workspace.defaultPrefix}-1, {workspace.defaultPrefix}-2…</p>
             </div>
             <div className="settings-block">
               <strong>Lumi</strong>
               <p className="dim small">Choose the harness and model for Ask Lumi. Changes to tasks still require your approval.</p>
               <div className="grid-2">
-                <label><span>Harness</span><select value={lumiHarness} onChange={(event) => setLumiHarness(event.target.value)}>
+                <label><span>Harness</span><select value={lumiHarness} onChange={(event) => {
+                  const next = event.target.value;
+                  setLumiHarness(next);
+                  setLumiModel(next === (workspace.lumiHarness ?? "pi") ? (workspace.lumiModel ?? "") : "");
+                }}>
                   <option value="pi">Pi</option><option value="claude_code">Claude Code</option>
                   <option value="fake">Fake (development)</option>
                 </select></label>
@@ -189,17 +183,7 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
                     )}
                     {lumiModels.map((model) => <option key={model.id} value={model.id}>{model.label}</option>)}
                   </select>
-                ) : <input value={lumiModel} placeholder="model id" onChange={(event) => setLumiModel(event.target.value)} />}</label>
-              </div>
-            </div>
-            <div className="settings-block">
-              <strong>New workspace</strong>
-              <div className="row">
-                <input aria-label="New workspace name" placeholder="name" value={newWorkspace}
-                  onChange={(event) => setNewWorkspace(event.target.value)} />
-                <input className="narrow-input" aria-label="New workspace prefix" placeholder="prefix" maxLength={5}
-                  value={newPrefix} onChange={(event) => setNewPrefix(event.target.value.toUpperCase())} />
-                <button disabled={busy || newWorkspace.trim().length < 2} onClick={() => void addWorkspace()}>Create</button>
+                ) : <input type="text" value={lumiModel} placeholder="model id" onChange={(event) => setLumiModel(event.target.value)} />}</label>
               </div>
             </div>
           </>
