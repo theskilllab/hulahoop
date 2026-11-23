@@ -224,6 +224,15 @@ impl Query {
     }
 
     /// The workspace's reusable knowledge.
+    /// Where each of the workspace's skills is loaded.
+    async fn skill_usage(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+    ) -> async_graphql::Result<Vec<crate::model::SkillUsage>> {
+        Ok(engine(ctx).skill_usage(workspace_id).await?)
+    }
+
     async fn skills(
         &self,
         ctx: &Context<'_>,
@@ -779,6 +788,11 @@ impl Mutation {
         .bind(&now)
         .execute(&engine(ctx).db.pool)
         .await?;
+        // A new agent reads the workspace's built-in skills from its first turn.
+        let _ = engine(ctx).seed_builtin_skills(workspace_id).await;
+        // Probe straight away: an agent that has never been used should not make
+        // the first task that names it wait for a probe.
+        let _ = engine(ctx).probe_everywhere(id).await;
         Ok(sqlx::query_as("select * from agents where id = ?")
             .bind(id)
             .fetch_one(&engine(ctx).db.pool)
@@ -837,11 +851,9 @@ impl Mutation {
             }
         }
         // A changed adapter or model makes the old probe meaningless: it answered a
-        // question about a command line that no longer exists.
-        sqlx::query("delete from agent_preflight where agent_id = ?")
-            .bind(id)
-            .execute(&engine.db.pool)
-            .await?;
+        // question about a command line that no longer exists. Ask it again now,
+        // so an agent nobody has used yet is ready before work arrives.
+        engine.probe_everywhere(id).await?;
         Ok(sqlx::query_as("select * from agents where id = ?")
             .bind(id)
             .fetch_one(&engine.db.pool)
@@ -1080,10 +1092,10 @@ impl Mutation {
     }
 
     /// The pull request merged, which is what closes a task.
+    /// Reads the merge from GitHub and records it: the revision a merge produced
+    /// is GitHub's fact, so pressing the button asks GitHub rather than a person.
     async fn merge_issue(&self, ctx: &Context<'_>, issue_id: Uuid) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx)
-            .transition(issue_id, hulahoop_core::IssueEvent::Merge)
-            .await?)
+        Ok(engine(ctx).merge_issue(issue_id).await?)
     }
 
     /// Back to To do, for work that is queued again after a merge or an abandon.
@@ -1136,18 +1148,18 @@ impl Mutation {
         .await?)
     }
 
+    /// Start a turn on a task. `agentId` names who works it; without one the
+    /// workflow's queue decides, and only a workflow naming `Any agent` falls back
+    /// to the project's bindings.
     async fn start_run(
         &self,
         ctx: &Context<'_>,
         issue_id: Uuid,
         agent_id: Option<Uuid>,
-        role: String,
         parent_run_id: Option<Uuid>,
     ) -> async_graphql::Result<Run> {
-        let role = AgentRole::parse(&role)
-            .ok_or_else(|| async_graphql::Error::new(format!("unknown role {role}")))?;
         Ok(engine(ctx)
-            .start_run(issue_id, agent_id, role, parent_run_id)
+            .start_run(issue_id, agent_id, parent_run_id)
             .await?)
     }
 

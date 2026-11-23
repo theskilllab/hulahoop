@@ -9,7 +9,7 @@ cd "$HULAHOOP_CHECKOUT"
 echo "{\"type\":\"message_start\",\"role\":\"${ROLE}\"}"
 
 case "$ROLE" in
-  implementer|test_author)
+  worker)
     # One commit does the whole job: the implementation and the test that proves
     # it. An agent owns both now, so there is no separate authoring stage.
     cat > tests/test_subtract.py <<'PY'

@@ -723,17 +723,13 @@ VCS=jj
 NO_COLOR=1
 ```
 
-The role prompts are files in the Hulahoop repo, embedded in the binary at build time:
+What an agent is told comes from three places, and Hulahoop hardcodes none of them:
 
-```text
-prompts/test_author.md
-prompts/implementer.md
-prompts/reviewer.md
-```
+- **The run contract**, one built-in skill (`crates/server/skills/run-contract.md`, embedded in the binary). It carries the mechanics the server has to read back: one turn, where the task is, the house rules, and the `HULAHOOP_VERDICT:` / `HULAHOOP_QUESTION:` line a turn ends with. It is attached to every agent, shown read-only in Skills, and is the one text a person cannot edit.
+- **The agent's own instructions** (`agents.agents_md`), written by whoever best knows that agent. An architect that plans and a developer that implements differ here, and only here.
+- **Its skills**: `SKILL.md` files with `name` and `description` front matter. The prompt lists each one by description, and the runner writes the bodies to `.hulahoop/skills/<name>/SKILL.md` in the checkout, which every repository ignores. The harness opens the one whose description fits the work; the bodies of the others never cost context.
 
-Every project runs the same embedded prompt set. Per-project prompt overrides are out of scope in v0, so a prompt change is a Hulahoop release and never a repo edit. Each run records `runs.prompt_revision` as `<app version>+<sha256 of the embedded prompt set>`, the same in every checkout; a run's outcome then attributes to the exact prompt text that produced it, and the desktop shows the revision beside the run.
-
-The Test Author reads the issue title, body, and acceptance criteria, plus repository instructions. It writes tests against the acceptance criteria on top of the base revision, touches nothing else, and leaves them failing. The Implementer reads the same issue, the frozen suite, and any prior review comments; it writes implementation code, keeps the diff focused, leaves the suite files alone, and reports evidence. The Reviewer reads the issue, the suite, the diff, and both run logs; it checks correctness, test integrity, and whether the acceptance criteria are actually met.
+Nothing about an agent's kind is stored, because nothing about it needs to be: what a turn *was* is read from what it did. A turn that changed the checkout carries a commit — the runner names `issue/<issue id>/head/<attempt>` at it, and that head is what a pull request and the next turn point at. A turn that changed nothing publishes nothing, so the workflow can put a planner, a validator and a rework in the same status without the server knowing which is which. A closing line of `HULAHOOP_VERDICT: approved` or `changes_requested` judges the work before it and is recorded as a review; the agent is what its `AGENTS.md` says it is. Each run records `runs.prompt_revision` as `<app version>+<sha256 of the agent's instructions>`, so an outcome attributes to the text that produced it, and the desktop shows the revision beside the run.
 
 ### The gate
 

@@ -487,6 +487,7 @@ export default function App() {
             repoId={projects.flatMap((entry) => entry.repos)[0]?.id ?? null}
             projectId={project?.id ?? null}
             onChanged={reload}
+            onOpenSkills={() => setView({ name: "skills" })}
           />
         )}
 

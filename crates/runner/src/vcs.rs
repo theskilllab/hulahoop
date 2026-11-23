@@ -271,24 +271,6 @@ impl Vcs {
     /// The paths one revision changed relative to another. Two revisions rather
     /// than a checkout, because a base replay asks about the candidate suite, not
     /// about whatever the user happens to have open.
-    pub fn changed_paths_between(&self, from: &str, to: &str) -> Result<Vec<String>> {
-        let from = self.resolve(from)?;
-        let to = self.resolve(to)?;
-        let output = self.run(
-            &self.root,
-            "jj",
-            &["diff", "--from", &from, "--to", &to, "--name-only"],
-        )?;
-        Ok(output
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(str::to_string)
-            .collect())
-    }
-
-    /// Base replay: the authored tests, restored onto the base revision. The
-    /// tests must fail there; if they pass, they were not proving anything.
     pub fn restore_from(&self, checkout: &Path, from: &str, paths: &[String]) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
@@ -309,18 +291,6 @@ impl Vcs {
     /// Rebasing a bookmark that sits on the last commit of a chain moves only that
     /// commit; the landing preview needs the suite commit beneath the implementation
     /// to travel too, so this takes a revision rather than a bookmarked head.
-    pub fn contains(&self, merge: &str, head: &str) -> Result<bool> {
-        let merge = self.resolve(merge)?;
-        let head = self.resolve(head)?;
-        let revset = format!("{head} & ::{merge}");
-        let output = self.run(
-            &self.root,
-            "jj",
-            &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
-        )?;
-        Ok(!output.trim().is_empty())
-    }
-
     pub fn fetch(&self) -> Result<()> {
         match self.kind() {
             Kind::Jj => {

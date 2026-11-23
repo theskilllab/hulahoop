@@ -434,8 +434,9 @@ async fn seed(args: &[String]) -> Result<()> {
         repo_json["data"]["addRepo"]["vcs"].as_str().unwrap_or("?")
     );
 
-    // Two pi agents and one claude agent: the roles differ by configuration, so
-    // the test author and the implementer can use different models.
+    // Two pi agents and one claude agent. Names are what WORKFLOWS.md asks for
+    // (`@Test Author`); only `worker` and `reviewer` are bound, because a status
+    // that names nobody falls back to those and nothing else is a role.
     let mut agent_ids = Vec::new();
     for (agent_name, adapter, model) in [
         ("Test Author", "pi", "anthropic/claude-sonnet-4-5"),
@@ -454,15 +455,15 @@ async fn seed(args: &[String]) -> Result<()> {
     }
 
     let bindings = format!(
-        "[{{role: \"test_author\", agentId: \"{}\"}}, {{role: \"implementer\", agentId: \"{}\"}}, {{role: \"reviewer\", agentId: \"{}\"}}]",
-        agent_ids[0], agent_ids[1], agent_ids[2]
+        "[{{role: \"worker\", agentId: \"{}\"}}, {{role: \"reviewer\", agentId: \"{}\"}}]",
+        agent_ids[1], agent_ids[2]
     );
     gql(format!(
         "mutation {{ setProjectAgents(projectId: \"{project_id}\", bindings: {bindings}) {{ role }} }}"
     ))
     .await?;
 
-    println!("agents bound: test_author, implementer, reviewer");
+    println!("agents bound: worker, reviewer");
     println!(
         "repo root: {}\nnext: create an issue in the app, or open it and press Start",
         repo.display()

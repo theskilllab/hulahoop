@@ -223,6 +223,8 @@ export interface Skill {
   name: string;
   description: string;
   source: string;
+  /** 1 for the skills a workspace is born with. They are read, never edited. */
+  builtin: number;
   updatedAt: string;
 }
 
@@ -446,7 +448,7 @@ export async function loadBoard(workspaceId: string): Promise<Issue[]> {
   return data.issues;
 }
 
-export const SKILL_FIELDS = `id name description source updatedAt`;
+export const SKILL_FIELDS = `id name description source builtin updatedAt`;
 
 export async function loadSkills(workspaceId: string): Promise<Skill[]> {
   const data = await gql<{ skills: Skill[] }>(
@@ -490,6 +492,28 @@ export async function deleteSkill(id: string): Promise<boolean> {
     { id },
   );
   return data.deleteSkill;
+}
+
+/** Which agents carry which skills. The library shows this before it lets you
+ *  write another skill for something already loaded. */
+export async function loadSkillUsage(workspaceId: string): Promise<Record<string, string[]>> {
+  const data = await gql<{ skillUsage: { skillId: string; agentNames: string[] }[] }>(
+    `query ($w: UUID!) { skillUsage(workspaceId: $w) { skillId agentNames } }`,
+    { w: workspaceId },
+  );
+  return Object.fromEntries(data.skillUsage.map((row) => [row.skillId, row.agentNames]));
+}
+
+/** The workspace's agents with the skills each one carries, for the Used-by
+ *  toggles on the Skills page. */
+export async function loadAgentSkills(
+  workspaceId: string,
+): Promise<{ id: string; name: string; skills: Skill[] }[]> {
+  const data = await gql<{ agents: { id: string; name: string; skills: Skill[] }[] }>(
+    `query ($w: UUID!) { agents(workspaceId: $w) { id name skills { id } } }`,
+    { w: workspaceId },
+  );
+  return data.agents;
 }
 
 export async function setAgentSkills(agentId: string, skillIds: string[]): Promise<Skill[]> {

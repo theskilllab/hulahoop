@@ -528,3 +528,135 @@ impl Engine {
         Ok(true)
     }
 }
+
+impl Engine {
+    /// Closes a task whose project has no pull request to read a merge from.
+    ///
+    /// A repository with no GitHub remote still has a loop in it: the head the
+    /// review looked at is what the work became, so it becomes the base and the
+    /// merge is recorded against the run's own revision.
+    async fn merge_without_pull_request(
+        &self,
+        issue: &crate::model::Issue,
+    ) -> anyhow::Result<crate::model::Issue> {
+        let head: Option<(Option<String>,)> = sqlx::query_as(
+            "select head_revision from runs where issue_id = ? and head_revision is not null \
+             order by created_at desc limit 1",
+        )
+        .bind(issue.id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        let revision = head.and_then(|(revision,)| revision).ok_or_else(|| {
+            anyhow::anyhow!("nothing was published on this task, so there is nothing to merge yet")
+        })?;
+
+        sqlx::query(
+            "update issues set merge_revision = ?, merged_at = ?, updated_at = ? where id = ?",
+        )
+        .bind(&revision)
+        .bind(crate::db::now_rfc3339())
+        .bind(crate::db::now_rfc3339())
+        .bind(issue.id)
+        .execute(&self.db.pool)
+        .await?;
+        sqlx::query("update repos set base_revision = ? where id = ?")
+            .bind(&revision)
+            .bind(issue.repo_id)
+            .execute(&self.db.pool)
+            .await?;
+        self.comment(
+            issue.id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            &format!(
+                "Merged as {}. There is no pull request on this project, so the head the review looked at became the base.",
+                &revision[..12.min(revision.len())]
+            ),
+            false,
+        )
+        .await?;
+        self.transition(issue.id, hulahoop_core::IssueEvent::Merge)
+            .await
+    }
+
+    /// Records a merge as GitHub describes it.
+    ///
+    /// The revision a merge produced only exists on GitHub's side, so it is read
+    /// from the pull request instead of typed by a person: a hand-pasted hash is
+    /// the kind of fact that is right once and stale afterwards.
+    pub async fn merge_issue(&self, issue_id: uuid::Uuid) -> anyhow::Result<crate::model::Issue> {
+        let issue = self.issue(issue_id).await?;
+        let Some(number) = issue.pr_number else {
+            // No pull request: either the project has no GitHub remote at all, or
+            // the handover never opened one. Both mean there is no GitHub side to
+            // read, and the run's own head is the merge.
+            return self.merge_without_pull_request(&issue).await;
+        };
+        let repo: crate::model::Repo = sqlx::query_as("select * from repos where id = ?")
+            .bind(issue.repo_id)
+            .fetch_one(&self.db.pool)
+            .await?;
+        let remote = crate::api::clone_url(&repo).ok_or_else(|| {
+            anyhow::anyhow!(
+                "repository {} has no remote to talk to github through",
+                repo.name
+            )
+        })?;
+        let (owner, name) = crate::github::split_remote(&remote)
+            .ok_or_else(|| anyhow::anyhow!("{remote} is not a github repository"))?;
+
+        let app = self
+            .stored_app(crate::github::PROVIDER, crate::connectors::KIND_GITHUB_APP)
+            .await?
+            .ok_or_else(|| {
+                anyhow::anyhow!("no usable GitHub app is stored, so the merge cannot be read back")
+            })?;
+        let jwt = crate::github::mint_token(&app.app_id, &app.private_key)?;
+        let http = reqwest::Client::new();
+        let token = crate::github::installation_token(&http, &jwt, &owner, &name).await?;
+        let state = crate::github::pull_request(&http, &token, &owner, &name, number).await?;
+
+        if !state.merged {
+            anyhow::bail!(
+                "pull request #{number} is still {} on github. Merge it there first, then press again — the revision comes from github, so nothing has to be typed."
+                , state.state
+            );
+        }
+        let merge_revision = state.merge_commit_sha.ok_or_else(|| {
+            anyhow::anyhow!("github reports #{number} merged but names no revision")
+        })?;
+
+        sqlx::query(
+            "update issues set merge_revision = ?, merged_at = ?, updated_at = ? where id = ?",
+        )
+        .bind(&merge_revision)
+        .bind(
+            state
+                .merged_at
+                .clone()
+                .unwrap_or_else(crate::db::now_rfc3339),
+        )
+        .bind(crate::db::now_rfc3339())
+        .bind(issue_id)
+        .execute(&self.db.pool)
+        .await?;
+        sqlx::query("update repos set base_revision = ? where id = ?")
+            .bind(&merge_revision)
+            .bind(issue.repo_id)
+            .execute(&self.db.pool)
+            .await?;
+        self.comment(
+            issue_id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            &format!(
+                "Merged as {} on github. The repository's base is now that revision, so the next task starts from the merge.",
+                &merge_revision[..12.min(merge_revision.len())]
+            ),
+            false,
+        )
+        .await?;
+        self.transition(issue_id, hulahoop_core::IssueEvent::Merge)
+            .await
+    }
+}

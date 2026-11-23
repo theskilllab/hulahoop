@@ -147,34 +147,42 @@ string_enum!(ReplayStatus {
     TimedOut => "timed_out",
 });
 
+// What the server does with a finished run. The old pipeline had three roles
+// because it had three stages. A team named in the workflow does not work that
+// way: an architect, a test author and a developer are all people the task
+// passes through, and the server treats each of their turns the same way —
+// record the work, advance the task. Only a review turn is different, because
+// its result is a verdict rather than a work product.
 string_enum!(AgentRole {
-    TestAuthor => "test_author",
-    Implementer => "implementer",
+    Worker => "worker",
     Reviewer => "reviewer",
 });
 
 impl AgentRole {
-    pub const ALL: [AgentRole; 3] = [
-        AgentRole::TestAuthor,
-        AgentRole::Implementer,
-        AgentRole::Reviewer,
-    ];
+    pub const ALL: [AgentRole; 2] = [AgentRole::Worker, AgentRole::Reviewer];
+
+    /// A role read back from a row. Turns recorded before the enum shrank still
+    /// name the stage they ran in; all of them were workers.
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "test_author" | "implementer" => Some(AgentRole::Worker),
+            other => AgentRole::parse(other),
+        }
+    }
 
     /// The author name a commit made by this role carries. One name per role is
     /// what makes "who wrote this" answerable from `jj log` alone, and the
     /// `.invalid` domain keeps the address obviously non-routable.
     pub fn commit_name(self) -> &'static str {
         match self {
-            AgentRole::TestAuthor => "hulahoop-test-author",
-            AgentRole::Implementer => "hulahoop-implementer",
+            AgentRole::Worker => "hulahoop-worker",
             AgentRole::Reviewer => "hulahoop-reviewer",
         }
     }
 
     pub fn commit_email(self) -> &'static str {
         match self {
-            AgentRole::TestAuthor => "hulahoop-test-author@hulahoop.invalid",
-            AgentRole::Implementer => "hulahoop-implementer@hulahoop.invalid",
+            AgentRole::Worker => "hulahoop-worker@hulahoop.invalid",
             AgentRole::Reviewer => "hulahoop-reviewer@hulahoop.invalid",
         }
     }
@@ -182,8 +190,7 @@ impl AgentRole {
     /// The role's half of a name, so one app can still write as three roles.
     pub fn name_suffix(self) -> &'static str {
         match self {
-            AgentRole::TestAuthor => "test-author",
-            AgentRole::Implementer => "implementer",
+            AgentRole::Worker => "worker",
             AgentRole::Reviewer => "reviewer",
         }
     }
@@ -205,6 +212,41 @@ impl AgentRole {
     /// address the commit shows up unattributed, which reads as if a human wrote
     /// it. Without both halves there is nothing honest to build, so the role's own
     /// non-routable address stands in and the panel says so.
+    /// The agent's own name as a git-safe slug: `Test Author` becomes
+    /// `test-author`, `Architect` becomes `architect`. The team a task runs
+    /// through is named in the workflow, so the commits should carry those names
+    /// and not the three fixed roles the old pipeline had.
+    pub fn app_commit_name_for(self, slug: Option<&str>, agent: Option<&str>) -> String {
+        let app = slug.map(str::trim).filter(|value| !value.is_empty());
+        match (app, agent.map(slugify).filter(|value| !value.is_empty())) {
+            (Some(app), Some(agent)) => format!("{app}-{agent}"),
+            (Some(app), None) => format!("{app}-{}", self.name_suffix()),
+            (None, Some(agent)) => agent,
+            (None, None) => self.commit_name().to_string(),
+        }
+    }
+
+    pub fn app_commit_email_for(
+        self,
+        app_id: Option<&str>,
+        slug: Option<&str>,
+        agent: Option<&str>,
+    ) -> String {
+        let agent = agent.map(slugify).filter(|value| !value.is_empty());
+        match (app_id, slug, agent) {
+            (Some(id), Some(app), Some(agent))
+                if !id.trim().is_empty() && !app.trim().is_empty() =>
+            {
+                format!(
+                    "{}+{}-{agent}[bot]@users.noreply.github.com",
+                    id.trim(),
+                    app.trim()
+                )
+            }
+            _ => self.app_commit_email(app_id, slug),
+        }
+    }
+
     pub fn app_commit_email(self, app_id: Option<&str>, slug: Option<&str>) -> String {
         match (app_id, slug) {
             (Some(app_id), Some(slug)) if !app_id.trim().is_empty() && !slug.trim().is_empty() => {
@@ -217,6 +259,26 @@ impl AgentRole {
             _ => self.commit_email().to_string(),
         }
     }
+}
+
+/// A display name reduced to something a git identity can hold: lowercase
+/// ASCII words joined by single dashes. Anything a name cannot carry is dropped,
+/// so `Ada Lovelace (plans)` still yields `ada-lovelace-plans`.
+pub fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut gap = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if gap && !out.is_empty() {
+                out.push('-');
+            }
+            gap = false;
+            out.extend(ch.to_lowercase());
+        } else {
+            gap = true;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 string_enum!(Adapter {
@@ -392,5 +454,48 @@ mod tests {
         assert_eq!(IssueStatus::board().len(), 6);
         assert!(IssueStatus::board().contains(&S::Blocked));
         assert!(!IssueStatus::board().contains(&S::Cancelled));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    #[test]
+    fn a_name_becomes_a_slug_a_git_identity_can_hold() {
+        assert_eq!(slugify("Architect"), "architect");
+        assert_eq!(slugify("Test Author"), "test-author");
+        assert_eq!(slugify("Ada Lovelace (plans)"), "ada-lovelace-plans");
+        assert_eq!(slugify("  Review   Bot  "), "review-bot");
+    }
+
+    #[test]
+    fn the_commit_is_named_after_the_agent_not_the_role() {
+        let role = AgentRole::Worker;
+        assert_eq!(
+            role.app_commit_name_for(Some("hulahoop-dev"), Some("Test Author")),
+            "hulahoop-dev-test-author"
+        );
+        assert_eq!(
+            role.app_commit_email_for(Some("5834164"), Some("hulahoop-dev"), Some("Architect")),
+            "5834164+hulahoop-dev-architect[bot]@users.noreply.github.com"
+        );
+    }
+
+    #[test]
+    fn without_an_agent_name_the_role_still_works() {
+        let role = AgentRole::Reviewer;
+        assert_eq!(
+            role.app_commit_name_for(Some("hulahoop-dev"), None),
+            "hulahoop-dev-reviewer"
+        );
+        assert_eq!(
+            role.app_commit_name_for(None, Some("Architect")),
+            "architect"
+        );
+        assert_eq!(
+            role.app_commit_email_for(None, None, Some("Architect")),
+            "hulahoop-reviewer@hulahoop.invalid"
+        );
     }
 }

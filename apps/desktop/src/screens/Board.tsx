@@ -59,7 +59,7 @@ export default function Board({
     <section className="board">
       <PageHeader
         title="Tasks"
-        subtitle={`${issues.length} open · agents work the middle columns, you decide the ones that ask`}
+        subtitle={`${issues.length} open`}
         actions={
           <button className="primary" onClick={onNew}>
             New issue

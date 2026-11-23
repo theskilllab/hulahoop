@@ -26,6 +26,19 @@ pub struct RunSpec {
     pub blocked_answer: Option<BlockedAnswer>,
     pub replays: Vec<ReplayInput>,
     pub limits: Limits,
+    /// The skills this agent carries, so the runner can write them into the
+    /// checkout where the harness looks for them.
+    #[serde(default)]
+    pub skills: Vec<SkillInput>,
+}
+
+/// One skill, ready to be written as `SKILL.md`. The body is the whole file as
+/// the workspace keeps it; the runner adds nothing to it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkillInput {
+    pub name: String,
+    pub description: String,
+    pub body: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -151,7 +164,7 @@ mod tests {
         RunSpec {
             run_id: Uuid::nil(),
             issue_id: Uuid::nil(),
-            role: AgentRole::Implementer,
+            role: AgentRole::Worker,
             attempt: 1,
             issue: IssueInput {
                 title: "Add multiplication".into(),
@@ -177,6 +190,7 @@ mod tests {
             blocked_answer: None,
             replays: vec![],
             limits: Limits::default(),
+            skills: vec![],
         }
     }
 

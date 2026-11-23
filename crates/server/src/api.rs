@@ -8,10 +8,10 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use hulahoop_core::junit;
 use hulahoop_core::runspec::{
     CheckoutInput, CriterionInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
 };
-use hulahoop_core::{junit, AgentRole};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -26,7 +26,7 @@ pub struct ApiState {
 /// What a local runner clones. The stored remote wins; the constant is the floor
 /// so a repository attached before remotes were read still has somewhere to come
 /// from.
-fn clone_url(repo: &Repo) -> Option<String> {
+pub(crate) fn clone_url(repo: &Repo) -> Option<String> {
     if let Some(remote) = repo.remote_url.as_deref() {
         return Some(remote.to_string());
     }
@@ -268,11 +268,21 @@ async fn complete_run(
     Json(body): Json<crate::engine::RunCompletion>,
 ) -> ApiResult<Value> {
     authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
-    let run = state
-        .engine
-        .complete_run(id, body)
-        .await
-        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let run = match state.engine.complete_run(id, body).await {
+        Ok(run) => run,
+        Err(error) => {
+            // The agent did its part; the server did not. Record what happened,
+            // give the turn back so the next attempt is not charged for it, and
+            // answer 200 so the runner stops retrying a request that cannot work.
+            if let Ok(failed) = state.engine.run(id).await {
+                let _ = state
+                    .engine
+                    .finish_server_error(failed.issue_id, failed.agent_id, &error.to_string(), id)
+                    .await;
+            }
+            return Ok(Json(serde_json::json!({ "run": serde_json::Value::Null })));
+        }
+    };
     Ok(Json(
         json!({ "run": { "id": run.id.to_string(), "status": run.status } }),
     ))
@@ -420,13 +430,20 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
                     .bind(parent_run.id)
                     .fetch_optional(&engine.db.pool)
                     .await?;
+                    // A reviewer's verdict is the handover when there is one. Any
+                    // other turn hands over through the message it left behind, so
+                    // the next agent reads what was decided instead of guessing.
+                    let (verdict, body) = match review {
+                        Some(review) => (review.verdict, review.body),
+                        None => (
+                            "handover".to_string(),
+                            parent_run.summary.clone().unwrap_or_default(),
+                        ),
+                    };
                     Some(ParentInput {
                         head_bookmark: parent_run.head_bookmark.unwrap_or_default(),
-                        verdict: review
-                            .as_ref()
-                            .map(|r| r.verdict.clone())
-                            .unwrap_or_else(|| "changes_requested".into()),
-                        body: review.map(|r| r.body).unwrap_or_default(),
+                        verdict,
+                        body,
                     })
                 }
                 None => None,
@@ -474,10 +491,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             "files": credential.files,
         })
     };
-    let github_token = match run.role_enum() {
-        AgentRole::Implementer => engine.github_token().await?,
-        AgentRole::TestAuthor | AgentRole::Reviewer => None,
-    };
+    // Committing is the app's act, so every turn gets the app's token: a turn that
+    // changed nothing pushes nothing, and nothing else may decide that in advance.
+    let github_token = engine.github_token().await?;
 
     let replays: Vec<Replay> =
         sqlx::query_as("select * from replays where issue_id = ? order by created_at desc limit 4")
@@ -499,6 +515,8 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             }
         })
         .collect();
+
+    let skills = engine.skill_inputs(agent.id).await?;
 
     let spec = RunSpec {
         run_id: run.id,
@@ -532,13 +550,14 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         blocked_answer,
         replays: replay_inputs,
         limits: Limits::default(),
+        skills,
     }
     .truncate_text();
 
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    let prompt = engine.compose_prompt(run.role_enum(), &agent).await?;
+    let prompt = engine.compose_prompt(&agent).await?;
     std::fs::write(&prompt_path, &prompt)?;
 
     Ok(json!({
@@ -548,6 +567,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "role": run.role_enum().as_str(),
         "adapter": agent.adapter,
         "model": agent.model,
+        "agent_name": agent.name,
         "prompt": prompt,
         "prompt_path": prompt_path,
         "input_path": input_path,
@@ -577,6 +597,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         // halves; either missing means the commit keeps the role address.
         "commit_app_id": engine.commit_identity().await?.0,
         "commit_app_slug": engine.commit_identity().await?.1,
+        "commit_agent_name": agent.name,
         "timeout_minutes": hulahoop_core::AGENT_WALL_CLOCK_MINUTES,
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
         "prompt_revision": engine.prompt_revision(&prompt),

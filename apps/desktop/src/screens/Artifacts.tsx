@@ -65,7 +65,7 @@ export default function Artifacts({ workspaceId, projects, milestones, artifacts
     <section className="screen page">
       <PageHeader
         title="Artifacts"
-        subtitle="Reference files: a spec, a screenshot, a tarball. Attach one to a milestone or leave it loose."
+        subtitle={`${artifacts.length} stored`}
         actions={
           <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
             {creating ? "Cancel" : "Add a file"}

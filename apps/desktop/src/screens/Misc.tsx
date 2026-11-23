@@ -40,11 +40,10 @@ export function Inbox({ issues, onOpen }: { issues: Issue[]; onOpen: (id: string
 
   return (
     <section className="screen inbox">
-      <PageHeader title="Inbox">
-        {rows.length === 0
-          ? "Nothing waits for you. Agents work the tasks; you decide the ones that ask."
-          : `${blocked.length} waiting on an answer, ${review.length} waiting on a merge.`}
-      </PageHeader>
+      <PageHeader
+        title="Inbox"
+        subtitle={`${blocked.length} waiting on an answer · ${review.length} waiting on a merge`}
+      />
 
       {rows.length === 0 ? (
         <div className="empty-inbox">
@@ -91,7 +90,7 @@ export function Projects({
     <section className="screen projects">
       <PageHeader
         title="Projects"
-        subtitle="A project holds repositories, carries the prefix on every task, and binds the agents its statuses call."
+        subtitle={`${projects.length} projects`}
         actions={
           <button className="ghost" onClick={onOpenSettings}>
             Manage in settings
@@ -207,9 +206,7 @@ export function Cost({ runners, agents }: { runners: RecentRun[]; agents: Agent[
 
   return (
     <section className="screen cost">
-      <PageHeader title="Cost control">
-        {`Tokens the agents reported, from ${runners.length} recent runs. Nothing is estimated: a run that reported nothing counts as nothing.`}
-      </PageHeader>
+      <PageHeader title="Cost control" subtitle={`${runners.length} recent runs`} />
 
       <div className="stat-row">
         <div className="stat">
@@ -279,7 +276,7 @@ export function PullRequests({ issues, onOpen }: { issues: Issue[]; onOpen: (id:
     <section className="screen prs">
       <PageHeader
         title="Pull requests"
-        subtitle="Opened when the implementation is green, so a person reviews a pull request rather than a branch."
+        subtitle={`${withPr.length} from GitHub`}
       />
 
       {withPr.length === 0 ? (
@@ -336,7 +333,7 @@ export function Activity({
     <section className="screen activity">
       <PageHeader
         title="Activity"
-        subtitle="Every run, newest first. A run that says nothing is a run that changed nothing."
+        subtitle={`${runners.length} runs`}
       />
 
       <ul className="activity-list">

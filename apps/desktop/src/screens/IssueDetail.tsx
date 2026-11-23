@@ -121,7 +121,7 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
             onClick={() =>
               mutate(
                 "start",
-                `mutation ($id: UUID!) { startRun(issueId: $id, role: "implementer") { id status } }`,
+                `mutation ($id: UUID!) { startRun(issueId: $id) { id status } }`,
                 { id: issue.id },
               )
             }

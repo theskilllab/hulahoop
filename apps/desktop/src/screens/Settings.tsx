@@ -161,7 +161,10 @@ export default function Settings({
 
   return (
     <section className="detail">
-      <PageHeader subtitle="Workspace, projects, repositories, connectors and the agent roster." title="Settings" />
+      <PageHeader
+        subtitle={`${workspaces.length === 1 ? "one workspace" : `${workspaces.length} workspaces`} · ${agents.length} agents`}
+        title="Settings"
+      />
 
       <div className="settings-block">
         <div className="row spread">
