@@ -1653,10 +1653,13 @@ impl Engine {
         if judged {
             if final_status == RunStatus::Succeeded {
                 let verdict = self.record_review(&issue, &run, &payload).await?;
-                // A rejection leaves the task where it is: the next turn there is a
-                // rework, and the workflow decides when that happens.
+                // A rejection keeps the task in its status and starts the round
+                // again: the document's first agent reworks, the reviewer judges
+                // the new head. `Turns:` is what stops the loop.
                 if verdict == "approved" {
                     self.advance_after_turn(run.issue_id, run.agent_id).await?;
+                } else {
+                    self.hand_back_for_rework(run.issue_id).await?;
                 }
             } else {
                 // A review that never finished judged nothing, so the task waits
@@ -1704,6 +1707,30 @@ impl Engine {
     /// hands over to the next agent it names, or to the first move the document
     /// declares out of it. A handover into review is what earns a pull request,
     /// and the reviewer is shown the run that put it there.
+    /// A review asked for changes: everybody in the status is owed a turn again,
+    /// in the document's order, and the first of them starts now.
+    async fn hand_back_for_rework(&self, issue_id: Uuid) -> Result<()> {
+        sqlx::query("update issues set turn_served = '[]' where id = ?")
+            .bind(issue_id)
+            .execute(&self.db.pool)
+            .await?;
+        let issue = self.issue(issue_id).await?;
+        if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+            let _ = self
+                .comment(
+                    issue_id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!(
+                        "the review asked for changes, but the rework could not start: {error}"
+                    ),
+                    false,
+                )
+                .await;
+        }
+        Ok(())
+    }
+
     async fn advance_after_turn(&self, issue_id: Uuid, agent_id: Uuid) -> Result<()> {
         let issue = self.issue(issue_id).await?;
         let _ = self.mark_served(&issue, agent_id).await;
@@ -2401,5 +2428,67 @@ mod criterion_tests {
         assert!(verdict("works").contains("too short"));
         assert!(verdict("it is correct").contains("generic"));
         assert!(verdict("the connections screen should work").contains("states a goal"));
+    }
+}
+
+#[cfg(test)]
+mod rework_tests {
+    use super::Engine;
+    use crate::db::Db;
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    const DOC: &str = "# Workflows\n\nTurns: 6\n\n## Backlog\n\nUsers: human\n\nNext: To do\n\n## To do\n\nUsers: human\n\nNext: In progress\n\n## In progress\n\nUsers: @Developer, @Reviewer\n\nNext: In progress - @Reviewer asks @Developer to work on it again\n\nNext: In review\n\n## Blocked\n\nUsers: human\n\nNext: In progress\n\n## In review\n\nUsers: human\n\nNext: Done\n\n## Done\n\nUsers: human\n\nNext: none\n";
+
+    /// A review that asks for changes is the reviewer handing the task back:
+    /// the round starts again from the first agent the status names.
+    #[tokio::test]
+    async fn changes_requested_hands_the_task_back_to_the_first_agent() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-rework-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, developer, reviewer, issue) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Rework',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        for (id, name) in [(developer, "Developer"), (reviewer, "Reviewer")] {
+            sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi','model-x',?,?)")
+                .bind(id).bind(workspace).bind(name).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        }
+        let served = serde_json::json!([developer.to_string()]).to_string();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, turn_queue, turn_served, turns_used, created_at, updated_at) values (?,?,?,?, 'RWK-1',1,'Task','in_progress','[\"Developer\",\"Reviewer\"]',?,2,?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo).bind(served)
+            .bind(now).bind(now).execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        engine.set_workflow(workspace, DOC).await.unwrap();
+        engine.hand_back_for_rework(issue).await.unwrap();
+
+        let task = engine.issue(issue).await.unwrap();
+        assert_eq!(task.turn_served, "[]");
+        assert_eq!(task.status, "in_progress");
+        assert_eq!(
+            engine.next_turn_agent(&task).await.unwrap().as_deref(),
+            Some("Developer")
+        );
+        // The rework was dispatched: the turn is counted against `Turns:`.
+        assert_eq!(task.turns_used, 3);
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }
