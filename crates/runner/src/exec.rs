@@ -176,34 +176,6 @@ impl Executor {
             )
             .await?;
 
-        // Frozen means frozen: a formatter run over the whole workspace rewrites the
-        // suite the implementer is not allowed to touch, and that should not throw
-        // away an hour of real work. Restoring first also means a deliberate edit to
-        // a test has no effect, which is the rule the gate is protecting.
-        let frozen: Vec<String> = spec["frozen_paths"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut restored = Vec::new();
-        let before = vcs.changed_paths(&checkout, &base).unwrap_or_default();
-        for path in &frozen {
-            if before.contains(path) {
-                vcs.restore_from(&checkout, &base, std::slice::from_ref(path))?;
-                restored.push(path.clone());
-            }
-        }
-        if !restored.is_empty() {
-            self.client
-                .event(run_id, "frozen_restored", json!({ "paths": restored }))
-                .await
-                .ok();
-        }
-
         // The team is named in the workflow, so the commit carries the agent's
         // own name: `Test Author` becomes `hulahoop-dev-test-author`.
         let agent_name = spec["commit_agent_name"].as_str();
@@ -239,25 +211,9 @@ impl Executor {
             )
             .with_context(|| "describing the commit")?;
         }
-        // The suite the gate freezes has to be formatted, or every head built on it
-        // fails `fmt-check` in CI and no agent may touch the frozen file to fix it.
-        // The loop formats what it is about to freeze.
-        {
-            let frozen: Vec<String> = spec["frozen_paths"]
-                .as_array()
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(|path| path.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let tests_bookmark = spec["tests_bookmark"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            self.format_tree(&checkout, &artifact_dir, &frozen, &tests_bookmark);
-        }
+        // A head that fails `fmt-check` in CI is a head nobody can merge, so the
+        // loop formats the tree before it records the diff.
+        self.format_tree(&checkout, &artifact_dir);
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
@@ -655,25 +611,23 @@ impl Executor {
             existing.is_some(),
         )?;
 
-        let criteria = pull["criteria"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .enumerate()
-                    .map(|(index, text)| format!("{}. {text}", index + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let review = pull["review"].as_str().unwrap_or("");
-        let body = format!(
-            "{}\n\n---\n\n**Acceptance criteria**\n\n{}\n\n**The suite was red before the change and green after it.**\n\n**Reviewer verdict**\n\n{}\n\n_Opened by Hulahoop. The loop wrote the tests first, froze them, then implemented against them._\n",
-            pull["body"].as_str().unwrap_or(""),
-            criteria,
-            review
+        // The description says what was asked; the run's own summary says what
+        // was done, which is what a reader of the pull request wants first.
+        let summary = pull["summary"].as_str().unwrap_or("").trim();
+        let summary = if summary.is_empty() {
+            "The agent left no summary for this change."
+        } else {
+            summary
+        };
+        let review = pull["review"].as_str().unwrap_or("").trim();
+        let mut body = format!(
+            "{}\n\n---\n\n**What changed**\n\n{summary}\n",
+            pull["body"].as_str().unwrap_or("")
         );
+        if !review.is_empty() {
+            body.push_str(&format!("\n**Reviewer verdict**\n\n{review}\n"));
+        }
+        body.push_str("\n_Opened by Hulahoop._\n");
         let title = pull["title"]
             .as_str()
             .map(|title| format!("{title} (hulahoop)"))
@@ -758,13 +712,7 @@ impl Executor {
         Ok(None)
     }
 
-    fn format_tree(
-        &self,
-        checkout: &Path,
-        artifact_dir: &Path,
-        frozen: &[String],
-        tests_bookmark: &str,
-    ) {
+    fn format_tree(&self, checkout: &Path, artifact_dir: &Path) {
         if std::fs::create_dir_all(artifact_dir).is_err() {
             return;
         }
@@ -787,18 +735,6 @@ impl Executor {
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             Some(&log),
         );
-        // A formatter will happily rewrite a frozen test, and the tree has to stay
-        // byte-identical to the suite the gate recorded, so those paths come back
-        // from the suite afterwards.
-        if frozen.is_empty() || tests_bookmark.trim().is_empty() {
-            return;
-        }
-        let mut argv: Vec<&str> = vec!["restore", "--from", tests_bookmark, "--"];
-        argv.extend(frozen.iter().map(String::as_str));
-        let _ = Command::new("jj")
-            .args(&argv)
-            .current_dir(checkout)
-            .output();
     }
 
     /// The recipes a repository declares beyond the suite, run at the same revision
@@ -1026,10 +962,6 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
         (
             "HULAHOOP_BASE_BOOKMARK".into(),
             spec["base_bookmark"].as_str().unwrap_or("main").into(),
-        ),
-        (
-            "HULAHOOP_TESTS_BOOKMARK".into(),
-            spec["tests_bookmark"].as_str().unwrap_or_default().into(),
         ),
         (
             "HULAHOOP_ARTIFACT_DIR".into(),

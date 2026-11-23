@@ -84,7 +84,7 @@ export default function Board({
                   <span className="meta">
                     <StatusPill status={issue.status} />
                     <span className="dim">
-                      {issue.criteria.length} criteria · attempt {issue.attempt || 0}
+                      {issue.priority} · attempt {issue.attempt || 0}
                     </span>
                   </span>
                   <TurnQueue issue={issue} />

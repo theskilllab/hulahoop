@@ -454,6 +454,16 @@ impl Engine {
         Ok(rows)
     }
 
+    /// The files attached to one task, oldest first, the order they were added.
+    pub async fn issue_files(&self, issue_id: Uuid) -> Result<Vec<Artifact>> {
+        Ok(sqlx::query_as::<_, Artifact>(
+            "select * from artifacts where issue_id = ? order by created_at, id",
+        )
+        .bind(issue_id)
+        .fetch_all(&self.db.pool)
+        .await?)
+    }
+
     /// Store bytes on disk and a row in the database. The row is the index; the
     /// file is the thing, kept under `artifacts/<id>/<filename>` so a delete is one
     /// directory and two artifacts can share a filename without ever colliding.
@@ -463,12 +473,21 @@ impl Engine {
         workspace_id: Uuid,
         project_id: Option<Uuid>,
         milestone_id: Option<Uuid>,
+        issue_id: Option<Uuid>,
         title: String,
         kind: Option<String>,
         filename: String,
         mime: Option<String>,
         bytes: &[u8],
     ) -> Result<Artifact> {
+        // A file can only be attached to a task of the same workspace; anything
+        // else would leak the file into somebody else's run input.
+        if let Some(issue_id) = issue_id {
+            let issue = self.issue(issue_id).await?;
+            if issue.workspace_id != workspace_id {
+                return Err(anyhow!("task {issue_id} belongs to another workspace"));
+            }
+        }
         let title = if title.trim().is_empty() {
             filename.clone()
         } else {
@@ -498,13 +517,14 @@ impl Engine {
             _ => "file".into(),
         });
         sqlx::query(
-            "insert into artifacts (id, workspace_id, project_id, milestone_id, title, kind, filename, mime, size, sha256, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into artifacts (id, workspace_id, project_id, milestone_id, issue_id, title, kind, filename, mime, size, sha256, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
         .bind(project_id)
         .bind(milestone_id)
+        .bind(issue_id)
         .bind(&title)
         .bind(&kind)
         .bind(&filename)

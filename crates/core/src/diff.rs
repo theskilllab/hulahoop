@@ -1,5 +1,5 @@
 //! Reading a unified diff: which files changed, how many lines moved, and
-//! whether any of them are frozen tests or contract files.
+//! whether any of them are contract files.
 
 use crate::contract::{classify_path, is_excluded, PathVerdict};
 use crate::{RunFlag, DIFF_LINE_LIMIT};
@@ -25,14 +25,6 @@ impl DiffSummary {
 pub struct DiffVerdict {
     pub summary: DiffSummary,
     pub flags: Vec<RunFlag>,
-    /// Frozen tests the diff touches. Non-empty means the run is rejected.
-    pub frozen_hits: Vec<String>,
-}
-
-impl DiffVerdict {
-    pub fn is_acceptable(&self) -> bool {
-        self.frozen_hits.is_empty()
-    }
 }
 
 /// Parse `+++ b/<path>` headers and count content lines, skipping the hunk
@@ -74,16 +66,14 @@ pub fn summarize(patch: &str) -> DiffSummary {
     summary
 }
 
-/// Classify a diff against the frozen suite and the contract, and derive the
-/// flags the approve dialog has to show.
-pub fn classify(patch: &str, frozen_paths: &[String]) -> DiffVerdict {
+/// Classify a diff against the contract, and derive the flags the approve
+/// dialog has to show.
+pub fn classify(patch: &str) -> DiffVerdict {
     let summary = summarize(patch);
     let mut flags = Vec::new();
-    let mut frozen_hits = Vec::new();
 
     for path in &summary.files {
-        match classify_path(path, frozen_paths) {
-            PathVerdict::Frozen => frozen_hits.push(path.clone()),
+        match classify_path(path) {
             PathVerdict::Gated(flag) => flags.push(flag),
             PathVerdict::Allowed => {}
         }
@@ -94,11 +84,7 @@ pub fn classify(patch: &str, frozen_paths: &[String]) -> DiffVerdict {
     flags.sort_by_key(|flag| flag.as_str());
     flags.dedup();
 
-    DiffVerdict {
-        summary,
-        flags,
-        frozen_hits,
-    }
+    DiffVerdict { summary, flags }
 }
 
 #[cfg(test)]
@@ -134,16 +120,8 @@ diff --git a/justfile b/justfile
 
     #[test]
     fn contract_files_are_flagged_not_rejected() {
-        let verdict = classify(PATCH, &[]);
-        assert!(verdict.is_acceptable());
+        let verdict = classify(PATCH);
         assert!(verdict.flags.contains(&RunFlag::TouchedContract));
-    }
-
-    #[test]
-    fn frozen_tests_reject_the_run() {
-        let verdict = classify(PATCH, &["calc.py".to_string()]);
-        assert!(!verdict.is_acceptable());
-        assert_eq!(verdict.frozen_hits, vec!["calc.py"]);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use hulahoop_core::junit;
 use hulahoop_core::runspec::{
-    CheckoutInput, CriterionInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
+    CheckoutInput, CommentInput, FileInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -438,7 +438,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     agent.adapter = run.adapter_snapshot.clone().unwrap_or(agent.adapter);
     agent.model = run.model.clone();
     agent.connector = run.connector_id.clone();
-    let criteria = engine.criteria(run.issue_id).await?;
     let project: Project = sqlx::query_as("select * from projects where id = ?")
         .bind(issue.project_id)
         .fetch_one(&engine.db.pool)
@@ -607,29 +606,22 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             body: issue.body.clone(),
             priority: issue.priority.clone(),
         },
-        criteria: criteria
-            .iter()
-            .map(|criterion| CriterionInput {
-                position: criterion.position,
-                text: criterion.text.clone(),
-            })
-            .collect(),
         repo: hulahoop_core::runspec::RepoInput {
             name: repo.name.clone(),
             path: repo.path.as_ref().map(std::path::PathBuf::from),
             base_bookmark: repo.base_bookmark.clone(),
-            tests_bookmark: issue.tests_bookmark.clone(),
         },
         checkout: CheckoutInput {
             path: checkout_path.clone(),
             base_bookmark: run.base_bookmark.clone(),
-            frozen_paths: issue.frozen_path_list(),
         },
         parent,
         blocked_answer,
         replays: replay_inputs,
         limits: Limits::default(),
         skills,
+        files: run_files(engine, issue.id).await?,
+        comments: run_comments(engine, issue.id, run.id).await?,
     }
     .truncate_text();
 
@@ -659,8 +651,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "clone_url": clone_url(&repo),
         "base_bookmark": run.base_bookmark,
         "base_revision": run.base_revision,
-        "tests_bookmark": issue.tests_bookmark,
-        "frozen_paths": issue.frozen_path_list(),
         "github_token": github_token,
         // What this adapter authenticates with: a key in the environment or the
         // credentials file the CLI wrote. Empty when nothing is stored, so the run
@@ -681,6 +671,65 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
         "prompt_revision": engine.prompt_revision(&prompt),
     }))
+}
+
+/// The task's files, as paths into the artifact store the runner can read.
+async fn run_files(engine: &Engine, issue_id: Uuid) -> anyhow::Result<Vec<FileInput>> {
+    Ok(engine
+        .issue_files(issue_id)
+        .await?
+        .iter()
+        .map(|artifact| FileInput {
+            id: artifact.id,
+            title: artifact.title.clone(),
+            filename: artifact.filename.clone(),
+            path: engine.artifact_path(artifact),
+        })
+        .collect())
+}
+
+/// What people and Lumi said since the previous turn on this task started.
+/// Agent comments are left out: the parent run already hands its message
+/// over, and server notes describe the app, not the work. The most recent
+/// comments win when there are many, and they read oldest first.
+pub(crate) async fn run_comments(
+    engine: &Engine,
+    issue_id: Uuid,
+    run_id: Uuid,
+) -> anyhow::Result<Vec<CommentInput>> {
+    let since: Option<String> = sqlx::query_scalar(
+        "select started_at from runs
+          where issue_id = ? and id <> ? and started_at is not null
+          order by julianday(started_at) desc limit 1",
+    )
+    .bind(issue_id)
+    .bind(run_id)
+    .fetch_optional(&engine.db.pool)
+    .await?
+    .flatten();
+    let rows: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+        "select author_type, author_id, body, created_at from comments
+          where issue_id = ?
+            and (author_type = 'human' or author_id = 'lumi')
+            and julianday(created_at) > coalesce(julianday(?), 0)
+          order by julianday(created_at) desc, rowid desc limit ?",
+    )
+    .bind(issue_id)
+    .bind(since)
+    .bind(hulahoop_core::runspec::MAX_RUN_COMMENTS as i64)
+    .fetch_all(&engine.db.pool)
+    .await?;
+    let mut comments = Vec::with_capacity(rows.len());
+    for (author_type, author_id, body, created_at) in rows.into_iter().rev() {
+        comments.push(CommentInput {
+            author: engine
+                .author_name(&author_type, author_id.as_deref())
+                .await?,
+            body,
+            created_at,
+        });
+    }
+    Ok(comments)
 }
 
 async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Value> {
@@ -749,10 +798,6 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
                     }
                     None => None,
                 };
-                let criteria = match issue.as_ref() {
-                    Some(issue) => engine.criteria(issue.id).await?,
-                    None => Vec::new(),
-                };
                 let review: Option<String> = match run.as_ref() {
                     Some(run) => {
                         sqlx::query_scalar::<_, String>(
@@ -780,7 +825,7 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
 
                     "title": issue.as_ref().map(|i| i.title.clone()),
                     "body": issue.as_ref().map(|i| i.body.clone()),
-                    "criteria": criteria.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+                    "summary": run.as_ref().and_then(|r| r.summary.clone()),
                     "review": review,
                     "app_token": engine.github_token().await?,
                 }))
@@ -952,6 +997,121 @@ mod claim_spec_tests {
             .as_str()
             .unwrap()
             .contains("Hulahoop context"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A turn reads the task's files and what people said since the last turn
+    /// started; older comments and agent comments stay out of its input.
+    #[tokio::test]
+    async fn run_input_carries_files_and_recent_comments() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-input-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, agent, issue, previous, run_id) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::minutes(10);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Input',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'INP-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo)
+            .bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("input-artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let started = now + Duration::minutes(2);
+        for (id, status, started_at) in [
+            (previous, "succeeded", Some(started)),
+            (run_id, "running", None),
+        ] {
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at, started_at) values (?,?,?,?,1,'main','prompt',?,?,'model-x',?,?)")
+                .bind(id).bind(issue).bind(repo).bind(agent)
+                .bind(artifacts.to_string_lossy().to_string()).bind(status).bind(now).bind(started_at)
+                .execute(&db.pool).await.unwrap();
+        }
+        for (minute, author_type, author_id, body) in [
+            (1, "human", None, "before the last turn"),
+            (3, "human", None, "use the staging config"),
+            (4, "agent", Some(agent.to_string()), "I did the thing"),
+            (
+                5,
+                "server",
+                Some("lumi".to_string()),
+                "Lumi says: check the logs",
+            ),
+        ] {
+            sqlx::query("insert into comments (id, issue_id, author_type, author_id, body, pinned, created_at) values (?,?,?,?,?,0,?)")
+                .bind(Uuid::now_v7()).bind(issue).bind(author_type).bind(author_id).bind(body)
+                .bind((now + Duration::minutes(minute)).to_rfc3339())
+                .execute(&db.pool).await.unwrap();
+        }
+
+        let engine = Engine::new(db);
+        let file = engine
+            .store_artifact(
+                workspace,
+                Some(project),
+                None,
+                Some(issue),
+                "Spec".into(),
+                None,
+                "spec.md".into(),
+                None,
+                b"# Spec",
+            )
+            .await
+            .unwrap();
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        build_run_spec(&engine, &run).await.unwrap();
+        let input: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(artifacts.join("input.json")).unwrap())
+                .unwrap();
+
+        let files = input["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "spec.md");
+        let path = std::path::PathBuf::from(files[0]["path"].as_str().unwrap());
+        assert_eq!(path, engine.artifact_path(&file));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "# Spec");
+
+        let comments: Vec<(String, String)> = input["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["author"].as_str().unwrap().to_string(),
+                    c["body"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            comments,
+            vec![
+                ("you".to_string(), "use the staging config".to_string()),
+                ("Lumi".to_string(), "Lumi says: check the logs".to_string()),
+            ]
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }

@@ -14,7 +14,6 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
   const first = projects[0] ?? null;
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
-  const [criteria, setCriteria] = useState("");
   const [projectId, setProjectId] = useState<string>(first?.id ?? "");
   const [repoPath, setRepoPath] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -26,7 +25,7 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
   const repoId = project?.repos[0]?.id ?? (projectId ? null : first?.repos[0]?.id ?? null);
 
   // A disabled button that will not say why is a dead end; name what is missing.
-  const missing = [title.trim() ? null : "a title", criteria.trim() ? null : "a criterion", repoId ? null : "a repository"]
+  const missing = [title.trim() ? null : "a title", repoId ? null : "a repository"]
     .filter(Boolean)
     .join(" and ");
 
@@ -47,24 +46,10 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
     setBusy(true);
     setError(null);
     try {
-      const lines = criteria
-        .split("\n")
-        .map((line) => line.trim())
-        .filter(Boolean);
-      // The server is the authority; this only turns a round trip into a sentence
-      // next to the field, with the same rules and the same wording.
       if (!title.trim()) throw new Error("the issue needs a title");
-      if (lines.length === 0) throw new Error("an issue needs at least one acceptance criterion, one per line");
-      for (const [index, line] of lines.entries()) {
-        if (line.length < 8) {
-          throw new Error(
-            `criterion ${index + 1} is too short to test: "${line}". Write the observable behavior and the condition, for example add(2,3) returns 5.`,
-          );
-        }
-      }
       const data = await gql<{ createIssue: { id: string } }>(
-        `mutation ($workspaceId: UUID!, $projectId: UUID, $repoId: UUID, $title: String!, $body: String!, $criteria: [String!]!) {
-           createIssue(workspaceId: $workspaceId, projectId: $projectId, repoId: $repoId, title: $title, body: $body, criteria: $criteria) { id }
+        `mutation ($workspaceId: UUID!, $projectId: UUID, $repoId: UUID, $title: String!, $body: String!) {
+           createIssue(workspaceId: $workspaceId, projectId: $projectId, repoId: $repoId, title: $title, body: $body) { id }
          }`,
         {
           workspaceId,
@@ -72,7 +57,6 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
           repoId,
           title: title.trim(),
           body: body.trim(),
-          criteria: lines,
         },
       );
       await onCreated(data.createIssue.id);
@@ -143,19 +127,6 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
         Context
         <textarea value={body} onChange={(e) => setBody(e.target.value)} rows={4} placeholder="Anything the agents should know." />
       </label>
-      <label>
-        Acceptance criteria — one per line <span className="required">required</span>
-        <textarea
-          value={criteria}
-          onChange={(e) => setCriteria(e.target.value)}
-          rows={6}
-          placeholder={"returns 401 when the token is expired\nrejects a request without a body"}
-        />
-      </label>
-      <p className="dim small">
-        Each criterion becomes exactly one test. A criterion that names internals or could be true of any program is refused at
-        freeze time.
-      </p>
       <div className="row">
         <button className="ghost" onClick={onCancel}>
           Cancel

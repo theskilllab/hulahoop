@@ -7,6 +7,7 @@ pub mod contract;
 pub mod diff;
 pub mod junit;
 pub mod runspec;
+pub mod transcript;
 pub mod usage;
 pub mod workflow;
 

@@ -10,9 +10,13 @@ second message, no waiting for an answer.
 
 ## What you were given
 
-- `$HULAHOOP_INPUT` is a JSON file: the task, its acceptance criteria, the
-  repository, the limits, and — when this is a rework — the previous turn under
-  `parent`. Read it first. Nothing else in the prompt describes the work.
+- `$HULAHOOP_INPUT` is a JSON file: the task, the repository, the limits, and —
+  when this is a rework — the previous turn under `parent`. Read it first.
+  Nothing else in the prompt describes the work.
+- `files` lists the files attached to the task, each with an absolute `path`
+  you can read. They are part of the brief: open the ones that matter.
+- `comments` holds what people (and Lumi) wrote on the task since the previous
+  turn started, oldest first. A comment can change the brief; read them all.
 - Your checkout is a workspace of the repository, parked on the current base.
   Work there. `jj` records it; you do not commit or push by hand.
 
@@ -20,9 +24,8 @@ second message, no waiting for an answer.
 
 - `direnv exec . just test` must pass before you finish, and so must the house
   rules the repository declares (`just fmt-check`, `just lint`). Run them.
-- Do not edit `flake.nix`, `flake.lock`, `justfile` or `.envrc`, and do not edit
-  anything listed in the input's `frozen_paths`. Those are the contract; a change
-  there is a change to the loop itself.
+- Do not edit `flake.nix`, `flake.lock`, `justfile` or `.envrc`. Those are the
+  contract; a change there is a change to the loop itself.
 - `just setup` has already run. If a dependency is genuinely missing, say so and
   stop.
 - Run the whole suite rather than a subset. A passing subset says little.

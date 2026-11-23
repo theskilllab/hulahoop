@@ -13,53 +13,6 @@ use hulahoop_core::diff;
 use hulahoop_core::{IssueEvent, IssueStatus, RunFlag, RunStatus};
 use uuid::Uuid;
 
-/// Words that fill a sentence without naming anything. A criterion built only from these
-/// says "it works", which is true of every program and assertable by no test.
-const FILLER: &[&str] = &[
-    "it",
-    "is",
-    "are",
-    "the",
-    "a",
-    "an",
-    "works",
-    "work",
-    "fine",
-    "good",
-    "correct",
-    "ok",
-    "okay",
-    "should",
-    "will",
-    "be",
-    "able",
-    "to",
-    "properly",
-    "correctly",
-    "well",
-    "and",
-    "this",
-    "that",
-    "must",
-    "do",
-    "does",
-    "not",
-    "crash",
-    "fast",
-    "handles",
-    "errors",
-];
-
-/// Future-tense intent: true of a product goal, and true of nothing a test can read.
-const GOAL_PHRASES: &[&str] = &[
-    "be able to",
-    "as a user",
-    "as an user",
-    "i want",
-    "should work",
-    "works well",
-];
-
 /// The provider's own refusal, when the adapter recorded one. pi reports a rejected
 /// model as a transcript line and an exit code of 0, which is why this looks at the
 /// text instead of the status.
@@ -74,6 +27,46 @@ fn adapter_failure(payload: &RunCompletion) -> Option<String> {
         return None;
     }
     Some(reason.to_string())
+}
+
+/// The priority ladder, highest first. A fixed set, so a board can sort by it
+/// and a filter can name every value.
+pub const PRIORITIES: [&str; 4] = ["urgent", "high", "medium", "low"];
+
+/// Read a priority someone typed. Absent means `medium`; `med` is how people
+/// shorten it. Anything off the ladder is refused by name rather than stored,
+/// because a priority nobody can sort by is noise on the board.
+pub fn priority(value: Option<&str>) -> Result<&'static str> {
+    let Some(value) = value.map(|v| v.trim().to_ascii_lowercase()) else {
+        return Ok("medium");
+    };
+    let value = if value == "med" {
+        "medium".into()
+    } else {
+        value
+    };
+    PRIORITIES
+        .iter()
+        .find(|known| **known == value)
+        .copied()
+        .ok_or_else(|| {
+            anyhow!(
+                "priority must be one of {}, not {value:?}",
+                PRIORITIES.join(", ")
+            )
+        })
+}
+
+/// Read a due date. Blank clears it; anything else must be a calendar day in
+/// `YYYY-MM-DD`, the one format every client and every sort agrees on.
+pub fn due_date(value: &str) -> Result<Option<String>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map(|date| Some(date.format("%Y-%m-%d").to_string()))
+        .map_err(|_| anyhow!("a due date is a calendar day like 2026-03-31, not {value:?}"))
 }
 
 pub struct Engine {
@@ -93,15 +86,6 @@ impl Engine {
             .fetch_optional(&self.db.pool)
             .await?
             .ok_or_else(|| anyhow!("issue {id} not found"))
-    }
-
-    pub async fn criteria(&self, issue_id: Uuid) -> Result<Vec<Criterion>> {
-        Ok(sqlx::query_as::<_, Criterion>(
-            "select * from criteria where issue_id = ? order by position",
-        )
-        .bind(issue_id)
-        .fetch_all(&self.db.pool)
-        .await?)
     }
 
     pub async fn transition(&self, issue_id: Uuid, event: IssueEvent) -> Result<Issue> {
@@ -320,7 +304,7 @@ impl Engine {
     /// while the task can still move: a blocked task waits for a person, and a
     /// finished one is done. A section that names an agent in either place would
     /// otherwise start turns on a task nobody can advance.
-    async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
+    pub(crate) async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
         let status = issue.status_enum();
         if status == IssueStatus::Blocked || status.is_terminal() || issue.project_id.is_none() {
             return Ok(());
@@ -543,8 +527,12 @@ impl Engine {
 
     /// Resolve the workflow's `Agent:` value to a concrete agent: a name in the
     /// workspace wins, `any` and an empty value fall back to the project binding.
-    async fn agent_for_name(&self, workspace_id: Uuid, name: Option<&str>) -> Result<Option<Uuid>> {
-        if let Some(name) = name {
+    pub(crate) async fn agent_for_name(
+        &self,
+        workspace_id: Uuid,
+        name: Option<&str>,
+    ) -> Result<Option<Uuid>> {
+        if let Some(name) = name.map(|name| name.trim().trim_start_matches('@')) {
             if !name.eq_ignore_ascii_case("any") {
                 // `@TestAuthor`, `test author` and `TestAuthor` are the same
                 // person; spaces and the `@` are how people write, not identity.
@@ -571,14 +559,31 @@ impl Engine {
         body: &str,
         pinned: bool,
     ) -> Result<Uuid> {
+        self.comment_on_run(issue_id, author, author_id, body, pinned, None)
+            .await
+    }
+
+    /// A comment that came out of a run: the run's summary, its question, a
+    /// reviewer's rejection, the pull request it opened. Linking the run lets a
+    /// reader jump from what was said to the transcript that said it.
+    pub async fn comment_on_run(
+        &self,
+        issue_id: Uuid,
+        author: hulahoop_core::AuthorType,
+        author_id: Option<&str>,
+        body: &str,
+        pinned: bool,
+        run_id: Option<Uuid>,
+    ) -> Result<Uuid> {
         let id = Uuid::now_v7();
-        sqlx::query("insert into comments (id, issue_id, author_type, author_id, body, pinned, created_at) values (?, ?, ?, ?, ?, ?, ?)")
+        sqlx::query("insert into comments (id, issue_id, author_type, author_id, body, pinned, run_id, created_at) values (?, ?, ?, ?, ?, ?, ?, ?)")
             .bind(id)
             .bind(issue_id)
             .bind(author.as_str())
             .bind(author_id)
             .bind(body)
             .bind(pinned)
+            .bind(run_id)
             .bind(crate::db::now_rfc3339())
             .execute(&self.db.pool)
             .await?;
@@ -590,55 +595,6 @@ impl Engine {
                 .await?;
         }
         Ok(id)
-    }
-
-    /// Criteria are the contract with the Test Author, so they are validated
-    /// before an issue may leave `backlog`. A criterion like "works" produces a
-    /// test that asserts nothing, and the loop then proves nothing.
-    pub fn validate_criteria(texts: &[String]) -> Result<()> {
-        if texts.is_empty() {
-            bail!("an issue needs at least one acceptance criterion");
-        }
-        for (index, text) in texts.iter().enumerate() {
-            let trimmed = text.trim();
-            if trimmed.len() < 8 {
-                bail!(
-                    "criterion {} is too short to test: {trimmed:?}. Write the observable behavior and the condition, for example `add(2,3) returns 5`.",
-                    index + 1
-                );
-            }
-            let lowered = trimmed.to_lowercase();
-            let generic = [
-                "works",
-                "is fast",
-                "handles errors",
-                "does not crash",
-                "is correct",
-            ];
-            let words: Vec<String> = trimmed
-                .split_whitespace()
-                .map(|word| {
-                    word.trim_matches(|c: char| !c.is_alphanumeric())
-                        .to_lowercase()
-                })
-                .filter(|word| !word.is_empty())
-                .collect();
-            let filler_only =
-                !words.is_empty() && words.iter().all(|word| FILLER.iter().any(|f| f == word));
-            if filler_only || generic.iter().any(|g| lowered == *g) {
-                bail!(
-                    "criterion {} is generic: {trimmed:?}. Name the observable behavior, for example `add(2,3) returns 5`.",
-                    index + 1
-                );
-            }
-            if GOAL_PHRASES.iter().any(|goal| lowered.contains(goal)) {
-                bail!(
-                    "criterion {} states a goal rather than an observable result: {trimmed:?}. Name what a test can read back, for example `the connections query lists github after the app is created`.",
-                    index + 1
-                );
-            }
-        }
-        Ok(())
     }
 
     // ----------------------------------------------------------- connectors
@@ -1277,10 +1233,14 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        // The agent that picks a task up assigns itself, so the board shows who
+        // has it. This is a label for people: dispatch reads WORKFLOWS.md, never
+        // the assignee, and a person may reassign at any time.
         sqlx::query(
-            "update issues set run_count = run_count + 1, attempt = ?, updated_at = ? where id = ?",
+            "update issues set run_count = run_count + 1, attempt = ?, assignee_type = 'agent', assignee_id = ?, updated_at = ? where id = ?",
         )
         .bind(issue.attempt + 1)
+        .bind(agent_id.to_string())
         .bind(crate::db::now_rfc3339())
         .bind(issue_id)
         .execute(&self.db.pool)
@@ -1521,7 +1481,7 @@ impl Engine {
         } else {
             payload.changed_paths.clone()
         };
-        let verdict = diff::classify(&payload.diff, &issue.frozen_path_list());
+        let verdict = diff::classify(&payload.diff);
         let diff_sha = sha256_hex(payload.diff.as_bytes());
         let artifact_dir = std::path::Path::new(&run.artifact_dir);
         std::fs::create_dir_all(artifact_dir)?;
@@ -1539,15 +1499,6 @@ impl Engine {
         let mut final_status = status;
         let mut error = payload.error.clone();
 
-        // Frozen tests are a hard reject: a turn that edits the suite replaced the
-        // proof with its own assertion.
-        if !verdict.is_acceptable() {
-            final_status = RunStatus::Failed;
-            error = Some(format!(
-                "the run changed frozen test files: {}. Implementation code must make the frozen suite pass.",
-                verdict.frozen_hits.join(", ")
-            ));
-        }
         // A run that changed nothing did no work. pi exits 0 even when its provider
         // rejected the model, so "the process ended" is not evidence that the turn ran;
         // without this, the issue sits at tests_in_progress offering a suite to freeze
@@ -1626,24 +1577,26 @@ impl Engine {
         // it is stored as the review it was, in the words the reviewer wrote.
         if !judged && final_status == RunStatus::Succeeded {
             if let Some(text) = summary.as_deref() {
-                self.comment(
+                self.comment_on_run(
                     run.issue_id,
                     hulahoop_core::AuthorType::Agent,
                     Some(&run.agent_id.to_string()),
                     text,
                     false,
+                    Some(run.id),
                 )
                 .await?;
             }
         }
 
         if let Some(question) = payload.question.as_deref().filter(|q| !q.trim().is_empty()) {
-            self.comment(
+            self.comment_on_run(
                 run.issue_id,
                 hulahoop_core::AuthorType::Agent,
                 Some(&run.agent_id.to_string()),
                 question,
                 true,
+                Some(run.id),
             )
             .await?;
             self.transition(run.issue_id, IssueEvent::Blocked).await?;
@@ -1818,6 +1771,69 @@ impl Engine {
         Ok(())
     }
 
+    /// The agent whose head became the pull request links it on the task, with
+    /// what it did, so a person reading the thread finds the PR where the work
+    /// was discussed. Posted once per pull request number.
+    async fn announce_pull_request(
+        &self,
+        issue_id: Uuid,
+        run_id: Option<Uuid>,
+        number: i64,
+        url: Option<&str>,
+    ) -> Result<()> {
+        let headline = match url {
+            Some(url) => format!("Opened pull request #{number}: {url}"),
+            None => format!("Opened pull request #{number}"),
+        };
+        let already: i64 = sqlx::query_scalar(
+            "select count(*) from comments where issue_id = ? and body like ? || '%'",
+        )
+        .bind(issue_id)
+        .bind(format!("Opened pull request #{number}"))
+        .fetch_one(&self.db.pool)
+        .await?;
+        if already > 0 {
+            return Ok(());
+        }
+        let run = match run_id {
+            Some(id) => self.run(id).await.ok(),
+            None => None,
+        };
+        let summary = run
+            .as_ref()
+            .and_then(|run| run.summary.as_deref())
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty());
+        let body = match summary {
+            Some(summary) => format!("{headline}\n\n{summary}"),
+            None => headline,
+        };
+        match run {
+            Some(run) => {
+                self.comment_on_run(
+                    issue_id,
+                    hulahoop_core::AuthorType::Agent,
+                    Some(&run.agent_id.to_string()),
+                    &body,
+                    false,
+                    Some(run.id),
+                )
+                .await?;
+            }
+            None => {
+                self.comment(
+                    issue_id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &body,
+                    false,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn record_review(
         &self,
         issue: &Issue,
@@ -1867,12 +1883,13 @@ impl Engine {
             // does put the work where the person reads it: the pull request.
             self.ensure_pull_request(issue).await?;
         } else {
-            self.comment(
+            self.comment_on_run(
                 issue.id,
                 hulahoop_core::AuthorType::Agent,
                 Some(&run.agent_id.to_string()),
                 &format!("Reviewer requested changes:\n\n{}", payload.body),
                 false,
+                Some(run.id),
             )
             .await?;
             let _ = self.transition(issue.id, IssueEvent::RequestChanges).await;
@@ -1974,6 +1991,7 @@ impl Engine {
                     payload.get("pr_number").and_then(|v| v.as_i64()),
                     job.issue_id,
                 ) {
+                    let before = self.issue(issue_id).await?.pr_number;
                     sqlx::query(
                         "update issues set pr_number = ?, pr_url = ?, pr_branch = ? where id = ?",
                     )
@@ -1983,6 +2001,17 @@ impl Engine {
                     .bind(issue_id)
                     .execute(&self.db.pool)
                     .await?;
+                    // A rework pushes to the same pull request; only a new one
+                    // is news worth a comment.
+                    if before != Some(number) {
+                        let run_id = payload
+                            .get("run_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|raw| Uuid::parse_str(raw).ok());
+                        let url = payload.get("pr_url").and_then(|v| v.as_str());
+                        self.announce_pull_request(issue_id, run_id, number, url)
+                            .await?;
+                    }
                 }
             }
             _ => {}
@@ -2383,51 +2412,6 @@ mod adapter_failure_tests {
         assert!(
             adapter_failure(&completion(r#"{"type":"agent_settled","aborted":false}"#)).is_none()
         );
-    }
-}
-
-#[cfg(test)]
-mod criterion_tests {
-    use super::*;
-
-    fn verdict(line: &str) -> String {
-        Engine::validate_criteria(&[line.to_string()])
-            .err()
-            .map(|e| e.to_string())
-            .unwrap_or_default()
-    }
-
-    #[test]
-    fn a_goal_is_refused_by_name() {
-        assert!(verdict("As a user, I will be able to create a Github app")
-            .contains("states a goal rather than an observable result"));
-        assert!(!verdict("In the UI, I will be able to see a list of my connections").is_empty());
-    }
-
-    #[test]
-    fn a_sentence_a_test_can_assert_is_accepted() {
-        // A keyword whitelist refused two of these; the freeze gate is what judges them,
-        // by demanding one failing test per criterion.
-        for line in [
-            "the commit author is hulahoop-test-author when the implementer commits",
-            "the github app credentials are used for the commit when the implementer commits",
-            "Each agents who commits will have their own names in the commit username",
-            "The app will use that information to do the commits on.",
-            "subtract(5, 3) returns 2",
-        ] {
-            assert!(
-                verdict(line).is_empty(),
-                "should be accepted: {line} -> {}",
-                verdict(line)
-            );
-        }
-    }
-
-    #[test]
-    fn the_generic_and_the_too_short_still_go() {
-        assert!(verdict("works").contains("too short"));
-        assert!(verdict("it is correct").contains("generic"));
-        assert!(verdict("the connections screen should work").contains("states a goal"));
     }
 }
 

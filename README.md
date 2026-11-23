@@ -1676,7 +1676,7 @@ heading per column, and two kinds of line under each:
 ## To do
 
 Users: @TestAuthor
-Next: In progress - when the criteria are written
+Next: In progress - when the tests are written
 Next: Blocked - when a decision is needed, and the agent cannot make it
 
 Ready for the team. Anything here is body text.
@@ -1712,3 +1712,13 @@ the pull-request check gate, and the transcripts. What it dropped: the separate
 Test Author, frozen test files, replays, the diff-hash approval, and the per-project
 agent bindings — a run says what it did by what it left behind, so nothing has to
 record what kind of turn it was.
+
+Acceptance criteria went the same way: a task is its title and body, and
+migration 0022 folded every existing criterion into its task's body as a
+`## Acceptance criteria` checklist. What a turn reads instead is the task, the
+files attached to it, and what people and Lumi said since the previous turn
+started. A comment can mention `@Agent` or `@Lumi`; an agent mention never goes
+around `WORKFLOWS.md` — it starts a turn only when the current status already
+owes that agent one and nothing is in flight, and otherwise it is a note the agent
+reads next time. Due date and assignee are for people: an agent becomes the
+assignee when it starts a turn, and neither field decides who works.

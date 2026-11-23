@@ -66,16 +66,6 @@ impl JUnitReport {
         self.cases.iter().map(|c| c.qualified_name()).collect()
     }
 
-    /// Tests whose name carries the criterion token. `ac1` must not match
-    /// `ac10`, so the token has to stand on a boundary.
-    pub fn tests_for_criterion(&self, position: i64) -> Vec<&TestCase> {
-        let token = format!("ac{position}");
-        self.cases
-            .iter()
-            .filter(|c| contains_token(&c.qualified_name(), &token))
-            .collect()
-    }
-
     pub fn case_named(&self, name: &str) -> Option<&TestCase> {
         self.cases.iter().find(|c| c.qualified_name() == name)
     }
@@ -242,19 +232,6 @@ mod tests {
             report.failed_names(),
             vec!["tests.test_calc.test_ac10_factorial"]
         );
-    }
-
-    #[test]
-    fn criterion_tokens_do_not_match_longer_numbers() {
-        let report = parse(SUITE);
-        let ac1: Vec<String> = report
-            .tests_for_criterion(1)
-            .iter()
-            .map(|c| c.qualified_name())
-            .collect();
-        assert_eq!(ac1, vec!["tests.test_calc.test_ac1_addition"]);
-        assert_eq!(report.tests_for_criterion(10).len(), 1);
-        assert!(report.tests_for_criterion(3).is_empty());
     }
 
     #[test]

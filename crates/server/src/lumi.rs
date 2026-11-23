@@ -64,6 +64,19 @@ impl Engine {
         text: &str,
         context: Option<&str>,
     ) -> Result<LumiMessage> {
+        self.ask_lumi_about(workspace_id, text, context, None).await
+    }
+
+    /// Ask Lumi with a task in hand. `@Lumi` in a task's comments comes here:
+    /// the question carries the task itself, and the job remembers the task
+    /// so the answer is posted back on it as well as in the panel.
+    pub async fn ask_lumi_about(
+        &self,
+        workspace_id: Uuid,
+        text: &str,
+        context: Option<&str>,
+        issue_id: Option<Uuid>,
+    ) -> Result<LumiMessage> {
         let workspace: Workspace = sqlx::query_as("select * from workspaces where id = ?")
             .bind(workspace_id)
             .fetch_one(&self.db.pool)
@@ -113,14 +126,17 @@ impl Engine {
             .iter()
             .map(|m| json!({ "role": m.role, "text": m.body }))
             .collect();
-        let message = match context {
+        let mut message = match context {
             Some(context) => format!("Looking at: {context}\n\n{text}"),
             None => text.to_string(),
         };
+        if let Some(issue_id) = issue_id {
+            message = format!("{}\n\n{message}", self.lumi_task_brief(issue_id).await?);
+        }
 
         self.queue_job(
             repo_id,
-            None,
+            issue_id,
             "lumi",
             json!({
                 "workspace_id": workspace_id,
@@ -129,6 +145,7 @@ impl Engine {
                 "system_prompt": system_prompt,
                 "message": message,
                 "history": conversation,
+                "issue_id": issue_id,
             }),
         )
         .await?;
@@ -136,6 +153,36 @@ impl Engine {
             .bind(id)
             .fetch_one(&self.db.pool)
             .await?)
+    }
+
+    /// The task a mention came from, written out for Lumi: what it is and what
+    /// was said on it lately, newest last, so the reply fits the thread.
+    async fn lumi_task_brief(&self, issue_id: Uuid) -> Result<String> {
+        let issue = self.issue(issue_id).await?;
+        let comments: Vec<(String, Option<String>, String)> = sqlx::query_as(
+            "select author_type, author_id, body from (select * from comments where issue_id = ?
+             order by created_at desc, id desc limit 10) order by created_at, id",
+        )
+        .bind(issue_id)
+        .fetch_all(&self.db.pool)
+        .await?;
+        let mut brief = format!(
+            "## Task {}: {}\n\nStatus: {}. Priority: {}.\n\n{}\n",
+            issue.issue_key,
+            issue.title,
+            issue.status,
+            issue.priority,
+            issue.body.trim()
+        );
+        if !comments.is_empty() {
+            brief.push_str("\n### Recent comments\n");
+            for (author_type, author_id, body) in comments {
+                let who = self.author_name(&author_type, author_id.as_deref()).await?;
+                let body: String = body.chars().take(1500).collect();
+                brief.push_str(&format!("\n**{who}:** {body}\n"));
+            }
+        }
+        Ok(brief)
     }
 
     /// What Lumi knows: the open work, the people and agents around it, and the
@@ -148,24 +195,21 @@ impl Engine {
         .bind(workspace_id)
         .fetch_all(&self.db.pool)
         .await?;
-        let mut issue_rows = Vec::new();
-        for issue in &issues {
-            let criteria: (i64,) =
-                sqlx::query_as("select count(*) from criteria where issue_id = ?")
-                    .bind(issue.id)
-                    .fetch_one(&self.db.pool)
-                    .await?;
-            issue_rows.push(json!({
-                "key": issue.issue_key,
-                "title": issue.title,
-                "status": issue.status,
-                "priority": issue.priority,
-                "has_description": !issue.body.trim().is_empty(),
-                "criteria": criteria.0,
-                "milestone_id": issue.milestone_id,
-                "pr_number": issue.pr_number,
-            }));
-        }
+        let issue_rows: Vec<Value> = issues
+            .iter()
+            .map(|issue| {
+                json!({
+                    "key": issue.issue_key,
+                    "title": issue.title,
+                    "status": issue.status,
+                    "priority": issue.priority,
+                    "due_date": issue.due_date,
+                    "has_description": !issue.body.trim().is_empty(),
+                    "milestone_id": issue.milestone_id,
+                    "pr_number": issue.pr_number,
+                })
+            })
+            .collect();
         let milestones: Vec<(Uuid, String, String, Option<String>)> = sqlx::query_as(
             "select id, title, status, target_date from milestones where workspace_id = ?",
         )
@@ -237,20 +281,45 @@ impl Engine {
                 }
             }
         };
-        sqlx::query(
+        let inserted = sqlx::query(
             "insert into lumi_messages (id, workspace_id, role, body, context, proposal, proposal_state, created_at, job_id)
              values (?, ?, 'lumi', ?, null, ?, ?, ?, ?)
              on conflict do nothing",
         )
         .bind(Uuid::now_v7())
         .bind(workspace_id)
-        .bind(body)
+        .bind(&body)
         .bind(proposal.as_ref().map(|p| p.to_string()))
         .bind(proposal.as_ref().map(|_| "open"))
         .bind(crate::db::now_rfc3339())
         .bind(job_id)
         .execute(&mut **tx)
         .await?;
+
+        // A question asked on a task is answered on the task. Only the first
+        // reply for a job is posted, so a retried job cannot answer twice. The
+        // insert goes through the open transaction: the pool would wait on the
+        // write lock this transaction holds.
+        let issue_id = job_payload["issue_id"]
+            .as_str()
+            .and_then(|raw| Uuid::parse_str(raw).ok());
+        if let (Some(issue_id), 1) = (issue_id, inserted.rows_affected()) {
+            let body = if proposal.is_some() {
+                format!("{body}\n\n_Lumi also proposed changes; review them in the Lumi panel._")
+            } else {
+                body
+            };
+            sqlx::query(
+                "insert into comments (id, issue_id, author_type, author_id, body, pinned, created_at)
+                 values (?, ?, 'server', 'lumi', ?, 0, ?)",
+            )
+            .bind(Uuid::now_v7())
+            .bind(issue_id)
+            .bind(body)
+            .bind(crate::db::now_rfc3339())
+            .execute(&mut **tx)
+            .await?;
+        }
         Ok(())
     }
 
@@ -365,16 +434,7 @@ impl Engine {
                 let Some((repo_id,)) = repo else {
                     bail!("the project has no repository, and an issue needs one");
                 };
-                let criteria: Vec<String> = args["criteria"]
-                    .as_array()
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(|c| c.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Engine::validate_criteria(&criteria)?;
+                let priority = crate::engine::priority(args["priority"].as_str())?;
                 let (number, issue_key) = self.next_issue_key(workspace_id, project_id).await?;
                 let id = Uuid::now_v7();
                 let now = crate::db::now_rfc3339();
@@ -390,29 +450,22 @@ impl Engine {
                 .bind(&issue_key)
                 .bind(title)
                 .bind(args["body"].as_str().unwrap_or_default())
-                .bind(args["priority"].as_str().unwrap_or("medium"))
+                .bind(priority)
                 .bind(&now)
                 .bind(&now)
                 .execute(&self.db.pool)
                 .await?;
-                for (index, text) in criteria.iter().enumerate() {
-                    sqlx::query(
-                        "insert into criteria (id, issue_id, position, text) values (?, ?, ?, ?)",
-                    )
-                    .bind(Uuid::now_v7())
-                    .bind(id)
-                    .bind((index as i64) + 1)
-                    .bind(text)
-                    .execute(&self.db.pool)
-                    .await?;
-                }
             }
             "update_issue" => {
                 let issue = self.lumi_issue(workspace_id, args).await?;
+                let priority = match args["priority"].as_str() {
+                    Some(value) => Some(crate::engine::priority(Some(value))?),
+                    None => None,
+                };
                 for (column, value) in [
                     ("title", args["title"].as_str()),
                     ("body", args["body"].as_str()),
-                    ("priority", args["priority"].as_str()),
+                    ("priority", priority),
                 ] {
                     if let Some(value) = value {
                         sqlx::query(&format!(

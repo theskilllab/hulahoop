@@ -74,13 +74,12 @@ pub fn probe_command(adapter: crate::Adapter, model: &str) -> Vec<String> {
 pub const INHERITED_ENV: [&str; 6] = ["PATH", "TMPDIR", "TERM", "LANG", "LC_ALL", "USER"];
 
 /// Variables Hulahoop sets itself. Passed by name, never inherited wholesale.
-pub const HULAHOOP_ENV: [&str; 8] = [
+pub const HULAHOOP_ENV: [&str; 7] = [
     "HULAHOOP_INPUT",
     "HULAHOOP_RUN_ID",
     "HULAHOOP_AGENT",
     "HULAHOOP_CHECKOUT",
     "HULAHOOP_ARTIFACT_DIR",
-    "HULAHOOP_TESTS_BOOKMARK",
     "HULAHOOP_BASE_BOOKMARK",
     "HULAHOOP_PROMPT",
 ];
@@ -103,19 +102,11 @@ pub enum PathVerdict {
     Allowed,
     /// A contract file: allowed, but the approval has to acknowledge it.
     Gated(RunFlag),
-    /// A frozen test: the run is rejected.
-    Frozen,
 }
 
-/// Classify one changed path against the frozen suite and the contract.
-pub fn classify_path(path: &str, frozen_paths: &[String]) -> PathVerdict {
+/// Classify one changed path against the contract.
+pub fn classify_path(path: &str) -> PathVerdict {
     let normalized = path.trim_start_matches("./");
-    if frozen_paths
-        .iter()
-        .any(|p| p.trim_start_matches("./") == normalized)
-    {
-        return PathVerdict::Frozen;
-    }
     if GATED_FILES.contains(&normalized) {
         return PathVerdict::Gated(RunFlag::TouchedContract);
     }
@@ -265,17 +256,12 @@ mod tests {
     }
 
     #[test]
-    fn frozen_tests_win_over_the_contract() {
-        let frozen = vec!["tests/test_calc.py".to_string()];
+    fn contract_files_are_gated() {
         assert_eq!(
-            classify_path("tests/test_calc.py", &frozen),
-            PathVerdict::Frozen
-        );
-        assert_eq!(
-            classify_path("./justfile", &frozen),
+            classify_path("./justfile"),
             PathVerdict::Gated(RunFlag::TouchedContract)
         );
-        assert_eq!(classify_path("calc.py", &frozen), PathVerdict::Allowed);
+        assert_eq!(classify_path("calc.py"), PathVerdict::Allowed);
     }
 
     #[test]

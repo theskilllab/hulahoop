@@ -1,7 +1,9 @@
 //! GraphQL surface. Resolvers stay thin: every rule lives in [`crate::engine`],
 //! so a mutation and a runner callback cannot disagree about the gate.
 
-use async_graphql::{ComplexObject, Context, EmptySubscription, Object, Schema, SimpleObject};
+use async_graphql::{
+    ComplexObject, Context, EmptySubscription, MaybeUndefined, Object, Schema, SimpleObject,
+};
 use uuid::Uuid;
 
 use crate::engine::Engine;
@@ -118,30 +120,26 @@ impl Query {
         workspace_id: Uuid,
         project_id: Option<Uuid>,
         status: Option<String>,
+        // Finished tasks (done or cancelled) are hidden unless asked for; a
+        // status filter that names one of them shows it either way.
+        #[graphql(default = false)] include_done: bool,
     ) -> async_graphql::Result<Vec<Issue>> {
-        let engine = engine(ctx);
-        let mut rows: Vec<Issue> = match project_id {
-            Some(project) => {
-                sqlx::query_as::<_, Issue>(
-                    "select * from issues where project_id = ? order by created_at desc",
-                )
-                .bind(project)
-                .fetch_all(&engine.db.pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as::<_, Issue>(
-                    "select * from issues where workspace_id = ? order by created_at desc",
-                )
-                .bind(workspace_id)
-                .fetch_all(&engine.db.pool)
-                .await?
-            }
-        };
-        if let Some(status) = status {
-            rows.retain(|issue| issue.status == status);
-        }
-        Ok(rows)
+        let include_done = include_done || status.is_some();
+        Ok(engine(ctx)
+            .list_issues(workspace_id, project_id, status.as_deref(), include_done)
+            .await?)
+    }
+
+    /// How many finished tasks the Active view hides, for its "+N" toggle.
+    async fn done_issue_count(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        project_id: Option<Uuid>,
+    ) -> async_graphql::Result<i64> {
+        Ok(engine(ctx)
+            .done_issue_count(workspace_id, project_id)
+            .await?)
     }
 
     async fn issue(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<Option<Issue>> {
@@ -659,6 +657,8 @@ impl Mutation {
         workspace_id: Uuid,
         project_id: Option<Uuid>,
         milestone_id: Option<Uuid>,
+        // Set to attach the file to a task; the task's runs then read it.
+        issue_id: Option<Uuid>,
         title: Option<String>,
         kind: Option<String>,
         filename: String,
@@ -679,6 +679,7 @@ impl Mutation {
                 workspace_id,
                 project_id,
                 milestone_id,
+                issue_id,
                 title.unwrap_or_default(),
                 kind,
                 filename,
@@ -994,10 +995,14 @@ impl Mutation {
         title: String,
         body: String,
         priority: Option<String>,
-        criteria: Vec<String>,
+        due_date: Option<String>,
+        assignee_type: Option<String>,
+        assignee_id: Option<String>,
     ) -> async_graphql::Result<Issue> {
         let engine = engine(ctx);
-        Engine::validate_criteria(&criteria)
+        let priority = crate::engine::priority(priority.as_deref())
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        let due_date = crate::engine::due_date(due_date.as_deref().unwrap_or_default())
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         // A repository always exists, because a run has to know where to work: the
         // caller may name one, a project with a single repository supplies it, and
@@ -1066,8 +1071,8 @@ impl Mutation {
         let id = Uuid::now_v7();
         let now = crate::db::now_rfc3339();
         sqlx::query(
-            "insert into issues (id, workspace_id, project_id, repo_id, number, issue_key, title, body, status, priority, created_at, updated_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?)",
+            "insert into issues (id, workspace_id, project_id, repo_id, number, issue_key, title, body, status, priority, due_date, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
@@ -1077,23 +1082,22 @@ impl Mutation {
         .bind(&issue_key)
         .bind(&title)
         .bind(&body)
-        .bind(priority.unwrap_or_else(|| "medium".into()))
+        .bind(priority)
+        .bind(due_date)
         .bind(&now)
         .bind(&now)
         .execute(&engine.db.pool)
         .await?;
-        for (index, text) in criteria.iter().enumerate() {
-            sqlx::query("insert into criteria (id, issue_id, position, text) values (?, ?, ?, ?)")
-                .bind(Uuid::now_v7())
-                .bind(id)
-                .bind((index as i64) + 1)
-                .bind(text)
-                .execute(&engine.db.pool)
-                .await?;
+        if assignee_type.is_some() {
+            engine
+                .assign_issue(id, assignee_type.as_deref(), assignee_id.as_deref())
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         }
         Ok(engine.issue(id).await?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn update_issue(
         &self,
         ctx: &Context<'_>,
@@ -1101,17 +1105,37 @@ impl Mutation {
         title: Option<String>,
         body: Option<String>,
         priority: Option<String>,
-        criteria: Option<Vec<String>>,
+        // `null` clears the date; leaving the argument out keeps it.
+        due_date: MaybeUndefined<String>,
+        // `assigneeType: null` clears the assignee; leaving it out keeps it.
+        assignee_type: MaybeUndefined<String>,
+        assignee_id: Option<String>,
     ) -> async_graphql::Result<Issue> {
         let engine = engine(ctx);
-        let issue = engine.issue(id).await?;
-        // A frozen suite is the bookmark, not the status: an issue can sit in
-        // `in_progress` with its suite already thawed, and then its criteria are
-        // editable again.
-        if issue.tests_bookmark.is_some() && criteria.is_some() {
-            return Err(async_graphql::Error::new(
-                "criteria cannot change while the suite is frozen: thaw it first, so the tests keep proving the criteria they were written for",
-            ));
+        engine.issue(id).await?;
+        let priority = match priority {
+            Some(value) => Some(
+                crate::engine::priority(Some(&value))
+                    .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                    .to_string(),
+            ),
+            None => None,
+        };
+        match due_date {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => engine.set_due_date(id, "").await?,
+            MaybeUndefined::Value(value) => engine
+                .set_due_date(id, &value)
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?,
+        }
+        match assignee_type {
+            MaybeUndefined::Undefined => {}
+            MaybeUndefined::Null => engine.assign_issue(id, None, None).await?,
+            MaybeUndefined::Value(kind) => engine
+                .assign_issue(id, Some(&kind), assignee_id.as_deref())
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?,
         }
         for (column, value) in [("title", title), ("body", body), ("priority", priority)] {
             if let Some(value) = value {
@@ -1125,40 +1149,7 @@ impl Mutation {
                 .await?;
             }
         }
-        if let Some(criteria) = criteria {
-            Engine::validate_criteria(&criteria)
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-            sqlx::query("delete from criteria where issue_id = ?")
-                .bind(id)
-                .execute(&engine.db.pool)
-                .await?;
-            for (index, text) in criteria.iter().enumerate() {
-                sqlx::query(
-                    "insert into criteria (id, issue_id, position, text) values (?, ?, ?, ?)",
-                )
-                .bind(Uuid::now_v7())
-                .bind(id)
-                .bind((index as i64) + 1)
-                .bind(text)
-                .execute(&engine.db.pool)
-                .await?;
-            }
-        }
         Ok(engine.issue(id).await?)
-    }
-
-    async fn approve_criteria(
-        &self,
-        ctx: &Context<'_>,
-        issue_id: Uuid,
-    ) -> async_graphql::Result<Issue> {
-        let engine = engine(ctx);
-        let criteria = engine.criteria(issue_id).await?;
-        let texts: Vec<String> = criteria.iter().map(|c| c.text.clone()).collect();
-        Engine::validate_criteria(&texts).map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        Ok(engine
-            .transition(issue_id, hulahoop_core::IssueEvent::Plan)
-            .await?)
     }
 
     /// The pull request merged, which is what closes a task.
@@ -1214,21 +1205,15 @@ impl Mutation {
         body: String,
     ) -> async_graphql::Result<Comment> {
         let engine = engine(ctx);
-        engine
-            .comment(
-                issue_id,
-                hulahoop_core::AuthorType::Human,
-                None,
-                &body,
-                false,
-            )
-            .await?;
-        Ok(sqlx::query_as::<_, Comment>(
-            "select * from comments where issue_id = ? order by created_at desc limit 1",
+        // Mentions are acted on after the comment is stored, and each one adds
+        // a note of its own, so the comment is fetched by id, not as the newest.
+        let id = engine.human_comment(issue_id, &body).await?;
+        Ok(
+            sqlx::query_as::<_, Comment>("select * from comments where id = ?")
+                .bind(id)
+                .fetch_one(&engine.db.pool)
+                .await?,
         )
-        .bind(issue_id)
-        .fetch_one(&engine.db.pool)
-        .await?)
     }
 
     /// Start a turn on a task. `agentId` names who works it; without one the
@@ -1478,8 +1463,32 @@ impl Issue {
         Ok(row.and_then(|(prefix,)| prefix))
     }
 
-    async fn criteria(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Criterion>> {
-        Ok(engine(ctx).criteria(self.id).await?)
+    /// Who is on the task, for people to read. The workflow decides who
+    /// works it; an agent becomes the assignee when it starts a turn.
+    async fn assignee(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Option<crate::tasks::Assignee>> {
+        Ok(engine(ctx).assignee(self).await?)
+    }
+
+    /// The effort the task has cost so far, in one aggregate over its runs.
+    async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<crate::tasks::IssueStats> {
+        Ok(engine(ctx).issue_stats(self.id).await?)
+    }
+
+    /// The files attached to the task; its runs read them.
+    async fn files(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Artifact>> {
+        Ok(engine(ctx).issue_files(self.id).await?)
+    }
+
+    async fn file_count(&self, ctx: &Context<'_>) -> async_graphql::Result<i64> {
+        Ok(
+            sqlx::query_scalar("select count(*) from artifacts where issue_id = ?")
+                .bind(self.id)
+                .fetch_one(&engine(ctx).db.pool)
+                .await?,
+        )
     }
 
     async fn runs(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Run>> {
@@ -1520,10 +1529,21 @@ impl Issue {
         .await?)
     }
 
-    async fn comments(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Comment>> {
-        Ok(sqlx::query_as::<_, Comment>(
-            "select * from comments where issue_id = ? order by created_at",
-        )
+    /// The thread, newest first unless asked otherwise. Comments written in
+    /// the same instant keep the order they were stored in.
+    async fn comments(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = true)] newest_first: bool,
+    ) -> async_graphql::Result<Vec<Comment>> {
+        let order = if newest_first {
+            "created_at desc, rowid desc"
+        } else {
+            "created_at, rowid"
+        };
+        Ok(sqlx::query_as::<_, Comment>(&format!(
+            "select * from comments where issue_id = ? order by {order}"
+        ))
         .bind(self.id)
         .fetch_all(&engine(ctx).db.pool)
         .await?)
@@ -1536,11 +1556,6 @@ impl Issue {
         .bind(self.id)
         .fetch_optional(&engine(ctx).db.pool)
         .await?)
-    }
-
-    /// The frozen paths as a list, since the column is JSON.
-    async fn frozen_paths(&self) -> Vec<String> {
-        self.frozen_path_list()
     }
 }
 
@@ -1572,6 +1587,16 @@ impl Run {
         Ok(all[start..].join("\n"))
     }
 
+    /// The run's transcript after `afterSeq`, normalized across harnesses.
+    /// Poll with the returned `lastSeq` while `live` is true.
+    async fn transcript(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default = 0)] after_seq: i64,
+    ) -> async_graphql::Result<crate::transcript::Transcript> {
+        Ok(engine(ctx).run_transcript(self, after_seq).await?)
+    }
+
     async fn reviews(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Review>> {
         Ok(sqlx::query_as::<_, Review>(
             "select * from reviews where reviewed_run_id = ? order by created_at desc",
@@ -1596,19 +1621,27 @@ impl Run {
 }
 #[ComplexObject]
 impl Comment {
-    /// Who wrote it: the agent's name, or `you` for a person.
+    /// Who wrote it: the agent's name, `Lumi`, or `you` for a person.
     async fn author(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
-        if self.author_type == "human" {
-            return Ok("you".to_string());
-        }
-        let Some(id) = self.author_id.clone() else {
-            return Ok(self.author_type.clone());
+        Ok(engine(ctx)
+            .author_name(&self.author_type, self.author_id.as_deref())
+            .await?)
+    }
+
+    /// The run that wrote it, for an agent's summary, question or verdict.
+    async fn run(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Run>> {
+        let Some(run_id) = self.run_id else {
+            return Ok(None);
         };
-        let name: Option<String> = sqlx::query_scalar("select name from agents where id = ?")
-            .bind(id)
+        Ok(sqlx::query_as::<_, Run>("select * from runs where id = ?")
+            .bind(run_id)
             .fetch_optional(&engine(ctx).db.pool)
-            .await?;
-        Ok(name.unwrap_or_else(|| self.author_type.clone()))
+            .await?)
+    }
+
+    /// The agents and Lumi the comment named.
+    async fn mentions(&self) -> Vec<crate::mentions::Mention> {
+        serde_json::from_str(&self.mentions).unwrap_or_default()
     }
 }
 

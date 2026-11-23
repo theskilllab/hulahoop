@@ -261,25 +261,6 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
         </div>
       ) : null}
 
-      <div className="section">
-        <h3>Acceptance criteria</h3>
-        {(issue.criteria ?? []).length === 0 ? (
-          <p className="dim">No criteria yet. Each line becomes one test the agent has to make pass.</p>
-        ) : (
-          <ul className="criteria">
-            {(issue.criteria ?? []).map((criterion) => (
-              <li key={criterion.id}>
-                <span>
-                  <span className="ac">ac{criterion.position}</span>
-                  {criterion.text}
-                </span>
-                {criterion.testName ? <span className="dim">{criterion.testName}</span> : null}
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-
       {verdict ? (
         <div className="section">
           <h3>

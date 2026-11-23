@@ -27,13 +27,6 @@ export interface Connection {
   label: string;
 }
 
-export interface Criterion {
-  id: string;
-  position: number;
-  text: string;
-  testName: string | null;
-}
-
 export interface Run {
   id: string;
   /** Who ran it. Every run records its agent, so a roster can read its own history. */
@@ -76,6 +69,31 @@ export interface Comment {
   body: string;
   pinned: boolean;
   createdAt: string;
+  /** The run that wrote it, for an agent's summary, question or verdict. */
+  runId?: string | null;
+  mentions?: Mention[];
+}
+
+export interface Mention {
+  type: "agent" | "lumi";
+  id: string;
+  name: string;
+}
+
+export interface Assignee {
+  type: "human" | "agent";
+  id: string;
+  name: string;
+}
+
+export interface IssueStats {
+  runs: number;
+  failedRuns: number;
+  turns: number;
+  toolCalls: number;
+  tokens: number;
+  apiEquivalentUsd: number;
+  activeMinutes: number;
 }
 
 export interface Replay {
@@ -107,9 +125,13 @@ export interface Issue {
   body: string;
   status: IssueStatus;
   priority: string;
+  /** `YYYY-MM-DD`, or null. */
+  dueDate: string | null;
+  assignee?: Assignee | null;
+  fileCount?: number;
+  stats?: IssueStats;
   attempt: number;
   runCount: number;
-  testsFrozenAt: string | null;
   mergeRevision: string | null;
   prUrl: string | null;
   prNumber: number | null;
@@ -122,7 +144,6 @@ export interface Issue {
   /** Where the workflow document says this status may go. */
   moves?: IssueStatus[];
   turnsUsed?: number;
-  criteria: Criterion[];
   runs: Run[];
   reviews: Review[];
   comments: Comment[];
@@ -263,6 +284,8 @@ export interface Artifact {
   id: string;
   projectId: string | null;
   milestoneId: string | null;
+  /** The task the file is attached to, when it is. */
+  issueId: string | null;
   title: string;
   kind: string;
   filename: string;
@@ -451,19 +474,19 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
 
 export const ISSUE_FIELDS = `
   id key number projectId projectPrefix milestoneId
-  title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
-  blockedBy projectName prUrl prNumber
-  criteria { id position text testName }
+  title body status priority dueDate attempt runCount mergeRevision pinnedCommentId
+  blockedBy projectName prUrl prNumber fileCount
+  assignee { type id name }
   runs { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
-  comments { id author authorType body pinned createdAt }
+  comments(newestFirst: false) { id author authorType body pinned createdAt runId mentions { type id name } }
   turnRemaining turnsUsed moves
   currentRun { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
 export async function loadBoard(workspaceId: string): Promise<Issue[]> {
   const data = await gql<{ issues: Issue[] }>(
-    `query ($workspaceId: UUID!) { issues(workspaceId: $workspaceId) { ${ISSUE_FIELDS} } }`,
+    `query ($workspaceId: UUID!) { issues(workspaceId: $workspaceId, includeDone: true) { ${ISSUE_FIELDS} } }`,
     { workspaceId },
   );
   return data.issues;
@@ -695,7 +718,7 @@ export async function loadMilestones(workspaceId: string): Promise<Milestone[]> 
   return data.milestones;
 }
 
-export const ARTIFACT_FIELDS = `id projectId milestoneId title kind filename mime size sha256 createdAt`;
+export const ARTIFACT_FIELDS = `id projectId milestoneId issueId title kind filename mime size sha256 createdAt`;
 
 export async function loadArtifacts(workspaceId: string): Promise<Artifact[]> {
   const data = await gql<{ artifacts: Artifact[] }>(

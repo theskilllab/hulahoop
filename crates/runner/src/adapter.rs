@@ -93,7 +93,7 @@ pub fn message_for(agent_name: &str, input_path: &Path, checkout: &Path) -> Stri
         agent_name.trim()
     };
     format!(
-        "You are {who} for one task.\n\nRead {} first; it carries the task, the criteria, the parent turn, and the limits.\nWork in the checkout at {}.\n\nWhen you are done, end your final message with the line your instructions ask for.",
+        "You are {who} for one task.\n\nRead {} first; it carries the task, its files, the latest comments, the parent turn, and the limits.\nWork in the checkout at {}.\n\nWhen you are done, end your final message with the line your instructions ask for.",
         input_path.display(),
         checkout.display(),
     )
