@@ -1147,6 +1147,24 @@ label > select {
   font-size: var(--fs-md);
   font-weight: 600;
 }
+/* The three lines of a skill card, at the prototype's sizes: the description
+   carries the body colour, the attachment line is the smallest thing there. */
+.skill-desc {
+  font-size: var(--fs-sm);
+  color: var(--text-2);
+}
+.skill-desc.title {
+  margin-top: var(--s1);
+  font-size: var(--fs-md);
+  color: var(--muted);
+}
+.skill-meta {
+  font-size: var(--fs-xs);
+  color: var(--muted);
+}
+.skill-meta.bad {
+  color: var(--bad);
+}
 
 .skills-pane h2 {
   font-size: var(--fs-xl);
@@ -3062,18 +3080,29 @@ table.transitions td {
 }
 .review-bar .od-fill { min-width: 200px; font-size: var(--fs-sm); }
 .field { display: grid; gap: var(--s1); align-content: start; }
-.field-label { font-size: var(--fs-xs); color: var(--muted); font-weight: 600; }
-.tgl-group { display: flex; flex-wrap: wrap; gap: 6px; }
+.field-label { font-size: var(--fs-sm); color: var(--text-2); font-weight: 600; }
+.tgl-group { display: flex; flex-wrap: wrap; gap: var(--s2); }
+/* DESIGN.md:90 — the multi-select toggle chip: 28px outlined, pressed fills
+   with the accent wash. Keyed on aria-pressed so a caller cannot forget the
+   state; `.on` stays for the screens that predate the attribute. */
 .tgl {
-  height: 24px;
-  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  height: var(--h-control);
+  padding: 0 var(--s3);
   border-radius: var(--r-pill);
   border: 1px solid var(--line);
   background: var(--bg);
   color: var(--text-2);
-  font-size: var(--fs-xs);
+  font-size: var(--fs-sm);
 }
-.tgl.on { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
+.tgl.on,
+.tgl[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--accent-text);
+  font-weight: 500;
+}
 .icon-btn {
   width: 24px;
   height: 24px;
