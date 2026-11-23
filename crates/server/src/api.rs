@@ -475,11 +475,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         None
     };
 
-    // Committing is the app's act, so the implementer is the role that gets the
-    // app's token. The test author and the reviewer write tests and read a diff;
-    // neither pushes as the user, so neither is handed a credential it cannot use.
-    // Every role gets the adapter's own credential: an agent that cannot log in
-    // produces nothing, whatever it was asked to do.
+    // Committing is the app's act, so the run gets the app's token. An agent that
+    // cannot log in produces nothing, so the adapter's own credential always
+    // travels too: a token for the app, a login for the harness.
     let credential = {
         let adapter =
             hulahoop_core::Adapter::parse(&agent.adapter).unwrap_or(hulahoop_core::Adapter::Pi);
@@ -521,7 +519,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let spec = RunSpec {
         run_id: run.id,
         issue_id: issue.id,
-        role: run.role_enum(),
         attempt: run.attempt,
         issue: IssueInput {
             title: issue.title.clone(),
@@ -564,7 +561,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "run_id": run.id,
         "issue_id": issue.id,
         "attempt": run.attempt,
-        "role": run.role_enum().as_str(),
         "adapter": agent.adapter,
         "model": agent.model,
         "agent_name": agent.name,
@@ -594,7 +590,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         // channel: the runner needs it to act, the desktop never sees it.
         "caller_role": "run",
         // The address GitHub rewrites into a link to the bot user needs both
-        // halves; either missing means the commit keeps the role address.
+        // halves; either missing means the commit keeps the plain app address.
         "commit_app_id": engine.commit_identity().await?.0,
         "commit_app_slug": engine.commit_identity().await?.1,
         "commit_agent_name": agent.name,

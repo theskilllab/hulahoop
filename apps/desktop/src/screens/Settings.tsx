@@ -17,13 +17,6 @@ import {
   type WorkspaceMember,
 } from "../api";
 
-const ROLES = ["test_author", "implementer", "reviewer"] as const;
-
-interface Binding {
-  role: string;
-  agentId: string;
-}
-
 export default function Settings({
   workspace,
   workspaces,
@@ -42,7 +35,6 @@ export default function Settings({
   onChanged: () => Promise<void>;
   onSwitchWorkspace: (id: string) => Promise<void>;
 }) {
-  const [bindings, setBindings] = useState<Record<string, string>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [chosen, setChosen] = useState<string>(active?.id ?? "");
@@ -128,22 +120,6 @@ export default function Settings({
     }
   }
 
-  async function loadBindings() {
-    if (!project) return;
-    const data = await gql<{ projectAgents: Binding[] }>(
-      `query ($id: UUID!) { projectAgents(projectId: $id) { role agentId } }`,
-      { id: project.id },
-    );
-    const next: Record<string, string> = {};
-    for (const binding of data.projectAgents) next[binding.role] = binding.agentId;
-    setBindings(next);
-  }
-
-  useEffect(() => {
-    void loadBindings();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [project?.id]);
-
   /** A new harness or model invalidates its probe, so ask for a fresh one. */
   async function action(label: string, work: () => Promise<unknown>) {
     setBusy(label);
@@ -151,7 +127,6 @@ export default function Settings({
     try {
       await work();
       await onChanged();
-      await loadBindings();
     } catch (cause) {
       setError(String(cause instanceof Error ? cause.message : cause));
     } finally {
@@ -445,45 +420,9 @@ export default function Settings({
       <h2 className="section">Agents</h2>
       <p className="dim small">
         Agents are created and edited on the <strong>Agents</strong> screen: harness, model, its own
-        AGENTS.md and the skills it carries. This screen only decides which of them a status calls.
+        AGENTS.md and the skills it carries. Which of them a status calls is the workflow's
+        decision, written down once in WORKFLOWS.md.
       </p>
-
-      <h2 className="section">Roles</h2>
-      {!project && <p className="dim">Create a project before binding roles.</p>}
-      <p className="dim small">
-        A Test Author and an Implementer on the same model family are weaker than they look: the tests and the code share the same
-        blind spots.
-      </p>
-      <div className="roles">
-        {ROLES.map((role) => (
-          <label key={role}>
-            {role.replaceAll("_", " ")}
-            <select
-              value={bindings[role] ?? ""}
-              onChange={(e) => {
-                const next = { ...bindings, [role]: e.target.value };
-                setBindings(next);
-                void action("bind", () =>
-                  gql(
-                    `mutation ($projectId: UUID!, $bindings: [RoleBinding!]!) { setProjectAgents(projectId: $projectId, bindings: $bindings) { role } }`,
-                    {
-                      projectId: project!.id,
-                      bindings: ROLES.filter((r) => next[r]).map((r) => ({ role: r, agentId: next[r] })),
-                    },
-                  ),
-                );
-              }}
-            >
-              <option value="">unassigned</option>
-              {agents.map((agent) => (
-                <option key={agent.id} value={agent.id}>
-                  {agent.name}
-                </option>
-              ))}
-            </select>
-          </label>
-        ))}
-      </div>
     </section>
   );
 }

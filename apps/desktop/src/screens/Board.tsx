@@ -91,7 +91,7 @@ export default function Board({
                   {issue.runs.length > 0 && (
                     <span className="timeline">
                       {issue.runs.slice(-4).map((run) => (
-                        <span key={run.id} className={`dot ${run.status}`} title={`${run.role} ${run.status}`} />
+                        <span key={run.id} className={`dot ${run.status}`} title={run.status} />
                       ))}
                     </span>
                   )}

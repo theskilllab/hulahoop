@@ -11,12 +11,6 @@ interface Props {
   onChanged: () => Promise<void> | void;
 }
 
-const ROLE_LABEL: Record<string, string> = {
-  test_author: "Test author",
-  implementer: "Agent",
-  reviewer: "Reviewer",
-};
-
 /**
  * One task, and the moves it allows.
  *
@@ -36,6 +30,9 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
   const current = issue.currentRun ?? runs[runs.length - 1] ?? null;
   const live = current && (current.status === "running" || current.status === "queued");
   const verdict = current ? issue.reviews?.filter((r) => r.reviewedRunId === current.id).slice(-1)[0] : undefined;
+  // A run says what it did by what it left behind: a verdict that named the head
+  // before it is a review, and every other turn is work.
+  const judged = new Set((issue.reviews ?? []).map((review) => review.reviewerRunId));
 
   async function run<T>(label: string, query: string, variables: Record<string, unknown>): Promise<T | null> {
     setBusy(label);
@@ -274,7 +271,7 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
             {[...runs].reverse().map((entry) => (
               <li key={entry.id}>
                 <div className="row">
-                  <span className="role">{ROLE_LABEL[entry.role] ?? entry.role}</span>
+                  <span className="role">{judged.has(entry.id) ? "reviewed" : "worked"}</span>
                   <StatusPill status={entry.status} />
                   <span className="dim">attempt {entry.attempt}</span>
                   {entry.adapter ? <span className="mark">{entry.adapter}</span> : null}

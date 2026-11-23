@@ -39,7 +39,7 @@ copy_fixture() {
 wait_status() {
   local issue="$1" wanted="$2" budget="${3:-180}" seen=""
   for _ in $(seq 1 "$budget"); do
-    seen="$(gql 'query ($id: UUID!) { issue(id: $id) { status runs { role status error } } }' "{\"id\":\"$issue\"}" \
+    seen="$(gql 'query ($id: UUID!) { issue(id: $id) { status runs { status error } } }' "{\"id\":\"$issue\"}" \
       | jq -r '.data.issue.status // "?"')"
     if [ "$seen" = "$wanted" ]; then
       return 0
@@ -47,7 +47,7 @@ wait_status() {
     case "$seen" in
       blocked|done|cancelled)
         echo "the task stopped at $seen while waiting for $wanted" >&2
-        gql 'query ($id: UUID!) { issue(id: $id) { runs { role status error } comments { body } } }' "{\"id\":\"$issue\"}" >&2
+        gql 'query ($id: UUID!) { issue(id: $id) { runs { status error } comments { body } } }' "{\"id\":\"$issue\"}" >&2
         return 1
         ;;
     esac
@@ -112,10 +112,58 @@ main() {
     echo "$id" >>"$WORK/agents"
     echo "agent $name -> $id"
   done
-  local first
-  first="$(head -1 "$WORK/agents")"
-  echo "bindings: $(gql 'mutation ($p: UUID!, $b: [RoleBinding!]!) { setProjectAgents(projectId: $p, bindings: $b) { role agentId } }' \
-    "{\"p\":\"$project\",\"b\":[{\"role\":\"worker\",\"agentId\":\"$first\"},{\"role\":\"reviewer\",\"agentId\":\"$first\"}]}" | jq -c '.data.setProjectAgents // .errors')"
+  # The document names the team: a status that names an agent has nobody to
+  # fall back to now, because there is no second place that maps jobs to people.
+  local doc
+  doc=$(cat <<'DOC'
+# Workflows
+
+## Backlog
+
+Users: human
+Next: To do
+
+Work you still want to do yourself. Nothing here is dispatched.
+
+## To do
+
+Users: ada
+Next: In progress
+
+Ready for the team. The agent picks a task up from here.
+
+## In progress
+
+Users: bram
+Next: In review - when the work is ready to read
+Next: Blocked - when the agent needs a decision it cannot make itself
+
+The agent works against the criteria. The reviewer reads the work and sends it
+back when it is not there yet.
+
+## Blocked
+
+Users: human
+Next: In progress - when the question is answered
+
+The agent asked a question, or the work waits on somebody outside.
+
+## In review
+
+Users: human
+Next: Done - when the merge lands
+
+Somebody reads the work and merges it.
+
+## Done
+
+Users: human
+
+The work landed. Nothing is dispatched from here.
+DOC
+)
+  echo "workflow: $(gql 'mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) { errors } }' \
+    "$(jq -cn --arg w "$workspace" --arg s "$doc" '{w:$w,s:$s}')" | jq -c '.data.setWorkflow // .errors')"
 
   local issue
   issue="$(gql 'mutation ($w: UUID!, $p: UUID!, $r: UUID!) { createIssue(workspaceId: $w, projectId: $p, repoId: $r, title: "subtract two numbers", body: "add subtract", criteria: ["subtract(5, 3) returns 2"]) { id status } }' \
@@ -128,9 +176,11 @@ main() {
   wait_status "$issue" "in_review" "${SLOW_WAIT:-600}"
   echo "in review: $(gql 'query ($id: UUID!) { issue(id: $id) { status } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue.status')"
 
+  # The review turn leaves the head alone: the work before it is what a merge
+  # takes, so the newest published head is read from the runs, not from currentRun.
   local head
-  head="$(gql 'query ($id: UUID!) { issue(id: $id) { currentRun { headRevision } } }' "{\"id\":\"$issue\"}" \
-    | jq -r '.data.issue.currentRun.headRevision // ""')"
+  head="$(gql 'query ($id: UUID!) { issue(id: $id) { runs { headRevision } } }' "{\"id\":\"$issue\"}" \
+    | jq -r '[.data.issue.runs[] | .headRevision | select(. != null)] | last // ""')"
   case "$head" in
     ????????????????????????????????????????) ;;
     *) echo "the review has no head revision: '$head'" >&2; return 1 ;;
@@ -139,7 +189,7 @@ main() {
 
   gql 'mutation ($id: UUID!) { mergeIssue(issueId: $id) { status } }' "{\"id\":\"$issue\"}" | jq -c '.data.mergeIssue.status'
   wait_status "$issue" "done" 60
-  echo "done: $(gql 'query ($id: UUID!) { issue(id: $id) { status runs { role status } } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue')"
+  echo "done: $(gql 'query ($id: UUID!) { issue(id: $id) { status runs { status } reviews { verdict } } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue')"
 }
 
 main "$@"

@@ -10,7 +10,7 @@ use anyhow::{anyhow, bail, Result};
 use chrono::Utc;
 use hulahoop_core::contract;
 use hulahoop_core::diff;
-use hulahoop_core::{AgentRole, IssueEvent, IssueStatus, RunFlag, RunStatus};
+use hulahoop_core::{IssueEvent, IssueStatus, RunFlag, RunStatus};
 use uuid::Uuid;
 
 /// Words that fill a sentence without naming anything. A criterion built only from these
@@ -174,17 +174,17 @@ impl Engine {
     /// The queue holds names because that is what the document says; service is
     /// recorded by id, because an agent's display name can be anything while the
     /// row that ran is unambiguous.
-    /// The run a reviewer is reviewing: the one a status handed over to
-    /// `In review` when there is one, otherwise the newest finished run that
-    /// changed something. A reviewer inside a status reads the work of the turn
-    /// before it, which is the point of a team in a column.
+    /// The run under review: the one a status handed over when there is one,
+    /// otherwise the newest finished run that published a head. A second turn in
+    /// a status reads the work of the turn before it, which is the point of a team
+    /// in a column.
     pub async fn run_under_review(&self, issue: &crate::model::Issue) -> Result<Uuid> {
         if let Some(id) = issue.current_run_id {
             return Ok(id);
         }
         sqlx::query_scalar::<_, Uuid>(
             "select id from runs
-              where issue_id = ? and role != 'reviewer' and status = 'succeeded'
+              where issue_id = ? and status = 'succeeded'
                 and head_bookmark is not null
               order by created_at desc limit 1",
         )
@@ -335,12 +335,19 @@ impl Engine {
             self.move_to(issue.id, IssueStatus::Blocked).await?;
             return Ok(());
         }
+        // A queue where everybody has served is the workflow's answer, so an
+        // automatic turn stays quiet instead of handing the work to whoever
+        // happens to be bound to the project.
+        let queued: Vec<String> = serde_json::from_str(&issue.turn_queue).unwrap_or_default();
+        if !queued.is_empty() && agent.is_none() {
+            return Ok(());
+        }
 
         sqlx::query("update issues set turns_used = turns_used + 1 where id = ?")
             .bind(issue.id)
             .execute(&self.db.pool)
             .await?;
-        // The parent is the turn before this one, whatever role it had: that is
+        // The parent is the turn before this one, whoever took it: that is
         // where the message the next agent has to read lives.
         let parent = self.last_finished_run(issue.id).await?;
         self.start_run(issue.id, agent, parent).await?;
@@ -1014,17 +1021,20 @@ impl Engine {
         .await?)
     }
 
-    /// Any agent bound to this project. The bindings are the fallback for a
-    /// workflow that names `Any agent`; a workflow that names people never reaches
-    /// them.
-    pub async fn bound_agent(&self, project_id: Uuid) -> Result<Option<Uuid>> {
+    /// Any agent in this workspace: the one whose last run is oldest, so a status
+    /// that says `any` gets a rotation through the roster instead of one
+    /// favourite. The workflow names people by name; this is what `any` means
+    /// when there is no name to look up.
+    pub async fn any_agent(&self, workspace_id: Uuid) -> Result<Option<Uuid>> {
         let row: Option<(Uuid,)> = sqlx::query_as(
-            // A status that names nobody is asking for work, so the worker comes
-            // first; a reviewer is reached by name or not at all.
-            "select agent_id from project_agents where project_id = ? \
-             order by case role when 'worker' then 0 else 1 end limit 1",
+            "select a.id from agents a
+               left join (select agent_id, max(created_at) as ran_at from runs group by agent_id) r
+                 on r.agent_id = a.id
+              where a.workspace_id = ?
+              order by coalesce(r.ran_at, '') asc, a.name asc
+              limit 1",
         )
-        .bind(project_id)
+        .bind(workspace_id)
         .fetch_optional(&self.db.pool)
         .await?;
         Ok(row.map(|(agent_id,)| agent_id))
@@ -1037,37 +1047,54 @@ impl Engine {
         parent_run_id: Option<Uuid>,
     ) -> Result<Run> {
         let issue = self.issue(issue_id).await?;
-        // A run needs somewhere to work and a project to borrow role bindings from.
-        // An issue without a project is planning, and planning is not running.
-        let project_id = issue.project_id.ok_or_else(|| {
-            anyhow!(
-                "this issue belongs to no project, so it has no agent roles to run. Move it into a project first."
-            )
-        })?;
+        // A run needs somewhere to work. An issue without a project is planning,
+        // and planning is not running.
+        if issue.project_id.is_none() {
+            bail!("this issue belongs to no project, so there is nowhere to run. Move it into a project first.");
+        }
         let repo: Repo = sqlx::query_as("select * from repos where id = ?")
             .bind(issue.repo_id)
             .fetch_one(&self.db.pool)
             .await?;
 
         // The workflow decides who works a status. When it names an agent, that
-        // agent runs — the role bindings are only the fallback for `Any agent`,
-        // which is the case below where nobody was named.
+        // agent runs; `any` means whichever agent in the workspace has waited
+        // longest. A status that names nobody starts nothing.
         let named = self.next_turn_agent(&issue).await?;
         let by_name = self
             .agent_for_name(issue.workspace_id, named.as_deref())
             .await?;
+        let by_name = match (by_name, named.as_deref()) {
+            (None, Some(name)) if name.eq_ignore_ascii_case("any") => {
+                self.any_agent(issue.workspace_id).await?
+            }
+            (found, _) => found,
+        };
         let agent_id = match (agent_id, by_name) {
             (Some(id), _) => id,
             (None, Some(id)) => id,
-            // A name nobody answers to is a document that has outlived the
-            // roster, so the project's binding takes the turn instead of the
-            // task sitting in a status no agent can serve.
-            (None, None) => self.bound_agent(project_id).await?.ok_or_else(|| {
-                anyhow!(
-                    "the workflow names {} for this status, and no agent is bound to this project. Assign one on the project screen, or name an agent this workspace has.",
-                    named.as_deref().unwrap_or("nobody")
-                )
-            })?,
+            // Nobody to run. Which of the two reasons it is decides what the
+            // person reading the task has to do about it.
+            (None, None) => {
+                let queued: Vec<String> =
+                    serde_json::from_str(&issue.turn_queue).unwrap_or_default();
+                if !queued.is_empty() {
+                    bail!(
+                        "every agent the workflow names for {} has taken a turn there, so nothing starts until a person moves the task.",
+                        issue.status_enum().title()
+                    );
+                }
+                match named.as_deref() {
+                    Some(name) => bail!(
+                        "the workflow names {name} for {}, and no agent in this workspace answers to that name. Rename the agent, or name the agent the document means.",
+                        issue.status_enum().title()
+                    ),
+                    None => bail!(
+                        "the workflow names nobody for {}, so nothing starts. Give the status a `Users:` line naming an agent or `human`.",
+                        issue.status_enum().title()
+                    ),
+                }
+            }
         };
 
         // A probe is the only evidence about the CLI, so a run without one would
@@ -1170,24 +1197,21 @@ impl Engine {
         );
 
         sqlx::query(
-            "insert into runs (id, issue_id, repo_id, agent_id, model, role, attempt, base_bookmark, base_revision,
+            "insert into runs (id, issue_id, repo_id, agent_id, model, attempt, base_bookmark, base_revision,
                 prompt_revision, artifact_dir, status, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
         )
         .bind(run_id)
         .bind(issue_id)
         .bind(issue.repo_id)
         .bind(agent_id)
         .bind(&run_agent.model)
-        // Every turn starts as work. A turn that ends with a verdict is recorded as
-        // the review it was, which is the only thing the two roles ever decided.
-        .bind(AgentRole::Worker.as_str())
         .bind(attempt)
         .bind(&base_bookmark)
-        // The base is a revision expression, not a frozen hash: an implementer run
-        // has to start on the frozen suite's bookmark, and resolving it here would
-        // mean a second process to ask jj. Storing the bookmark keeps the run on
-        // the suite the gate proved red, even after another attempt moves it.
+        // The base is a revision expression, not a frozen hash: a turn starts on the
+        // bookmark its predecessor published, and resolving it here would mean a
+        // second process to ask jj. Storing the bookmark keeps the run on the head
+        // that was reviewed, even after another attempt moves it.
         .bind(&base_bookmark)
         .bind(&prompt_revision)
         .bind(artifact_dir.display().to_string())
@@ -1441,9 +1465,9 @@ impl Engine {
         let mut final_status = status;
         let mut error = payload.error.clone();
 
-        // Frozen tests are a hard reject: an implementer that edits the suite
-        // replaced the proof with its own assertion.
-        if run.role_enum() == AgentRole::Worker && !verdict.is_acceptable() {
+        // Frozen tests are a hard reject: a turn that edits the suite replaced the
+        // proof with its own assertion.
+        if !verdict.is_acceptable() {
             final_status = RunStatus::Failed;
             error = Some(format!(
                 "the run changed frozen test files: {}. Implementation code must make the frozen suite pass.",
@@ -1451,7 +1475,7 @@ impl Engine {
             ));
         }
         // A run that changed nothing did no work. pi exits 0 even when its provider
-        // rejected the model, so "the process ended" is not evidence that the role ran;
+        // rejected the model, so "the process ended" is not evidence that the turn ran;
         // without this, the issue sits at tests_in_progress offering a suite to freeze
         // that was never written.
         let asked = payload
@@ -1466,9 +1490,9 @@ impl Engine {
             final_status = RunStatus::Failed;
             error = Some(match adapter_failure(&payload) {
                 Some(reason) => format!(
-                    "the agent changed no files: {reason}. Nothing was run for this role, so the issue stays where it is; fix the agent in Settings and retry."
+                    "the agent changed no files: {reason}. Nothing was run for this turn, so the issue stays where it is; fix the agent in Settings and retry."
                 ),
-                None => "the agent changed no files and said nothing. A role that edits nothing did no work; check its transcript in the run log, then retry.".to_string(),
+                None => "the agent changed no files and said nothing. A turn that edits nothing did no work; check its transcript in the run log, then retry.".to_string(),
             });
         }
         if final_status == RunStatus::Succeeded && payload.artifact_limit_hit {
@@ -1503,10 +1527,24 @@ impl Engine {
         .execute(&self.db.pool)
         .await?;
 
+        // What a turn *was* is read from what it did. A closing message that
+        // carries a verdict judged the work before it; anything else is work, and
+        // its commit becomes the head the next turn starts from and the pull
+        // request carries. Who the agent is decides none of this.
+        //
+        // A verdict is only a review when there is something behind the turn to
+        // judge: the first turn of a status has no work before it, so its closing
+        // line is a statement about its own work, and the task moves on.
+        let judged = matches!(
+            payload.verdict.as_deref(),
+            Some("approved") | Some("changes_requested")
+        ) && self.run_under_review(&issue).await.is_ok();
+
         // An agent that worked and said nothing leaves the next turn guessing. Its
         // closing message is the handover, so it is shown where a person reads the
-        // task and handed to whoever works it next.
-        if run.role_enum() != AgentRole::Reviewer && final_status == RunStatus::Succeeded {
+        // task and handed to whoever works it next. A judgement is not a handover:
+        // it is stored as the review it was, in the words the reviewer wrote.
+        if !judged && final_status == RunStatus::Succeeded {
             if let Some(text) = summary.as_deref() {
                 self.comment(
                     run.issue_id,
@@ -1532,26 +1570,9 @@ impl Engine {
             return self.run(run_id).await;
         }
 
-        // What a turn *was* is read from what it did. A closing message that
-        // carries a verdict judged the work before it; anything else is work, and
-        // its commit becomes the head the next turn starts from and the pull
-        // request carries. Who the agent is decides none of this.
-        //
-        // A verdict is only a review when there is something behind the turn to
-        // judge: the first turn of a status has no work before it, so its closing
-        // line is a statement about its own work, and the task moves on.
-        let judged = matches!(
-            payload.verdict.as_deref(),
-            Some("approved") | Some("changes_requested")
-        ) && self.run_under_review(&issue).await.is_ok();
         if judged {
             if final_status == RunStatus::Succeeded {
                 let verdict = self.record_review(&issue, &run, &payload).await?;
-                sqlx::query("update runs set role = ? where id = ?")
-                    .bind(AgentRole::Reviewer.as_str())
-                    .bind(run_id)
-                    .execute(&self.db.pool)
-                    .await?;
                 // A rejection leaves the task where it is: the next turn there is a
                 // rework, and the workflow decides when that happens.
                 if verdict == "approved" {

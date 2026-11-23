@@ -18,8 +18,6 @@ export const BOARD_STATUSES: IssueStatus[] = [
   "done",
 ];
 
-export type Role = "test_author" | "implementer" | "reviewer";
-
 export interface Connection {
   /** The server's GraphQL endpoint root, like `http://127.0.0.1:51234`. */
   url: string;
@@ -40,7 +38,6 @@ export interface Run {
   id: string;
   /** Who ran it. Every run records its agent, so a roster can read its own history. */
   agentId: string;
-  role: Role;
   status: string;
   attempt: number;
   adapter: string;
@@ -162,12 +159,6 @@ export interface ModelOption {
   costIn: number | null;
   costOut: number | null;
   contextWindow: number | null;
-}
-
-export interface ProjectAgent {
-  projectId: string;
-  agentId: string;
-  role: Role;
 }
 
 export interface Project {
@@ -433,11 +424,11 @@ export const ISSUE_FIELDS = `
   title body status priority attempt runCount testsFrozenAt mergeRevision pinnedCommentId
   blockedBy projectName prUrl prNumber
   criteria { id position text testName }
-  runs { id agentId role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
+  runs { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments { id author authorType body pinned createdAt }
   turnRemaining turnsUsed
-  currentRun { id agentId role status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
+  currentRun { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
 export async function loadBoard(workspaceId: string): Promise<Issue[]> {
@@ -539,7 +530,6 @@ export interface RecentRun {
   id: string;
   issueId: string;
   agentId: string;
-  role: Role;
   status: string;
   adapter: string;
   /** The model the run was given, frozen at spawn. */
@@ -555,7 +545,7 @@ export interface RecentRun {
 export async function loadRecentRuns(workspaceId: string, limit = 120): Promise<RecentRun[]> {
   const data = await gql<{ recentRuns: RecentRun[] }>(
     `query ($w: UUID!, $n: Int) { recentRuns(workspaceId: $w, limit: $n) {
-      id issueId agentId role status adapter model attempt tokensIn tokensOut error startedAt finishedAt
+      id issueId agentId status adapter model attempt tokensIn tokensOut error startedAt finishedAt
     } }`,
     { w: workspaceId, n: limit },
   );

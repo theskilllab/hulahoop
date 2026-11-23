@@ -88,13 +88,6 @@ pub struct AgentPreflight {
     pub checked_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
-pub struct ProjectAgent {
-    pub project_id: Uuid,
-    pub agent_id: Uuid,
-    pub role: String,
-}
-
 /// A person on a workspace, joined with their row in `users` so the UI can name
 /// them. Local mode has exactly one.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
@@ -196,11 +189,9 @@ pub struct Run {
     pub issue_id: Uuid,
     pub repo_id: Uuid,
     pub agent_id: Uuid,
-    pub role: String,
     pub attempt: i64,
-    /// The agent's closing message. A reviewer's becomes a review row; for every
-    /// other role this is the only record of what it decided, and the next turn
-    /// of a status reads it as `parent`.
+    /// The agent's closing message: the only record of what it decided, and the
+    /// next turn of a status reads it as `parent`.
     pub summary: Option<String>,
     pub base_bookmark: String,
     pub base_revision: Option<String>,
@@ -251,11 +242,6 @@ pub struct Run {
 impl Run {
     pub fn status_enum(&self) -> hulahoop_core::RunStatus {
         hulahoop_core::RunStatus::parse(&self.status).unwrap_or(hulahoop_core::RunStatus::Queued)
-    }
-
-    pub fn role_enum(&self) -> hulahoop_core::AgentRole {
-        hulahoop_core::AgentRole::from_stored(&self.role)
-            .unwrap_or(hulahoop_core::AgentRole::Worker)
     }
 
     pub fn flags_enum(&self) -> Vec<hulahoop_core::RunFlag> {

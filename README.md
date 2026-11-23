@@ -52,7 +52,7 @@ The first version exists to answer one question:
 - One local user, with a schema that already supports multiple workspaces, projects, and repos.
 - First project: the Hulahoop repo.
 - Two adapters: Pi first, Claude Code second.
-- Three roles: Test Author, Implementer, Reviewer.
+- Statuses name their agents in the workspace's `WORKFLOWS.md`, so one workflow can put a planner, a writer and a reviewer in the same status.
 - Three agents: Pi Test Author, Pi Implementer on a different model, Claude Code Reviewer. The human approves and merges.
 - One frozen test suite per issue, authored before any implementation and replayed at the base revision.
 - One repo contract: `flake.nix` and `justfile` with `setup` and `test` recipes, plus the `.envrc` the runner generates. No per-repo command settings.
@@ -68,7 +68,7 @@ The first version exists to answer one question:
   - create/edit issue
   - acceptance criteria field
   - suite status: red at base, green at head
-  - “Run” button per role
+  - “Run” button that starts the agent the status names
   - live run log
   - diff view
   - comments, which carry a blocking question and its answer
@@ -232,7 +232,7 @@ The desktop app is a client. It never owns the state machine.
 | GraphQL client | `urql` + `graphql-codegen` (fallback: Apollo) |
 | VCS | jj workspaces first, git worktree fallback |
 | Agent adapter | Pi first, Claude Code second |
-| Agents | Multiple, role-scoped from v0 |
+| Agents | Multiple, each bound to the statuses that name it |
 | License | MIT (recommended) |
 | Repo contract | `flake.nix` + `justfile` (`setup`, `test`), a generated `.envrc`, executed via `direnv exec` |
 | Shell entry | `direnv` + `nix-direnv`; cached dev shell per `flake.lock` |
@@ -317,9 +317,6 @@ agent_preflight       the last probe of one adapter in one repo
                         keyed by the pair, because the probe runs inside that
                           repo's dev shell: one toolchain cannot answer for another
 
-project_agents        role: test_author | implementer | reviewer
-  project_id, agent_id, role
-
 issues
   id, project_id, repo_id, title, body, status, priority,
   status_before_blocked, pinned_comment_id, run_cap_cleared_at,
@@ -355,12 +352,11 @@ checkouts              one per active run, replay, or preflight
                         state: creating | ready | cleaning | removed
 
 runs
-  id, issue_id, repo_id, agent_id, role, attempt, base_bookmark, base_revision,
+  id, issue_id, repo_id, agent_id, attempt, base_bookmark, base_revision,
   head_revision, head_bookmark, parent_run_id, runner_id, claimed_at,
   last_heartbeat_at, pid, pgid, toolchain_lock, prompt_revision, sandbox,
   env_keys, artifact_dir, diff_sha, flags, status, started_at, finished_at,
   exit_code, error, tokens_in, tokens_out
-                        role: test_author | implementer | reviewer
                         attempt: copied from `issues.attempt` for an implementer
                         base_bookmark: the bookmark the checkout was created from
                         toolchain_lock: sha256(flake.lock) at run start
@@ -464,19 +460,19 @@ The server owns every transition. A mutation or a run completion event fires it;
 | From | Event | Guard | To |
 | --- | --- | --- | --- |
 | `backlog` | `approveCriteria` | every criterion matches the required shape | `ready` |
-| `ready` | `startRun(role: test_author)` | criteria valid, agent bound to the role, no run queued or running on the repo | `tests_in_progress` |
-| `tests_in_progress` | `startRun(role: test_author)` | no run queued or running, reached by a thaw or a rejected freeze | `tests_in_progress` |
+| `ready` | `startRun(agentId)` | criteria valid, the status names that agent, no run queued or running on the repo | `tests_in_progress` |
+| `tests_in_progress` | `startRun(agentId)` | no run queued or running, reached by a thaw or a rejected freeze | `tests_in_progress` |
 | `tests_in_progress` | authoring run completes | writes `tests/<issue>/cand/<run-id>` and queues the base replay | `tests_in_progress` |
 | `tests_in_progress` | base replay completes | it ran the candidate suite against `repos.base_revision` | `tests_in_progress` |
 | `tests_in_progress` | `freezeSuite(issueId)` | base replay present, every authored test fails in it, each criterion maps to exactly one test name, no run queued or running | `tests_ready` |
 | `tests_in_progress` | `freezeSuite(issueId)` rejected | an authored test passes at base, or a criterion has no test | `tests_in_progress` |
 | `tests_in_progress` | authoring run fails | `runs.error` records why, nothing is frozen yet | `ready` |
-| `tests_ready` | `startRun(role: implementer)` | suite frozen, no run queued or running on the repo | `in_progress` |
+| `tests_ready` | `startRun(agentId)` | suite frozen, no run queued or running on the repo | `in_progress` |
 | `tests_ready` | `unfreezeSuite(reason)` | human, archives `tests/<issue>` as `tests/<issue>/archive/<suite_seq>` and clears `current_run_id` | `tests_in_progress` |
-| `in_progress` | `startRun(role: implementer, parentRunId)` | no run queued or running; the rework run branches from that run's head bookmark | `in_progress` |
+| `in_progress` | `startRun(agentId, parentRunId)` | no run queued or running; the rework run branches from that run's head bookmark | `in_progress` |
 | `in_progress` | implementer run completes | head replay green, frozen test files unchanged, sets `current_run_id` | `in_review` |
 | `in_progress` | implementer run fails | `runs.error` records why; the issue stays put so the human can start another attempt | `in_progress` |
-| `in_review` | `startRun(role: reviewer)` | `current_run_id` set and that run has a head bookmark | `in_review` |
+| `in_review` | `startRun(agentId)` | `current_run_id` set and that run has a head bookmark | `in_review` |
 | `in_review` | reviewer verdict `changes_requested` | review row written, body quotes the failing tests | `in_progress` |
 | `in_review` | reviewer verdict `approved` | review row written, the approval still needs a human | `in_review` |
 | `in_review` | `requestChanges(body)` | human, comment recorded | `in_progress` |
@@ -500,7 +496,7 @@ Three rules live in the schema, so a race cannot violate them:
 
 - `create unique index one_active_run on runs(issue_id) where status in ('queued','running')` gives one queued or running run per issue. A second `startRun` fails with "a run is already active".
 - `create unique index one_active_run_per_repo on runs(repo_id) where status in ('queued','running')` gives one running agent per repo. Two agents in one repo would fight the same jj op log and the same `cargo`/`pnpm` cache, so the second run queues behind the index instead of behind a sentence in the risk table. Parallel work across projects still works; parallelism inside one repo arrives when replays get a build cache of their own.
-- `startRun(issueId, agentId, role)` rejects an agent that is not bound to that role in `project_agents`, so the three-role handoff cannot be reassigned by a client.
+- `startRun(issueId, agentId)` starts the agent the status names, and rejects one the workflow does not name for that status. A status that names `any` gets the agent whose last run is oldest, so a workflow that names nobody by hand still has a turn to serve.
 
 ### Defaults
 
@@ -510,10 +506,10 @@ Constants in code, not settings. The UI shows them where they bite:
 | --- | --- |
 | runner heartbeat | 5s |
 | runner declared dead after | 30s without a heartbeat |
-| agent wall clock, `just setup` excluded | 30 min per role |
+| agent wall clock, `just setup` excluded | 30 min per run |
 | `just setup` | 20 min |
 | one `just test` replay | 15 min |
-| runs per issue | 12 rows, which covers three roles across four attempts; the Run button disables until a human calls `clearRunCap` |
+| runs per issue | 12 rows, which covers a work turn and its review across four attempts; the Run button disables until a human calls `clearRunCap` |
 | GraphQL request | 30s |
 | SQLite `busy_timeout` | 5s |
 | log rotation | at 50 MB a run keeps its first and last 50 MB (`agent.jsonl`, `agent.1.jsonl`); metadata retained forever |
@@ -669,15 +665,15 @@ claude -p --output-format stream-json --model <model>
 
 Both CLIs are run non-interactively, so the runner passes the flags that keep them from blocking on prompts: `pi -p --approve --tools …` and `claude -p --permission-mode …`. Each adapter declares its tool allowlist in config; the default excludes `git push`.
 
-Hulahoop 0 ships three role-scoped agents:
+Hulahoop 0 ships three agents, and the default workflow names them by name rather than by kind:
 
-| Role | Adapter | Input | Output |
+| Agent | Adapter | Input | Output |
 | --- | --- | --- | --- |
 | Test Author | Pi | issue title, body, criteria, base revision; no implementation | test-only diff |
 | Implementer | Pi, separate model | frozen suite, criteria, prior review comments | implementation diff |
 | Reviewer | Claude Code | issue, suite diff, implementation diff, both run logs | `approved` or `changes_requested` |
 
-Different adapters and different roles make handoff bugs visible during dogfooding. Claude Code uses the machine’s existing Claude subscription or API credentials.
+Different adapters and different agents make handoff bugs visible during dogfooding. Claude Code uses the machine’s existing Claude subscription or API credentials.
 
 The adapter interface:
 
@@ -704,7 +700,8 @@ The probe runs the way the run will, so an adapter that only exists inside the f
 
 A probe needs a working copy, and at `addRepo` time there is none, so the server creates a preflight checkout (`owner_kind = preflight`) under `repo_locks`, generates `.envrc` there, and points `HOME` at a scratch directory. The user's own working tree is never written to and its `.envrc` is never executed: a committed `.envrc` is still arbitrary shell, and v0 runs it on the user's machine only inside a checkout Hulahoop owns.
 
-The outcome lands in `agent_preflight` keyed by `(agent_id, repo_id)`, because the probe answers a question about one adapter in one dev shell. A single row on `agents` would let repo B's toolchain overwrite repo A's verdict. The project screen reads those rows, and a failed probe blocks role assignment for that repo with the message above, so the first run does not die on a missing credential.
+The outcome lands in `agent_preflight` keyed by `(agent_id, repo_id)`, because the probe answers a question about one adapter in one dev shell. A single row on `agents` would let repo B's toolchain overwrite repo A's verdict. The project screen reads those rows, and a failed probe keeps that agent out of that
+repo's runs with the message above, so the first run does not die on a missing credential.
 
 ### Stacked runs
 
@@ -715,7 +712,7 @@ The runner sets:
 ```text
 HULAHOOP_ISSUE_ID
 HULAHOOP_RUN_ID
-HULAHOOP_ROLE
+HULAHOOP_AGENT
 HULAHOOP_CHECKOUT
 HULAHOOP_BASE_BOOKMARK
 HULAHOOP_TESTS_BOOKMARK
@@ -767,7 +764,7 @@ Four screens are enough for Hulahoop 0:
    - title, body, acceptance criteria
    - freeze suite / thaw suite, the thaw asking for a reason
    - suite status: red at base, green at head
-   - run / cancel per role
+   - run / cancel per agent the status names
    - live log
    - diff
    - approve / request changes; approve is disabled until the Reviewer's verdict is `approved` and every flag is acknowledged
@@ -805,19 +802,17 @@ enum IssueStatus {
   MERGING BLOCKED DONE CANCELLED
 }
 
-enum AgentRole { TEST_AUTHOR IMPLEMENTER REVIEWER }
-
 type Mutation {
   createProject(input: CreateProjectInput!): Project!
   addRepo(input: AddRepoInput!): Repo!
   updateRepo(input: UpdateRepoInput!): Repo!
   createAgent(input: CreateAgentInput!): Agent!
   updateAgent(input: UpdateAgentInput!): Agent!
-  setProjectAgents(input: SetProjectAgentsInput!): Project!
   createIssue(input: CreateIssueInput!): Issue!
   updateIssue(input: UpdateIssueInput!): Issue!
   approveCriteria(issueId: ID!): Issue!
-  startRun(issueId: ID!, agentId: ID!, role: AgentRole!, parentRunId: ID): Run!
+  startRun(issueId: ID!, agentId: ID!, parentRunId: ID): Run!
+                        agentId must be one the status names, or `any`
                         parentRunId stacks a rework run on the head under review
   cancelRun(runId: ID!): Run!         stops the process, the issue keeps its status
   abandonIssue(issueId: ID!, reason: String!): Issue!
@@ -890,7 +885,6 @@ type Run {
   id: ID!
   issueId: ID!
   agent: Agent!
-  role: AgentRole!
   status: RunStatus!
   baseRevision: String!
   headBookmark: String
@@ -936,8 +930,7 @@ type Approval { id: ID!, runId: ID!, headRevision: String!, diffSha: String!, la
 type Repo { id: ID!, projectId: ID!, name: String!, path: String!, vcs: Vcs!, baseRevision: String!, contractVersion: String!, fetchedAt: DateTime }
 type Agent { id: ID!, name: String!, adapter: Adapter!, model: String! }
 type AgentPreflight { agentId: ID!, repoId: ID!, ok: Boolean!, detail: String, checkedAt: DateTime! }
-type Project { id: ID!, workspaceId: ID!, name: String!, repos: [Repo!]!, agents: [ProjectAgent!]!, preflight: [AgentPreflight!]! }
-type ProjectAgent { role: AgentRole!, agent: Agent! }
+type Project { id: ID!, workspaceId: ID!, name: String!, repos: [Repo!]!, preflight: [AgentPreflight!]! }
 type Workspace { id: ID!, name: String!, slug: String!, projects: [Project!]!, users: [User!]! }
 type User { id: ID!, name: String!, email: String! }
 
@@ -1283,7 +1276,7 @@ just test               # nextest + the JUnit report the gate reads
 just lint               # clippy, warnings are errors
 just ci                 # what CI runs
 just dev                # server + runner + desktop against .hulahoop-dev
-just seed /path/to/repo # create a project, a repo, three agents, three role bindings
+just seed /path/to/repo # create a project, a repo, three agents, and the workflow that names them
 hulahoop up             # server and runner on this host, one command (--listen, --port, --data-dir)
 just dev 0.0.0.0 9000   # debug build of server + runner, on every interface, so a Mac can connect
 just debug 192.168.1.19 9000   # why can't the app reach it: address, port, /health, token
@@ -1335,9 +1328,9 @@ hulahoop up --listen 0.0.0.0 --port 9000
 jq -r .token ~/.local/share/hulahoop/connection.json   # the token, from another shell
 ```
 
-One executable covers both roles: `up` runs `serve`, waits for the connection file,
+One executable covers both halves: `up` runs `serve`, waits for the connection file,
 then runs `runner` with `--server` and `--token`, and stops the other when either exits.
-Running one role by hand (`hulahoop serve --listen 0.0.0.0`, `hulahoop runner --server
+Running one half by hand (`hulahoop serve --listen 0.0.0.0`, `hulahoop runner --server
 http://host:9000 --token <token>`) is what you do when they live on different machines.
 
 Where the binaries come from:
@@ -1423,7 +1416,7 @@ $DATA/workspace/<project>/<issue>/<run>/checkout
 ```
 
 Four levels, because the numbers multiply: a project holds issues, an issue holds
-attempts, an attempt holds one run per role. One project with ten issues and four
+attempts, an attempt holds one run per turn. One project with ten issues and four
 attempts is 120 workspaces; the run directory is the unit of deletion, so a cleanup
 can never take a neighbour with it.
 
@@ -1484,9 +1477,10 @@ Three deliberate rules:
 1. **An issue key is stored.** Renaming a project's prefix rewrites its issues' keys
    (`setProjectPrefix`), because a key is what people quote in a commit message and a
    ticket; recomputing it on read would silently rewrite history.
-2. **A run needs a project.** Agent roles are bound per project, so `startRun` refuses
-   an issue that belongs to none ("this issue belongs to no project, so it has no agent
-   roles to run"). Filing an issue without a project is planning; running it is not.
+2. **A run needs a project.** The workflow and the repository live on the project, so
+   `startRun` refuses an issue that belongs to none ("this issue belongs to no project,
+   so there is nowhere to run"). Filing an issue without a project is planning;
+   running it is not.
 3. **An artifact is a file with an index row, and a download is authenticated.** The
    mutation takes base64 (`createArtifact`), the server writes
    `$DATA/artifacts/<id>/<filename>` and stores size, sha256, mime and kind; the
@@ -1654,10 +1648,10 @@ Ready for the team. Anything here is body text.
 ```
 
 `Users` is the only line about people: `human` (or `you`) for a column a person
-works, an agent's name for a column an agent works, `any` for whichever agent the
-project binds to the column, and a mix when both may act. One line, comma
-separated, `@` optional. A column with no `Users` line belongs to a person, so a
-half-written document never dispatches an agent nobody named.
+works, an agent's name for a column an agent works, `any` for the agent whose last
+run is oldest, and a mix when both may act. One line, comma separated, `@`
+optional. A column with no `Users` line belongs to a person, so a half-written
+document never dispatches an agent nobody named.
 
 Each `Next:` is one move and its reason, written `Next: <status> - <when>`. The
 reason may contain commas; only the part before the dash is a status. A column may
@@ -1666,7 +1660,7 @@ no `Next:` is final. The parser refuses a document that names an unknown status,
 omits a column, or leaves a `Next` pointing nowhere, because a board that silently
 drops a column lies about where work can go.
 
-An agent is a role plus its own knowledge: a role prompt, its `AGENTS.md`, and the
+An agent is its own knowledge: an instructions text, its `AGENTS.md`, and the
 skills attached to it. Skills are workspace knowledge — a convention, a checklist,
 a house rule with the story behind it — written once and carried by whichever
 agents need them.
@@ -1678,4 +1672,6 @@ closes a task is that pull request merging; nothing else moves a task to Done.
 What the loop keeps from the frozen-suite years: one workspace per run, the house
 rules (`just fmt-check`, `just lint`) checked at the same revision as the suite,
 the pull-request check gate, and the transcripts. What it dropped: the separate
-Test Author, frozen test files, replays, and the diff-hash approval.
+Test Author, frozen test files, replays, the diff-hash approval, and the per-project
+agent bindings — a run says what it did by what it left behind, so nothing has to
+record what kind of turn it was.
