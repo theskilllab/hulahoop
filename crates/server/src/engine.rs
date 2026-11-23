@@ -1711,7 +1711,7 @@ impl Engine {
             .await?
             .unwrap_or(IssueStatus::InReview);
         if target == IssueStatus::InReview {
-            sqlx::query("update issues set current_run_id = (select id from runs where issue_id = ? and status = 'succeeded' order by created_at desc limit 1) where id = ?")
+            sqlx::query("update issues set current_run_id = (select id from runs where issue_id = ? and status = 'succeeded' and head_bookmark is not null order by created_at desc limit 1) where id = ?")
                 .bind(issue_id)
                 .bind(issue_id)
                 .execute(&self.db.pool)
@@ -1719,20 +1719,59 @@ impl Engine {
         }
         let issue = self.move_to(issue_id, target).await?;
         if issue.status_enum() == IssueStatus::InReview {
-            let newest: Option<Uuid> = sqlx::query_scalar(
-                "select id from runs where issue_id = ? and status = 'succeeded' order by created_at desc limit 1",
-            )
-            .bind(issue_id)
-            .fetch_optional(&self.db.pool)
-            .await?;
-            self.queue_job(
-                issue.repo_id,
-                Some(issue.id),
-                "open_pr",
-                serde_json::json!({ "run_id": newest }),
-            )
-            .await?;
+            self.ensure_pull_request(&issue).await?;
         }
+        Ok(())
+    }
+
+    /// The pull request the work needs, opened once.
+    ///
+    /// A review that approves is the moment the work is ready for a person to read
+    /// on GitHub, so approval opens the pull request even when the task stays in its
+    /// column. The turn named is the newest one that published a head: a reviewer
+    /// publishes none, and naming it asks the runner to push a branch that does not
+    /// exist.
+    async fn ensure_pull_request(&self, issue: &Issue) -> Result<()> {
+        if issue.pr_number.is_some() {
+            return Ok(());
+        }
+        let opened: i64 = sqlx::query_scalar(
+            "select count(*) from runner_jobs
+              where issue_id = ? and kind = 'open_pr'
+                and status in ('queued', 'running', 'succeeded')",
+        )
+        .bind(issue.id)
+        .fetch_one(&self.db.pool)
+        .await?;
+        if opened > 0 {
+            return Ok(());
+        }
+        let head: Option<Uuid> = sqlx::query_scalar(
+            "select id from runs
+              where issue_id = ? and status = 'succeeded' and head_bookmark is not null
+              order by created_at desc limit 1",
+        )
+        .bind(issue.id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        let Some(run_id) = head else {
+            self.comment(
+                issue.id,
+                hulahoop_core::AuthorType::Server,
+                None,
+                "no turn published a head, so there is nothing to open a pull request from.",
+                false,
+            )
+            .await?;
+            return Ok(());
+        };
+        self.queue_job(
+            issue.repo_id,
+            Some(issue.id),
+            "open_pr",
+            serde_json::json!({ "run_id": run_id }),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1781,7 +1820,9 @@ impl Engine {
         }
 
         if verdict == "approved" {
-            // Approval is advice the human reads; it does not move the task.
+            // Approval is advice the human reads; it does not move the task, and it
+            // does put the work where the person reads it: the pull request.
+            self.ensure_pull_request(issue).await?;
         } else {
             self.comment(
                 issue.id,
