@@ -11,12 +11,6 @@ interface Props {
   onChanged: () => Promise<void> | void;
 }
 
-const ROLE_LABEL: Record<string, string> = {
-  test_author: "Test author",
-  implementer: "Agent",
-  reviewer: "Reviewer",
-};
-
 /**
  * One task, and the moves it allows.
  *
@@ -36,6 +30,9 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
   const current = issue.currentRun ?? runs[runs.length - 1] ?? null;
   const live = current && (current.status === "running" || current.status === "queued");
   const verdict = current ? issue.reviews?.filter((r) => r.reviewedRunId === current.id).slice(-1)[0] : undefined;
+  // A run says what it did by what it left behind: a verdict that named the head
+  // before it is a review, and every other turn is work.
+  const judged = new Set((issue.reviews ?? []).map((review) => review.reviewerRunId));
 
   async function run<T>(label: string, query: string, variables: Record<string, unknown>): Promise<T | null> {
     setBusy(label);
@@ -230,6 +227,33 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
         </div>
       )}
 
+      {issue.status === "blocked" && (
+        <div className="panel">
+          <h3>Move</h3>
+          <p className="hint">
+            The workflow document names these exits. A move is a person's decision:
+            nothing starts on its own while the task waits.
+          </p>
+          <div className="actions">
+            {(issue.moves ?? []).map((move) => (
+              <button
+                key={move}
+                disabled={busy !== null}
+                onClick={() =>
+                  void mutate(
+                    `move-${move}`,
+                    `mutation ($id: UUID!, $status: String!) { moveIssue(issueId: $id, status: $status) { id status } }`,
+                    { id: issue.id, status: move },
+                  )
+                }
+              >
+                Move to {move.replace(/_/g, " ")}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {issue.body ? (
         <div className="section">
           <h3>Description</h3>
@@ -274,7 +298,7 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
             {[...runs].reverse().map((entry) => (
               <li key={entry.id}>
                 <div className="row">
-                  <span className="role">{ROLE_LABEL[entry.role] ?? entry.role}</span>
+                  <span className="role">{judged.has(entry.id) ? "reviewed" : "worked"}</span>
                   <StatusPill status={entry.status} />
                   <span className="dim">attempt {entry.attempt}</span>
                   {entry.adapter ? <span className="mark">{entry.adapter}</span> : null}

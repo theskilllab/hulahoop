@@ -1,10 +1,7 @@
 //! GraphQL surface. Resolvers stay thin: every rule lives in [`crate::engine`],
 //! so a mutation and a runner callback cannot disagree about the gate.
 
-use async_graphql::{
-    ComplexObject, Context, EmptySubscription, InputObject, Object, Schema, SimpleObject,
-};
-use hulahoop_core::AgentRole;
+use async_graphql::{ComplexObject, Context, EmptySubscription, Object, Schema, SimpleObject};
 use uuid::Uuid;
 
 use crate::engine::Engine;
@@ -104,19 +101,6 @@ impl Query {
     /// providers this machine is signed in to, Claude Code reports its aliases.
     async fn models(&self, harness: String) -> Vec<crate::models::ModelOption> {
         crate::models::catalogue(&harness)
-    }
-
-    async fn project_agents(
-        &self,
-        ctx: &Context<'_>,
-        project_id: Uuid,
-    ) -> async_graphql::Result<Vec<ProjectAgent>> {
-        Ok(
-            sqlx::query_as::<_, ProjectAgent>("select * from project_agents where project_id = ?")
-                .bind(project_id)
-                .fetch_all(&engine(ctx).db.pool)
-                .await?,
-        )
     }
 
     async fn issues(
@@ -512,7 +496,7 @@ impl Mutation {
         Ok(engine(ctx).set_agent_skills(agent_id, &skill_ids).await?)
     }
 
-    /// The agent's own instructions, appended to its role prompt.
+    /// The agent's own instructions, appended to the built-in contract.
     async fn set_agent_instructions(
         &self,
         ctx: &Context<'_>,
@@ -811,10 +795,6 @@ impl Mutation {
             .bind(id)
             .execute(&engine.db.pool)
             .await?;
-        sqlx::query("delete from project_agents where agent_id = ?")
-            .bind(id)
-            .execute(&engine.db.pool)
-            .await?;
         let done = sqlx::query("delete from agents where id = ?")
             .bind(id)
             .execute(&engine.db.pool)
@@ -858,36 +838,6 @@ impl Mutation {
             .bind(id)
             .fetch_one(&engine.db.pool)
             .await?)
-    }
-
-    async fn set_project_agents(
-        &self,
-        ctx: &Context<'_>,
-        project_id: Uuid,
-        bindings: Vec<RoleBinding>,
-    ) -> async_graphql::Result<Vec<ProjectAgent>> {
-        let engine = engine(ctx);
-        sqlx::query("delete from project_agents where project_id = ?")
-            .bind(project_id)
-            .execute(&engine.db.pool)
-            .await?;
-        for binding in bindings {
-            let role = AgentRole::parse(&binding.role).ok_or_else(|| {
-                async_graphql::Error::new(format!("unknown role {}", binding.role))
-            })?;
-            sqlx::query("insert into project_agents (project_id, agent_id, role) values (?, ?, ?)")
-                .bind(project_id)
-                .bind(binding.agent_id)
-                .bind(role.as_str())
-                .execute(&engine.db.pool)
-                .await?;
-        }
-        Ok(
-            sqlx::query_as("select * from project_agents where project_id = ?")
-                .bind(project_id)
-                .fetch_all(&engine.db.pool)
-                .await?,
-        )
     }
 
     async fn run_preflight(
@@ -1109,6 +1059,19 @@ impl Mutation {
             .await?)
     }
 
+    /// The move a person makes by hand, as the document declares it: a blocked
+    /// task has the exits its workflow lists, and no others.
+    async fn move_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        status: String,
+    ) -> async_graphql::Result<Issue> {
+        let target = hulahoop_core::IssueStatus::parse(&status)
+            .ok_or_else(|| async_graphql::Error::new(format!("`{status}` names no status")))?;
+        Ok(engine(ctx).move_declared(issue_id, target).await?)
+    }
+
     /// Backlog and To do are the same task on either side of the human's line.
     async fn plan_issue(
         &self,
@@ -1275,12 +1238,6 @@ impl Mutation {
     }
 }
 
-#[derive(InputObject)]
-pub struct RoleBinding {
-    pub role: String,
-    pub agent_id: Uuid,
-}
-
 /// Nested reads stay on one screen's worth of data: the board asks for issues,
 /// the detail screen asks for the rest.
 #[ComplexObject]
@@ -1307,6 +1264,18 @@ impl Agent {
 
 #[ComplexObject]
 impl Issue {
+    /// The places this task may go, as the workflow document declares them for the
+    /// status it sits in. A blocked task shows exactly these exits, so a person
+    /// moves it where the document says and nowhere else.
+    async fn moves(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
+        Ok(engine(ctx)
+            .workflow_moves(self.workspace_id, self.status_enum())
+            .await?
+            .into_iter()
+            .map(|status| status.as_str().to_string())
+            .collect())
+    }
+
     /// Who still owes a turn in this status. Empty means the status is done with
     /// its team, and the next move (or a person) takes over.
     async fn turn_remaining(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
@@ -1492,7 +1461,7 @@ impl Run {
         .await?)
     }
 
-    /// Which adapter ran this role, so a run list can say `pi` or `claude_code`
+    /// Which adapter ran the turn, so a run list can say `pi` or `claude_code`
     /// without a second round trip to the agent.
     async fn adapter(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
         let adapter: Option<String> = sqlx::query_scalar("select adapter from agents where id = ?")

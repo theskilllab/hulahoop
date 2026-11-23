@@ -434,9 +434,9 @@ async fn seed(args: &[String]) -> Result<()> {
         repo_json["data"]["addRepo"]["vcs"].as_str().unwrap_or("?")
     );
 
-    // Two pi agents and one claude agent. Names are what WORKFLOWS.md asks for
-    // (`@Test Author`); only `worker` and `reviewer` are bound, because a status
-    // that names nobody falls back to those and nothing else is a role.
+    // Two pi agents and one claude agent. The names are what WORKFLOWS.md asks
+    // for (`@Test Author`), and the document is the only thing that decides who
+    // works a status.
     let mut agent_ids = Vec::new();
     for (agent_name, adapter, model) in [
         ("Test Author", "pi", "anthropic/claude-sonnet-4-5"),
@@ -454,16 +454,7 @@ async fn seed(args: &[String]) -> Result<()> {
         agent_ids.push(agent_id);
     }
 
-    let bindings = format!(
-        "[{{role: \"worker\", agentId: \"{}\"}}, {{role: \"reviewer\", agentId: \"{}\"}}]",
-        agent_ids[1], agent_ids[2]
-    );
-    gql(format!(
-        "mutation {{ setProjectAgents(projectId: \"{project_id}\", bindings: {bindings}) {{ role }} }}"
-    ))
-    .await?;
-
-    println!("agents bound: worker, reviewer");
+    println!("agents created: {}", agent_ids.len());
     println!(
         "repo root: {}\nnext: create an issue in the app, or open it and press Start",
         repo.display()

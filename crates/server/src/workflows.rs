@@ -156,6 +156,28 @@ impl Engine {
             .and_then(|section| section.transitions.first().map(|m| m.to)))
     }
 
+    /// Every place the document lets a person move a task from this status, in
+    /// the order it lists them. A stopped task offers exactly these exits, so the
+    /// board cannot invent a move the document never declared.
+    pub async fn workflow_moves(
+        &self,
+        workspace_id: Uuid,
+        status: IssueStatus,
+    ) -> anyhow::Result<Vec<IssueStatus>> {
+        let doc = self.workflow(workspace_id).await?;
+        let parsed = workflow::parse(&doc.source);
+        let Some(section) = parsed.section(status) else {
+            return Ok(Vec::new());
+        };
+        let mut moves: Vec<IssueStatus> = Vec::new();
+        for transition in section.transitions.iter() {
+            if transition.to != status && !moves.contains(&transition.to) {
+                moves.push(transition.to);
+            }
+        }
+        Ok(moves)
+    }
+
     /// Where a finished run hands the task over.
     ///
     /// A section may list moves back into itself — "the reviewer asks for changes"

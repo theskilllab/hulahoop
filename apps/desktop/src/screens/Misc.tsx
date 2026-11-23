@@ -346,7 +346,6 @@ export function Activity({
                 <span className={`dot ${run.status}`} aria-hidden="true" />
                 <span className="mono key">{issue?.key ?? "—"}</span>
                 <span className="who">{agent?.name ?? run.adapter}</span>
-                <span className="role">{run.role.replaceAll("_", " ")}</span>
                 <span className="dim mono">
                   {number(run.tokensIn)}/{number(run.tokensOut)}
                 </span>

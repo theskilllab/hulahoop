@@ -452,11 +452,14 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         None => None,
     };
 
-    let blocked_answer = if let (Some(pinned), true) =
-        (issue.pinned_comment_id, issue.status == "blocked")
-    {
+    // A question stays pinned until a run carries it. The status a task returns to
+    // after an answer is the one it left, so the pin — not the status — is what
+    // says this turn has a question and an answer to read.
+    let blocked_answer = if let Some(pinned) = issue.pinned_comment_id {
+        // The id is bound as a uuid, not as its text: sqlite stores these as blobs,
+        // so a string never matches and the question reads as missing.
         let question: Option<(String,)> = sqlx::query_as("select body from comments where id = ?")
-            .bind(pinned.to_string())
+            .bind(pinned)
             .fetch_optional(&engine.db.pool)
             .await?;
         let answer: Option<(String,)> = sqlx::query_as(
@@ -475,11 +478,19 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         None
     };
 
-    // Committing is the app's act, so the implementer is the role that gets the
-    // app's token. The test author and the reviewer write tests and read a diff;
-    // neither pushes as the user, so neither is handed a credential it cannot use.
-    // Every role gets the adapter's own credential: an agent that cannot log in
-    // produces nothing, whatever it was asked to do.
+    // The pair is handed over once. A run that re-reads its spec after a runner
+    // restart is rebuilt without it, which is the price of keeping the question in
+    // the comments a person reads rather than on the run row.
+    if blocked_answer.is_some() {
+        sqlx::query("update issues set pinned_comment_id = null where id = ?")
+            .bind(issue.id)
+            .execute(&engine.db.pool)
+            .await?;
+    }
+
+    // Committing is the app's act, so the run gets the app's token. An agent that
+    // cannot log in produces nothing, so the adapter's own credential always
+    // travels too: a token for the app, a login for the harness.
     let credential = {
         let adapter =
             hulahoop_core::Adapter::parse(&agent.adapter).unwrap_or(hulahoop_core::Adapter::Pi);
@@ -521,7 +532,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let spec = RunSpec {
         run_id: run.id,
         issue_id: issue.id,
-        role: run.role_enum(),
         attempt: run.attempt,
         issue: IssueInput {
             title: issue.title.clone(),
@@ -564,7 +574,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "run_id": run.id,
         "issue_id": issue.id,
         "attempt": run.attempt,
-        "role": run.role_enum().as_str(),
         "adapter": agent.adapter,
         "model": agent.model,
         "agent_name": agent.name,
@@ -594,7 +603,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         // channel: the runner needs it to act, the desktop never sees it.
         "caller_role": "run",
         // The address GitHub rewrites into a link to the bot user needs both
-        // halves; either missing means the commit keeps the role address.
+        // halves; either missing means the commit keeps the plain app address.
         "commit_app_id": engine.commit_identity().await?.0,
         "commit_app_slug": engine.commit_identity().await?.1,
         "commit_agent_name": agent.name,

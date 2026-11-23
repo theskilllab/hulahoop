@@ -4,7 +4,7 @@ use crate::adapter;
 use crate::client::Client;
 use crate::vcs::{Kind, Vcs};
 use anyhow::{anyhow, bail, Context, Result};
-use hulahoop_core::{contract, slugify, Adapter, AgentRole};
+use hulahoop_core::{contract, slugify, Adapter};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -85,8 +85,6 @@ impl Executor {
     }
 
     async fn execute_run(&self, run_id: &str, spec: &Value) -> Result<()> {
-        let role = AgentRole::from_stored(spec["role"].as_str().unwrap_or_default())
-            .ok_or_else(|| anyhow!("unknown role in spec"))?;
         let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
         let repo_path = host_repository(spec)?;
@@ -196,19 +194,11 @@ impl Executor {
                 .ok();
         }
 
-        // The role owns the commit, whichever agent produced it: the working
-        // copy is rewritten to the role's identity before the bookmark names it,
-        // so `jj log` answers "who wrote this" without the runner's config. A
-        // failure here is fatal on purpose: a machine-authored commit that carries
-        // the human's name is worse than a failed run, because nothing shows it.
-        // The address decides whether GitHub links the commit to the app's bot
-        // user, so it is built from the app id and slug when both are known.
         // The team is named in the workflow, so the commit carries the agent's
-        // own name: `Test Author` becomes `hulahoop-dev-test-author`, not the
-        // role the old pipeline used.
+        // own name: `Test Author` becomes `hulahoop-dev-test-author`.
         let agent_name = spec["commit_agent_name"].as_str();
-        let author_name = role.app_commit_name_for(spec["commit_app_slug"].as_str(), agent_name);
-        let author_email = role.app_commit_email_for(
+        let author_name = hulahoop_core::commit_name(spec["commit_app_slug"].as_str(), agent_name);
+        let author_email = hulahoop_core::commit_email(
             spec["commit_app_id"].as_str(),
             spec["commit_app_slug"].as_str(),
             agent_name,
@@ -819,7 +809,6 @@ fn ensure_envrc(checkout: &Path) -> Result<()> {
 /// The agent's environment is the v0 boundary: an allowlist, a scratch home, and
 /// a checkout. Nothing from the user's shell comes through.
 fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(String, String)>> {
-    let role = spec["role"].as_str().unwrap_or("run");
     let adapter =
         Adapter::parse(spec["adapter"].as_str().unwrap_or_default()).unwrap_or(Adapter::Pi);
     let home = contract::scratch_home(data_dir, adapter);
@@ -854,7 +843,10 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
             "HULAHOOP_RUN_ID".into(),
             spec["run_id"].as_str().unwrap_or_default().into(),
         ),
-        ("HULAHOOP_ROLE".into(), role.into()),
+        (
+            "HULAHOOP_AGENT".into(),
+            spec["agent_name"].as_str().unwrap_or_default().into(),
+        ),
         (
             "HULAHOOP_BASE_BOOKMARK".into(),
             spec["base_bookmark"].as_str().unwrap_or("main").into(),
@@ -913,24 +905,23 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
                 .with_context(|| format!("writing {relative} into the run's home"))?;
         }
     }
-    // The commit this role produces has to say who wrote it. jj reads its
-    // identity from the environment, so the agent commits under the role's name
-    // even where the runner's own identity is the machine's.
+    // The commit says who wrote it. jj reads its identity from the environment,
+    // so the agent commits under its own name even where the runner's identity is
+    // the machine's. The team is named in the workflow, so the commit carries the
+    // agent's name: `Test Author` becomes `hulahoop-dev-test-author`.
     let agent_name = spec["commit_agent_name"].as_str();
-    if let Some(role) = AgentRole::from_stored(role) {
-        env.push((
-            "JJ_USER".into(),
-            role.app_commit_name_for(spec["commit_app_slug"].as_str(), agent_name),
-        ));
-        env.push((
-            "JJ_EMAIL".into(),
-            role.app_commit_email_for(
-                spec["commit_app_id"].as_str(),
-                spec["commit_app_slug"].as_str(),
-                agent_name,
-            ),
-        ));
-    }
+    env.push((
+        "JJ_USER".into(),
+        hulahoop_core::commit_name(spec["commit_app_slug"].as_str(), agent_name),
+    ));
+    env.push((
+        "JJ_EMAIL".into(),
+        hulahoop_core::commit_email(
+            spec["commit_app_id"].as_str(),
+            spec["commit_app_slug"].as_str(),
+            agent_name,
+        ),
+    ));
     // A token minted for the stored app; absent when there is no app, because a
     // variable holding an empty credential is worse than one that is not set.
     if let Some(token) = spec["github_token"]

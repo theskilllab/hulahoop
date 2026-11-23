@@ -133,7 +133,7 @@ export default function NewIssue({ workspaceId, projects, onAddRepo, onCreated, 
       </label>
       <p className="dim small">
         The key comes from the project: {project?.prefix ? `${project.prefix}-1` : "no project, so the workspace prefix"}. A run
-        needs a project, because the agent roles are bound per project.
+        needs a project, because the repository and the workflow live on one.
       </p>
       <label>
         Title <span className="required">required</span>

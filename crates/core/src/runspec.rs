@@ -4,7 +4,7 @@
 //! Nothing about the issue travels in argv or in the environment, because both
 //! leak into `ps` and into the agent's own tool output.
 
-use crate::{AgentRole, DIFF_LINE_LIMIT};
+use crate::DIFF_LINE_LIMIT;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -16,7 +16,6 @@ pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub struct RunSpec {
     pub run_id: Uuid,
     pub issue_id: Uuid,
-    pub role: AgentRole,
     pub attempt: i64,
     pub issue: IssueInput,
     pub criteria: Vec<CriterionInput>,
@@ -164,7 +163,6 @@ mod tests {
         RunSpec {
             run_id: Uuid::nil(),
             issue_id: Uuid::nil(),
-            role: AgentRole::Worker,
             attempt: 1,
             issue: IssueInput {
                 title: "Add multiplication".into(),
