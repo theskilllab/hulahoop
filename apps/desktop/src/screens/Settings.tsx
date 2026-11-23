@@ -93,6 +93,11 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
       .then((models) => {
         if (!live) return;
         setLumiModels(models);
+        // A model saved for another harness is foreign to this catalogue; the
+        // first entry is a real choice, the stale id is a guaranteed failure.
+        setLumiModel((current) =>
+          models.length && !models.some((model) => model.id === current) ? models[0].id : current,
+        );
       })
       .catch(() => { if (live) setLumiModels([]); });
     return () => { live = false; };
@@ -178,7 +183,11 @@ export default function Settings({ workspace, initialTab, onChanged, onSwitchWor
               <strong>Lumi</strong>
               <p className="dim small">Choose the harness and model for Ask Lumi. Changes to tasks still require your approval.</p>
               <div className="grid-2">
-                <label><span>Harness</span><select value={lumiHarness} onChange={(event) => setLumiHarness(event.target.value)}>
+                <label><span>Harness</span><select value={lumiHarness} onChange={(event) => {
+                  const next = event.target.value;
+                  setLumiHarness(next);
+                  setLumiModel(next === (workspace.lumiHarness ?? "pi") ? (workspace.lumiModel ?? "") : "");
+                }}>
                   <option value="pi">Pi</option><option value="claude_code">Claude Code</option>
                   <option value="fake">Fake (development)</option>
                 </select></label>
