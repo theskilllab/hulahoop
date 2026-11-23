@@ -1059,6 +1059,19 @@ impl Mutation {
             .await?)
     }
 
+    /// The move a person makes by hand, as the document declares it: a blocked
+    /// task has the exits its workflow lists, and no others.
+    async fn move_issue(
+        &self,
+        ctx: &Context<'_>,
+        issue_id: Uuid,
+        status: String,
+    ) -> async_graphql::Result<Issue> {
+        let target = hulahoop_core::IssueStatus::parse(&status)
+            .ok_or_else(|| async_graphql::Error::new(format!("`{status}` names no status")))?;
+        Ok(engine(ctx).move_declared(issue_id, target).await?)
+    }
+
     /// Backlog and To do are the same task on either side of the human's line.
     async fn plan_issue(
         &self,
@@ -1251,6 +1264,18 @@ impl Agent {
 
 #[ComplexObject]
 impl Issue {
+    /// The places this task may go, as the workflow document declares them for the
+    /// status it sits in. A blocked task shows exactly these exits, so a person
+    /// moves it where the document says and nowhere else.
+    async fn moves(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {
+        Ok(engine(ctx)
+            .workflow_moves(self.workspace_id, self.status_enum())
+            .await?
+            .into_iter()
+            .map(|status| status.as_str().to_string())
+            .collect())
+    }
+
     /// Who still owes a turn in this status. Empty means the status is done with
     /// its team, and the next move (or a person) takes over.
     async fn turn_remaining(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<String>> {

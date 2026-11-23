@@ -452,11 +452,14 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         None => None,
     };
 
-    let blocked_answer = if let (Some(pinned), true) =
-        (issue.pinned_comment_id, issue.status == "blocked")
-    {
+    // A question stays pinned until a run carries it. The status a task returns to
+    // after an answer is the one it left, so the pin — not the status — is what
+    // says this turn has a question and an answer to read.
+    let blocked_answer = if let Some(pinned) = issue.pinned_comment_id {
+        // The id is bound as a uuid, not as its text: sqlite stores these as blobs,
+        // so a string never matches and the question reads as missing.
         let question: Option<(String,)> = sqlx::query_as("select body from comments where id = ?")
-            .bind(pinned.to_string())
+            .bind(pinned)
             .fetch_optional(&engine.db.pool)
             .await?;
         let answer: Option<(String,)> = sqlx::query_as(
@@ -474,6 +477,16 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     } else {
         None
     };
+
+    // The pair is handed over once. A run that re-reads its spec after a runner
+    // restart is rebuilt without it, which is the price of keeping the question in
+    // the comments a person reads rather than on the run row.
+    if blocked_answer.is_some() {
+        sqlx::query("update issues set pinned_comment_id = null where id = ?")
+            .bind(issue.id)
+            .execute(&engine.db.pool)
+            .await?;
+    }
 
     // Committing is the app's act, so the run gets the app's token. An agent that
     // cannot log in produces nothing, so the adapter's own credential always

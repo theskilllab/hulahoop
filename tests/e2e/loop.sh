@@ -165,6 +165,33 @@ DOC
   echo "workflow: $(gql 'mutation ($w: UUID!, $s: String!) { setWorkflow(workspaceId: $w, source: $s) { errors } }' \
     "$(jq -cn --arg w "$workspace" --arg s "$doc" '{w:$w,s:$s}')" | jq -c '.data.setWorkflow // .errors')"
 
+  # A question is the workflow's other exit: the agent asks, the task lands in
+  # Blocked the way the document's `Next: Blocked` line says, and the answer puts
+  # it back where it was with the pair in the next turn's input. The fake agent
+  # asks only when that input carries no answer, so a lost answer shows up as a
+  # second question rather than as a passing test.
+  local asked question
+  asked="$(gql 'mutation ($w: UUID!, $p: UUID!, $r: UUID!) { createIssue(workspaceId: $w, projectId: $p, repoId: $r, title: "ask me: does subtract saturate?", body: "a question for a person", criteria: ["the person decides"]) { id } }' \
+    "{\"w\":\"$workspace\",\"p\":\"$project\",\"r\":\"$repo\"}" | jq -r '.data.createIssue.id')"
+  echo "question issue $asked created"
+  echo "planned: $(gql 'mutation ($id: UUID!) { planIssue(issueId: $id, planned: true) { status } }' "{\"id\":\"$asked\"}" | jq -c '.data.planIssue.status')"
+  wait_status "$asked" "blocked" 240
+  moves="$(gql 'query ($id: UUID!) { issue(id: $id) { moves } }' "{\"id\":\"$asked\"}" | jq -c '.data.issue.moves')"
+  case "$moves" in
+    *in_progress*) echo "blocked exits: $moves" ;;
+    *) echo "the document names no exit from blocked: '$moves'" >&2; return 1 ;;
+  esac
+  question="$(gql 'query ($id: UUID!) { issue(id: $id) { comments { body pinned } } }' "{\"id\":\"$asked\"}" \
+    | jq -r '[.data.issue.comments[] | select(.pinned) | .body] | last // ""')"
+  case "$question" in
+    *saturate*) echo "question: $question" ;;
+    *) echo "the pinned comment is not the question: '$question'" >&2; return 1 ;;
+  esac
+  echo "answered: $(gql 'mutation ($id: UUID!, $a: String!) { resumeIssue(issueId: $id, answer: $a) { status } }' \
+    "{\"id\":\"$asked\",\"a\":\"no, it may go negative\"}" | jq -c '.data.resumeIssue.status')"
+  wait_status "$asked" "in_review" 240
+  echo "after the answer: $(gql 'query ($id: UUID!) { issue(id: $id) { status runs { status } } }' "{\"id\":\"$asked\"}" | jq -c '.data.issue')"
+
   local issue
   issue="$(gql 'mutation ($w: UUID!, $p: UUID!, $r: UUID!) { createIssue(workspaceId: $w, projectId: $p, repoId: $r, title: "subtract two numbers", body: "add subtract", criteria: ["subtract(5, 3) returns 2"]) { id status } }' \
     "{\"w\":\"$workspace\",\"p\":\"$project\",\"r\":\"$repo\"}" | jq -r '.data.createIssue.id')"

@@ -12,6 +12,15 @@ echo "{\"type\":\"message_start\",\"role\":\"${AGENT}\"}"
 # agent's name because that is what the server hands it; there is no role to read.
 case "$AGENT" in
   ada)
+    # A question is a turn that ends with `HULAHOOP_QUESTION:` and nothing else.
+    # The answer arrives as `blocked_answer` in the input of the turn that resumes
+    # the work, so asking again after it is how the test learns the answer was lost.
+    if jq -e '.issue.title | test("^ask me")' "$HULAHOOP_INPUT" >/dev/null 2>&1 &&
+      jq -e '.blocked_answer == null' "$HULAHOOP_INPUT" >/dev/null 2>&1; then
+      echo '{"type":"message","text":"This one needs a person."}'
+      echo 'HULAHOOP_QUESTION: shall subtract saturate at zero instead of going negative?'
+      exit 0
+    fi
     # One commit does the whole job: the implementation and the test that proves
     # it. An agent owns both now, so there is no separate authoring stage.
     cat > tests/test_subtract.py <<'PY'

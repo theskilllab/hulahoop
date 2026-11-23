@@ -479,7 +479,7 @@ The server owns every transition. A mutation or a run completion event fires it;
 | `in_review` | `approveIssue(runId, reviewedHead, diffSha, acknowledgeFlags)` | `runId` is `current_run_id`, that run has an `approved` review, head and diff match it, every flag acknowledged | `merging` |
 | `merging` | landing replay turns red or times out | failing test names in the replay report, the approval is voided | `in_progress` |
 | `merging` | `recordMerge(mergeRevision)` | a green landing replay for this approval exists, `ancestry_ok` is true | `done` |
-| `blocked` | `resumeIssue(issueId, answer)` | writes the answer comment, clears `pinned_comment_id`, `status_before_blocked` is one of `tests_in_progress`, `tests_ready`, `in_progress`, `in_review`, `merging` | `status_before_blocked` |
+| `blocked` | `resumeIssue(issueId, answer)` | writes the answer comment, puts the task back in `status_before_blocked` with a fresh round of turns, and starts the agent that status names; `pinned_comment_id` retires when the run carrying the question and the answer is built, `status_before_blocked` is one of `tests_in_progress`, `tests_ready`, `in_progress`, `in_review`, `merging` | `status_before_blocked` |
 | `tests_in_progress`, `tests_ready`, `in_progress`, `in_review`, `merging` | agent ends its run with a question | comment recorded and pinned | `blocked` |
 | `tests_in_progress`, `tests_ready`, `in_progress`, `in_review`, `merging` | `cancelRun(runId)` | process group killed; the issue keeps its status and loses its active run | unchanged |
 | any state except `done` and `cancelled` | `abandonIssue(reason)` | human | `cancelled` |
@@ -834,9 +834,13 @@ type Mutation {
   recordMerge(issueId: ID!, mergeRevision: String!): Issue!
                         closes the issue once the landing replay is green
   resumeIssue(issueId: ID!, answer: String!): Issue!
-                        writes the answer as a comment, clears pinned_comment_id,
-                        returns the issue to status_before_blocked
+                        writes the answer as a comment, returns the issue to
+                        status_before_blocked, and starts the turn it names
   clearRunCap(issueId: ID!): Issue!     human override after 12 runs
+  moveIssue(issueId: ID!, status: String!): Issue!
+                        a person's move, allowed only where the current status's
+                        `Next:` lines say the task may go; `Issue.moves` lists
+                        them, which is what the drawer's Move panel shows
   requestChanges(issueId: ID!, body: String!): Issue!
   addComment(issueId: ID!, body: String!): Comment!
 }

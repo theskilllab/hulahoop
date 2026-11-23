@@ -227,6 +227,33 @@ export default function IssueDetail({ milestones, issue, onBack, onChanged }: Pr
         </div>
       )}
 
+      {issue.status === "blocked" && (
+        <div className="panel">
+          <h3>Move</h3>
+          <p className="hint">
+            The workflow document names these exits. A move is a person's decision:
+            nothing starts on its own while the task waits.
+          </p>
+          <div className="actions">
+            {(issue.moves ?? []).map((move) => (
+              <button
+                key={move}
+                disabled={busy !== null}
+                onClick={() =>
+                  void mutate(
+                    `move-${move}`,
+                    `mutation ($id: UUID!, $status: String!) { moveIssue(issueId: $id, status: $status) { id status } }`,
+                    { id: issue.id, status: move },
+                  )
+                }
+              >
+                Move to {move.replace(/_/g, " ")}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
       {issue.body ? (
         <div className="section">
           <h3>Description</h3>

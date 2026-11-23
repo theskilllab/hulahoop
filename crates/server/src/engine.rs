@@ -174,6 +174,45 @@ impl Engine {
     /// The queue holds names because that is what the document says; service is
     /// recorded by id, because an agent's display name can be anything while the
     /// row that ran is unambiguous.
+    /// A move a person makes, held to the document: only a status the current one
+    /// declares is a move, so a stopped task has the exits its workflow names and
+    /// nothing else.
+    pub async fn move_declared(&self, issue_id: Uuid, target: IssueStatus) -> Result<Issue> {
+        let issue = self.issue(issue_id).await?;
+        let moves = self
+            .workflow_moves(issue.workspace_id, issue.status_enum())
+            .await?;
+        if !moves.contains(&target) {
+            let allowed = match moves.as_slice() {
+                [] => "nothing".to_string(),
+                moves => moves
+                    .iter()
+                    .map(|status| status.title())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            };
+            bail!(
+                "the document does not move `{}` to {}. It names {}.",
+                issue.status_enum().title(),
+                target.title(),
+                allowed
+            );
+        }
+        self.move_to(issue_id, target).await
+    }
+
+    /// The newest head the issue published, whoever published it: the work a
+    /// review judged stays the base of the turns that follow it.
+    async fn newest_head(&self, issue_id: Uuid) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar::<_, String>(
+            "select head_bookmark from runs where issue_id = ? and head_bookmark is not null \
+             order by created_at desc limit 1",
+        )
+        .bind(issue_id)
+        .fetch_optional(&self.db.pool)
+        .await?)
+    }
+
     /// The run under review: the one a status handed over when there is one,
     /// otherwise the newest finished run that published a head. A second turn in
     /// a status reads the work of the turn before it, which is the point of a team
@@ -1176,10 +1215,16 @@ impl Engine {
                     .fetch_optional(&self.db.pool)
                     .await?
                     .ok_or_else(|| anyhow!("parent run {parent_id} not found"))?;
-                parent
-                    .head_bookmark
-                    .clone()
-                    .unwrap_or(repo.base_bookmark.clone())
+                match parent.head_bookmark.clone() {
+                    Some(head) => head,
+                    // A review publishes nothing, and neither does a turn that only
+                    // asked. The work still sits on the newest head the issue has, so
+                    // a later turn starts there instead of on the repository's base.
+                    None => self
+                        .newest_head(issue_id)
+                        .await?
+                        .unwrap_or_else(|| repo.base_bookmark.clone()),
+                }
             }
             None => repo.base_bookmark.clone(),
         };
@@ -1310,10 +1355,9 @@ impl Engine {
             false,
         )
         .await?;
-        sqlx::query("update issues set pinned_comment_id = null where id = ?")
-            .bind(issue_id)
-            .execute(&self.db.pool)
-            .await?;
+        // The question stays pinned until a turn carries it: the pin is what puts
+        // the pair in the next run's input, so it retires with the run that reads
+        // it (`build_run_spec`), not with the answer that is only half of it.
         let restored = hulahoop_core::resume_to(
             issue
                 .status_before_blocked
@@ -1327,6 +1371,22 @@ impl Engine {
             .bind(issue_id)
             .execute(&self.db.pool)
             .await?;
+        // An answer is a person's act, the same as a move: the status the task
+        // returns to brings its own round of turns, so the queue belongs to that
+        // status again and the question reaches the agent that started it.
+        let _ = self.reset_turns(issue_id, restored).await;
+        let issue = self.issue(issue_id).await?;
+        if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
+            let _ = self
+                .comment(
+                    issue_id,
+                    hulahoop_core::AuthorType::Server,
+                    None,
+                    &format!("the answered turn could not start: {error}"),
+                    false,
+                )
+                .await;
+        }
         self.issue(issue_id).await
     }
 

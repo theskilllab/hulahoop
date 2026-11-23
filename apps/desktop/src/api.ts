@@ -119,6 +119,8 @@ export interface Issue {
   projectName: string | null;
   /** Who still owes a turn in the current status, in the workflow's order. */
   turnRemaining?: string[];
+  /** Where the workflow document says this status may go. */
+  moves?: IssueStatus[];
   turnsUsed?: number;
   criteria: Criterion[];
   runs: Run[];
@@ -427,7 +429,7 @@ export const ISSUE_FIELDS = `
   runs { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments { id author authorType body pinned createdAt }
-  turnRemaining turnsUsed
+  turnRemaining turnsUsed moves
   currentRun { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
 `;
 
