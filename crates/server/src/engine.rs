@@ -1052,22 +1052,22 @@ impl Engine {
         // The workflow decides who works a status. When it names an agent, that
         // agent runs — the role bindings are only the fallback for `Any agent`,
         // which is the case below where nobody was named.
-        let agent_id = match agent_id {
-            Some(id) => id,
-            // Nobody named: the workflow's queue says whose turn it is next, and
-            // only when no agent answers to those names does the project's binding
-            // stand in.
-            None => match self.next_turn_agent(&issue).await? {
-                Some(name) => self
-                    .agent_for_name(issue.workspace_id, Some(&name))
-                    .await?
-                    .ok_or_else(|| anyhow!("the workflow names {name}, which no agent answers to"))?,
-                None => self.bound_agent(project_id).await?.ok_or_else(|| {
-                    anyhow!(
-                        "the workflow names no agent for this status, and no agent is bound to this project. Assign one on the project screen before starting a run."
-                    )
-                })?,
-            },
+        let named = self.next_turn_agent(&issue).await?;
+        let by_name = self
+            .agent_for_name(issue.workspace_id, named.as_deref())
+            .await?;
+        let agent_id = match (agent_id, by_name) {
+            (Some(id), _) => id,
+            (None, Some(id)) => id,
+            // A name nobody answers to is a document that has outlived the
+            // roster, so the project's binding takes the turn instead of the
+            // task sitting in a status no agent can serve.
+            (None, None) => self.bound_agent(project_id).await?.ok_or_else(|| {
+                anyhow!(
+                    "the workflow names {} for this status, and no agent is bound to this project. Assign one on the project screen, or name an agent this workspace has.",
+                    named.as_deref().unwrap_or("nobody")
+                )
+            })?,
         };
 
         // A probe is the only evidence about the CLI, so a run without one would
@@ -1536,10 +1536,14 @@ impl Engine {
         // carries a verdict judged the work before it; anything else is work, and
         // its commit becomes the head the next turn starts from and the pull
         // request carries. Who the agent is decides none of this.
+        //
+        // A verdict is only a review when there is something behind the turn to
+        // judge: the first turn of a status has no work before it, so its closing
+        // line is a statement about its own work, and the task moves on.
         let judged = matches!(
             payload.verdict.as_deref(),
             Some("approved") | Some("changes_requested")
-        );
+        ) && self.run_under_review(&issue).await.is_ok();
         if judged {
             if final_status == RunStatus::Succeeded {
                 let verdict = self.record_review(&issue, &run, &payload).await?;

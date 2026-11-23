@@ -530,6 +530,55 @@ impl Engine {
 }
 
 impl Engine {
+    /// Closes a task whose project has no pull request to read a merge from.
+    ///
+    /// A repository with no GitHub remote still has a loop in it: the head the
+    /// review looked at is what the work became, so it becomes the base and the
+    /// merge is recorded against the run's own revision.
+    async fn merge_without_pull_request(
+        &self,
+        issue: &crate::model::Issue,
+    ) -> anyhow::Result<crate::model::Issue> {
+        let head: Option<(Option<String>,)> = sqlx::query_as(
+            "select head_revision from runs where issue_id = ? and head_revision is not null \
+             order by created_at desc limit 1",
+        )
+        .bind(issue.id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        let revision = head.and_then(|(revision,)| revision).ok_or_else(|| {
+            anyhow::anyhow!("nothing was published on this task, so there is nothing to merge yet")
+        })?;
+
+        sqlx::query(
+            "update issues set merge_revision = ?, merged_at = ?, updated_at = ? where id = ?",
+        )
+        .bind(&revision)
+        .bind(crate::db::now_rfc3339())
+        .bind(crate::db::now_rfc3339())
+        .bind(issue.id)
+        .execute(&self.db.pool)
+        .await?;
+        sqlx::query("update repos set base_revision = ? where id = ?")
+            .bind(&revision)
+            .bind(issue.repo_id)
+            .execute(&self.db.pool)
+            .await?;
+        self.comment(
+            issue.id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            &format!(
+                "Merged as {}. There is no pull request on this project, so the head the review looked at became the base.",
+                &revision[..12.min(revision.len())]
+            ),
+            false,
+        )
+        .await?;
+        self.transition(issue.id, hulahoop_core::IssueEvent::Merge)
+            .await
+    }
+
     /// Records a merge as GitHub describes it.
     ///
     /// The revision a merge produced only exists on GitHub's side, so it is read
@@ -537,9 +586,12 @@ impl Engine {
     /// the kind of fact that is right once and stale afterwards.
     pub async fn merge_issue(&self, issue_id: uuid::Uuid) -> anyhow::Result<crate::model::Issue> {
         let issue = self.issue(issue_id).await?;
-        let number = issue.pr_number.ok_or_else(|| {
-            anyhow::anyhow!("this issue has no pull request, so there is nothing to merge yet")
-        })?;
+        let Some(number) = issue.pr_number else {
+            // No pull request: either the project has no GitHub remote at all, or
+            // the handover never opened one. Both mean there is no GitHub side to
+            // read, and the run's own head is the merge.
+            return self.merge_without_pull_request(&issue).await;
+        };
         let repo: crate::model::Repo = sqlx::query_as("select * from repos where id = ?")
             .bind(issue.repo_id)
             .fetch_one(&self.db.pool)
