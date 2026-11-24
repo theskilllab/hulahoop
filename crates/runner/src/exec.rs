@@ -2744,9 +2744,12 @@ mod checkout_tests {
     use std::process::Command;
 
     fn sh(cwd: &Path, program: &str, args: &[&str]) -> String {
+        // CI machines have no jj identity, and jj will not push a commit without one.
         let output = Command::new(program)
             .args(args)
             .current_dir(cwd)
+            .env("JJ_USER", "t")
+            .env("JJ_EMAIL", "t@example.test")
             .output()
             .unwrap();
         assert!(

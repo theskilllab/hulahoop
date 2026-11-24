@@ -201,9 +201,11 @@ pub fn is_owned_checkout(data_dir: &Path, path: &Path) -> bool {
     let canonical = data_dir
         .canonicalize()
         .unwrap_or_else(|_| data_dir.to_path_buf());
+    let resolved = resolve_existing(path);
     let Some(rest) = path
         .strip_prefix(data_dir)
         .or_else(|_| path.strip_prefix(&canonical))
+        .or_else(|_| resolved.strip_prefix(&canonical))
         .ok()
     else {
         return false;
@@ -232,6 +234,24 @@ pub fn is_owned_checkout(data_dir: &Path, path: &Path) -> bool {
         }
     }
     true
+}
+
+/// The path with only its data-directory part canonicalized: the directory three
+/// levels up (where `checkouts/<project>/<issue>` hangs), so the same directory
+/// reached by two spellings (macOS `/var` and `/private/var`) compares equal.
+/// The three parts below are left as written, so a symlink among them is still
+/// seen and refused.
+fn resolve_existing(path: &Path) -> PathBuf {
+    let Some(top) = path.ancestors().nth(3) else {
+        return path.to_path_buf();
+    };
+    let Ok(below) = path.strip_prefix(top) else {
+        return path.to_path_buf();
+    };
+    match top.canonicalize() {
+        Ok(top) => top.join(below),
+        Err(_) => path.to_path_buf(),
+    }
 }
 
 pub fn run_artifact_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
