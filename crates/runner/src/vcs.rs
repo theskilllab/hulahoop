@@ -268,24 +268,6 @@ impl Vcs {
             .collect())
     }
 
-    /// The paths one revision changed relative to another. Two revisions rather
-    /// than a checkout, because a base replay asks about the candidate suite, not
-    /// about whatever the user happens to have open.
-    pub fn restore_from(&self, checkout: &Path, from: &str, paths: &[String]) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-        let resolved = self.resolve(from)?;
-        let mut args: Vec<String> = vec!["restore".into(), "--from".into(), resolved];
-        if !paths.is_empty() {
-            args.push("--".into());
-            args.extend(paths.iter().cloned());
-        }
-        let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
-        self.run(checkout, "jj", &args_ref)?;
-        Ok(())
-    }
-
     /// Move a revision **and its descendants** onto `dest`.
     ///
     /// Rebasing a bookmark that sits on the last commit of a chain moves only that

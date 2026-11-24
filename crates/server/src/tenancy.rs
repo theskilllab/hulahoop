@@ -454,6 +454,16 @@ impl Engine {
         Ok(rows)
     }
 
+    /// The files attached to one task, oldest first, the order they were added.
+    pub async fn issue_files(&self, issue_id: Uuid) -> Result<Vec<Artifact>> {
+        Ok(sqlx::query_as::<_, Artifact>(
+            "select * from artifacts where issue_id = ? order by created_at, id",
+        )
+        .bind(issue_id)
+        .fetch_all(&self.db.pool)
+        .await?)
+    }
+
     /// Store bytes on disk and a row in the database. The row is the index; the
     /// file is the thing, kept under `artifacts/<id>/<filename>` so a delete is one
     /// directory and two artifacts can share a filename without ever colliding.
@@ -463,12 +473,21 @@ impl Engine {
         workspace_id: Uuid,
         project_id: Option<Uuid>,
         milestone_id: Option<Uuid>,
+        issue_id: Option<Uuid>,
         title: String,
         kind: Option<String>,
         filename: String,
         mime: Option<String>,
         bytes: &[u8],
     ) -> Result<Artifact> {
+        // A file can only be attached to a task of the same workspace; anything
+        // else would leak the file into somebody else's run input.
+        if let Some(issue_id) = issue_id {
+            let issue = self.issue(issue_id).await?;
+            if issue.workspace_id != workspace_id {
+                return Err(anyhow!("task {issue_id} belongs to another workspace"));
+            }
+        }
         let title = if title.trim().is_empty() {
             filename.clone()
         } else {
@@ -498,13 +517,14 @@ impl Engine {
             _ => "file".into(),
         });
         sqlx::query(
-            "insert into artifacts (id, workspace_id, project_id, milestone_id, title, kind, filename, mime, size, sha256, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into artifacts (id, workspace_id, project_id, milestone_id, issue_id, title, kind, filename, mime, size, sha256, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
         .bind(project_id)
         .bind(milestone_id)
+        .bind(issue_id)
         .bind(&title)
         .bind(&kind)
         .bind(&filename)
@@ -530,6 +550,31 @@ impl Engine {
 }
 
 impl Engine {
+    /// Closes a task that has no repository. There is no code to merge and no
+    /// base to move, so the merge is only the transition; `merged_at` still
+    /// dates the finish so cost reporting attributes the task's effort.
+    async fn close_without_repository(
+        &self,
+        issue: &crate::model::Issue,
+    ) -> anyhow::Result<crate::model::Issue> {
+        sqlx::query("update issues set merged_at = ?, updated_at = ? where id = ?")
+            .bind(crate::db::now_rfc3339())
+            .bind(crate::db::now_rfc3339())
+            .bind(issue.id)
+            .execute(&self.db.pool)
+            .await?;
+        self.comment(
+            issue.id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            "Closed. This task has no repository, so there is nothing to merge.",
+            false,
+        )
+        .await?;
+        self.transition(issue.id, hulahoop_core::IssueEvent::Merge)
+            .await
+    }
+
     /// Closes a task whose project has no pull request to read a merge from.
     ///
     /// A repository with no GitHub remote still has a loop in it: the head the
@@ -586,6 +631,9 @@ impl Engine {
     /// the kind of fact that is right once and stale afterwards.
     pub async fn merge_issue(&self, issue_id: uuid::Uuid) -> anyhow::Result<crate::model::Issue> {
         let issue = self.issue(issue_id).await?;
+        let Some(repo_id) = issue.repo_id else {
+            return self.close_without_repository(&issue).await;
+        };
         let Some(number) = issue.pr_number else {
             // No pull request: either the project has no GitHub remote at all, or
             // the handover never opened one. Both mean there is no GitHub side to
@@ -593,7 +641,7 @@ impl Engine {
             return self.merge_without_pull_request(&issue).await;
         };
         let repo: crate::model::Repo = sqlx::query_as("select * from repos where id = ?")
-            .bind(issue.repo_id)
+            .bind(repo_id)
             .fetch_one(&self.db.pool)
             .await?;
         let remote = crate::api::clone_url(&repo).ok_or_else(|| {

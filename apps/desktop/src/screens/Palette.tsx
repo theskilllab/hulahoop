@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import type { Agent, Issue } from "../api";
+import type { Agent, IssueSummary as Issue } from "../api";
 import Icon from "../Icon";
 
 export interface PaletteTarget {
@@ -58,14 +58,16 @@ export default function Palette({
       label: entry.label,
       hint: entry.hint,
     }));
-    const tasks = issues
-      .filter((issue) => !["done", "cancelled"].includes(issue.status))
+    // Done and cancelled tasks are findable too, after the open ones.
+    const finished = (issue: Issue) => issue.status === "done" || issue.status === "cancelled";
+    const tasks = [...issues.filter((issue) => !finished(issue)), ...issues.filter(finished)]
       .map((issue) => ({
         kind: "issue" as const,
         id: issue.id,
         label: `${issue.key} · ${issue.title}`,
-        hint: issue.status.replace("_", " "),
+        hint: issue.status.replace(/_/g, " "),
       }));
+    const finishedIds = new Set(issues.filter(finished).map((issue) => issue.id));
     const people = agents.map((agent) => ({
       kind: "agent" as const,
       id: agent.id,
@@ -73,7 +75,7 @@ export default function Palette({
       hint: `${agent.adapter} · ${agent.model || "default model"}`,
     }));
     const all = [...views, ...tasks, ...people];
-    if (!needle) return all.slice(0, 24);
+    if (!needle) return [...views, ...tasks.filter((entry) => !finishedIds.has(entry.id)), ...people].slice(0, 24);
     return all
       .filter((entry) => `${entry.label} ${entry.hint}`.toLowerCase().includes(needle))
       .slice(0, 24);

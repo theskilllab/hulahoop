@@ -86,6 +86,21 @@ pub fn invocation(
 /// The message the agent receives. Everything it must know is in `input.json`
 /// and in the instructions it was started with, so the message only says where to
 /// look and how to end the turn.
+/// The opening message for a run on a task with no repository: the directory is
+/// scratch space, and the result is the closing message.
+pub fn scratch_message_for(agent_name: &str, input_path: &Path, scratch: &Path) -> String {
+    let who = if agent_name.trim().is_empty() {
+        "one task"
+    } else {
+        agent_name.trim()
+    };
+    format!(
+        "You are {who} for one task.\n\nRead {} first; it carries the task, its files, the latest comments, the parent turn, and the limits.\nThis task has no repository. Work in the empty scratch directory at {}; it is deleted when the turn ends, so put your result in your final message.\n\nWhen you are done, end your final message with the line your instructions ask for.",
+        input_path.display(),
+        scratch.display(),
+    )
+}
+
 pub fn message_for(agent_name: &str, input_path: &Path, checkout: &Path) -> String {
     let who = if agent_name.trim().is_empty() {
         "one task"
@@ -93,7 +108,7 @@ pub fn message_for(agent_name: &str, input_path: &Path, checkout: &Path) -> Stri
         agent_name.trim()
     };
     format!(
-        "You are {who} for one task.\n\nRead {} first; it carries the task, the criteria, the parent turn, and the limits.\nWork in the checkout at {}.\n\nWhen you are done, end your final message with the line your instructions ask for.",
+        "You are {who} for one task.\n\nRead {} first; it carries the task, its files, the latest comments, the parent turn, and the limits.\nWork in the checkout at {}.\n\nWhen you are done, end your final message with the line your instructions ask for.",
         input_path.display(),
         checkout.display(),
     )

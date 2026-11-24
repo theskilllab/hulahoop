@@ -16,7 +16,7 @@ if [ -z "${HULAHOOP_AGENT:-}" ]; then
   done
   case "$message" in
     *follow-up*)
-      echo 'LUMI {"reply":"One thing is missing: nothing says what subtract does below zero.","proposal":{"title":"File the follow-up","items":[{"group":"Tasks","text":"Create a task to decide what subtract does below zero","action":"create_issue","args":{"title":"decide what subtract does below zero","project":"Bali","criteria":["subtract(3, 5) has a decided answer"]}}]}}'
+      echo 'LUMI {"reply":"One thing is missing: nothing says what subtract does below zero.","proposal":{"title":"File the follow-up","items":[{"group":"Tasks","text":"Create a task to decide what subtract does below zero","action":"create_issue","args":{"title":"decide what subtract does below zero","project":"Bali","body":"subtract(3, 5) has a decided answer"}}]}}'
       ;;
     *)
       echo 'LUMI {"reply":"The board looks healthy."}'

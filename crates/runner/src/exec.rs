@@ -64,11 +64,16 @@ impl Executor {
         let spec = &envelope["spec"];
         let run_id = run["id"].as_str().context("run has no id")?.to_string();
         let result = self.execute_run(&run_id, spec).await;
-        // A local checkout is a copy of the repository, and a copy per run
-        // compounds: one project, ten issues, four attempts, three roles. It is
-        // deleted the moment the run is over; the artifacts it produced live
-        // under runs/<id>/ and are what anyone reads afterwards.
-        if spec["runner_mode"].as_str() == Some("local") {
+        // A repo-less run's scratch directory is private to the run and goes the
+        // moment it is over, whatever the outcome; its artifacts stay under
+        // runs/<id>/ like any other run's.
+        if is_repo_less(spec) {
+            remove_scratch(&self.data_dir, &run_id);
+        } else if spec["runner_mode"].as_str() == Some("local") {
+            // A local checkout is a copy of the repository, and a copy per run
+            // compounds: one project, ten issues, four attempts, three roles. It is
+            // deleted the moment the run is over; the artifacts it produced live
+            // under runs/<id>/ and are what anyone reads afterwards.
             let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
             let mirror = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default());
             // The directory goes, the registration goes with it: the mirror is long
@@ -94,7 +99,76 @@ impl Executor {
         result.map(|_| ())
     }
 
+    /// A run on a task with no repository: an empty scratch directory, the
+    /// agent, and its closing message. No repository, lock, clone, workspace,
+    /// setup, checks, diff, commit or push — there is nothing to change but the
+    /// answer.
+    async fn execute_scratch_run(&self, run_id: &str, spec: &Value) -> Result<()> {
+        let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
+            .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
+        let scratch = prepare_scratch(&self.data_dir, run_id)?;
+        let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
+        std::fs::create_dir_all(&artifact_dir)?;
+        let model = spec["model"].as_str().unwrap_or_default().to_string();
+        let system_prompt = spec["prompt"].as_str().unwrap_or_default().to_string();
+        let input_path = PathBuf::from(spec["input_path"].as_str().unwrap_or_default());
+        let wall_clock = spec["timeout_minutes"]
+            .as_i64()
+            .unwrap_or(hulahoop_core::AGENT_WALL_CLOCK_MINUTES);
+
+        self.client
+            .event(
+                run_id,
+                "checkout",
+                json!({ "path": scratch, "scratch": true }),
+            )
+            .await
+            .ok();
+
+        let env = agent_env(spec, &scratch, &self.data_dir)?;
+        self.write_skills(spec, &scratch)?;
+        let agent_name = spec["agent_name"].as_str().unwrap_or_default();
+        let message = adapter::scratch_message_for(agent_name, &input_path, &scratch);
+        let invocation = adapter::invocation(adapter, &model, &system_prompt, &message)?;
+        let outcome = self
+            .spawn_and_stream(
+                run_id,
+                &scratch,
+                &artifact_dir,
+                &invocation,
+                &system_prompt,
+                &message,
+                &env,
+                wall_clock,
+            )
+            .await?;
+
+        let artifact_limit_hit = dir_size(&artifact_dir) > hulahoop_core::ARTIFACT_LIMIT_BYTES;
+        self.client
+            .complete_run(
+                run_id,
+                json!({
+                    "status": run_status(&outcome),
+                    "exit_code": outcome.exit_code,
+                    "error": outcome.error,
+                    "diff": "",
+                    "changed_paths": Vec::<String>::new(),
+                    "commit": Value::Null,
+                    "question": outcome.question,
+                    "verdict": outcome.verdict,
+                    "body": outcome.final_text,
+                    "artifact_limit_hit": artifact_limit_hit,
+                    "transcript": transcript_tail(&outcome),
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn execute_run(&self, run_id: &str, spec: &Value) -> Result<()> {
+        if is_repo_less(spec) {
+            return self.execute_scratch_run(run_id, spec).await;
+        }
         let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
         let repo_path = host_repository(spec)?;
@@ -176,34 +250,6 @@ impl Executor {
             )
             .await?;
 
-        // Frozen means frozen: a formatter run over the whole workspace rewrites the
-        // suite the implementer is not allowed to touch, and that should not throw
-        // away an hour of real work. Restoring first also means a deliberate edit to
-        // a test has no effect, which is the rule the gate is protecting.
-        let frozen: Vec<String> = spec["frozen_paths"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let mut restored = Vec::new();
-        let before = vcs.changed_paths(&checkout, &base).unwrap_or_default();
-        for path in &frozen {
-            if before.contains(path) {
-                vcs.restore_from(&checkout, &base, std::slice::from_ref(path))?;
-                restored.push(path.clone());
-            }
-        }
-        if !restored.is_empty() {
-            self.client
-                .event(run_id, "frozen_restored", json!({ "paths": restored }))
-                .await
-                .ok();
-        }
-
         // The team is named in the workflow, so the commit carries the agent's
         // own name: `Test Author` becomes `hulahoop-dev-test-author`.
         let agent_name = spec["commit_agent_name"].as_str();
@@ -239,25 +285,9 @@ impl Executor {
             )
             .with_context(|| "describing the commit")?;
         }
-        // The suite the gate freezes has to be formatted, or every head built on it
-        // fails `fmt-check` in CI and no agent may touch the frozen file to fix it.
-        // The loop formats what it is about to freeze.
-        {
-            let frozen: Vec<String> = spec["frozen_paths"]
-                .as_array()
-                .map(|paths| {
-                    paths
-                        .iter()
-                        .filter_map(|path| path.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let tests_bookmark = spec["tests_bookmark"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string();
-            self.format_tree(&checkout, &artifact_dir, &frozen, &tests_bookmark);
-        }
+        // A head that fails `fmt-check` in CI is a head nobody can merge, so the
+        // loop formats the tree before it records the diff.
+        self.format_tree(&checkout, &artifact_dir);
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
@@ -277,13 +307,7 @@ impl Executor {
         // already visible to the replay that has to prove the work; nothing to push.
         let _ = &published;
 
-        let status = if outcome.timed_out {
-            "timed_out"
-        } else if outcome.exit_code == Some(0) && outcome.error.is_none() {
-            "succeeded"
-        } else {
-            "failed"
-        };
+        let status = run_status(&outcome);
 
         let artifact_limit_hit = dir_size(&artifact_dir) > hulahoop_core::ARTIFACT_LIMIT_BYTES;
 
@@ -303,15 +327,7 @@ impl Executor {
                     "artifact_limit_hit": artifact_limit_hit,
                     "commit_name": commit_name,
                     "commit_email": commit_email,
-                    "transcript": outcome
-                        .lines
-                        .iter()
-                        .rev()
-                        .take(40)
-                        .rev()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n"),
+                    "transcript": transcript_tail(&outcome),
                 }),
             )
             .await?;
@@ -655,25 +671,23 @@ impl Executor {
             existing.is_some(),
         )?;
 
-        let criteria = pull["criteria"]
-            .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| item.as_str())
-                    .enumerate()
-                    .map(|(index, text)| format!("{}. {text}", index + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-            .unwrap_or_default();
-        let review = pull["review"].as_str().unwrap_or("");
-        let body = format!(
-            "{}\n\n---\n\n**Acceptance criteria**\n\n{}\n\n**The suite was red before the change and green after it.**\n\n**Reviewer verdict**\n\n{}\n\n_Opened by Hulahoop. The loop wrote the tests first, froze them, then implemented against them._\n",
-            pull["body"].as_str().unwrap_or(""),
-            criteria,
-            review
+        // The description says what was asked; the run's own summary says what
+        // was done, which is what a reader of the pull request wants first.
+        let summary = pull["summary"].as_str().unwrap_or("").trim();
+        let summary = if summary.is_empty() {
+            "The agent left no summary for this change."
+        } else {
+            summary
+        };
+        let review = pull["review"].as_str().unwrap_or("").trim();
+        let mut body = format!(
+            "{}\n\n---\n\n**What changed**\n\n{summary}\n",
+            pull["body"].as_str().unwrap_or("")
         );
+        if !review.is_empty() {
+            body.push_str(&format!("\n**Reviewer verdict**\n\n{review}\n"));
+        }
+        body.push_str("\n_Opened by Hulahoop._\n");
         let title = pull["title"]
             .as_str()
             .map(|title| format!("{title} (hulahoop)"))
@@ -758,13 +772,7 @@ impl Executor {
         Ok(None)
     }
 
-    fn format_tree(
-        &self,
-        checkout: &Path,
-        artifact_dir: &Path,
-        frozen: &[String],
-        tests_bookmark: &str,
-    ) {
+    fn format_tree(&self, checkout: &Path, artifact_dir: &Path) {
         if std::fs::create_dir_all(artifact_dir).is_err() {
             return;
         }
@@ -787,18 +795,6 @@ impl Executor {
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             Some(&log),
         );
-        // A formatter will happily rewrite a frozen test, and the tree has to stay
-        // byte-identical to the suite the gate recorded, so those paths come back
-        // from the suite afterwards.
-        if frozen.is_empty() || tests_bookmark.trim().is_empty() {
-            return;
-        }
-        let mut argv: Vec<&str> = vec!["restore", "--from", tests_bookmark, "--"];
-        argv.extend(frozen.iter().map(String::as_str));
-        let _ = Command::new("jj")
-            .args(&argv)
-            .current_dir(checkout)
-            .output();
     }
 
     /// The recipes a repository declares beyond the suite, run at the same revision
@@ -1026,10 +1022,6 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
         (
             "HULAHOOP_BASE_BOOKMARK".into(),
             spec["base_bookmark"].as_str().unwrap_or("main").into(),
-        ),
-        (
-            "HULAHOOP_TESTS_BOOKMARK".into(),
-            spec["tests_bookmark"].as_str().unwrap_or_default().into(),
         ),
         (
             "HULAHOOP_ARTIFACT_DIR".into(),
@@ -2277,6 +2269,62 @@ async fn open_pull_request(http: &reqwest::Client, pull: PullRequest<'_>) -> Res
 /// They live under `.hulahoop/`, which every repository the loop works in ignores:
 /// a file the agent was given to read is not part of the change it is making, so it
 /// must not show up in the diff, in the commit, or in a review.
+/// What the server reports for a run's end, from how the agent process ended.
+fn run_status(outcome: &Outcome) -> &'static str {
+    if outcome.timed_out {
+        "timed_out"
+    } else if outcome.exit_code == Some(0) && outcome.error.is_none() {
+        "succeeded"
+    } else {
+        "failed"
+    }
+}
+
+/// The last lines of the agent's stream, for the server to diagnose a turn
+/// that said nothing.
+fn transcript_tail(outcome: &Outcome) -> String {
+    outcome
+        .lines
+        .iter()
+        .rev()
+        .take(40)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether the server sent a run for a task with no repository. Such a run has
+/// no checkout to make: the server says so with `checkout: "none"`.
+fn is_repo_less(spec: &Value) -> bool {
+    spec["checkout"].as_str() == Some("none")
+}
+
+/// A fresh, empty working directory for a repo-less run, private to it:
+/// `data_dir/scratch/<run_id>`. Anything left from an earlier attempt with the
+/// same id is cleared first, so the agent always starts from nothing. The run id
+/// must be a uuid, which also keeps it from naming a path outside `scratch/`.
+fn prepare_scratch(data_dir: &Path, run_id: &str) -> Result<PathBuf> {
+    let id =
+        uuid::Uuid::parse_str(run_id).with_context(|| format!("run id {run_id} is not a uuid"))?;
+    let dir = contract::scratch_dir(data_dir, &id);
+    if dir.exists() {
+        std::fs::remove_dir_all(&dir)
+            .with_context(|| format!("clearing a stale scratch directory at {}", dir.display()))?;
+    }
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("creating the scratch directory {}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Deletes a repo-less run's scratch directory. Best effort: a leftover is
+/// cleared by `prepare_scratch` the next time the id is used.
+fn remove_scratch(data_dir: &Path, run_id: &str) {
+    if let Ok(id) = uuid::Uuid::parse_str(run_id) {
+        let _ = std::fs::remove_dir_all(contract::scratch_dir(data_dir, &id));
+    }
+}
+
 fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
     let Some(skills) = spec["skills"].as_array() else {
         return Ok(());
@@ -2444,5 +2492,43 @@ mod remote_tests {
             error.to_string().contains("somewhere else"),
             "unhelpful: {error}"
         );
+    }
+}
+
+#[cfg(test)]
+mod scratch_tests {
+    use super::{is_repo_less, prepare_scratch, remove_scratch, write_skills};
+
+    /// A repo-less run works in its own empty directory under the data dir,
+    /// gets its skills written there like a checkout would, starts clean on a
+    /// retry, and leaves nothing behind once it is removed.
+    #[test]
+    fn a_repo_less_run_gets_a_private_scratch_directory() {
+        let data = std::env::temp_dir().join(format!("hulahoop-scratch-{}", uuid::Uuid::now_v7()));
+        let run_id = uuid::Uuid::now_v7().to_string();
+        let spec = serde_json::json!({
+            "checkout": "none",
+            "repo_path": null,
+            "clone_url": null,
+            "skills": [{ "name": "Report", "description": "how", "body": "# Report" }],
+        });
+        assert!(is_repo_less(&spec));
+        assert!(!is_repo_less(&serde_json::json!({ "checkout": "repo" })));
+        assert!(!is_repo_less(&serde_json::json!({})));
+
+        let dir = prepare_scratch(&data, &run_id).expect("scratch");
+        assert_eq!(dir, data.join("scratch").join(&run_id));
+        assert_eq!(dir.read_dir().unwrap().count(), 0, "starts empty");
+        write_skills(&spec, &dir).expect("skills");
+        assert!(dir.join(".hulahoop/skills/report/SKILL.md").exists());
+        std::fs::write(dir.join("left-over.txt"), "x").unwrap();
+
+        let again = prepare_scratch(&data, &run_id).expect("scratch again");
+        assert_eq!(again.read_dir().unwrap().count(), 0, "a retry starts clean");
+
+        remove_scratch(&data, &run_id);
+        assert!(!again.exists());
+        assert!(prepare_scratch(&data, "../escape").is_err());
+        let _ = std::fs::remove_dir_all(&data);
     }
 }

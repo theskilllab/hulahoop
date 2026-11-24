@@ -9,7 +9,8 @@ import {
   setAgentInstructions,
   setAgentSkills,
   type Agent,
-  type Issue,
+  type IssueSummary,
+  type RecentRun,
   type ConnectorRow,
   type ModelOption,
   type Skill,
@@ -54,6 +55,7 @@ export default function Agents({
   agents,
   skills,
   issues,
+  runs,
   repoId,
   projectId,
   onChanged,
@@ -62,7 +64,9 @@ export default function Agents({
   workspaceId: string;
   agents: Agent[];
   skills: Skill[];
-  issues: Issue[];
+  issues: IssueSummary[];
+  /** Recent runs across the workspace; each records its agent and task. */
+  runs: RecentRun[];
   repoId: string | null;
   projectId: string | null;
   onChanged: () => Promise<void>;
@@ -115,21 +119,18 @@ export default function Agents({
   /** The newest run this agent started. Every run records whose time it was. */
   const current = useMemo(() => {
     if (!agent) return null;
-    const flat = issues.flatMap((issue) => issue.runs.map((run) => ({ issue, run })));
-    const mine = flat
-      .filter((entry) => entry.run.agentId === agent.id)
-      .sort((a, b) => (a.run.startedAt ?? "").localeCompare(b.run.startedAt ?? ""));
-    return mine.at(-1) ?? null;
-  }, [agent, issues]);
+    const mine = runs
+      .filter((run) => run.agentId === agent.id)
+      .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? ""));
+    const run = mine.at(-1);
+    const issue = run ? issues.find((entry) => entry.id === run.issueId) : undefined;
+    return run && issue ? { issue, run } : null;
+  }, [agent, issues, runs]);
 
   const running = current?.run.status === "running";
 
   /** Which harnesses have a live run right now — the roster's status chip reads it. */
-  const runningAgents = new Set(
-    issues.flatMap((issue) =>
-      issue.runs.filter((run) => run.status === "running").map((run) => run.agentId),
-    ),
-  );
+  const runningAgents = new Set(runs.filter((run) => run.status === "running").map((run) => run.agentId));
 
   return (
     <section className="screen agents-screen">

@@ -398,8 +398,8 @@ Work you still want to do yourself. Nothing here is dispatched.
 Users: Implementer
 Next: In progress
 
-Ready for the team. The agent picks a task up from here and writes the tests
-that the acceptance criteria describe.
+Ready for the team. The agent picks a task up from here and reads the
+description, the attached files and the latest comments.
 
 ## In progress
 
@@ -407,7 +407,7 @@ Users: Implementer, Reviewer
 Next: In review - when the pull request is open and the tests pass
 Next: Blocked - when the agent needs a decision it cannot make itself
 
-The agent works against the criteria. The reviewer reads the pull request when
+The agent works from the description. The reviewer reads the pull request when
 it is open, and sends it back when the work is not there yet.
 
 ## Blocked

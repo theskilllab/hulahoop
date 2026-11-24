@@ -10,7 +10,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use hulahoop_core::junit;
 use hulahoop_core::runspec::{
-    CheckoutInput, CriterionInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
+    CheckoutInput, CommentInput, FileInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -425,10 +425,17 @@ async fn unlock_repo(
 /// the database.
 async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let issue = engine.issue(run.issue_id).await?;
-    let repo: Repo = sqlx::query_as("select * from repos where id = ?")
-        .bind(run.repo_id)
-        .fetch_one(&engine.db.pool)
-        .await?;
+    // A run on a task with no repository has no checkout: the runner gives it an
+    // empty scratch directory instead.
+    let repo: Option<Repo> = match run.repo_id {
+        Some(repo_id) => Some(
+            sqlx::query_as("select * from repos where id = ?")
+                .bind(repo_id)
+                .fetch_one(&engine.db.pool)
+                .await?,
+        ),
+        None => None,
+    };
     let mut agent: Agent = sqlx::query_as("select * from agents where id = ?")
         .bind(run.agent_id)
         .fetch_one(&engine.db.pool)
@@ -438,13 +445,18 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     agent.adapter = run.adapter_snapshot.clone().unwrap_or(agent.adapter);
     agent.model = run.model.clone();
     agent.connector = run.connector_id.clone();
-    let criteria = engine.criteria(run.issue_id).await?;
-    let project: Project = sqlx::query_as("select * from projects where id = ?")
-        .bind(issue.project_id)
-        .fetch_one(&engine.db.pool)
-        .await?;
-
-    let checkout_path = checkout_for(&engine.db.data_dir, &project.id, &issue.id, &run.id);
+    let checkout_path = match &repo {
+        Some(repo) => {
+            // A task attached to a repository before projects were required may
+            // still have none; the repository's own project names the checkout.
+            let project: Project = sqlx::query_as("select * from projects where id = ?")
+                .bind(issue.project_id.unwrap_or(repo.project_id))
+                .fetch_one(&engine.db.pool)
+                .await?;
+            checkout_for(&engine.db.data_dir, &project.id, &issue.id, &run.id)
+        }
+        None => hulahoop_core::contract::scratch_dir(&engine.db.data_dir, &run.id),
+    };
 
     // The parent run carries the review body the next attempt has to answer.
     let parent = match run.parent_run_id {
@@ -607,37 +619,53 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             body: issue.body.clone(),
             priority: issue.priority.clone(),
         },
-        criteria: criteria
-            .iter()
-            .map(|criterion| CriterionInput {
-                position: criterion.position,
-                text: criterion.text.clone(),
-            })
-            .collect(),
-        repo: hulahoop_core::runspec::RepoInput {
+        repo: repo.as_ref().map(|repo| hulahoop_core::runspec::RepoInput {
             name: repo.name.clone(),
             path: repo.path.as_ref().map(std::path::PathBuf::from),
             base_bookmark: repo.base_bookmark.clone(),
-            tests_bookmark: issue.tests_bookmark.clone(),
-        },
+        }),
         checkout: CheckoutInput {
             path: checkout_path.clone(),
             base_bookmark: run.base_bookmark.clone(),
-            frozen_paths: issue.frozen_path_list(),
         },
         parent,
         blocked_answer,
         replays: replay_inputs,
         limits: Limits::default(),
         skills,
+        files: run_files(engine, issue.id).await?,
+        comments: run_comments(engine, issue.id, run.id).await?,
     }
     .truncate_text();
 
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    let prompt = engine.compose_prompt(&agent).await?;
+    let prompt = engine.compose_prompt(&agent, repo.is_some()).await?;
     std::fs::write(&prompt_path, &prompt)?;
+
+    // What the runner reads to find the repository. A repo-less run sends nulls
+    // and `checkout: "none"`, which tells the runner to skip the clone, the
+    // workspace, the checks, the diff and the push.
+    let (repo_path, repo_mirror, repo_clone_token, vcs, repo_id, repo_clone_url) = match &repo {
+        Some(repo) => (
+            json!(host_path(repo, &engine.db.data_dir)),
+            json!(is_mirror(repo)),
+            json!(clone_token(engine, repo).await),
+            json!(repo.vcs),
+            json!(repo.id),
+            json!(clone_url(repo)),
+        ),
+        None => (
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+    };
+    let checkout_mode = if repo.is_some() { "repo" } else { "none" };
 
     Ok(json!({
         "run_id": run.id,
@@ -649,18 +677,17 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "prompt": prompt,
         "prompt_path": prompt_path,
         "input_path": input_path,
-        "repo_path": host_path(&repo, &engine.db.data_dir),
-        "repo_mirror": is_mirror(&repo),
-        "clone_token": clone_token(engine, &repo).await,
-        "vcs": repo.vcs,
-        "repo_id": repo.id,
+        "repo_path": repo_path,
+        "repo_mirror": repo_mirror,
+        "clone_token": repo_clone_token,
+        "vcs": vcs,
+        "repo_id": repo_id,
+        "checkout": checkout_mode,
         "checkout_path": checkout_path,
         "runner_mode": runner_mode(),
-        "clone_url": clone_url(&repo),
+        "clone_url": repo_clone_url,
         "base_bookmark": run.base_bookmark,
         "base_revision": run.base_revision,
-        "tests_bookmark": issue.tests_bookmark,
-        "frozen_paths": issue.frozen_path_list(),
         "github_token": github_token,
         // What this adapter authenticates with: a key in the environment or the
         // credentials file the CLI wrote. Empty when nothing is stored, so the run
@@ -681,6 +708,65 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
         "prompt_revision": engine.prompt_revision(&prompt),
     }))
+}
+
+/// The task's files, as paths into the artifact store the runner can read.
+async fn run_files(engine: &Engine, issue_id: Uuid) -> anyhow::Result<Vec<FileInput>> {
+    Ok(engine
+        .issue_files(issue_id)
+        .await?
+        .iter()
+        .map(|artifact| FileInput {
+            id: artifact.id,
+            title: artifact.title.clone(),
+            filename: artifact.filename.clone(),
+            path: engine.artifact_path(artifact),
+        })
+        .collect())
+}
+
+/// What people and Lumi said since the previous turn on this task started.
+/// Agent comments are left out: the parent run already hands its message
+/// over, and server notes describe the app, not the work. The most recent
+/// comments win when there are many, and they read oldest first.
+pub(crate) async fn run_comments(
+    engine: &Engine,
+    issue_id: Uuid,
+    run_id: Uuid,
+) -> anyhow::Result<Vec<CommentInput>> {
+    let since: Option<String> = sqlx::query_scalar(
+        "select started_at from runs
+          where issue_id = ? and id <> ? and started_at is not null
+          order by julianday(started_at) desc limit 1",
+    )
+    .bind(issue_id)
+    .bind(run_id)
+    .fetch_optional(&engine.db.pool)
+    .await?
+    .flatten();
+    let rows: Vec<(String, Option<String>, String, String)> = sqlx::query_as(
+        "select author_type, author_id, body, created_at from comments
+          where issue_id = ?
+            and (author_type = 'human' or author_id = 'lumi')
+            and julianday(created_at) > coalesce(julianday(?), 0)
+          order by julianday(created_at) desc, rowid desc limit ?",
+    )
+    .bind(issue_id)
+    .bind(since)
+    .bind(hulahoop_core::runspec::MAX_RUN_COMMENTS as i64)
+    .fetch_all(&engine.db.pool)
+    .await?;
+    let mut comments = Vec::with_capacity(rows.len());
+    for (author_type, author_id, body, created_at) in rows.into_iter().rev() {
+        comments.push(CommentInput {
+            author: engine
+                .author_name(&author_type, author_id.as_deref())
+                .await?,
+            body,
+            created_at,
+        });
+    }
+    Ok(comments)
 }
 
 async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Value> {
@@ -749,10 +835,6 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
                     }
                     None => None,
                 };
-                let criteria = match issue.as_ref() {
-                    Some(issue) => engine.criteria(issue.id).await?,
-                    None => Vec::new(),
-                };
                 let review: Option<String> = match run.as_ref() {
                     Some(run) => {
                         sqlx::query_scalar::<_, String>(
@@ -780,7 +862,7 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
 
                     "title": issue.as_ref().map(|i| i.title.clone()),
                     "body": issue.as_ref().map(|i| i.body.clone()),
-                    "criteria": criteria.iter().map(|c| c.text.clone()).collect::<Vec<_>>(),
+                    "summary": run.as_ref().and_then(|r| r.summary.clone()),
                     "review": review,
                     "app_token": engine.github_token().await?,
                 }))
@@ -952,6 +1034,194 @@ mod claim_spec_tests {
             .as_str()
             .unwrap()
             .contains("Hulahoop context"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A turn reads the task's files and what people said since the last turn
+    /// started; older comments and agent comments stay out of its input.
+    #[tokio::test]
+    async fn run_input_carries_files_and_recent_comments() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-input-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, agent, issue, previous, run_id) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::minutes(10);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Input',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'INP-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo)
+            .bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("input-artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let started = now + Duration::minutes(2);
+        for (id, status, started_at) in [
+            (previous, "succeeded", Some(started)),
+            (run_id, "running", None),
+        ] {
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at, started_at) values (?,?,?,?,1,'main','prompt',?,?,'model-x',?,?)")
+                .bind(id).bind(issue).bind(repo).bind(agent)
+                .bind(artifacts.to_string_lossy().to_string()).bind(status).bind(now).bind(started_at)
+                .execute(&db.pool).await.unwrap();
+        }
+        for (minute, author_type, author_id, body) in [
+            (1, "human", None, "before the last turn"),
+            (3, "human", None, "use the staging config"),
+            (4, "agent", Some(agent.to_string()), "I did the thing"),
+            (
+                5,
+                "server",
+                Some("lumi".to_string()),
+                "Lumi says: check the logs",
+            ),
+        ] {
+            sqlx::query("insert into comments (id, issue_id, author_type, author_id, body, pinned, created_at) values (?,?,?,?,?,0,?)")
+                .bind(Uuid::now_v7()).bind(issue).bind(author_type).bind(author_id).bind(body)
+                .bind((now + Duration::minutes(minute)).to_rfc3339())
+                .execute(&db.pool).await.unwrap();
+        }
+
+        let engine = Engine::new(db);
+        let file = engine
+            .store_artifact(
+                workspace,
+                Some(project),
+                None,
+                Some(issue),
+                "Spec".into(),
+                None,
+                "spec.md".into(),
+                None,
+                b"# Spec",
+            )
+            .await
+            .unwrap();
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        build_run_spec(&engine, &run).await.unwrap();
+        let input: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(artifacts.join("input.json")).unwrap())
+                .unwrap();
+
+        let files = input["files"].as_array().unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0]["filename"], "spec.md");
+        let path = std::path::PathBuf::from(files[0]["path"].as_str().unwrap());
+        assert_eq!(path, engine.artifact_path(&file));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "# Spec");
+
+        let comments: Vec<(String, String)> = input["comments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["author"].as_str().unwrap().to_string(),
+                    c["body"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            comments,
+            vec![
+                ("you".to_string(), "use the staging config".to_string()),
+                ("Lumi".to_string(), "Lumi says: check the logs".to_string()),
+            ]
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A task with no project has no repository: its claim spec names no
+    /// repository, no clone and no checkout to make, points the runner at a
+    /// scratch directory, and still carries the agent's skills and a prompt
+    /// that says where the work goes.
+    #[tokio::test]
+    async fn a_repo_less_claim_spec_names_no_repository() {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-claim-scratch-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (agent, issue, run_id) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'writer','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null, 'TSK-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("scratch-artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,null,?,1,'','prompt',?,'running','model-x',?)")
+            .bind(run_id).bind(issue).bind(agent)
+            .bind(artifacts.to_string_lossy().to_string()).bind(now)
+            .execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        let skill = engine
+            .create_skill(
+                workspace,
+                "report-style",
+                "How reports read.",
+                "# Report style\nShort sentences.",
+            )
+            .await
+            .unwrap();
+        engine.set_agent_skills(agent, &[skill.id]).await.unwrap();
+
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        let spec = build_run_spec(&engine, &run).await.unwrap();
+
+        assert_eq!(spec["checkout"], "none");
+        for key in [
+            "repo_path",
+            "repo_mirror",
+            "clone_url",
+            "clone_token",
+            "repo_id",
+            "vcs",
+        ] {
+            assert!(spec[key].is_null(), "{key} should be null: {}", spec[key]);
+        }
+        assert_eq!(
+            spec["checkout_path"].as_str().unwrap(),
+            hulahoop_core::contract::scratch_dir(&engine.db.data_dir, &run_id).to_string_lossy()
+        );
+        let skills = spec["skills"].as_array().expect("claim spec names skills");
+        assert!(skills.iter().any(|s| s["name"] == "report-style"));
+        assert!(spec["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("This task has no repository"));
+
+        let input: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(spec["input_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(input["repo"].is_null(), "{}", input["repo"]);
 
         let _ = std::fs::remove_dir_all(directory);
     }

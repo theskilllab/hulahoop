@@ -9,10 +9,13 @@ pub mod engine;
 pub mod github;
 pub mod gql;
 pub mod lumi;
+pub mod mentions;
 pub mod model;
 pub mod models;
 pub mod skills;
+pub mod tasks;
 pub mod tenancy;
+pub mod transcript;
 pub mod vault;
 pub mod workflows;
 

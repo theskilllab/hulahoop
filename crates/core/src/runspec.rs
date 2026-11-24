@@ -12,14 +12,24 @@ use uuid::Uuid;
 /// Inputs are bounded: an issue body is not a place to paste a repository.
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 
+/// A comment is a note, not a document. Anything longer is cut so twenty of
+/// them still fit comfortably in a prompt.
+pub const MAX_COMMENT_BYTES: usize = 4 * 1024;
+
+/// How many recent comments a run is handed. The oldest drop off first; the
+/// agent can always ask for the full thread through the task.
+pub const MAX_RUN_COMMENTS: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RunSpec {
     pub run_id: Uuid,
     pub issue_id: Uuid,
     pub attempt: i64,
     pub issue: IssueInput,
-    pub criteria: Vec<CriterionInput>,
-    pub repo: RepoInput,
+    /// `None` for a task with no repository: the run works in an empty scratch
+    /// directory (`checkout.path`), with nothing to commit and no pull request.
+    #[serde(default)]
+    pub repo: Option<RepoInput>,
     pub checkout: CheckoutInput,
     pub parent: Option<ParentInput>,
     pub blocked_answer: Option<BlockedAnswer>,
@@ -29,6 +39,31 @@ pub struct RunSpec {
     /// checkout where the harness looks for them.
     #[serde(default)]
     pub skills: Vec<SkillInput>,
+    /// Files attached to the task, as absolute paths the agent can read.
+    #[serde(default)]
+    pub files: Vec<FileInput>,
+    /// What people (and Lumi) said on the task since the previous run started,
+    /// oldest first, so a nudge or a clarification reaches the next turn.
+    #[serde(default)]
+    pub comments: Vec<CommentInput>,
+}
+
+/// One file attached to the task. `path` points into the server's artifact
+/// store, so it is readable from a runner on the same machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FileInput {
+    pub id: Uuid,
+    pub title: String,
+    pub filename: String,
+    pub path: PathBuf,
+}
+
+/// One comment on the task, already reduced to who said it and what they said.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommentInput {
+    pub author: String,
+    pub body: String,
+    pub created_at: String,
 }
 
 /// One skill, ready to be written as `SKILL.md`. The body is the whole file as
@@ -48,27 +83,18 @@ pub struct IssueInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct CriterionInput {
-    pub position: i64,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoInput {
     pub name: String,
     /// Absent when the repository was attached by its remote and never checked out
     /// on this machine; a runner then clones instead of borrowing.
     pub path: Option<PathBuf>,
     pub base_bookmark: String,
-    pub tests_bookmark: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckoutInput {
     pub path: PathBuf,
     pub base_bookmark: String,
-    /// Files the suite is frozen over. The agent must not touch them.
-    pub frozen_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,8 +142,8 @@ impl RunSpec {
     pub fn truncate_text(mut self) -> Self {
         self.issue.title = truncate(&self.issue.title);
         self.issue.body = truncate(&self.issue.body);
-        for criterion in &mut self.criteria {
-            criterion.text = truncate(&criterion.text);
+        for comment in &mut self.comments {
+            comment.body = truncate_to(&comment.body, MAX_COMMENT_BYTES);
         }
         if let Some(parent) = &mut self.parent {
             parent.body = truncate(&parent.body);
@@ -145,14 +171,18 @@ impl RunSpec {
 }
 
 fn truncate(text: &str) -> String {
-    if text.len() <= MAX_TEXT_BYTES {
+    truncate_to(text, MAX_TEXT_BYTES)
+}
+
+fn truncate_to(text: &str, limit: usize) -> String {
+    if text.len() <= limit {
         return text.to_string();
     }
-    let mut end = MAX_TEXT_BYTES;
+    let mut end = limit;
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n\n[truncated at {MAX_TEXT_BYTES} bytes]", &text[..end])
+    format!("{}\n\n[truncated at {limit} bytes]", &text[..end])
 }
 
 #[cfg(test)]
@@ -169,26 +199,31 @@ mod tests {
                 body: body.into(),
                 priority: "high".into(),
             },
-            criteria: vec![CriterionInput {
-                position: 1,
-                text: "mul(2,3) returns 6".into(),
-            }],
-            repo: RepoInput {
+            repo: Some(RepoInput {
                 name: "fixture".into(),
                 path: Some("/tmp/fixture".into()),
                 base_bookmark: "main".into(),
-                tests_bookmark: Some("tests/abc".into()),
-            },
+            }),
             checkout: CheckoutInput {
                 path: "/tmp/checkout".into(),
-                base_bookmark: "tests/abc".into(),
-                frozen_paths: vec!["tests/test_calc.py".into()],
+                base_bookmark: "main".into(),
             },
             parent: None,
             blocked_answer: None,
             replays: vec![],
             limits: Limits::default(),
             skills: vec![],
+            files: vec![FileInput {
+                id: Uuid::nil(),
+                title: "Spec".into(),
+                filename: "spec.md".into(),
+                path: "/tmp/artifacts/spec.md".into(),
+            }],
+            comments: vec![CommentInput {
+                author: "you".into(),
+                body: "Please keep the API stable.".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+            }],
         }
     }
 
@@ -204,10 +239,34 @@ mod tests {
     }
 
     #[test]
+    fn a_repo_less_spec_round_trips_with_no_repository() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-spec-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input.json");
+        let mut original = spec("body");
+        original.repo = None;
+        original.write(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["repo"].is_null());
+        assert_eq!(RunSpec::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn oversized_bodies_are_truncated_and_marked() {
         let big = "x".repeat(MAX_TEXT_BYTES * 2);
         let trimmed = spec(&big).truncate_text();
         assert!(trimmed.issue.body.len() <= MAX_TEXT_BYTES + 64);
         assert!(trimmed.issue.body.contains("truncated at"));
+    }
+
+    #[test]
+    fn long_comments_are_cut_shorter_than_bodies() {
+        let mut long = spec("body");
+        long.comments[0].body = "y".repeat(MAX_COMMENT_BYTES * 3);
+        let trimmed = long.truncate_text();
+        assert!(trimmed.comments[0].body.len() <= MAX_COMMENT_BYTES + 64);
+        assert!(trimmed.comments[0].body.contains("truncated at"));
     }
 }

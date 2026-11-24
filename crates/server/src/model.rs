@@ -127,7 +127,9 @@ pub struct Issue {
     pub workspace_id: Uuid,
     /// Null when the issue is planning work that belongs to no project yet.
     pub project_id: Option<Uuid>,
-    pub repo_id: Uuid,
+    /// Null for a task with no repository: its runs work in an empty scratch
+    /// directory and never merge.
+    pub repo_id: Option<Uuid>,
     pub milestone_id: Option<Uuid>,
     /// The number inside its project (or workspace, when it has no project).
     pub number: i64,
@@ -142,7 +144,6 @@ pub struct Issue {
     pub pinned_comment_id: Option<Uuid>,
     pub run_cap_cleared_at: Option<DateTime<Utc>>,
     pub attempt: i64,
-    pub suite_seq: i64,
     pub run_count: i64,
     pub current_run_id: Option<Uuid>,
     /// Agents still owed a turn in this status, in the workflow's order, plus the
@@ -150,17 +151,21 @@ pub struct Issue {
     pub turn_queue: String,
     pub turn_served: String,
     pub turns_used: i64,
-    pub tests_revision: Option<String>,
-    pub tests_bookmark: Option<String>,
-    #[graphql(skip)]
-    pub frozen_paths: String,
-    pub tests_frozen_at: Option<DateTime<Utc>>,
     pub merge_revision: Option<String>,
     pub merged_at: Option<DateTime<Utc>>,
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
     pub pr_branch: Option<String>,
     pub abandon_reason: Option<String>,
+    /// A calendar day, `YYYY-MM-DD`. Informational: nothing is scheduled on it.
+    pub due_date: Option<String>,
+    /// `human` or `agent`; read through the `assignee` resolver, which names
+    /// whoever it is. Never consulted by dispatch.
+    #[graphql(skip)]
+    pub assignee_type: Option<String>,
+    /// The agent's uuid for an agent; null for the local human.
+    #[graphql(skip)]
+    pub assignee_id: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -172,19 +177,6 @@ impl Issue {
         hulahoop_core::IssueStatus::parse(&self.status)
             .unwrap_or(hulahoop_core::IssueStatus::Backlog)
     }
-
-    pub fn frozen_path_list(&self) -> Vec<String> {
-        crate::db::json_list(&self.frozen_paths)
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
-pub struct Criterion {
-    pub id: Uuid,
-    pub issue_id: Uuid,
-    pub position: i64,
-    pub text: String,
-    pub test_name: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -208,7 +200,8 @@ pub struct Checkout {
 pub struct Run {
     pub id: Uuid,
     pub issue_id: Uuid,
-    pub repo_id: Uuid,
+    /// Null when the task has no repository.
+    pub repo_id: Option<Uuid>,
     pub agent_id: Uuid,
     pub attempt: i64,
     /// The agent's closing message: the only record of what it decided, and the
@@ -326,6 +319,11 @@ pub struct Comment {
     pub author_id: Option<String>,
     pub body: String,
     pub pinned: bool,
+    /// The run that wrote this comment, when an agent wrote it during a run.
+    pub run_id: Option<Uuid>,
+    /// JSON `[{type, id, name}]`; read through the `mentions` resolver.
+    #[graphql(skip)]
+    pub mentions: String,
     pub created_at: DateTime<Utc>,
 }
 
@@ -351,7 +349,9 @@ pub struct Approval {
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
 pub struct RunnerJob {
     pub id: Uuid,
-    pub repo_id: Uuid,
+    /// Null for jobs that touch no repository, such as Lumi questions about a
+    /// repo-less workspace.
+    pub repo_id: Option<Uuid>,
     pub issue_id: Option<Uuid>,
     pub kind: String,
     pub payload: String,
@@ -425,6 +425,8 @@ pub struct Artifact {
     pub mime: String,
     pub size: i64,
     pub sha256: String,
+    /// The task this file is attached to, when it is one of a task's files.
+    pub issue_id: Option<Uuid>,
     pub created_at: DateTime<Utc>,
 }
 
