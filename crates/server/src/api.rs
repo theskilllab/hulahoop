@@ -58,6 +58,18 @@ fn host_path(repo: &Repo, data_dir: &std::path::Path) -> Option<std::path::PathB
         .map(|_| data_dir.join("mirrors").join(repo.id.to_string()))
 }
 
+/// A task title as a commit subject: its first line, at most 72 characters.
+fn commit_title(title: &str) -> String {
+    title
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(72)
+        .collect()
+}
+
 fn is_mirror(repo: &Repo) -> bool {
     !repo
         .path
@@ -467,9 +479,15 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
                 .await?;
             match parent_run {
                 Some(parent_run) => {
+                    // The parent is usually the reviewer's own run (the turn
+                    // before this one), so the review it wrote counts first; a
+                    // review of the parent's work is the older way in.
                     let review: Option<Review> = sqlx::query_as(
-                        "select * from reviews where reviewed_run_id = ? order by created_at desc limit 1",
+                        "select * from reviews where reviewer_run_id = ? or reviewed_run_id = ?
+                          order by reviewer_run_id = ? desc, created_at desc limit 1",
                     )
+                    .bind(parent_run.id)
+                    .bind(parent_run.id)
                     .bind(parent_run.id)
                     .fetch_optional(&engine.db.pool)
                     .await?;
@@ -483,8 +501,14 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
                             parent_run.summary.clone().unwrap_or_default(),
                         ),
                     };
+                    // A review publishes no head; the work it read is the
+                    // newest head the task has.
+                    let head_bookmark = match parent_run.head_bookmark {
+                        Some(head) => head,
+                        None => engine.newest_head(issue.id).await?.unwrap_or_default(),
+                    };
                     Some(ParentInput {
-                        head_bookmark: parent_run.head_bookmark.unwrap_or_default(),
+                        head_bookmark,
                         verdict,
                         body,
                     })
@@ -688,6 +712,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "clone_url": repo_clone_url,
         "base_bookmark": run.base_bookmark,
         "base_revision": run.base_revision,
+        // The bookmark the task lands on. A rework starts from the previous head,
+        // and the runner moves that work onto the newest base before the turn.
+        "repo_base_bookmark": repo.as_ref().map(|repo| repo.base_bookmark.clone()),
         "github_token": github_token,
         // What this adapter authenticates with: a key in the environment or the
         // credentials file the CLI wrote. Empty when nothing is stored, so the run
@@ -696,6 +723,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
         "skills": skill_files,
+        // The runner names the commit after the task; without the title every head
+        // read "implement: the issue".
+        "issue": { "key": issue.issue_key, "title": commit_title(&issue.title) },
         // The connector, opened server-side, travels only on this authenticated
         // channel: the runner needs it to act, the desktop never sees it.
         "caller_role": "run",
@@ -1027,6 +1057,7 @@ mod claim_spec_tests {
             .unwrap();
         let spec = build_run_spec(&engine, &run).await.unwrap();
 
+        assert_eq!(spec["issue"]["title"], "Task");
         let skills = spec["skills"].as_array().expect("claim spec names skills");
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0]["name"], "hulahoop-context");
@@ -1222,6 +1253,59 @@ mod claim_spec_tests {
         )
         .unwrap();
         assert!(input["repo"].is_null(), "{}", input["repo"]);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A rework's parent is the reviewer's run, which wrote the review but
+    /// published nothing: the spec carries that review as the handover.
+    #[tokio::test]
+    async fn a_rework_reads_the_review_its_parent_wrote() {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-claim-rework-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (agent, issue, head, review, rework) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'Developer','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null, 'TSK-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("rework-artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        for (id, parent, status) in [
+            (head, None, "succeeded"),
+            (review, None, "succeeded"),
+            (rework, Some(review), "running"),
+        ] {
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, parent_run_id, created_at) values (?,?,null,?,1,'','prompt',?,?,'model-x',?,?)")
+                .bind(id).bind(issue).bind(agent)
+                .bind(artifacts.to_string_lossy().to_string()).bind(status).bind(parent).bind(now)
+                .execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at) values (?,?,?,?,'changes_requested','Fix the target date field.',?)")
+            .bind(Uuid::now_v7()).bind(issue).bind(head).bind(review).bind(now)
+            .execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(rework)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        let spec = build_run_spec(&engine, &run).await.unwrap();
+        let input: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(spec["input_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(input["parent"]["verdict"], "changes_requested");
+        assert_eq!(input["parent"]["body"], "Fix the target date field.");
 
         let _ = std::fs::remove_dir_all(directory);
     }

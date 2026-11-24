@@ -2,7 +2,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { loadTranscript, type TranscriptEntry } from "../api";
 import Icon from "../Icon";
 import MarkdownView from "./MarkdownView";
-import { RunStatusChip, plural } from "./TaskBits";
+import { Avatar, RunStatusChip, plural } from "./TaskBits";
 
 const POLL_MS = 1500;
 
@@ -166,9 +166,8 @@ export default function Transcript({
   return (
     <div className="transcript" ref={root}>
       <div className="tx-head">
-        <button ref={back} type="button" className="ghost" onClick={onBack}>
-          <Icon name="back" size={13} />
-          Back to {issueKey}
+        <button ref={back} type="button" className="linkbtn tx-back" onClick={onBack}>
+          ← Back to {issueKey}
         </button>
         <h2>
           Transcript <span className="dim">· {agentName}</span>
@@ -187,19 +186,19 @@ export default function Transcript({
       </div>
       {error ? <p className="error">{error}</p> : null}
       {loaded && entries.length === 0 && !error ? (
-        <p className="dim small">{live ? "Waiting for the agent's first words…" : "This run left no transcript."}</p>
+        <p className="tx-note dim">{live ? "Waiting for the agent's first words…" : "This run left no transcript."}</p>
       ) : null}
       <ol className="tx-list">
         {rows.map((row) =>
           row.kind === "tool" ? (
             <ToolRow key={row.call.key} call={row.call} result={row.result} live={live} expandAll={expandAll} />
           ) : (
-            <TranscriptLine key={row.entry.key} entry={row.entry} issueKey={issueKey} />
+            <TranscriptLine key={row.entry.key} entry={row.entry} issueKey={issueKey} agentName={agentName} />
           ),
         )}
       </ol>
       {live && loaded ? (
-        <p className="tx-live dim small">
+        <p className="tx-live tx-note">
           <span className="pulse" aria-hidden="true" /> Live — new lines appear as the agent works
         </p>
       ) : null}
@@ -207,7 +206,7 @@ export default function Transcript({
   );
 }
 
-function TranscriptLine({ entry, issueKey }: { entry: TranscriptEntry; issueKey: string }) {
+function TranscriptLine({ entry, issueKey, agentName }: { entry: TranscriptEntry; issueKey: string; agentName: string }) {
   switch (entry.kind) {
     case "prompt":
       return (
@@ -229,14 +228,15 @@ function TranscriptLine({ entry, issueKey }: { entry: TranscriptEntry; issueKey:
       );
     case "text":
       return (
-        <li className="tx-text">
+        <li className="tx-text tx-agent">
+          <Avatar name={agentName} kind="agent" />
           <MarkdownView value={entry.text} />
         </li>
       );
     case "error":
       return <li className="tx-error">{entry.text}</li>;
     case "done":
-      return <li className="tx-done dim small">{entry.text || "Run finished"}</li>;
+      return <li className="tx-done tx-note dim">{entry.text || "Run finished"}</li>;
     default:
       return (
         <li className="tx-text">

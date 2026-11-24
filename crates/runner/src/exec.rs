@@ -129,7 +129,8 @@ impl Executor {
         self.write_skills(spec, &scratch)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
         let message = adapter::scratch_message_for(agent_name, &input_path, &scratch);
-        let invocation = adapter::invocation(adapter, &model, &system_prompt, &message)?;
+        let prompt_file = adapter::write_system_prompt(&artifact_dir, &system_prompt)?;
+        let invocation = adapter::invocation(adapter, &model, &prompt_file, &message)?;
         let outcome = self
             .spawn_and_stream(
                 run_id,
@@ -211,6 +212,39 @@ impl Executor {
         // A clone is its own repository; a workspace shares the one at repo_path.
         // Everything after this point asks the checkout, which is right either way.
         let vcs = Vcs::detect(&checkout)?;
+
+        // A rework starts on the previous head; the task lands on the repository's
+        // base. Moving the work onto the newest base before the turn keeps the pull
+        // request mergeable and leaves conflicts to the agent that understands them.
+        let carried = match spec["repo_base_bookmark"].as_str().filter(|b| !b.is_empty()) {
+            Some(landing) => match vcs.newest_base(landing) {
+                Some(newest) => vcs.carry_onto(&checkout, &base, &newest).unwrap_or_else(|error| {
+                    tracing::warn!(%error, run_id, "could not move the work onto the newest base");
+                    None
+                }),
+                None => None,
+            },
+            None => None,
+        };
+        // The scaffolding merge goes however this function ends: a setup failure,
+        // an error from the agent, or a normal finish.
+        let _scaffold = Scaffold {
+            repo: repo_path.clone(),
+            merge: carried.as_ref().and_then(|c| c.merge.clone()),
+        };
+        if let Some(carried) = &carried {
+            base = carried.diff_base.clone();
+            self.client
+                .event(
+                    run_id,
+                    "rebase",
+                    json!({ "onto": spec["repo_base_bookmark"], "conflicts": carried.conflicts }),
+                )
+                .await
+                .ok();
+        }
+        // After the carry: the working copy it builds starts from the base's tree,
+        // which would drop a generated `.envrc` written before it.
         ensure_envrc(&checkout)?;
 
         self.client
@@ -232,12 +266,23 @@ impl Executor {
         let env = agent_env(spec, &checkout, &self.data_dir)?;
         self.write_skills(spec, &checkout)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
-        let message = adapter::message_for(agent_name, &input_path, &checkout);
+        let mut message = adapter::message_for(agent_name, &input_path, &checkout);
+        if let Some(conflicts) = carried
+            .as_ref()
+            .map(|c| &c.conflicts)
+            .filter(|c| !c.is_empty())
+        {
+            message.push_str(&conflict_note(
+                spec["repo_base_bookmark"].as_str().unwrap_or("main"),
+                conflicts,
+            ));
+        }
 
         // Every adapter goes through the same spawn path, the fake one included:
         // a test that does not exercise the real plumbing proves nothing about it.
-        let invocation = adapter::invocation(adapter, &model, &system_prompt, &message)?;
-        let outcome = self
+        let prompt_file = adapter::write_system_prompt(&artifact_dir, &system_prompt)?;
+        let invocation = adapter::invocation(adapter, &model, &prompt_file, &message)?;
+        let mut outcome = self
             .spawn_and_stream(
                 run_id,
                 &checkout,
@@ -269,10 +314,24 @@ impl Executor {
         // Did this turn change anything? A turn that read, answered and left the
         // checkout alone produced no commit, so it publishes no head: the next turn
         // in line still starts from the last head that carried a change.
-        let changed = !vcs
+        let touched = !vcs
             .changed_paths(&checkout, &base)
             .unwrap_or_default()
             .is_empty();
+        // A head with conflicts cannot be pushed or merged, so a turn that leaves
+        // any behind fails instead of publishing one.
+        let unresolved = if touched {
+            vcs.conflicted_paths(&checkout).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        if !unresolved.is_empty() {
+            outcome.error = Some(format!(
+                "the turn left conflicts in {}, so its work was not published",
+                unresolved.join(", ")
+            ));
+        }
+        let changed = touched && unresolved.is_empty();
         // A commit with no message cannot be pushed and reads as noise in `jj log`.
         // The author says who, the issue says what.
         if changed {
@@ -320,7 +379,7 @@ impl Executor {
                     "error": outcome.error,
                     "diff": diff,
                     "changed_paths": changed_paths,
-                    "commit": if changed { Some(commit) } else { None },
+                    "commit": if changed { Some(commit.clone()) } else { None },
                     "question": outcome.question,
                     "verdict": outcome.verdict,
                     "body": outcome.final_text,
@@ -336,8 +395,21 @@ impl Executor {
         // look at the mess a cancel or a crash left behind... for one attempt.
         // A workspace has to be forgotten or the repository accumulates them; a clone
         // is a directory, and `run_run` deletes the whole run directory.
-        if status == "succeeded" && !local {
+        // A turn that changed nothing left nothing worth inspecting in its checkout.
+        if (status == "succeeded" || !changed) && !local {
             let _ = vcs.remove_workspace(&checkout);
+        }
+        // Scaffolding and empty commits are litter in everybody's `jj log`: the
+        // merge only measured the diff, and a turn that changed nothing published
+        // nothing, so its working copy has no reason to outlive it. The checkout may
+        // be gone by now, so the repository it belonged to does the abandoning.
+        if !changed && !commit.is_empty() {
+            if local {
+                forget_workspace(&repo_path, &format!("run-{run_id}"));
+            }
+            if let Ok(repo) = Vcs::detect(&repo_path) {
+                let _ = repo.abandon(&commit);
+            }
         }
         Ok(())
     }
@@ -542,7 +614,8 @@ impl Executor {
         ];
 
         apply_credential(&mut env, spec, &home)?;
-        let invocation = adapter::invocation(adapter, model, system_prompt, &message)?;
+        let prompt_file = adapter::write_system_prompt(&home, system_prompt)?;
+        let invocation = adapter::invocation(adapter, model, &prompt_file, &message)?;
         let mut child = adapter::spawn(&invocation, &workdir, &env)?;
         let pid = child.id() as i64;
         let stdout = child
@@ -1327,6 +1400,34 @@ fn prepare_workspace(root: &Path, checkout: &Path, base: &str, name: &str) -> Re
     bail!(
         "the mirror holds no revision to start from ({}). A run cannot start from a revision that does not exist, and starting from the wrong one would blame the agent for changes it never made.",
         refused.join("; ")
+    )
+}
+
+/// Abandons a carried turn's scaffolding merge when the run is over, on every
+/// path out of it.
+struct Scaffold {
+    repo: PathBuf,
+    merge: Option<String>,
+}
+
+impl Drop for Scaffold {
+    fn drop(&mut self) {
+        if let (Some(merge), Ok(repo)) = (self.merge.as_deref(), Vcs::detect(&self.repo)) {
+            let _ = repo.abandon(merge);
+        }
+    }
+}
+
+/// What the agent is told when moving the task onto the newest base conflicted.
+/// Resolving them comes first: a head with conflicts cannot be pushed or merged.
+fn conflict_note(landing: &str, conflicts: &[String]) -> String {
+    let files = conflicts
+        .iter()
+        .map(|path| format!("- `{path}`"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "\n\nBefore this turn the loop moved the task's work onto the newest `{landing}`, and these files conflict:\n{files}\n\nIf your turn changes the work, resolve them first: edit each file so it keeps both `{landing}`'s changes and the task's intent, and remove every conflict marker; `jj resolve --list` must print nothing before you finish, or the turn's work is not published. A review judges the work as it will land, conflicts included."
     )
 }
 

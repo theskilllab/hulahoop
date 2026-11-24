@@ -1,7 +1,7 @@
 import type { MouseEvent } from "react";
 import type { IssueSummary } from "../api";
 import type { Column } from "./TaskBoard";
-import { Avatar, PriorityIcon, fmtDue, isLiveRun, isOverdue, priorityLabel } from "./TaskBits";
+import { Avatar, PriorityIcon, StatusIcon, fmtDue, isLiveRun, isOverdue, priorityLabel } from "./TaskBits";
 
 /**
  * Every task in one table, sorted by the workflow's column order. Each row is a
@@ -67,7 +67,7 @@ export default function TaskList({
                 {isLiveRun(issue.currentRun?.status) ? <span className="pulse running-dot" aria-label="Agent working" /> : null}
               </span>
               <span className="task-row-status">
-                <i className={`status-dot ${issue.status}`} aria-hidden="true" />
+                <StatusIcon status={issue.status} />
                 {title.get(issue.status) ?? issue.status.replace(/_/g, " ")}
               </span>
               <span className="task-row-prio">

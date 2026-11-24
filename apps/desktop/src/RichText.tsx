@@ -24,6 +24,7 @@ export default function RichText({
   autoFocus = false,
   editable = true,
   extensions = [],
+  onSubmit,
 }: {
   /** Markdown in. */
   value: string;
@@ -38,7 +39,11 @@ export default function RichText({
   editable?: boolean;
   /** Extra nodes this field needs, e.g. the workflow's metadata lines. */
   extensions?: Extensions;
+  /** ⌘↵ (Ctrl↵ elsewhere); `shift` when ⇧ is held too. Without it ⌘↵ is a line break. */
+  onSubmit?: (shift: boolean) => void;
 }) {
+  const submitRef = useRef(onSubmit);
+  submitRef.current = onSubmit;
   // The last markdown this component emitted, so an echo of our own change does
   // not reset the document (and the caret) while a person is typing.
   const emitted = useRef(value);
@@ -55,6 +60,14 @@ export default function RichText({
         "aria-multiline": "true",
         "aria-label": ariaLabel ?? "Rich text",
         spellcheck: "true",
+      },
+      handleKeyDown: (_view, event) => {
+        if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && submitRef.current) {
+          event.preventDefault();
+          submitRef.current(event.shiftKey);
+          return true;
+        }
+        return false;
       },
     },
     onUpdate: ({ editor: live }) => {

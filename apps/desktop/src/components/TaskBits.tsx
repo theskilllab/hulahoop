@@ -31,13 +31,53 @@ export function PriorityIcon({ priority }: { priority: string }) {
   );
 }
 
-/** An initial in a circle. Agents and Lumi get the accent tint, people neutral. */
+/** The prototype's robot: the one mark for an agent, wherever one appears. */
+export function BotIcon({ size = 14 }: { size?: number }) {
+  return <Icon name="bot" size={size} />;
+}
+
+/**
+ * An initial in a circle for people; an agent is the robot in a rounded,
+ * accent-tinted square, like the prototype's `.av.bot`.
+ */
 export function Avatar({ name, kind, size = "md" }: { name: string; kind?: "agent" | "lumi" | "human" | "server"; size?: "sm" | "md" }) {
   const initial = (name.trim()[0] ?? "?").toUpperCase();
   return (
     <span className={`av ${kind ?? "human"} ${size}`} aria-hidden="true">
-      {initial}
+      {kind === "agent" ? <BotIcon size={size === "sm" ? 10 : 14} /> : initial}
     </span>
+  );
+}
+
+/// The prototype's status glyphs (`sg()`), shape for shape: a dashed ring for
+/// backlog, a ring for todo, half filled for in progress, a bar for blocked, a
+/// dot for in review, and a filled check for done. Colours live in `.sg`.
+const STATUS_GLYPHS: Record<string, string> = {
+  backlog: '<circle cx="12" cy="12" r="8" stroke-dasharray="3 3"/>',
+  todo: '<circle cx="12" cy="12" r="8"/>',
+  in_progress: '<circle cx="12" cy="12" r="8"/><path d="M12 4a8 8 0 010 16z" fill="currentColor"/>',
+  blocked: '<circle cx="12" cy="12" r="8"/><path d="M8.5 12h7"/>',
+  in_review: '<circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3" fill="currentColor"/>',
+  done: '<circle cx="12" cy="12" r="8" fill="currentColor"/><path class="sg-check" d="M8.5 12.3l2.5 2.5 4.5-5"/>',
+  // The prototype has no cancelled state; a crossed ring keeps it apart from todo.
+  cancelled: '<circle cx="12" cy="12" r="8"/><path d="M9.5 9.5l5 5M14.5 9.5l-5 5"/>',
+};
+
+export function StatusIcon({ status, size = 16 }: { status: string; size?: number }) {
+  return (
+    <svg
+      className={`sg ${status}`}
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={1.75}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      dangerouslySetInnerHTML={{ __html: STATUS_GLYPHS[status] ?? STATUS_GLYPHS.todo }}
+    />
   );
 }
 
@@ -142,7 +182,7 @@ export function AssigneeOptions({ agents }: { agents: { id: string; name: string
       <option value="human:me">You</option>
       {agents.map((agent) => (
         <option key={agent.id} value={`agent:${agent.id}`}>
-          {agent.name} · agent
+          {agent.name}
         </option>
       ))}
     </>

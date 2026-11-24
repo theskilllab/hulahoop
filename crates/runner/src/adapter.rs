@@ -16,12 +16,17 @@ pub struct Invocation {
 /// `pi` and `claude` both take the prompt as the trailing message and the role
 /// instructions as a system prompt, so the same two files serve both: the
 /// prompt text is the role, the message is the task.
+///
+/// The instructions go in by file, never as an argument. Anything in argv is in
+/// every process listing, and an agent cleaning up with `pkill -f "just test"`
+/// matched its own instructions (which name `just test`) and killed itself.
 pub fn invocation(
     adapter: Adapter,
     model: &str,
-    system_prompt: &str,
+    system_prompt_file: &Path,
     message: &str,
 ) -> Result<Invocation> {
+    let system_prompt_file = system_prompt_file.to_string_lossy().to_string();
     let (program, args) = match adapter {
         Adapter::Pi => {
             // An empty model means "whatever the adapter is configured for", so the
@@ -37,8 +42,9 @@ pub fn invocation(
                 args.push(model.to_string());
             }
             args.push("--approve".to_string());
+            // `--system-prompt` reads an existing file's contents.
             args.push("--system-prompt".to_string());
-            args.push(system_prompt.to_string());
+            args.push(system_prompt_file);
             args.push(message.to_string());
             ("pi".to_string(), args)
         }
@@ -53,8 +59,8 @@ pub fn invocation(
                 args.push("--model".to_string());
                 args.push(model.to_string());
             }
-            args.push("--append-system-prompt".to_string());
-            args.push(system_prompt.to_string());
+            args.push("--append-system-prompt-file".to_string());
+            args.push(system_prompt_file);
             // The environment is the boundary in v0: the agent cannot see the user's
             // shell or credentials, so its permission prompts would deadlock a
             // non-interactive run.
@@ -114,6 +120,15 @@ pub fn message_for(agent_name: &str, input_path: &Path, checkout: &Path) -> Stri
     )
 }
 
+/// Write the instructions where the agent's command line can point at them:
+/// the run's artifact directory, outside the checkout, so nothing commits it.
+pub fn write_system_prompt(dir: &Path, text: &str) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join("system-prompt.md");
+    std::fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    Ok(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
 /// Spawn the agent in its own process group so a cancel or a timeout can kill
 /// the whole tree, including a build the agent started.
 pub fn spawn(
@@ -140,4 +155,29 @@ pub fn spawn(
     command
         .spawn()
         .with_context(|| format!("starting {}", invocation.program))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The instructions reach the agent as a file: no argument carries their
+    /// text, so a `pkill -f` pattern taken from them cannot match the agent.
+    #[test]
+    fn instructions_stay_out_of_argv() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-argv-{}", uuid::Uuid::now_v7()));
+        let instructions = "Run `just test` before you hand over.";
+        let file = write_system_prompt(&dir, instructions).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), instructions);
+        for (adapter, flag) in [
+            (Adapter::Pi, "--system-prompt"),
+            (Adapter::ClaudeCode, "--append-system-prompt-file"),
+        ] {
+            let invocation = invocation(adapter, "model-x", &file, "Read input.json").unwrap();
+            assert!(invocation.args.iter().all(|arg| !arg.contains("just test")));
+            let at = invocation.args.iter().position(|arg| arg == flag).unwrap();
+            assert_eq!(invocation.args[at + 1], file.to_string_lossy());
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

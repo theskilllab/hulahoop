@@ -4,7 +4,7 @@ import { gql, type Artifact, type IssueSummary as Issue, type Milestone, type Pr
 import PageHeader from "../PageHeader";
 import { FALLBACK_COLUMNS, isDoneStatus, type Column } from "../components/TaskBoard";
 import LinkTasksDialog from "../components/LinkTasksDialog";
-import { plural } from "../components/TaskBits";
+import { StatusIcon, plural } from "../components/TaskBits";
 
 interface Props {
   workspaceId: string;
@@ -413,7 +413,7 @@ function Detail({
           <span className="ms-counts">
             {counts.map((entry) => (
               <span key={entry.status} className="ms-count">
-                <i className={`status-dot ${entry.status}`} aria-hidden="true" />
+                <StatusIcon status={entry.status} />
                 {statusLabel(columns, entry.status)} {entry.n}
               </span>
             ))}
@@ -471,7 +471,7 @@ function Detail({
                 <span className="mono muted ms-nowrap">{issue.key}</span>
                 <span className="od-fill ms-name">{issue.title}</span>
                 <span className="ms-nowrap">
-                  <i className={`status-dot ${issue.status}`} aria-hidden="true" /> {statusLabel(columns, issue.status)}
+                  <StatusIcon status={issue.status} /> {statusLabel(columns, issue.status)}
                 </span>
               </button>
               <button

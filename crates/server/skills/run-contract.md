@@ -32,6 +32,12 @@ second message, no waiting for an answer.
 - `just setup` has already run. If a dependency is genuinely missing, say so and
   stop.
 - Run the whole suite rather than a subset. A passing subset says little.
+- Stop only processes you started, by the PID you got when you started them
+  (`kill <pid>`). Never use `pkill -f`, `killall` or another kill by name or
+  pattern: other agents, the runner and the person's own shells run on the same
+  machine, and a pattern such as `pkill -f "just test"` kills them too, your own
+  agent process included. Wait for a long command to finish rather than killing
+  it; if one hangs, say so in your final message.
 
 ## No repository
 
