@@ -119,6 +119,38 @@ pub async fn schema_version(data_dir: &Path) -> anyhow::Result<Option<SchemaVers
     }))
 }
 
+/// Migrations run on their own connection with foreign keys off. sqlx wraps
+/// every SQLite migration in a transaction, where `PRAGMA foreign_keys = OFF`
+/// is ignored, so a migration that rebuilds a parent table (`drop table
+/// issues`) would otherwise either cascade-delete its children or fail on them.
+/// The rebuilt schema is checked afterwards, so a migration that leaves a
+/// dangling reference still refuses to start.
+async fn migrate(options: &SqliteConnectOptions) -> anyhow::Result<()> {
+    // One connection, so the pragma holds for every statement the migrator runs.
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options.clone().foreign_keys(false))
+        .await
+        .context("opening the SQLite database")?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .context("running migrations")?;
+    let dangling: Vec<(String, Option<i64>, String)> =
+        sqlx::query_as("select \"table\", rowid, parent from pragma_foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .context("checking foreign keys after migrations")?;
+    pool.close().await;
+    if let Some((table, rowid, parent)) = dangling.first() {
+        anyhow::bail!(
+            "after migrations, {} row(s) point at missing parents (first: {table} row {rowid:?} -> {parent})",
+            dangling.len()
+        );
+    }
+    Ok(())
+}
+
 pub struct Db {
     pub pool: SqlitePool,
     pub data_dir: PathBuf,
@@ -140,19 +172,15 @@ impl Db {
             .busy_timeout(std::time::Duration::from_millis(
                 hulahoop_core::SQLITE_BUSY_TIMEOUT_MS as u64,
             ))
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
-            .foreign_keys(true);
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+
+        migrate(&options).await?;
 
         let pool = SqlitePoolOptions::new()
             .max_connections(4)
-            .connect_with(options)
+            .connect_with(options.foreign_keys(true))
             .await
             .context("opening the SQLite database")?;
-
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .context("running migrations")?;
 
         Ok(Self {
             pool,
@@ -303,6 +331,98 @@ mod backup_tests {
         assert_eq!(std::fs::read_dir(&backups).expect("list").count(), 5);
         assert!(backups.join("hulahoop-20260107-000000.sqlite").exists());
         assert!(!backups.join("hulahoop-20260100-000000.sqlite").exists());
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
+
+    /// 0023 rebuilds `issues` and `runs`, which have children. Applied to a
+    /// database that already holds a task with runs and comments, it used to
+    /// fail with `FOREIGN KEY constraint failed`, because sqlx runs it inside a
+    /// transaction where `PRAGMA foreign_keys = OFF` does nothing.
+    #[tokio::test]
+    async fn rebuilding_a_parent_table_keeps_its_children() {
+        let dir = scratch("rebuild");
+        let file = contract::database_file(&dir);
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", file.display()))
+            .expect("options")
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        let full = sqlx::migrate!("./migrations");
+        let before = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                full.iter()
+                    .filter(|migration| migration.version < 23)
+                    .cloned()
+                    .collect(),
+            ),
+            ..full
+        };
+        before.run(&pool).await.expect("migrations before 0023");
+        let db = Db {
+            pool,
+            data_dir: dir.clone(),
+        };
+        let workspace = db.seed_local().await.expect("seed");
+        let (project, repo, agent, issue, run, comment) = (
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+            uuid::Uuid::now_v7(),
+        );
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Keep',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(&now)
+        .execute(&db.pool)
+        .await
+        .expect("project");
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(&now).execute(&db.pool).await.expect("repo");
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(&now).bind(&now).execute(&db.pool).await.expect("agent");
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'KEP-1',1,'Task','done',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo).bind(&now).bind(&now).execute(&db.pool).await.expect("issue");
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,?,?,1,'main','prompt','/tmp','succeeded','model-x',?)")
+            .bind(run).bind(issue).bind(repo).bind(agent).bind(&now).execute(&db.pool).await.expect("run");
+        sqlx::query("insert into comments (id, issue_id, author_type, body, created_at, run_id) values (?,?, 'agent','done',?,?)")
+            .bind(comment).bind(issue).bind(&now).bind(run).execute(&db.pool).await.expect("comment");
+        db.pool.close().await;
+
+        let db = Db::open(&dir)
+            .await
+            .expect("0023 applies over existing rows");
+        let counts: (i64, i64, i64) = sqlx::query_as(
+            "select (select count(*) from issues), (select count(*) from runs), (select count(*) from comments)",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("counts");
+        assert_eq!(
+            counts,
+            (1, 1, 1),
+            "the task, its run and its comment survive"
+        );
+        sqlx::query("update issues set repo_id = null where id = ?")
+            .bind(issue)
+            .execute(&db.pool)
+            .await
+            .expect("repo_id is optional after 0023");
+        let enforced: (i64,) = sqlx::query_as("pragma foreign_keys")
+            .fetch_one(&db.pool)
+            .await
+            .expect("pragma");
+        assert_eq!(enforced.0, 1, "the pool still enforces foreign keys");
+        db.pool.close().await;
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
 }
