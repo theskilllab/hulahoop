@@ -12,6 +12,7 @@ pub mod lumi;
 pub mod mentions;
 pub mod model;
 pub mod models;
+pub mod pulls;
 pub mod skills;
 pub mod tasks;
 pub mod tenancy;
@@ -103,34 +104,7 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         runner_id_default: format!("runner-{}", std::process::id()),
     });
 
-    let schema = gql::build_schema(engine.clone());
-    let app = axum::Router::new()
-        .route(
-            "/graphql",
-            axum::routing::any_service(async_graphql_axum::GraphQL::new(schema)),
-        )
-        .route("/health", axum::routing::get(|| async { "ok" }))
-        .merge(api::router(api_state))
-        // The desktop runs from the Tauri origin (or Vite's fixed dev port).
-        // Multi-user deployment also requires identity-aware GraphQL authorization.
-        // An arbitrary website must not read workspace reports or mutate budgets
-        // through the local GraphQL endpoint.
-        .layer(
-            tower_http::cors::CorsLayer::new()
-                .allow_origin([
-                    axum::http::HeaderValue::from_static("tauri://localhost"),
-                    axum::http::HeaderValue::from_static("http://tauri.localhost"),
-                    axum::http::HeaderValue::from_static("https://tauri.localhost"),
-                    axum::http::HeaderValue::from_static("http://localhost:5183"),
-                    axum::http::HeaderValue::from_static("http://127.0.0.1:5183"),
-                ])
-                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
-                .allow_headers([
-                    axum::http::header::CONTENT_TYPE,
-                    axum::http::header::AUTHORIZATION,
-                ]),
-        )
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+    let app = router(api_state);
 
     let socket = SocketAddr::from((listen, port));
     let listener = tokio::net::TcpListener::bind(socket)
@@ -188,6 +162,9 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         }
     });
 
+    // Pull requests are read from a cache this keeps in step with GitHub.
+    tokio::spawn(engine.clone().pull_sync_loop());
+
     let connection_path_clone = connection_path.clone();
     let shutdown = async move {
         let _ = tokio::signal::ctrl_c().await;
@@ -200,6 +177,75 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         .await
         .context("serving HTTP")?;
     Ok(())
+}
+
+/// Every route the server answers. `serve` binds it; tests drive it directly.
+pub fn router(api_state: Arc<api::ApiState>) -> axum::Router {
+    let schema = gql::build_schema(api_state.engine.clone());
+    let ws_schema = schema.clone();
+    let ws_token: Arc<str> = Arc::from(api_state.token.as_str());
+    let http_token = ws_token.clone();
+    axum::Router::new()
+        .route(
+            "/graphql",
+            axum::routing::any_service(async_graphql_axum::GraphQL::new(schema)).layer(
+                axum::middleware::from_fn(move |request, next| {
+                    graphql_auth(http_token.clone(), request, next)
+                }),
+            ),
+        )
+        .route(
+            "/graphql/ws",
+            axum::routing::get(
+                move |headers: axum::http::HeaderMap, upgrade: axum::extract::WebSocketUpgrade| {
+                    gql::serve_websocket(ws_schema.clone(), ws_token.clone(), headers, upgrade)
+                },
+            ),
+        )
+        .route("/health", axum::routing::get(|| async { "ok" }))
+        .merge(api::router(api_state))
+        // The desktop runs from the Tauri origin (or Vite's fixed dev port).
+        // Multi-user deployment also requires identity-aware GraphQL authorization.
+        // An arbitrary website must not read workspace reports or mutate budgets
+        // through the local GraphQL endpoint.
+        .layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin([
+                    axum::http::HeaderValue::from_static("tauri://localhost"),
+                    axum::http::HeaderValue::from_static("http://tauri.localhost"),
+                    axum::http::HeaderValue::from_static("https://tauri.localhost"),
+                    axum::http::HeaderValue::from_static("http://localhost:5183"),
+                    axum::http::HeaderValue::from_static("http://127.0.0.1:5183"),
+                ])
+                .allow_methods([axum::http::Method::GET, axum::http::Method::POST])
+                .allow_headers([
+                    axum::http::header::CONTENT_TYPE,
+                    axum::http::header::AUTHORIZATION,
+                ]),
+        )
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+}
+
+/// GraphQL over HTTP carries the same bearer token as the internal API and the
+/// WebSocket's `connection_init`. Without it, any page in the browser could post a
+/// `text/plain` "simple request" here and act on the workspace — CORS only stops
+/// it reading the answer.
+async fn graphql_auth(
+    token: Arc<str>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let provided = request
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or_default();
+    if api::same_token(&token, provided) {
+        next.run(request).await
+    } else {
+        axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED)
+    }
 }
 
 /// The host a client should dial: loopback when the server listens everywhere,
@@ -281,4 +327,173 @@ fn restrict_permissions(path: &std::path::Path) -> std::io::Result<()> {
         std::fs::set_permissions(path, permissions)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod auth_tests {
+    //! Both ways into GraphQL — HTTP and the WebSocket — want the server token.
+
+    use super::*;
+    use async_graphql::http::{WebSocketProtocols, WsMessage};
+    use futures::StreamExt;
+    use serde_json::json;
+    use std::time::Duration;
+
+    const TOKEN: &str = "the-server-token";
+
+    async fn engine() -> (Arc<engine::Engine>, std::path::PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-auth-{}", uuid::Uuid::now_v7()));
+        let database = db::Db::open(&directory).await.unwrap();
+        database.seed_local().await.unwrap();
+        (Arc::new(engine::Engine::new(database)), directory)
+    }
+
+    #[tokio::test]
+    async fn graphql_over_http_needs_the_token() {
+        let (engine, directory) = engine().await;
+        let app = router(Arc::new(api::ApiState {
+            engine,
+            token: TOKEN.to_string(),
+            runner_id_default: "runner-test".to_string(),
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let http = reqwest::Client::new();
+        let url = format!("http://{address}/graphql");
+        let query = json!({ "query": "{ workspaces { id } }" });
+
+        let none = http.post(&url).json(&query).send().await.unwrap();
+        assert_eq!(none.status(), reqwest::StatusCode::UNAUTHORIZED);
+        let wrong = http
+            .post(&url)
+            .bearer_auth("not-the-token")
+            .json(&query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), reqwest::StatusCode::UNAUTHORIZED);
+        // A cross-site "simple request" gets nowhere either.
+        let simple = http
+            .post(&url)
+            .header("content-type", "text/plain")
+            .body(query.to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(simple.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        let right = http
+            .post(&url)
+            .bearer_auth(TOKEN)
+            .json(&query)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(right.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = right.json().await.unwrap();
+        assert!(body.get("errors").is_none(), "{body}");
+        assert!(body["data"]["workspaces"].is_array(), "{body}");
+
+        // Health stays open, so a launcher can wait for the server.
+        let health = http
+            .get(format!("http://{address}/health"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(health.status(), reqwest::StatusCode::OK);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The frames a socket answers to `input`, until it closes or goes quiet.
+    async fn answers(input: Vec<serde_json::Value>, init_timeout: Duration) -> Vec<WsMessage> {
+        let (engine, directory) = engine().await;
+        let schema = gql::build_schema(engine);
+        let frames: Vec<String> = input.iter().map(|frame| frame.to_string()).collect();
+        // The client keeps the socket open after its frames, as a real one would.
+        let input = futures::stream::iter(frames)
+            .chain(futures::stream::pending())
+            .boxed();
+        let output = gql::socket_messages(
+            schema,
+            Arc::from(TOKEN),
+            input,
+            WebSocketProtocols::GraphQLWS,
+            init_timeout,
+        );
+        futures::pin_mut!(output);
+        let mut seen = Vec::new();
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_secs(1), output.next()).await
+        {
+            seen.push(message);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
+        seen
+    }
+
+    fn closed_with(messages: &[WsMessage]) -> Option<(u16, String)> {
+        messages.iter().find_map(|message| match message {
+            WsMessage::Close(code, reason) => Some((*code, reason.clone())),
+            WsMessage::Text(_) => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn a_socket_with_the_wrong_token_is_closed_as_forbidden() {
+        let seen = answers(
+            vec![json!({ "type": "connection_init", "payload": { "token": "nope" } })],
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(
+            closed_with(&seen),
+            Some((gql::CLOSE_FORBIDDEN, gql::BAD_TOKEN.to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subscription_before_connection_init_closes_the_socket() {
+        let seen = answers(
+            vec![json!({
+                "type": "subscribe", "id": "1",
+                "payload": { "query": "subscription { runDiff(runId: \"00000000-0000-0000-0000-000000000000\") { patch } }" }
+            })],
+            Duration::from_secs(10),
+        )
+        .await;
+        let (code, _) = closed_with(&seen).expect("the socket is closed");
+        assert_eq!(code, 1011);
+        assert!(
+            seen.iter()
+                .all(|m| !matches!(m, WsMessage::Text(text) if text.contains("\"next\""))),
+            "{seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_socket_that_never_initialises_is_closed() {
+        let seen = answers(Vec::new(), Duration::from_millis(100)).await;
+        assert_eq!(
+            closed_with(&seen).map(|(code, _)| code),
+            Some(gql::CLOSE_INIT_TIMEOUT)
+        );
+    }
+
+    #[tokio::test]
+    async fn the_right_token_is_acknowledged_and_the_timeout_stops() {
+        let seen = answers(
+            vec![json!({ "type": "connection_init", "payload": { "token": TOKEN } })],
+            Duration::from_millis(200),
+        )
+        .await;
+        assert!(
+            matches!(&seen[0], WsMessage::Text(text) if text.contains("connection_ack")),
+            "{seen:?}"
+        );
+        assert_eq!(closed_with(&seen), None, "an initialised socket stays open");
+    }
 }

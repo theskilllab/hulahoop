@@ -15,7 +15,7 @@ const GROUPS = ["Source control", "Agent access"] as const;
  * What the loop signs in with. One column, never wider than 760px: the rows are
  * a list of decisions, and a wide table would make them look like data.
  */
-export function Connectors() {
+export function Connectors({ onOpenSettings }: { onOpenSettings?: () => void } = {}) {
   const [rows, setRows] = useState<ConnectorRow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [open, setOpen] = useState<ConnectorRow | null>(null);
@@ -141,6 +141,14 @@ export function Connectors() {
             void load();
           }}
           onError={setError}
+          onOpenSettings={
+            onOpenSettings
+              ? () => {
+                  setOpen(null);
+                  onOpenSettings();
+                }
+              : undefined
+          }
         />
       ) : null}
     </section>
@@ -153,17 +161,18 @@ function ConnectDialog({
   onClose,
   onDone,
   onError,
+  onOpenSettings,
 }: {
   row: ConnectorRow;
   onClose: () => void;
   onDone: () => void;
   onError: (message: string | null) => void;
+  /** Where a person adds their own GitHub token. */
+  onOpenSettings?: () => void;
 }) {
   const [busy, setBusy] = useState(false);
-  const [method, setMethod] = useState<"app" | "token">("app");
   const [appId, setAppId] = useState("");
   const [pem, setPem] = useState("");
-  const [pat, setPat] = useState("");
   const [key, setKey] = useState("");
   const [token, setToken] = useState("");
   const [contents, setContents] = useState("");
@@ -181,79 +190,53 @@ function ConnectDialog({
     if (row.id === "github") {
       return (
         <>
-          <div className="seg" role="group" aria-label="Connection method">
-            <button type="button" aria-pressed={method === "app"} onClick={() => setMethod("app")}>
-              GitHub App
-            </button>
-            <button
-              type="button"
-              aria-pressed={method === "token"}
-              onClick={() => setMethod("token")}
-            >
-              Personal access token
-            </button>
-          </div>
-          {method === "app" ? (
-            <>
-              <label className="field">
-                <span className="field-label">App ID</span>
-                <input
-                  className="input mono"
-                  value={appId}
-                  placeholder="1042517"
-                  onChange={(event) => setAppId(event.target.value)}
-                />
-              </label>
-              <label className="field">
-                <span className="field-label">Private key</span>
-                <textarea
-                  className="textarea mono"
-                  rows={5}
-                  value={pem}
-                  placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----"}
-                  onChange={(event) => setPem(event.target.value)}
-                />
-                <span className="dim small">
-                  Paste the .pem from the app's settings. It is sealed before it is stored.
-                </span>
-              </label>
-              <button
-                className="primary"
-                disabled={busy || !appId.trim() || !pem.trim()}
-                onClick={() =>
-                  run(`mutation ($appId: String!, $key: String!) { createGithubApp(appId: $appId, privateKey: $key) { id connected } }`, {
-                    appId: appId.trim(),
-                    key: pem,
-                  })
-                }
-              >
-                Connect
+          <p className="dim small">
+            The workspace connects through a GitHub App, which pushes branches and opens pull requests.
+            To review and merge as yourself, add your own token in{" "}
+            {onOpenSettings ? (
+              <button type="button" className="link" onClick={onOpenSettings}>
+                Settings → Personal
               </button>
-            </>
-          ) : (
-            <>
-              <label className="field">
-                <span className="field-label">Token</span>
-                <input
-                  className="input mono"
-                  type="password"
-                  value={pat}
-                  placeholder="ghp_… or github_pat_…"
-                  onChange={(event) => setPat(event.target.value)}
-                />
-                <span className="dim small">
-                  Needs repository access. Work appears on GitHub as you, not as an app.
-                </span>
-              </label>
-              <button
-                className="primary"
-                disabled
-                title="A personal access token is not wired to the push path yet; use the GitHub App"
-              >
-                Connect
-              </button>
-            </>
-          )}
+            ) : (
+              "Settings → Personal"
+            )}
+            .
+          </p>
+          <label className="field">
+            <span className="field-label">App ID</span>
+            <input
+              type="text"
+              className="input mono"
+              value={appId}
+              placeholder="1042517"
+              onChange={(event) => setAppId(event.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span className="field-label">Private key</span>
+            <textarea
+              className="textarea mono"
+              rows={5}
+              value={pem}
+              placeholder={"-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----"}
+              onChange={(event) => setPem(event.target.value)}
+            />
+            <span className="dim small">
+              Paste the .pem from the app's settings. It is sealed before it is stored.
+            </span>
+          </label>
+          <button
+            className="primary"
+            disabled={busy || !appId.trim() || !pem.trim()}
+            onClick={() =>
+              run(`mutation ($appId: String!, $key: String!) { createGithubApp(appId: $appId, privateKey: $key) { id connected } }`, {
+                appId: appId.trim(),
+                key: pem,
+              })
+            }
+          >
+            Connect
+          </button>
         </>
       );
     }

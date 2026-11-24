@@ -165,51 +165,6 @@ export function Projects({
   );
 }
 
-/* --------------------------------------------------------- Pull requests --- */
-
-export function PullRequests({ issues, onOpen }: { issues: Issue[]; onOpen: (id: string) => void }) {
-  const withPr = issues.filter((issue) => issue.prUrl);
-  return (
-    <section className="screen prs">
-      <PageHeader
-        title="Pull requests"
-        subtitle={`${withPr.length} from GitHub`}
-      />
-
-      {withPr.length === 0 ? (
-        <p className="dim">No pull requests yet.</p>
-      ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>task</th>
-              <th>title</th>
-              <th>pull</th>
-              <th>status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {withPr.map((issue) => (
-              <tr key={issue.id} onClick={() => onOpen(issue.id)} className="clickable">
-                <td className="mono">{issue.key}</td>
-                <td>{issue.title}</td>
-                <td className="mono">
-                  <a href={issue.prUrl ?? "#"} target="_blank" rel="noreferrer">
-                    #{issue.prNumber}
-                  </a>
-                </td>
-                <td>
-                  <span className={`pill ${issue.status}`}>{issue.status.replaceAll("_", " ")}</span>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </section>
-  );
-}
-
 /* ------------------------------------------------------------- Activity --- */
 
 export function Activity({

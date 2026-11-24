@@ -4,7 +4,7 @@ use crate::adapter;
 use crate::client::Client;
 use crate::vcs::{Kind, Vcs};
 use anyhow::{anyhow, bail, Context, Result};
-use hulahoop_core::{contract, slugify, Adapter};
+use hulahoop_core::{contract, github_api, slugify, Adapter};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -128,6 +128,7 @@ impl Executor {
                 &message,
                 &env,
                 wall_clock,
+                None,
             )
             .await?;
 
@@ -281,6 +282,18 @@ impl Executor {
         // a test that does not exercise the real plumbing proves nothing about it.
         let prompt_file = adapter::write_system_prompt(&artifact_dir, &system_prompt)?;
         let invocation = adapter::invocation(adapter, &model, &prompt_file, &message)?;
+        // The base is resolved once, before the agent starts: from here on the
+        // live diff only reads the checkout with git, never with jj.
+        let live_diff = match vcs.resolve(&base) {
+            Ok(commit) => crate::live::LiveDiffSource::new(&checkout, &commit).await,
+            Err(error) => {
+                tracing::debug!(run_id, %error, "could not resolve the live diff's base");
+                None
+            }
+        };
+        if live_diff.is_none() {
+            tracing::info!(run_id, checkout = %checkout.display(), "git cannot read this checkout; no live diff for this run");
+        }
         let mut outcome = self
             .spawn_and_stream(
                 run_id,
@@ -291,6 +304,7 @@ impl Executor {
                 &message,
                 &env,
                 wall_clock,
+                live_diff,
             )
             .await?;
 
@@ -898,6 +912,7 @@ impl Executor {
         message: &str,
         env: &[(String, String)],
         wall_clock_minutes: i64,
+        live_diff: Option<crate::live::LiveDiffSource>,
     ) -> Result<Outcome> {
         let pid_slot = Arc::new(AtomicI64::new(0));
         let pgid_slot = Arc::new(AtomicI64::new(0));
@@ -952,6 +967,19 @@ impl Executor {
             .map(|file| std::sync::Arc::new(std::sync::Mutex::new(std::io::BufWriter::new(file))));
         let mut log_bytes = 0usize;
         let mut artifact_limit_hit = false;
+
+        // The working diff is taken every few seconds while the agent works, so
+        // a person can watch the change grow. It runs beside this loop, so the
+        // heartbeat and the output never wait on it; dropping it stops it.
+        let _live_diff = live_diff.map(|source| {
+            crate::live::spawn(
+                self.client.clone(),
+                run_id.to_string(),
+                source,
+                Duration::from_secs(hulahoop_core::LIVE_DIFF_INTERVAL_SECS),
+                Duration::from_secs(hulahoop_core::LIVE_DIFF_TIMEOUT_SECS),
+            )
+        });
 
         loop {
             let wait = next_heartbeat.saturating_duration_since(Instant::now());
@@ -1923,7 +1951,8 @@ async fn installation_token(
 ) -> Result<String> {
     let response = http
         .get(format!(
-            "https://api.github.com/repos/{owner}/{repo}/installation"
+            "{}/repos/{owner}/{repo}/installation",
+            github_api()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -1944,7 +1973,8 @@ async fn installation_token(
         .context("the installation response had no id")?;
     let response = http
         .post(format!(
-            "https://api.github.com/app/installations/{installation}/access_tokens"
+            "{}/app/installations/{installation}/access_tokens",
+            github_api()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -2020,7 +2050,8 @@ async fn update_pull_request(
 ) -> Result<()> {
     let response = http
         .patch(format!(
-            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+            "{}/repos/{owner}/{repo}/pulls/{number}",
+            github_api()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -2069,7 +2100,8 @@ async fn job_watch_checks(spec: &Value) -> Result<Value> {
     loop {
         let checks = http
             .get(format!(
-                "https://api.github.com/repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100"
+                "{}/repos/{owner}/{name}/commits/{sha}/check-runs?per_page=100",
+                github_api()
             ))
             .header("accept", "application/vnd.github+json")
             .header("user-agent", "hulahoop")
@@ -2158,7 +2190,8 @@ async fn open_change_requests(
 ) -> Result<Vec<String>> {
     let response = http
         .get(format!(
-            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100"
+            "{}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100",
+            github_api()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -2202,7 +2235,8 @@ async fn comment_on_pull_request(
     };
     let response = http
         .post(format!(
-            "https://api.github.com/repos/{owner}/{repo}/issues/{number}/comments"
+            "{}/repos/{owner}/{repo}/issues/{number}/comments",
+            github_api()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -2253,7 +2287,8 @@ async fn job_review_pr(spec: &Value) -> Result<Value> {
     let installation = installation_token(&http, token, &owner, &name).await?;
     let response = http
         .post(format!(
-            "https://api.github.com/repos/{owner}/{name}/pulls/{number}/reviews"
+            "{}/repos/{owner}/{name}/pulls/{number}/reviews",
+            github_api()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -2329,7 +2364,7 @@ async fn open_pull_request(http: &reqwest::Client, pull: PullRequest<'_>) -> Res
         body,
     } = pull;
     let response = http
-        .post(format!("https://api.github.com/repos/{owner}/{repo}/pulls"))
+        .post(format!("{}/repos/{owner}/{repo}/pulls", github_api()))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
         .bearer_auth(token)

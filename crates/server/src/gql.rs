@@ -2,22 +2,165 @@
 //! so a mutation and a runner callback cannot disagree about the gate.
 
 use async_graphql::{
-    ComplexObject, Context, EmptySubscription, MaybeUndefined, Object, Schema, SimpleObject,
+    ComplexObject, Context, MaybeUndefined, Object, Schema, SimpleObject, Subscription,
 };
 use uuid::Uuid;
 
 use crate::engine::Engine;
 use crate::model::*;
+use crate::pulls::{
+    DiffSide, GithubAccount, MergeMethod, PullRequest, PullRequestComment, PullRequestDetail,
+    PullRequestFilter, ReviewEvent, RunDiff,
+};
 use crate::workflows::WorkflowDoc;
 
-pub type HulahoopSchema = Schema<Query, Mutation, EmptySubscription>;
+pub type HulahoopSchema = Schema<Query, Mutation, SubscriptionRoot>;
 
 pub fn build_schema(engine: std::sync::Arc<Engine>) -> HulahoopSchema {
-    Schema::build(Query, Mutation, EmptySubscription)
+    Schema::build(Query, Mutation, SubscriptionRoot)
         .data(engine)
         .limit_depth(12)
         .limit_complexity(2000)
         .finish()
+}
+
+/// What a WebSocket whose `connection_init` carried the wrong token is told.
+pub const BAD_TOKEN: &str = "bad token";
+/// `graphql-transport-ws`'s "Forbidden": the token did not match, and trying
+/// again with the same one will not change that.
+pub const CLOSE_FORBIDDEN: u16 = 4403;
+/// `graphql-transport-ws`'s "Connection initialisation timeout".
+pub const CLOSE_INIT_TIMEOUT: u16 = 4408;
+/// How long a socket may stay open without a successful `connection_init`.
+pub const WS_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The GraphQL WebSocket, which carries subscriptions. Speaks both
+/// `graphql-transport-ws` and the older `graphql-ws`. The client proves it holds
+/// the server token in `connection_init` (`{ "token": "…" }`); without it the
+/// connection closes before any subscription starts: 4403 for a wrong token,
+/// 4408 when no `connection_init` was accepted within [`WS_INIT_TIMEOUT`], and
+/// 1011 for a subscription sent before it.
+pub async fn serve_websocket(
+    schema: HulahoopSchema,
+    token: std::sync::Arc<str>,
+    headers: axum::http::HeaderMap,
+    upgrade: axum::extract::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    use futures::{SinkExt, StreamExt};
+    let protocol = headers
+        .get(axum::http::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|protocols| {
+            protocols.split(',').find_map(|p| {
+                p.trim()
+                    .parse::<async_graphql::http::WebSocketProtocols>()
+                    .ok()
+            })
+        });
+    let Some(protocol) = protocol else {
+        return axum::http::StatusCode::BAD_REQUEST.into_response();
+    };
+    upgrade
+        .protocols(async_graphql::http::ALL_WEBSOCKET_PROTOCOLS)
+        .on_upgrade(move |socket| async move {
+            use axum::extract::ws::{CloseFrame, Message};
+            let (mut sink, stream) = socket.split();
+            let input = stream
+                .take_while(|message| futures::future::ready(message.is_ok()))
+                .filter_map(|message| {
+                    futures::future::ready(match message {
+                        Ok(message @ (Message::Text(_) | Message::Binary(_))) => {
+                            Some(message.into_data())
+                        }
+                        _ => None,
+                    })
+                });
+            let output = socket_messages(schema, token, input, protocol, WS_INIT_TIMEOUT);
+            futures::pin_mut!(output);
+            while let Some(message) = output.next().await {
+                let message = match message {
+                    async_graphql::http::WsMessage::Text(text) => Message::Text(text.into()),
+                    async_graphql::http::WsMessage::Close(code, reason) => {
+                        Message::Close(Some(CloseFrame {
+                            code,
+                            reason: reason.into(),
+                        }))
+                    }
+                };
+                if sink.send(message).await.is_err() {
+                    break;
+                }
+            }
+        })
+}
+
+/// The protocol side of [`serve_websocket`], over any stream of client frames,
+/// so it can be driven without a socket. `init_timeout` is how long the client
+/// has to get a `connection_init` accepted.
+pub fn socket_messages<S>(
+    schema: HulahoopSchema,
+    token: std::sync::Arc<str>,
+    input: S,
+    protocol: async_graphql::http::WebSocketProtocols,
+    init_timeout: std::time::Duration,
+) -> impl futures::Stream<Item = async_graphql::http::WsMessage> + Send + 'static
+where
+    S: futures::Stream + Send + Unpin + 'static,
+    S::Item: AsRef<[u8]>,
+{
+    use async_graphql::http::WsMessage;
+    use futures::StreamExt;
+    let inner = async_graphql::http::WebSocket::new(schema, input, protocol)
+        .on_connection_init(move |payload: serde_json::Value| async move {
+            let provided = payload["token"].as_str().unwrap_or_default();
+            if crate::api::same_token(&token, provided) {
+                Ok(async_graphql::Data::default())
+            } else {
+                Err(async_graphql::Error::new(BAD_TOKEN))
+            }
+        })
+        .boxed();
+    let deadline = Some(tokio::time::Instant::now() + init_timeout);
+    futures::stream::unfold(
+        (inner, deadline, false),
+        |(mut inner, mut deadline, done)| async move {
+            if done {
+                return None;
+            }
+            let message = match deadline {
+                Some(at) => tokio::select! {
+                    message = inner.next() => message?,
+                    _ = tokio::time::sleep_until(at) => {
+                        let close = WsMessage::Close(
+                            CLOSE_INIT_TIMEOUT,
+                            "Connection initialisation timeout".to_string(),
+                        );
+                        return Some((close, (inner, None, true)));
+                    }
+                },
+                None => inner.next().await?,
+            };
+            let message = match message {
+                WsMessage::Text(text) => {
+                    let acked = serde_json::from_str::<serde_json::Value>(&text)
+                        .is_ok_and(|value| value["type"] == "connection_ack");
+                    if acked {
+                        deadline = None;
+                    }
+                    WsMessage::Text(text)
+                }
+                // async-graphql closes a refused init with 1002; the client is
+                // told the protocol's own "forbidden" instead.
+                WsMessage::Close(1002, reason) if reason == BAD_TOKEN => {
+                    WsMessage::Close(CLOSE_FORBIDDEN, reason)
+                }
+                other => other,
+            };
+            let closing = matches!(message, WsMessage::Close(..));
+            Some((message, (inner, deadline, closing)))
+        },
+    )
 }
 
 pub fn engine<'a>(ctx: &'a Context<'a>) -> &'a Engine {
@@ -332,6 +475,69 @@ impl Query {
         .fetch_all(&engine(ctx).db.pool)
         .await?)
     }
+
+    /// The person's GitHub account, when they gave a token.
+    async fn github_account(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Option<GithubAccount>> {
+        Ok(engine(ctx).github_account().await?)
+    }
+
+    /// Pull requests in the linked repositories, from the server's cache.
+    async fn pull_requests(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(default_with = "PullRequestFilter::Open")] filter: PullRequestFilter,
+    ) -> async_graphql::Result<Vec<PullRequest>> {
+        Ok(engine(ctx).pull_requests(filter).await?)
+    }
+
+    async fn open_pull_request_count(&self, ctx: &Context<'_>) -> async_graphql::Result<i64> {
+        Ok(engine(ctx).open_pull_request_count().await?)
+    }
+
+    async fn pull_requests_synced_at(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok(engine(ctx).pull_requests_synced_at().await?)
+    }
+
+    async fn pull_request_sync_problems(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Vec<String>> {
+        Ok(engine(ctx).pull_request_sync_problems().await?)
+    }
+
+    /// One pull request, read live from GitHub.
+    async fn pull_request(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        number: i64,
+    ) -> async_graphql::Result<Option<PullRequestDetail>> {
+        Ok(engine(ctx).pull_request_detail(repo_id, number).await?)
+    }
+}
+
+/// Named `Subscription` in the schema, like the contract; the Rust name only
+/// avoids clashing with the derive.
+pub struct SubscriptionRoot;
+
+#[Subscription(name = "Subscription")]
+impl SubscriptionRoot {
+    /// A run's working diff: the current one at once, then every change, and
+    /// the final one with `live: false` before the stream ends.
+    async fn run_diff(
+        &self,
+        ctx: &Context<'_>,
+        run_id: Uuid,
+    ) -> async_graphql::Result<impl futures::Stream<Item = RunDiff>> {
+        let engine = ctx.data_unchecked::<std::sync::Arc<Engine>>();
+        Ok(engine.watch_diff(run_id).await?)
+    }
 }
 
 #[derive(SimpleObject, sqlx::FromRow)]
@@ -348,6 +554,80 @@ pub struct Mutation;
 
 #[Object]
 impl Mutation {
+    /// Checks a GitHub token and keeps it sealed. Fails when GitHub does not
+    /// say whose it is.
+    async fn set_github_token(
+        &self,
+        ctx: &Context<'_>,
+        token: String,
+    ) -> async_graphql::Result<GithubAccount> {
+        Ok(engine(ctx).set_github_token(&token).await?)
+    }
+
+    async fn clear_github_token(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).clear_github_token().await?)
+    }
+
+    /// Syncs every linked repository now and answers when it finished.
+    async fn sync_pull_requests(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<chrono::DateTime<chrono::Utc>> {
+        Ok(engine(ctx).sync_pull_requests(None).await?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn add_pull_request_comment(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        number: i64,
+        path: String,
+        line: i64,
+        side: DiffSide,
+        body: String,
+    ) -> async_graphql::Result<PullRequestComment> {
+        Ok(engine(ctx)
+            .add_pull_request_comment(repo_id, number, &path, line, side, &body)
+            .await?)
+    }
+
+    async fn delete_pull_request_comment(
+        &self,
+        ctx: &Context<'_>,
+        id: async_graphql::ID,
+    ) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).delete_pull_request_comment(&id).await?)
+    }
+
+    async fn review_pull_request(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        number: i64,
+        event: ReviewEvent,
+        body: Option<String>,
+    ) -> async_graphql::Result<PullRequestDetail> {
+        Ok(engine(ctx)
+            .review_pull_request(repo_id, number, event, body.as_deref())
+            .await?)
+    }
+
+    /// Merges on GitHub, pinned to `head_sha`: the head the person reviewed.
+    /// Left out, the cached head is used.
+    async fn merge_pull_request(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        number: i64,
+        method: MergeMethod,
+        head_sha: Option<String>,
+    ) -> async_graphql::Result<PullRequest> {
+        Ok(engine(ctx)
+            .merge_pull_request(repo_id, number, method, head_sha.as_deref())
+            .await?)
+    }
+
     async fn save_cost_settings(
         &self,
         ctx: &Context<'_>,
@@ -1274,19 +1554,7 @@ impl Mutation {
         issue_id: Uuid,
         body: String,
     ) -> async_graphql::Result<Issue> {
-        let engine = engine(ctx);
-        engine
-            .comment(
-                issue_id,
-                hulahoop_core::AuthorType::Human,
-                None,
-                &body,
-                false,
-            )
-            .await?;
-        Ok(engine
-            .transition(issue_id, hulahoop_core::IssueEvent::RequestChanges)
-            .await?)
+        Ok(engine(ctx).request_changes(issue_id, &body).await?)
     }
 
     /// Asks the runner to read the pull request's checks again at the current

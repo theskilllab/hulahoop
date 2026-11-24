@@ -1153,3 +1153,266 @@ export async function loadConnections(): Promise<ConnectorRow[]> {
   );
   return data.connections;
 }
+
+/* ------------------------------------------------------------ Pull requests --- */
+
+/** The person's own GitHub account: what their token can do, never the token. */
+export interface GithubAccount {
+  login: string;
+  name: string | null;
+  avatarUrl: string | null;
+  /** `github_pat_…a1B2`: enough to recognise the token, never enough to use it. */
+  tokenHint: string;
+  validatedAt: string;
+  /** What probing found missing; empty when the token can do everything. */
+  problems: string[];
+}
+
+export type PullRequestFilter = "OPEN" | "NEEDS_MY_REVIEW" | "MINE" | "BY_AGENTS" | "FAILING_CI" | "MERGED";
+export type ReviewState = "DRAFT" | "REVIEW_REQUESTED" | "APPROVED" | "CHANGES_REQUESTED" | "MERGED" | "CLOSED";
+export type CiState = "PASSING" | "FAILING" | "RUNNING" | "NONE";
+export type MergeMethod = "MERGE" | "SQUASH" | "REBASE";
+export type ReviewEvent = "APPROVE" | "REQUEST_CHANGES";
+export type DiffSide = "LEFT" | "RIGHT";
+
+export interface PullRequest {
+  /** `<repoId>#<number>`. */
+  id: string;
+  repoId: string;
+  /** `owner/repo`. */
+  repoName: string;
+  number: number;
+  title: string;
+  url: string;
+  /** `open` or `closed`. */
+  state: string;
+  draft: boolean;
+  merged: boolean;
+  authorLogin: string;
+  authorAvatarUrl: string | null;
+  byAgent: boolean;
+  headRef: string;
+  headSha: string;
+  baseRef: string;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  reviewState: ReviewState;
+  reviewRequestedFromMe: boolean;
+  ciState: CiState;
+  createdAt: string;
+  updatedAt: string;
+  mergedAt: string | null;
+  /** The task the pull request carries, when Hulahoop opened it. */
+  issue: { id: string; key: string; title: string; status: IssueStatus } | null;
+  /** The task's queued or running run, whose working diff can be watched. */
+  liveRun: { id: string; agentId: string; status: string } | null;
+}
+
+export interface PullRequestFile {
+  path: string;
+  previousPath: string | null;
+  /** `added`, `removed`, `modified` or `renamed`. */
+  status: string;
+  additions: number;
+  deletions: number;
+  /** GitHub's hunks; null for a binary or too large file. */
+  patch: string | null;
+}
+
+export interface PullRequestComment {
+  id: string;
+  path: string;
+  line: number;
+  side: DiffSide;
+  body: string;
+  authorLogin: string;
+  createdAt: string;
+  /** Saved in Hulahoop, not on GitHub yet: it goes with the next review. */
+  pending: boolean;
+  /** Pending, and there is no token to send it with. */
+  onlyInHulahoop: boolean;
+}
+
+export interface PullRequestReview {
+  authorLogin: string;
+  state: string;
+  body: string | null;
+  submittedAt: string | null;
+}
+
+export interface CheckRun {
+  name: string;
+  status: string;
+  conclusion: string | null;
+  url: string | null;
+}
+
+export interface PullRequestDetail {
+  pullRequest: PullRequest;
+  body: string | null;
+  files: PullRequestFile[];
+  comments: PullRequestComment[];
+  reviews: PullRequestReview[];
+  checks: CheckRun[];
+  mergeMethods: MergeMethod[];
+  lastMergeMethod: MergeMethod | null;
+  canReview: boolean;
+  reviewBlockedReason: string | null;
+  canMerge: boolean;
+  mergeBlockedReason: string | null;
+}
+
+export interface RunDiff {
+  runId: string;
+  patch: string;
+  sha: string;
+  live: boolean;
+  updatedAt: string;
+}
+
+export const GITHUB_ACCOUNT_FIELDS = `login name avatarUrl tokenHint validatedAt problems`;
+
+export const PULL_REQUEST_FIELDS = `
+  id repoId repoName number title url state draft merged authorLogin authorAvatarUrl byAgent
+  headRef headSha baseRef additions deletions changedFiles reviewState reviewRequestedFromMe ciState
+  createdAt updatedAt mergedAt
+  issue { id key title status }
+  liveRun { id agentId status }
+`;
+
+export const PULL_REQUEST_COMMENT_FIELDS = `id path line side body authorLogin createdAt pending onlyInHulahoop`;
+
+export const PULL_REQUEST_DETAIL_FIELDS = `
+  pullRequest { ${PULL_REQUEST_FIELDS} }
+  body
+  files { path previousPath status additions deletions patch }
+  comments { ${PULL_REQUEST_COMMENT_FIELDS} }
+  reviews { authorLogin state body submittedAt }
+  checks { name status conclusion url }
+  mergeMethods lastMergeMethod canReview reviewBlockedReason canMerge mergeBlockedReason
+`;
+
+/** The person's GitHub account, or null before they add a token. */
+export async function loadGithubAccount(): Promise<GithubAccount | null> {
+  const data = await gql<{ githubAccount: GithubAccount | null }>(
+    `query { githubAccount { ${GITHUB_ACCOUNT_FIELDS} } }`,
+  );
+  return data.githubAccount;
+}
+
+/** The server checks the token against GitHub before sealing it, and refuses a bad one. */
+export async function setGithubToken(token: string): Promise<GithubAccount> {
+  const data = await gql<{ setGithubToken: GithubAccount }>(
+    `mutation ($token: String!) { setGithubToken(token: $token) { ${GITHUB_ACCOUNT_FIELDS} } }`,
+    { token },
+  );
+  return data.setGithubToken;
+}
+
+export async function clearGithubToken(): Promise<boolean> {
+  const data = await gql<{ clearGithubToken: boolean }>(`mutation { clearGithubToken }`);
+  return data.clearGithubToken;
+}
+
+/** From the server's cache, which it keeps in sync with GitHub on its own. */
+export async function loadPullRequests(filter: PullRequestFilter): Promise<PullRequest[]> {
+  const data = await gql<{ pullRequests: PullRequest[] }>(
+    `query ($filter: PullRequestFilter!) { pullRequests(filter: $filter) { ${PULL_REQUEST_FIELDS} } }`,
+    { filter },
+  );
+  return data.pullRequests;
+}
+
+/** The sidebar's count. It reads the server's cache, so the 2.5 s poll may ask for it. */
+export async function loadOpenPullRequestCount(): Promise<number> {
+  const data = await gql<{ openPullRequestCount: number }>(`query { openPullRequestCount }`);
+  return data.openPullRequestCount;
+}
+
+export interface PullRequestSyncStatus {
+  syncedAt: string | null;
+  problems: string[];
+}
+
+export async function loadPullRequestSyncStatus(): Promise<PullRequestSyncStatus> {
+  const data = await gql<{ pullRequestsSyncedAt: string | null; pullRequestSyncProblems: string[] }>(
+    `query { pullRequestsSyncedAt pullRequestSyncProblems }`,
+  );
+  return { syncedAt: data.pullRequestsSyncedAt, problems: data.pullRequestSyncProblems };
+}
+
+/** Files, reviews, comments and checks, which the server reads from GitHub. */
+export async function loadPullRequest(repoId: string, number: number): Promise<PullRequestDetail | null> {
+  const data = await gql<{ pullRequest: PullRequestDetail | null }>(
+    `query ($repoId: UUID!, $number: Int!) { pullRequest(repoId: $repoId, number: $number) { ${PULL_REQUEST_DETAIL_FIELDS} } }`,
+    { repoId, number },
+  );
+  return data.pullRequest;
+}
+
+/** Ask the server to sync now; returns when it finished. */
+export async function syncPullRequests(): Promise<string> {
+  const data = await gql<{ syncPullRequests: string }>(`mutation { syncPullRequests }`);
+  return data.syncPullRequests;
+}
+
+export interface PullRequestCommentInput {
+  repoId: string;
+  number: number;
+  path: string;
+  line: number;
+  side: DiffSide;
+  body: string;
+}
+
+export async function addPullRequestComment(input: PullRequestCommentInput): Promise<PullRequestComment> {
+  const data = await gql<{ addPullRequestComment: PullRequestComment }>(
+    `mutation ($repoId: UUID!, $number: Int!, $path: String!, $line: Int!, $side: DiffSide!, $body: String!) {
+      addPullRequestComment(repoId: $repoId, number: $number, path: $path, line: $line, side: $side, body: $body) { ${PULL_REQUEST_COMMENT_FIELDS} }
+    }`,
+    { ...input },
+  );
+  return data.addPullRequestComment;
+}
+
+/** Only a pending comment can go; one on GitHub stays there. */
+export async function deletePullRequestComment(id: string): Promise<boolean> {
+  const data = await gql<{ deletePullRequestComment: boolean }>(
+    `mutation ($id: ID!) { deletePullRequestComment(id: $id) }`,
+    { id },
+  );
+  return data.deletePullRequestComment;
+}
+
+/** Sends the review with every pending line comment. `body` may be empty when comments carry it. */
+export async function reviewPullRequest(
+  repoId: string,
+  number: number,
+  event: ReviewEvent,
+  body: string | null,
+): Promise<PullRequestDetail> {
+  const data = await gql<{ reviewPullRequest: PullRequestDetail }>(
+    `mutation ($repoId: UUID!, $number: Int!, $event: ReviewEvent!, $body: String) {
+      reviewPullRequest(repoId: $repoId, number: $number, event: $event, body: $body) { ${PULL_REQUEST_DETAIL_FIELDS} }
+    }`,
+    { repoId, number, event, body },
+  );
+  return data.reviewPullRequest;
+}
+
+/** `headSha` pins the merge to the head the person saw: GitHub refuses it if someone pushed since. */
+export async function mergePullRequest(
+  repoId: string,
+  number: number,
+  method: MergeMethod,
+  headSha?: string | null,
+): Promise<PullRequest> {
+  const data = await gql<{ mergePullRequest: PullRequest }>(
+    `mutation ($repoId: UUID!, $number: Int!, $method: MergeMethod!, $headSha: String) {
+      mergePullRequest(repoId: $repoId, number: $number, method: $method, headSha: $headSha) { ${PULL_REQUEST_FIELDS} }
+    }`,
+    { repoId, number, method, headSha: headSha ?? null },
+  );
+  return data.mergePullRequest;
+}

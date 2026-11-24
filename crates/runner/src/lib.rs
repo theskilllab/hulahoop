@@ -4,6 +4,7 @@
 mod adapter;
 mod client;
 mod exec;
+mod live;
 mod vcs;
 
 use anyhow::Context;

@@ -4623,3 +4623,124 @@ button.link.new-task-choose { justify-self: start; margin-top: calc(-1 * var(--s
   .mslist { border-right: 0; border-bottom: 1px solid var(--line); max-height: 40vh; }
   .msd { padding: var(--s4) var(--s3); }
 }
+
+/* ---------- Pull requests: a filtered list beside the one being read ---------- */
+.screen.prs > .prsplit,
+.screen.prs > .pr-noaccess { padding: 0; }
+.pr-problems { display: flex; align-items: flex-start; gap: var(--s2); margin: 0 0 var(--s2); padding: var(--s2) var(--s3); border-radius: var(--r-sm); background: var(--warn-soft); color: var(--warn); font-size: var(--fs-xs); }
+.pr-problems ul { margin: 0; padding: 0; list-style: none; display: grid; gap: 2px; }
+.pr-tokenhint { margin: 0 0 var(--s2); color: var(--muted); }
+.pr-noaccess { margin: var(--s6) auto; max-width: 460px; }
+.pr-noaccess-actions { justify-content: center; gap: var(--s2); margin-top: var(--s3); flex-wrap: wrap; }
+.prsplit { flex: 1 1 0; display: grid; grid-template-columns: minmax(320px, 400px) minmax(0, 1fr); min-height: 0; border-top: 1px solid var(--line); }
+.prlist { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); }
+.pr-filters { display: flex; flex-wrap: wrap; gap: 6px; padding: var(--s3) var(--s4); border-bottom: 1px solid var(--line); }
+.pr-filters button { height: var(--h-compact); padding: 0 10px; border: 1px solid var(--line); border-radius: var(--r-pill); background: var(--bg); color: var(--text-2); font-size: var(--fs-xs); white-space: nowrap; }
+@media (hover: hover) { .pr-filters button:hover { background: var(--bg-2); } }
+.pr-filters button[aria-pressed="true"] { background: var(--text); border-color: var(--text); color: var(--bg); font-weight: 600; }
+.pr-filters button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pr-rows { flex: 1 1 0; overflow-y: auto; min-height: 0; }
+.prrow { display: grid; grid-template-columns: 22px minmax(0, 1fr) auto; gap: var(--s2); align-items: start; width: 100%; padding: var(--s3) var(--s4); border: 0; border-radius: 0; border-bottom: 0.5px solid var(--line); background: none; color: var(--text); text-align: left; font-size: var(--fs-sm); }
+@media (hover: hover) { .prrow:hover { background: var(--bg-2); } }
+.prrow[aria-current="true"] { background: var(--accent-soft); }
+.prrow:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.pr-main { display: grid; gap: 4px; min-width: 0; }
+.pr-title { font-weight: 550; line-height: 1.35; }
+.pr-meta { display: flex; flex-wrap: wrap; gap: 4px var(--s2); font-size: var(--fs-xs); color: var(--muted); }
+.pr-chips { display: grid; gap: 4px; justify-items: end; }
+.pr-icon { display: inline-flex; color: var(--ok); margin-top: 2px; }
+.pr-icon.draft, .pr-icon.closed { color: var(--muted); }
+.pr-icon.merged { color: var(--accent-text); }
+.pr-skel { height: 56px; margin: var(--s2) var(--s4); border-radius: var(--r-md); background: linear-gradient(90deg, var(--bg-2), var(--bg-3), var(--bg-2)); background-size: 200% 100%; animation: pr-shimmer 1.2s linear infinite; }
+@keyframes pr-shimmer { from { background-position: 200% 0; } to { background-position: 0 0; } }
+@media (prefers-reduced-motion: reduce) { .pr-skel { animation: none; } }
+.prdetail { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.pr-nodetail { margin: auto; }
+.pr-pane { display: flex; flex-direction: column; min-height: 0; flex: 1 1 0; }
+.pr-head { display: grid; gap: var(--s2); padding: var(--s4) var(--s5); border-bottom: 1px solid var(--line); }
+.pr-titlerow { align-items: flex-start; gap: var(--s2); }
+.pr-head h2 { margin: 0; font-size: var(--fs-lg); font-weight: 650; line-height: 1.35; }
+.pr-number { font-weight: 400; }
+.pr-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.pr-cluster > button.chip { cursor: pointer; border: 0; }
+.pr-by { font-size: var(--fs-xs); }
+.pr-branch { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); overflow-wrap: anywhere; }
+.pr-actions { gap: var(--s2); margin-top: var(--s1); }
+.prs a.btn { text-decoration: none; }
+.prs .btn.ok { background: var(--ok); border-color: var(--ok); color: var(--bg); }
+.prs .btn.ok:hover:not(:disabled) { filter: brightness(1.06); }
+.prs .btn[aria-pressed="true"] { background: var(--bg-3); }
+.prs .btn:disabled { cursor: not-allowed; }
+.prs .btn:focus-visible, .prs a.btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.prback { display: none; }
+.pr-why { margin: 0; color: var(--muted); }
+.pr-merge { position: relative; display: inline-flex; }
+.pr-merge .pr-merge-main:not(:last-of-type) { border-top-right-radius: 0; border-bottom-right-radius: 0; }
+.pr-merge .pr-merge-more { padding: 0 6px; border-top-left-radius: 0; border-bottom-left-radius: 0; border-left: 1px solid color-mix(in srgb, var(--bg) 35%, var(--ok)); }
+.pr-merge-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 20; display: grid; min-width: 260px; padding: 4px; background: var(--bg); border: 1px solid var(--line); border-radius: var(--r-md); box-shadow: var(--shadow); }
+.pr-merge-menu button { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: var(--s2); align-items: start; padding: 6px var(--s2); border: 0; border-radius: var(--r-sm); background: none; color: var(--text); text-align: left; font-size: var(--fs-sm); }
+.pr-merge-menu button > span:last-child { display: grid; gap: 2px; }
+.pr-merge-menu button:hover, .pr-merge-menu button:focus-visible { background: var(--bg-2); outline: none; }
+.pr-merge-check { display: inline-flex; padding-top: 3px; color: var(--accent-text); }
+.pr-fb { display: grid; gap: var(--s2); padding: var(--s3) var(--s5); border-bottom: 1px solid var(--line); background: var(--bg-2); }
+.pr-fb-hint { font-weight: 400; }
+.pr-fb-actions { justify-content: flex-end; gap: var(--s2); }
+.pr-filesbar { display: flex; align-items: center; gap: var(--s3); padding: var(--s2) var(--s5); border-bottom: 1px solid var(--line); }
+.pr-live { margin-left: auto; gap: 6px; }
+.pr-body { flex: 1 1 0; min-height: 0; overflow: auto; padding-bottom: var(--s5); }
+.pr-body > .error { margin: var(--s4) var(--s5); }
+
+/* ---------- Diffs: unified, file by file ---------- */
+.diff-view { display: grid; gap: var(--s4); padding: var(--s4) var(--s5); }
+.diff-empty { margin: var(--s5); }
+.diff-file { border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; background: var(--bg); }
+.diff-file-head { margin: 0; font: inherit; }
+.diff-fold { display: flex; align-items: center; gap: var(--s2); width: 100%; padding: 8px var(--s3); border: 0; border-radius: 0; background: var(--bg-2); color: var(--text); text-align: left; font-size: var(--fs-sm); }
+.diff-file:has(.diff-code) .diff-fold, .diff-file:has(.diff-note) .diff-fold { border-bottom: 1px solid var(--line); }
+.diff-fold:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.diff-path { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.diff-stat { white-space: nowrap; font-size: var(--fs-xs); }
+.diff-plus { color: var(--ok); }
+.diff-minus { color: var(--bad); }
+.diff-note { margin: 0; padding: var(--s2) var(--s3); }
+.diff-code { overflow-x: auto; font-family: var(--font-mono); font-size: var(--fs-sm); line-height: 19px; }
+.diff-line { display: grid; grid-template-columns: 22px 40px 40px minmax(max-content, 1fr); min-width: 100%; width: max-content; }
+.diff-line.add { background: var(--add-bg); color: var(--add-fg); }
+.diff-line.del { background: var(--del-bg); color: var(--del-fg); }
+.diff-line.hunk, .diff-line.note { background: var(--bg-2); color: var(--muted); }
+.diff-num { padding: 0 6px; text-align: right; color: var(--muted); font-size: var(--fs-xs); user-select: none; }
+.diff-text { padding: 0 var(--s3) 0 var(--s1); white-space: pre; }
+.diff-cbtn-cell { display: inline-flex; }
+.diff-cbtn { width: 22px; height: 19px; padding: 0; border: 0; border-radius: var(--r-xs); background: none; color: var(--accent-text); font-weight: 700; line-height: 1; opacity: 0; }
+.diff-line:hover .diff-cbtn, .diff-cbtn:focus-visible, .diff-cbtn[aria-expanded="true"] { opacity: 1; }
+.diff-cbtn:hover { background: var(--accent-soft); }
+.diff-cbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+@media (hover: none) { .diff-cbtn { opacity: 0.6; } }
+.diff-cmt { display: grid; gap: var(--s2); margin: var(--s2) var(--s3) var(--s2) 62px; padding: var(--s2) var(--s3); max-width: 560px; border: 1px solid var(--line); border-radius: var(--r-md); background: var(--bg); font-family: var(--font-ui); font-size: var(--fs-sm); line-height: 1.45; white-space: normal; }
+.diff-cmt.pending { border-style: dashed; background: var(--bg-2); }
+.diff-cmt-head { gap: 6px; flex-wrap: wrap; }
+.diff-cmt-delete { margin-left: auto; font-size: var(--fs-xs); }
+.diff-cmt-body { white-space: pre-wrap; overflow-wrap: anywhere; }
+.diff-cmt-actions { justify-content: flex-end; gap: var(--s2); }
+.diff-compose textarea { width: 100%; }
+.diff-show { display: block; margin: var(--s3); }
+.diff-outside { display: grid; padding: var(--s2) 0; border-top: 1px solid var(--line); }
+.diff-outside > span { padding: 0 var(--s3); }
+
+/* ---------- Settings → Personal: GitHub account ---------- */
+.gh-who { gap: var(--s3); }
+.gh-avatar { width: 32px; height: 32px; border-radius: 50%; flex: none; }
+.gh-problems { margin: 0; padding: var(--s2) var(--s3) var(--s2) var(--s5); border-radius: var(--r-sm); background: var(--warn-soft); color: var(--warn); font-size: var(--fs-xs); }
+.gh-token { align-items: flex-end; gap: var(--s2); }
+
+/* Narrow: the list, then the one being read with a way back. Never both squeezed together. */
+@media (max-width: 900px) {
+  .prsplit { grid-template-columns: minmax(0, 1fr); }
+  .prlist { border-right: 0; }
+  .prsplit .prdetail { display: none; }
+  .prsplit.showdetail .prlist { display: none; }
+  .prsplit.showdetail .prdetail { display: flex; }
+  .prback { display: inline-flex; order: -1; }
+  .pr-head, .pr-fb, .pr-filesbar { padding-left: var(--s3); padding-right: var(--s3); }
+  .diff-view { padding: var(--s3); }
+}
