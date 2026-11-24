@@ -637,23 +637,25 @@ mod carry_tests {
         commit(&root, "a.txt", "one\n", "base");
         jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
         // The task's head: changes a.txt and adds b.txt.
+        // Its bookmark is not called "head": on a case-insensitive disk (macOS)
+        // git confuses `refs/heads/head` with HEAD when jj adds a worktree.
         commit(&root, "a.txt", "task\n", "task a");
         commit(&root, "b.txt", "b\n", "task b");
-        jj(&root, &["bookmark", "create", "head", "-r", "@-"]);
+        jj(&root, &["bookmark", "create", "task", "-r", "@-"]);
         // main moves on and touches a.txt too.
         jj(&root, &["new", "main"]);
         commit(&root, "c.txt", "c\n", "main c");
         commit(&root, "a.txt", "main\n", "main a");
         jj(&root, &["bookmark", "set", "main", "-r", "@-"]);
-        let head_before = Vcs::detect(&root).unwrap().resolve("head").unwrap();
+        let head_before = Vcs::detect(&root).unwrap().resolve("task").unwrap();
 
         let checkout = root.join("ws");
         let vcs = Vcs::detect(&root).unwrap();
-        vcs.add_workspace(&checkout, "head").unwrap();
+        vcs.add_workspace(&checkout, "task").unwrap();
         let ws = Vcs::detect(&checkout).unwrap();
         let newest = ws.newest_base("main").unwrap();
         let carried = ws
-            .carry_onto(&checkout, "head", &newest)
+            .carry_onto(&checkout, "task", &newest)
             .unwrap()
             .expect("the head is behind main");
 
@@ -670,7 +672,7 @@ mod carry_tests {
             &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
         );
         assert_eq!(parent.trim(), newest);
-        assert_eq!(vcs.resolve("head").unwrap(), head_before);
+        assert_eq!(vcs.resolve("task").unwrap(), head_before);
 
         vcs.abandon(carried.merge.as_deref().unwrap()).unwrap();
         // Already current: nothing to carry.
