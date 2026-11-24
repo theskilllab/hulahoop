@@ -69,19 +69,6 @@ impl Executor {
         // runs/<id>/ like any other run's.
         if is_repo_less(spec) {
             remove_scratch(&self.data_dir, &run_id);
-        } else if spec["runner_mode"].as_str() == Some("local") {
-            // A local checkout is a copy of the repository, and a copy per run
-            // compounds: one project, ten issues, four attempts, three roles. It is
-            // deleted the moment the run is over; the artifacts it produced live
-            // under runs/<id>/ and are what anyone reads afterwards.
-            let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
-            let mirror = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default());
-            // The directory goes, the registration goes with it: the mirror is long
-            // lived, and a workspace name for a path that no longer exists is litter.
-            forget_workspace(&mirror, &format!("run-{run_id}"));
-            if let Some(run_dir) = checkout.parent() {
-                let _ = std::fs::remove_dir_all(run_dir);
-            }
         }
         if let Err(error) = &result {
             tracing::error!(%error, run_id, "run failed to execute");
@@ -172,8 +159,12 @@ impl Executor {
         }
         let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
-        let repo_path = host_repository(spec)?;
-        let checkout = PathBuf::from(spec["checkout_path"].as_str().unwrap_or_default());
+        let repo_path = host_repository(spec).await?;
+        let checkout = owned_checkout(
+            &self.data_dir,
+            &spec["checkout_project_id"],
+            &spec["issue_id"],
+        )?;
         let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
         std::fs::create_dir_all(&artifact_dir)?;
         let base_bookmark = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
@@ -198,19 +189,27 @@ impl Executor {
             .as_i64()
             .unwrap_or(hulahoop_core::AGENT_WALL_CLOCK_MINUTES);
 
-        let local = spec["runner_mode"].as_str() == Some("local");
-        if local {
-            // Local mode gives the run its own directory, and shares the mirror's
-            // repository: one object store, one op log, no clone, no fetch, and no
-            // bookmarks to push back afterwards.
-            base = prepare_workspace(&repo_path, &checkout, &base, &format!("run-{run_id}"))?;
-        } else {
-            let vcs = Vcs::detect(&repo_path)?;
-            vcs.ensure_vcs()?;
-            vcs.add_workspace(&checkout, &base)?;
+        // The task's checkout is a workspace of the mirror, reused across its
+        // turns; the server allows one live run per task, so no other turn is in
+        // it. Everything after this point asks the checkout.
+        let mirror = Vcs::detect(&repo_path)?;
+        mirror.ensure_vcs()?;
+        // A task that was in flight when its repository moved to a fresh mirror
+        // can name a revision the mirror never had; its bookmark on the remote,
+        // or the repository's base there, is where it picks up instead.
+        let repo_base = spec["repo_base_bookmark"].as_str().unwrap_or_default();
+        let start = mirror.resolve_first(&[
+            base.clone(),
+            base_bookmark.clone(),
+            on_origin(&base_bookmark),
+            on_origin(repo_base),
+            repo_base.to_string(),
+        ])?;
+        if mirror.resolve(&base).ok().as_deref() != Some(start.as_str()) {
+            tracing::warn!(run_id, %base, %start, "the start revision is not in the mirror; starting from its bookmark instead");
         }
-        // A clone is its own repository; a workspace shares the one at repo_path.
-        // Everything after this point asks the checkout, which is right either way.
+        base = start;
+        mirror.add_workspace(&checkout, &base)?;
         let vcs = Vcs::detect(&checkout)?;
 
         // A rework starts on the previous head; the task lands on the repository's
@@ -362,8 +361,8 @@ impl Executor {
         } else {
             Vec::new()
         };
-        // A workspace shares the loop's repository, so the bookmark set above is
-        // already visible to the replay that has to prove the work; nothing to push.
+        // A workspace shares the mirror's repository, so the bookmark set above is
+        // already in the mirror; a pull request job pushes it from there.
         let _ = &published;
 
         let status = run_status(&outcome);
@@ -391,25 +390,16 @@ impl Executor {
             )
             .await?;
 
-        // The checkout is removed on success; a failure keeps it so the human can
-        // look at the mess a cancel or a crash left behind... for one attempt.
-        // A workspace has to be forgotten or the repository accumulates them; a clone
-        // is a directory, and `run_run` deletes the whole run directory.
-        // A turn that changed nothing left nothing worth inspecting in its checkout.
-        if (status == "succeeded" || !changed) && !local {
-            let _ = vcs.remove_workspace(&checkout);
-        }
+        // The checkout stays: the task's next turn reuses it, build outputs and
+        // all, and it goes when the task is merged, closed or cancelled.
         // Scaffolding and empty commits are litter in everybody's `jj log`: the
         // merge only measured the diff, and a turn that changed nothing published
-        // nothing, so its working copy has no reason to outlive it. The checkout may
-        // be gone by now, so the repository it belonged to does the abandoning.
-        if !changed && !commit.is_empty() {
-            if local {
-                forget_workspace(&repo_path, &format!("run-{run_id}"));
-            }
-            if let Ok(repo) = Vcs::detect(&repo_path) {
-                let _ = repo.abandon(&commit);
-            }
+        // nothing, so its working copy has no reason to outlive it. The next turn
+        // brings the stale checkout back with `jj workspace update-stale`. A turn
+        // that left conflicts published nothing either, but its work stays in its
+        // commit for a person to look at.
+        if !touched && !commit.is_empty() {
+            let _ = mirror.abandon(&commit);
         }
         Ok(())
     }
@@ -419,17 +409,33 @@ impl Executor {
         let spec = &envelope["spec"];
         let job_id = job["id"].as_str().context("job has no id")?.to_string();
         let kind = spec["kind"].as_str().unwrap_or_default().to_string();
-        let repo_path = host_repository(spec)?;
 
+        // A cleanup and a forgotten mirror only delete; cloning or fetching the
+        // mirror first would be work for nothing. Every other job works from an
+        // up-to-date mirror, and one that cannot have it fails with the reason.
         let result = match kind.as_str() {
-            "fetch" => self.job_fetch(&repo_path, spec).await,
-            "preflight" => self.job_preflight(&repo_path, spec).await,
-            "bookmark" => self.job_bookmark(&repo_path, spec).await,
-            "open_pr" => self.job_open_pr(&repo_path, spec).await,
-            "review_pr" => job_review_pr(spec).await,
-            "watch_checks" => job_watch_checks(spec).await,
-            "lumi" => self.job_lumi(&repo_path, spec, &job_id).await,
-            other => Err(anyhow!("unknown job kind {other}")),
+            "cleanup" => job_cleanup(&self.data_dir, spec),
+            "forget_mirror" => job_forget_mirror(&self.data_dir, spec).await,
+            _ => match host_repository(spec).await {
+                Ok(repo_path) => match kind.as_str() {
+                    "fetch" => self.job_fetch(&repo_path, spec).await,
+                    "land" => {
+                        // Landing moves a bookmark in the mirror, which a fetch
+                        // in the other lane must not interleave with.
+                        let lock = mirror_lock(&repo_path);
+                        let _turn = lock.lock().await;
+                        job_land(&repo_path, spec)
+                    }
+                    "preflight" => self.job_preflight(&repo_path, spec).await,
+                    "bookmark" => self.job_bookmark(&repo_path, spec).await,
+                    "open_pr" => self.job_open_pr(&repo_path, spec).await,
+                    "review_pr" => job_review_pr(spec).await,
+                    "watch_checks" => job_watch_checks(spec).await,
+                    "lumi" => self.job_lumi(&repo_path, spec, &job_id).await,
+                    other => Err(anyhow!("unknown job kind {other}")),
+                },
+                Err(error) => Err(error),
+            },
         };
 
         if kind == "lumi" {
@@ -466,7 +472,15 @@ impl Executor {
                 "bookmark {base_bookmark} does not exist in the repo; set it in the repo, then fetch again"
             ));
         }
-        Ok(json!({ "base_revision": revision }))
+        // The recorded base can be ahead of what the remote says: a landing was
+        // recorded after the remote answered an earlier fetch, or the remote
+        // lags. Reporting that, and which base it was compared with, lets the
+        // server keep the newer base instead of moving it back.
+        let recorded = span["base_revision"].as_str().unwrap_or_default().trim();
+        let behind = !recorded.is_empty()
+            && recorded != revision
+            && vcs.is_strict_ancestor(&revision, recorded).unwrap_or(false);
+        Ok(json!({ "base_revision": revision, "behind": behind, "compared_with": recorded }))
     }
 
     async fn job_preflight(&self, repo_path: &Path, span: &Value) -> Result<Value> {
@@ -1268,12 +1282,6 @@ pub fn prune_workspace(data_dir: &Path) -> usize {
     pruned
 }
 
-/// Produce the checkout a local runner works in: a fresh clone of the repository,
-/// parked on the revision the server accepted the run against.
-///
-/// The base revision has to exist in the clone. It does not when the base was never
-/// pushed, and the honest answer then is to say so instead of quietly branching
-/// from the branch head and blaming the agent for the difference.
 /// Environment that makes git and jj send the token, without it ever appearing in
 /// `ps` or in a stored remote URL.
 fn git_auth(token: &str) -> Vec<(&'static str, String)> {
@@ -1290,31 +1298,37 @@ fn git_auth(token: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The host repository a run borrows from. A repository attached by its remote has
-/// no checkout on this machine, so the server gives it a mirror path it owns; the
-/// first run clones into it, later runs fetch. Cloning here keeps the loop out of
-/// any working copy the user is using, and lets a private repository work without
-/// the token ever being written to disk.
-fn host_repository(spec: &Value) -> Result<PathBuf> {
+/// The mirror a run or job works from: Hulahoop's own clone of the
+/// repository's url, under the data directory. The first use clones into it,
+/// later ones fetch. Cloning here keeps the loop out of any working copy the
+/// user is using, and lets a private repository work without the token ever
+/// being written to disk.
+///
+/// The job lane and the Lumi lane can both want the same mirror at once, so
+/// clones and fetches of one mirror take turns. A clone lands in a temporary
+/// directory first and is renamed into place, so a half-done clone is never
+/// mistaken for a mirror.
+async fn host_repository(spec: &Value) -> Result<PathBuf> {
     let raw = spec["repo_path"]
         .as_str()
         .unwrap_or_default()
         .trim()
         .to_string();
     if raw.is_empty() {
-        bail!(
-            "this repository has neither a checkout nor a remote, so a run has nothing to work from. Attach it by path or by its GitHub remote in Settings."
-        );
+        bail!("the server named no mirror for this repository, so there is nothing to work from");
     }
     let path = PathBuf::from(&raw);
-    if !spec["repo_mirror"].as_bool().unwrap_or(false) {
-        return Ok(path);
-    }
-    let url = spec["clone_url"].as_str().unwrap_or_default().to_string();
+    let url = spec["clone_url"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     if url.is_empty() {
-        bail!("the mirror has no clone url, so the run cannot fetch the repository");
+        bail!("this repository has no url to clone from. Set its url in the project settings.");
     }
     let token = spec["clone_token"].as_str().map(str::to_string);
+    let lock = mirror_lock(&path);
+    let _turn = lock.lock().await;
     if path.join(".git").exists() || path.join(".jj").exists() {
         let mut command = Command::new("jj");
         command.args(["git", "fetch"]).current_dir(&path);
@@ -1333,74 +1347,96 @@ fn host_repository(spec: &Value) -> Result<PathBuf> {
         }
         return Ok(path);
     }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .context("the mirror path has no parent directory")?;
+    std::fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(".tmp-{}", uuid::Uuid::now_v7()));
     let mut command = Command::new("jj");
     command
-        .args(["git", "clone", "--colocate", &url])
-        .arg(&path);
+        .args(["git", "clone", "--colocate", "--", &url])
+        .arg(&staging);
     if let Some(token) = &token {
         command.envs(git_auth(token));
     }
     let output = command
         .output()
-        .context("running jj git clone for the mirror")?;
+        .context("running jj git clone for the mirror");
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
     if !output.status.success() {
+        let _ = std::fs::remove_dir_all(&staging);
         bail!(
             "cloning {url} into the mirror at {} failed: {}",
             path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    // Another runner on this data directory may have finished the same clone
+    // first; theirs is as good as this one.
+    if std::fs::rename(&staging, &path).is_err() && path.join(".jj").exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+    } else if staging.exists() {
+        let _ = std::fs::remove_dir_all(&staging);
+        bail!(
+            "could not move the new clone into the mirror at {}",
+            path.display()
+        );
+    }
     Ok(path)
 }
 
-/// Local mode: the run gets its own directory but shares the mirror's repository.
-///
-/// A workspace costs the working copy and nothing else — no second object store,
-/// no fetch, and no bookmarks to push back — which is what keeps a run per attempt
-/// affordable. The price is one shared op log, so the repository pins history:
-/// `immutable_heads` covers everything reachable from a bookmark or a tag, and jj
-/// refuses to rewrite the revision a run started from.
-fn prepare_workspace(root: &Path, checkout: &Path, base: &str, name: &str) -> Result<String> {
-    let vcs = Vcs::detect(root)?;
-    vcs.ensure_vcs()?;
-    ensure_immutability(root)?;
-    forget_workspace(root, name);
-    if checkout.exists() {
-        std::fs::remove_dir_all(checkout)
-            .with_context(|| format!("clearing a stale workspace at {}", checkout.display()))?;
+/// The lock that makes clones and fetches of one mirror take turns inside this
+/// runner. jj records every fetch as an operation, and two at once in one
+/// repository leave divergent operations behind.
+fn mirror_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks.entry(path.to_path_buf()).or_default().clone()
+}
+
+/// A bookmark's name on the remote the mirror was cloned from; empty for no
+/// bookmark.
+fn on_origin(bookmark: &str) -> String {
+    let bookmark = bookmark.trim();
+    if bookmark.is_empty() {
+        String::new()
+    } else {
+        format!("{bookmark}@origin")
     }
-    if let Some(parent) = checkout.parent() {
-        std::fs::create_dir_all(parent)?;
+}
+
+/// The checkout of the task `issue` in project `project`, derived here instead
+/// of taken from the server: the runner rebuilds and deletes this directory, so
+/// it is only ever one under the data directory's `checkouts/` that it owns.
+fn owned_checkout(data_dir: &Path, project: &Value, issue: &Value) -> Result<PathBuf> {
+    let id = |value: &Value, what: &str| {
+        value
+            .as_str()
+            .and_then(|raw| uuid::Uuid::parse_str(raw.trim()).ok())
+            .with_context(|| format!("the server named no {what} for the task's checkout"))
+    };
+    let project = id(project, "project")?;
+    let issue = id(issue, "task")?;
+    let checkout = contract::checkout_dir(data_dir, &project.to_string(), &issue);
+    if !contract::is_owned_checkout(data_dir, &checkout) {
+        bail!(
+            "refusing to use {}: a task checkout must be a real directory under {}",
+            checkout.display(),
+            data_dir.join("checkouts").display()
+        );
     }
-    let mut refused = Vec::new();
-    for candidate in [
-        base.to_string(),
-        format!("{base}@origin"),
-        "main@origin".to_string(),
-        "main".to_string(),
-    ] {
-        let added = std::process::Command::new("jj")
-            .args(["workspace", "add"])
-            .arg(checkout)
-            .args(["--name", name, "-r", &candidate])
-            .current_dir(root)
-            .output()
-            .context("running jj workspace add")?;
-        if added.status.success() {
-            return Ok(candidate);
-        }
-        refused.push(format!(
-            "{candidate}: {}",
-            String::from_utf8_lossy(&added.stderr).trim()
-        ));
-    }
-    bail!(
-        "the mirror holds no revision to start from ({}). A run cannot start from a revision that does not exist, and starting from the wrong one would blame the agent for changes it never made.",
-        refused.join("; ")
-    )
+    Ok(checkout)
 }
 
 /// Abandons a carried turn's scaffolding merge when the run is over, on every
@@ -1429,48 +1465,6 @@ fn conflict_note(landing: &str, conflicts: &[String]) -> String {
     format!(
         "\n\nBefore this turn the loop moved the task's work onto the newest `{landing}`, and these files conflict:\n{files}\n\nIf your turn changes the work, resolve them first: edit each file so it keeps both `{landing}`'s changes and the task's intent, and remove every conflict marker; `jj resolve --list` must print nothing before you finish, or the turn's work is not published. A review judges the work as it will land, conflicts included."
     )
-}
-
-/// Drops a workspace registration before its directory disappears, so the mirror
-/// does not accumulate names for paths that are gone.
-fn forget_workspace(root: &Path, name: &str) {
-    let _ = std::process::Command::new("jj")
-        .args(["workspace", "forget", name])
-        .current_dir(root)
-        .output();
-}
-
-/// A run may extend history, never rewrite it. Bookmarks carry every revision the
-/// loop has accepted, so the revset below makes them immutable for every workspace
-/// that shares the repository — enforced by jj, with no wrapper in the agent's path.
-fn ensure_immutability(root: &Path) -> Result<()> {
-    // jj 0.47 keeps repo-level config outside the repository, and prints the path
-    // it would read, so ask instead of guessing at `.jj/repo/config.toml`.
-    let printed = std::process::Command::new("jj")
-        .args(["config", "path", "--repo"])
-        .current_dir(root)
-        .output()
-        .context("asking jj where the repository config lives")?;
-    let path = String::from_utf8_lossy(&printed.stdout).trim().to_string();
-    let config = if path.is_empty() {
-        root.join(".jj").join("repo").join("config.toml")
-    } else {
-        PathBuf::from(path)
-    };
-    if let Some(parent) = config.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let existing = std::fs::read_to_string(&config).unwrap_or_default();
-    if existing.contains("immutable_heads()") {
-        return Ok(());
-    }
-    // The alias form is the one jj reads: `revsets.immutable_heads` is accepted as
-    // a plain value and silently ignored, which is worse than no guard at all.
-    let body = format!(
-        "{existing}[revset-aliases]\n# Hulahoop pins history: a run may extend it, never rewrite it.\n\"immutable_heads()\" = \"builtin_immutable_heads() | bookmarks() | tags()\"\n"
-    );
-    std::fs::write(&config, body).with_context(|| format!("writing {}", config.display()))?;
-    Ok(())
 }
 
 /// The dev shell decides what `just`, the compiler, and the test runner are; the
@@ -2418,6 +2412,105 @@ fn prepare_scratch(data_dir: &Path, run_id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Deletes a task's checkout once no turn will use it: the workspace is
+/// forgotten in the mirror and its directory removed. The path is derived from
+/// the project and task ids in the payload, and only a real directory below the
+/// data directory's `checkouts/` may go this way, so a wrong payload cannot
+/// delete anything else. A checkout that is already gone is not an error:
+/// there is nothing left to do.
+fn job_cleanup(data_dir: &Path, spec: &Value) -> Result<Value> {
+    let payload = &spec["payload"];
+    let checkout = owned_checkout(data_dir, &payload["project_id"], &payload["issue_id"])?;
+    let mirror = PathBuf::from(spec["repo_path"].as_str().unwrap_or_default().trim());
+    match Vcs::detect(&mirror) {
+        Ok(mirror) => mirror.remove_workspace(&checkout)?,
+        Err(_) => {
+            if checkout.exists() {
+                std::fs::remove_dir_all(&checkout)
+                    .with_context(|| format!("removing {}", checkout.display()))?;
+            }
+        }
+    }
+    Ok(json!({ "removed": checkout }))
+}
+
+/// Deletes a repository's mirror after its url changed, so the next job or
+/// run clones the new url instead of fetching the old one. Only a
+/// `mirrors/<repository id>` directory may go this way: the mirror the server
+/// names has to be exactly that, an absolute path with no `..` in it, and
+/// without a name the one under this runner's data directory is used. A mirror
+/// that is already gone is not an error.
+async fn job_forget_mirror(data_dir: &Path, spec: &Value) -> Result<Value> {
+    use std::path::Component;
+    let id = spec["repo_id"]
+        .as_str()
+        .and_then(|raw| uuid::Uuid::parse_str(raw.trim()).ok())
+        .context("the server named no repository whose mirror to forget")?;
+    let named = spec["repo_path"].as_str().unwrap_or_default().trim();
+    let mirror = if named.is_empty() {
+        contract::mirror_dir(data_dir, &id)
+    } else {
+        PathBuf::from(named)
+    };
+    let plain = mirror
+        .components()
+        .all(|part| matches!(part, Component::RootDir | Component::Normal(_)));
+    if !mirror.is_absolute()
+        || !plain
+        || !mirror.ends_with(Path::new("mirrors").join(id.to_string()))
+    {
+        bail!(
+            "refusing to delete {}: a mirror is mirrors/<repository id> under the data directory",
+            mirror.display()
+        );
+    }
+    let lock = mirror_lock(&mirror);
+    let _turn = lock.lock().await;
+    match std::fs::symlink_metadata(&mirror) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&mirror)
+            .with_context(|| format!("removing {}", mirror.display()))?,
+        Ok(_) => std::fs::remove_file(&mirror)
+            .with_context(|| format!("removing {}", mirror.display()))?,
+        Err(_) => {}
+    }
+    Ok(json!({ "removed": mirror }))
+}
+
+/// Lands a merge made without a pull request: the repository's base bookmark
+/// moves forward to the merged head in the mirror and is pushed to the remote,
+/// so the next fetch finds the merge there instead of undoing it. A base that
+/// moved on since the head was made cannot be moved to it without dropping
+/// work, so that is refused and reported.
+fn job_land(repo_path: &Path, spec: &Value) -> Result<Value> {
+    let base = spec["base_bookmark"].as_str().unwrap_or("main").trim();
+    let revision = spec["payload"]["revision"]
+        .as_str()
+        .unwrap_or_default()
+        .trim();
+    if base.is_empty() || revision.is_empty() {
+        bail!("a landing needs the repository's base bookmark and the merged revision");
+    }
+    let vcs = Vcs::detect(repo_path)?;
+    let landed = vcs.advance_bookmark(base, revision).with_context(|| {
+        format!("{base} could not move forward to {revision}; it has work the merged head does not")
+    })?;
+    let mut command = Command::new("jj");
+    command
+        .args(["git", "push", "--bookmark", base])
+        .current_dir(repo_path);
+    if let Some(token) = spec["clone_token"].as_str() {
+        command.envs(git_auth(token));
+    }
+    let output = command.output().context("running jj git push")?;
+    if !output.status.success() {
+        bail!(
+            "pushing {base} to the repository's remote failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(json!({ "base_revision": landed }))
+}
+
 /// Deletes a repo-less run's scratch directory. Best effort: a leftover is
 /// cleared by `prepare_scratch` the next time the id is used.
 fn remove_scratch(data_dir: &Path, run_id: &str) {
@@ -2427,6 +2520,14 @@ fn remove_scratch(data_dir: &Path, run_id: &str) {
 }
 
 fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
+    // The checkout is reused across turns, and the agent of an earlier turn may
+    // have had other skills: only this turn's agent's skills are left in it.
+    let root = checkout.join(".hulahoop").join("skills");
+    match std::fs::symlink_metadata(&root) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&root)?,
+        Ok(_) => std::fs::remove_file(&root)?,
+        Err(_) => {}
+    }
     let Some(skills) = spec["skills"].as_array() else {
         return Ok(());
     };
@@ -2631,5 +2732,269 @@ mod scratch_tests {
         assert!(!again.exists());
         assert!(prepare_scratch(&data, "../escape").is_err());
         let _ = std::fs::remove_dir_all(&data);
+    }
+}
+
+#[cfg(test)]
+mod checkout_tests {
+    use super::{
+        contract, host_repository, job_cleanup, job_forget_mirror, job_land, owned_checkout,
+    };
+    use std::path::Path;
+    use std::process::Command;
+
+    fn sh(cwd: &Path, program: &str, args: &[&str]) -> String {
+        let output = Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A repository with no url has nothing to clone, and the run says so
+    /// instead of working in some other directory.
+    #[tokio::test]
+    async fn a_repository_without_a_url_fails_clearly() {
+        let mirror = std::env::temp_dir().join(format!("hulahoop-mirror-{}", uuid::Uuid::now_v7()));
+        let spec = serde_json::json!({
+            "repo_path": mirror,
+            "clone_url": null,
+        });
+        let error = host_repository(&spec).await.unwrap_err().to_string();
+        assert!(error.contains("no url to clone from"), "{error}");
+        assert!(
+            !mirror.exists(),
+            "nothing is created for a repository without a url"
+        );
+    }
+
+    /// The first use clones the url into the mirror through a temporary
+    /// directory that does not outlive it.
+    #[tokio::test]
+    async fn a_mirror_is_cloned_into_place() {
+        let root = std::env::temp_dir().join(format!("hulahoop-clone-{}", uuid::Uuid::now_v7()));
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        sh(&origin, "git", &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("a.txt"), "one\n").unwrap();
+        sh(&origin, "git", &["add", "-A"]);
+        sh(
+            &origin,
+            "git",
+            &[
+                "-c",
+                "user.email=t@example.test",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+        let mirror = root.join("data/mirrors/repo");
+        let spec = serde_json::json!({
+            "repo_path": mirror,
+            "clone_url": origin,
+        });
+        assert_eq!(host_repository(&spec).await.unwrap(), mirror);
+        assert!(mirror.join(".jj").exists() && mirror.join("a.txt").exists());
+        // The second use fetches the mirror it has.
+        assert_eq!(host_repository(&spec).await.unwrap(), mirror);
+        let left: Vec<_> = std::fs::read_dir(root.join("data/mirrors"))
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("repo")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A checkout is always `checkouts/<project id>/<task id>` under the data
+    /// directory: ids that are not ids, and a symlink that leads out of it, are
+    /// refused.
+    #[test]
+    fn a_checkout_is_derived_from_ids_and_stays_inside() {
+        let data = std::env::temp_dir().join(format!("hulahoop-owned-{}", uuid::Uuid::now_v7()));
+        let (project, issue) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let ids = |p: &str, i: &str| (serde_json::json!(p), serde_json::json!(i));
+
+        let (p, i) = ids(&project.to_string(), &issue.to_string());
+        let checkout = owned_checkout(&data, &p, &i).unwrap();
+        assert_eq!(
+            checkout,
+            data.join("checkouts")
+                .join(project.to_string())
+                .join(issue.to_string())
+        );
+        for (p, i) in [
+            ids("project", &issue.to_string()),
+            ids("../../mirrors", &issue.to_string()),
+            ids(&project.to_string(), ""),
+        ] {
+            assert!(owned_checkout(&data, &p, &i).is_err(), "{p} {i}");
+        }
+
+        // A project directory that is a symlink to the mirrors is not a checkout.
+        let mirrors = data.join("mirrors");
+        std::fs::create_dir_all(&mirrors).unwrap();
+        std::fs::create_dir_all(data.join("checkouts")).unwrap();
+        std::os::unix::fs::symlink(&mirrors, data.join("checkouts").join(project.to_string()))
+            .unwrap();
+        let (p, i) = ids(&project.to_string(), &issue.to_string());
+        assert!(owned_checkout(&data, &p, &i).is_err());
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A cleanup deletes the task's checkout under the data directory and
+    /// nothing else; a payload that names no task is refused.
+    #[test]
+    fn a_cleanup_only_deletes_task_checkouts() {
+        let data = std::env::temp_dir().join(format!("hulahoop-cleanup-{}", uuid::Uuid::now_v7()));
+        let (project, issue) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let checkout = data
+            .join("checkouts")
+            .join(project.to_string())
+            .join(issue.to_string());
+        let mirror = data.join("mirrors").join("repo");
+        std::fs::create_dir_all(checkout.join("target")).unwrap();
+        std::fs::create_dir_all(&mirror).unwrap();
+
+        for payload in [
+            serde_json::json!({ "checkout": mirror }),
+            serde_json::json!({ "project_id": "..", "issue_id": issue }),
+            serde_json::json!({ "project_id": project }),
+        ] {
+            let spec = serde_json::json!({
+                "repo_path": data.join("mirrors/none"),
+                "payload": payload,
+            });
+            assert!(job_cleanup(&data, &spec).is_err(), "{payload}");
+        }
+        assert!(mirror.exists() && checkout.exists());
+
+        // The mirror is not a repository here, so only the directory goes.
+        let spec = serde_json::json!({
+            "repo_path": data.join("mirrors/none"),
+            "payload": { "project_id": project, "issue_id": issue },
+        });
+        job_cleanup(&data, &spec).expect("cleanup");
+        assert!(!checkout.exists());
+        // Already gone is done, not an error.
+        job_cleanup(&data, &spec).expect("cleanup again");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A repository whose url changed loses its mirror and nothing else: the
+    /// path has to be `mirrors/<repository id>`, whatever the server sent.
+    #[tokio::test]
+    async fn forgetting_a_mirror_only_deletes_that_mirror() {
+        let data = std::env::temp_dir().join(format!("hulahoop-forget-{}", uuid::Uuid::now_v7()));
+        let repo = uuid::Uuid::now_v7();
+        let mirror = contract::mirror_dir(&data, &repo);
+        let other = contract::mirror_dir(&data, &uuid::Uuid::now_v7());
+        std::fs::create_dir_all(mirror.join(".jj")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+
+        for spec in [
+            serde_json::json!({ "repo_path": mirror }),
+            serde_json::json!({ "repo_id": repo, "repo_path": other }),
+            serde_json::json!({ "repo_id": repo, "repo_path": data }),
+            serde_json::json!({ "repo_id": repo, "repo_path": other.join("..").join(repo.to_string()) }),
+            serde_json::json!({ "repo_id": repo, "repo_path": format!("mirrors/{repo}") }),
+        ] {
+            assert!(job_forget_mirror(&data, &spec).await.is_err(), "{spec}");
+        }
+        assert!(mirror.exists() && other.exists());
+
+        let spec = serde_json::json!({ "repo_id": repo, "repo_path": mirror });
+        job_forget_mirror(&data, &spec).await.expect("forget");
+        assert!(!mirror.exists() && other.exists());
+        // Already gone is done, not an error.
+        job_forget_mirror(&data, &spec).await.expect("forget again");
+        let _ = std::fs::remove_dir_all(&data);
+    }
+
+    /// A merge without a pull request moves the base forward to the merged
+    /// head and pushes it, so the remote has the merge; a base that moved on
+    /// sideways is refused instead of losing its work.
+    #[test]
+    fn a_landing_pushes_the_base_forward_only() {
+        let root = std::env::temp_dir().join(format!("hulahoop-land-{}", uuid::Uuid::now_v7()));
+        let origin = root.join("origin.git");
+        std::fs::create_dir_all(&origin).unwrap();
+        sh(&origin, "git", &["init", "-q", "--bare", "-b", "main"]);
+        let seed = root.join("seed");
+        std::fs::create_dir_all(&seed).unwrap();
+        sh(&seed, "git", &["init", "-q", "-b", "main"]);
+        std::fs::write(seed.join("a.txt"), "one\n").unwrap();
+        sh(&seed, "git", &["add", "-A"]);
+        let identity = ["-c", "user.email=t@example.test", "-c", "user.name=t"];
+        sh(
+            &seed,
+            "git",
+            &[&identity[..], &["commit", "-qm", "one"]].concat(),
+        );
+        sh(
+            &seed,
+            "git",
+            &["push", "-q", &origin.to_string_lossy(), "main"],
+        );
+
+        let mirror = root.join("mirror");
+        sh(
+            &root,
+            "jj",
+            &[
+                "git",
+                "clone",
+                "--colocate",
+                "--",
+                &origin.to_string_lossy(),
+                "mirror",
+            ],
+        );
+        // The task's head, on top of main.
+        sh(&mirror, "jj", &["new", "main", "-m", "task"]);
+        std::fs::write(mirror.join("b.txt"), "b\n").unwrap();
+        let head = sh(
+            &mirror,
+            "jj",
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+        );
+        sh(&mirror, "jj", &["new"]);
+
+        let spec = serde_json::json!({
+            "base_bookmark": "main",
+            "payload": { "revision": head },
+        });
+        let landed = job_land(&mirror, &spec).unwrap();
+        assert_eq!(landed["base_revision"].as_str(), Some(head.as_str()));
+        assert_eq!(sh(&origin, "git", &["rev-parse", "main"]), head);
+
+        // main moves on elsewhere; an older sibling head cannot land on it.
+        sh(&mirror, "jj", &["new", "main-", "-m", "other"]);
+        std::fs::write(mirror.join("c.txt"), "c\n").unwrap();
+        let sideways = sh(
+            &mirror,
+            "jj",
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+        );
+        let spec = serde_json::json!({
+            "base_bookmark": "main",
+            "payload": { "revision": sideways },
+        });
+        let error = job_land(&mirror, &spec).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("could not move forward"),
+            "{error:#}"
+        );
+        assert_eq!(sh(&origin, "git", &["rev-parse", "main"]), head);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

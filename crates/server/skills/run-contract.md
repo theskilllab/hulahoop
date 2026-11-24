@@ -19,6 +19,12 @@ second message, no waiting for an answer.
   turn started, oldest first. A comment can change the brief; read them all.
 - Your checkout is a workspace of the repository, parked on the current base.
   Work there. `jj` records it; you do not commit or push by hand.
+- The task keeps that checkout for all of its turns. Ignored build output
+  (`target/`, `node_modules`, `.venv`) from an earlier turn is still there and
+  makes builds faster, but the tracked files are reset to this turn's start.
+  Do not rely on anything else left over: untracked scratch files from an
+  earlier turn are gone, and an ignored file may be stale. Rebuild or
+  regenerate what you depend on.
 - When `repo` in the input is `null`, the task has no repository: your working
   directory is an empty scratch directory, private to this turn and deleted when
   it ends. See "No repository" below.

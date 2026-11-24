@@ -125,14 +125,6 @@ export interface IssueStats {
   activeMinutes: number;
 }
 
-export interface Replay {
-  id: string;
-  kind: "base" | "head" | "landing";
-  status: string;
-  failedTests: string[] | null;
-  createdAt: string;
-}
-
 export interface Issue {
   id: string;
   /** `BAL-15`: the project's prefix and the number inside it. */
@@ -187,8 +179,7 @@ export type IssueSummary = Omit<
 export interface Repo {
   id: string;
   name: string;
-  /** Null when the repository was attached by its remote and lives in a mirror. */
-  path: string | null;
+  /** The url Hulahoop clones the repository from into its own mirror. */
   remoteUrl: string | null;
   vcs: string;
   baseBookmark: string;
@@ -973,7 +964,7 @@ export async function loadWorkspace(workspaceId?: string | null): Promise<Worksp
     data.workspaces.find((entry) => entry.id === workspaceId) ?? data.workspaces[0];
   if (!workspace) throw new Error("the server has no workspace yet");
   const projects = await gql<{ projects: Project[] }>(
-    `query ($id: UUID!) { projects(workspaceId: $id) { id name prefix repos { id name path vcs baseBookmark contractVersion fetchedAt } } }`,
+    `query ($id: UUID!) { projects(workspaceId: $id) { id name prefix repos { id name remoteUrl vcs baseBookmark contractVersion fetchedAt } } }`,
     { id: workspace.id },
   );
   const agents = await gql<{ agents: Agent[] }>(

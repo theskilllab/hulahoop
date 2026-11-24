@@ -8,9 +8,8 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use hulahoop_core::junit;
 use hulahoop_core::runspec::{
-    CheckoutInput, CommentInput, FileInput, IssueInput, Limits, ParentInput, ReplayInput, RunSpec,
+    CheckoutInput, CommentInput, FileInput, IssueInput, Limits, ParentInput, RunSpec,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -23,39 +22,24 @@ pub struct ApiState {
     pub runner_id_default: String,
 }
 
-/// What a local runner clones. The stored remote wins; the constant is the floor
-/// so a repository attached before remotes were read still has somewhere to come
-/// from.
+/// The url a repository is cloned from. Every repository works from a clone
+/// Hulahoop owns, so one without a url cannot run; the runner says so when it
+/// is handed `null` here.
 pub(crate) fn clone_url(repo: &Repo) -> Option<String> {
-    if let Some(remote) = repo.remote_url.as_deref() {
-        return Some(remote.to_string());
-    }
-    // With no remote, the checkout on this machine is the source: cloning a path
-    // needs no network and produces the same history. A repository attached from
-    // GitHub has the remote and no path; one attached by path may have neither.
-    repo.path
-        .as_deref()
-        .map(|path| path.trim().to_string())
-        .filter(|path| !path.is_empty())
-}
-
-/// Where a run finds the repository it works from. A repository attached by path
-/// borrows that checkout; one attached by its remote gets a mirror the runner owns,
-/// so the loop never works inside a checkout the user is using. The mirror also
-/// keeps a private clone possible: the server mints a token scoped to that one
-/// repository and hands it to the runner.
-fn host_path(repo: &Repo, data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
-    if let Some(path) = repo
-        .path
+    repo.remote_url
         .as_deref()
         .map(str::trim)
-        .filter(|path| !path.is_empty())
-    {
-        return Some(std::path::PathBuf::from(path));
-    }
-    repo.remote_url
-        .as_ref()
-        .map(|_| data_dir.join("mirrors").join(repo.id.to_string()))
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+}
+
+/// Where a run finds the repository it works from: the mirror under the data
+/// directory, cloned from the repository's url and fetched by the runner. A
+/// checkout the user works in is never touched. The mirror also keeps a private
+/// clone possible: the server mints a token scoped to that one repository and
+/// hands it to the runner.
+fn host_path(repo: &Repo, data_dir: &std::path::Path) -> std::path::PathBuf {
+    hulahoop_core::contract::mirror_dir(data_dir, &repo.id)
 }
 
 /// A task title as a commit subject: its first line, at most 72 characters.
@@ -70,16 +54,6 @@ fn commit_title(title: &str) -> String {
         .collect()
 }
 
-fn is_mirror(repo: &Repo) -> bool {
-    !repo
-        .path
-        .as_deref()
-        .map(str::trim)
-        .map(|path| !path.is_empty())
-        .unwrap_or(false)
-        && repo.remote_url.is_some()
-}
-
 async fn clone_token(engine: &Engine, repo: &Repo) -> Option<String> {
     let (owner, name) = crate::github::split_remote(repo.remote_url.as_deref()?)?;
     let app = engine
@@ -91,41 +65,6 @@ async fn clone_token(engine: &Engine, repo: &Repo) -> Option<String> {
     crate::github::installation_token(&reqwest::Client::new(), &jwt, &owner, &name)
         .await
         .ok()
-}
-
-/// Runs either borrow the repository at its path or produce a checkout of their
-/// own. Single decision point, because a runner that mixes the two is a runner
-/// that leaves half a clone behind.
-fn runner_mode() -> &'static str {
-    match std::env::var("HULAHOOP_RUNNER_MODE").as_deref() {
-        Ok("local") => "local",
-        _ => "workspace",
-    }
-}
-
-/// Replays read the loop's own bookmarks (`tests/<issue>/…`), which never leave the
-/// host repository, so they always run in the borrowed one.
-fn checkout_for(
-    data_dir: &std::path::Path,
-    project: &uuid::Uuid,
-    issue: &uuid::Uuid,
-    owner: &uuid::Uuid,
-) -> std::path::PathBuf {
-    if runner_mode() == "local" {
-        hulahoop_core::contract::workspace_checkout_dir(
-            data_dir,
-            &project.to_string(),
-            issue,
-            owner,
-        )
-    } else {
-        hulahoop_core::contract::checkout_dir(
-            data_dir,
-            &project.to_string(),
-            issue,
-            &owner.to_string(),
-        )
-    }
 }
 
 pub fn router(state: Arc<ApiState>) -> Router {
@@ -457,7 +396,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     agent.adapter = run.adapter_snapshot.clone().unwrap_or(agent.adapter);
     agent.model = run.model.clone();
     agent.connector = run.connector_id.clone();
-    let checkout_path = match &repo {
+    let (checkout_project, checkout_path) = match &repo {
         Some(repo) => {
             // A task attached to a repository before projects were required may
             // still have none; the repository's own project names the checkout.
@@ -465,9 +404,20 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
                 .bind(issue.project_id.unwrap_or(repo.project_id))
                 .fetch_one(&engine.db.pool)
                 .await?;
-            checkout_for(&engine.db.data_dir, &project.id, &issue.id, &run.id)
+            // One checkout per task, shared by its turns. The runner derives the
+            // same path from the project and the task itself; this one is for
+            // the record.
+            let path = hulahoop_core::contract::checkout_dir(
+                &engine.db.data_dir,
+                &project.id.to_string(),
+                &issue.id,
+            );
+            (Some(project.id), path)
         }
-        None => hulahoop_core::contract::scratch_dir(&engine.db.data_dir, &run.id),
+        None => (
+            None,
+            hulahoop_core::contract::scratch_dir(&engine.db.data_dir, &run.id),
+        ),
     };
 
     // The parent run carries the review body the next attempt has to answer.
@@ -607,27 +557,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     // changed nothing pushes nothing, and nothing else may decide that in advance.
     let github_token = engine.github_token().await?;
 
-    let replays: Vec<Replay> =
-        sqlx::query_as("select * from replays where issue_id = ? order by created_at desc limit 4")
-            .bind(issue.id)
-            .fetch_all(&engine.db.pool)
-            .await?;
-    let replay_inputs: Vec<ReplayInput> = replays
-        .iter()
-        .map(|replay| {
-            let report_path = std::path::Path::new(&replay.artifact_dir).join("junit.xml");
-            let failed = std::fs::read_to_string(&report_path)
-                .map(|xml| junit::parse(&xml).failed_names())
-                .unwrap_or_default();
-            ReplayInput {
-                kind: replay.kind.clone(),
-                status: replay.status.clone(),
-                report_path: report_path.exists().then_some(report_path),
-                failed,
-            }
-        })
-        .collect();
-
     let skills = engine.skill_inputs(agent.id).await?;
     // The runner writes these into the checkout before the agent starts; a skill
     // that only exists inside input.json is advertised in the prompt but absent
@@ -645,7 +574,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         },
         repo: repo.as_ref().map(|repo| hulahoop_core::runspec::RepoInput {
             name: repo.name.clone(),
-            path: repo.path.as_ref().map(std::path::PathBuf::from),
             base_bookmark: repo.base_bookmark.clone(),
         }),
         checkout: CheckoutInput {
@@ -654,7 +582,6 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         },
         parent,
         blocked_answer,
-        replays: replay_inputs,
         limits: Limits::default(),
         skills,
         files: run_files(engine, issue.id).await?,
@@ -671,17 +598,15 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     // What the runner reads to find the repository. A repo-less run sends nulls
     // and `checkout: "none"`, which tells the runner to skip the clone, the
     // workspace, the checks, the diff and the push.
-    let (repo_path, repo_mirror, repo_clone_token, vcs, repo_id, repo_clone_url) = match &repo {
+    let (repo_path, repo_clone_token, vcs, repo_id, repo_clone_url) = match &repo {
         Some(repo) => (
             json!(host_path(repo, &engine.db.data_dir)),
-            json!(is_mirror(repo)),
             json!(clone_token(engine, repo).await),
             json!(repo.vcs),
             json!(repo.id),
             json!(clone_url(repo)),
         ),
         None => (
-            Value::Null,
             Value::Null,
             Value::Null,
             Value::Null,
@@ -702,13 +627,12 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "prompt_path": prompt_path,
         "input_path": input_path,
         "repo_path": repo_path,
-        "repo_mirror": repo_mirror,
         "clone_token": repo_clone_token,
         "vcs": vcs,
         "repo_id": repo_id,
         "checkout": checkout_mode,
         "checkout_path": checkout_path,
-        "runner_mode": runner_mode(),
+        "checkout_project_id": checkout_project,
         "clone_url": repo_clone_url,
         "base_bookmark": run.base_bookmark,
         "base_revision": run.base_revision,
@@ -800,27 +724,10 @@ pub(crate) async fn run_comments(
 }
 
 async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Value> {
-    let mut repo: Repo = sqlx::query_as("select * from repos where id = ?")
+    let repo: Repo = sqlx::query_as("select * from repos where id = ?")
         .bind(job.repo_id)
         .fetch_one(&engine.db.pool)
         .await?;
-    // A repository attached before the column existed has no remote, and a pull
-    // request job cannot work without one. Reading it now costs a subprocess and
-    // saves a migration that would have to guess.
-    if repo.remote_url.is_none() {
-        let found = repo
-            .path
-            .as_deref()
-            .and_then(|path| crate::vcs_remote(std::path::Path::new(path)));
-        if let Some(remote) = found {
-            sqlx::query("update repos set remote_url = ? where id = ?")
-                .bind(&remote)
-                .bind(repo.id)
-                .execute(&engine.db.pool)
-                .await?;
-            repo.remote_url = Some(remote);
-        }
-    }
     let checkout_path = engine
         .db
         .data_dir
@@ -922,7 +829,7 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         "kind": job.kind,
         "payload": payload,
         "repo_path": host_path(&repo, &engine.db.data_dir),
-        "repo_mirror": is_mirror(&repo),
+        "clone_url": clone_url(&repo),
         "clone_token": clone_token(engine, &repo).await,
         "repo_id": repo.id,
         "vcs": repo.vcs,
@@ -931,6 +838,10 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         "artifact_dir": engine.db.data_dir.join("jobs").join(job.id.to_string()),
         "data_dir": engine.db.data_dir,
         "base_bookmark": repo.base_bookmark,
+        // A fetch never moves the base back behind the revision recorded here: a
+        // merge without a pull request records its head before the remote has it.
+        "base_revision": repo.base_revision,
+        "issue_id": job.issue_id,
         "caller_role": "job",
         "pull_request": pull_request,
     }))
@@ -1024,7 +935,7 @@ mod claim_spec_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
             .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
@@ -1094,7 +1005,7 @@ mod claim_spec_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
             .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
@@ -1227,14 +1138,7 @@ mod claim_spec_tests {
         let spec = build_run_spec(&engine, &run).await.unwrap();
 
         assert_eq!(spec["checkout"], "none");
-        for key in [
-            "repo_path",
-            "repo_mirror",
-            "clone_url",
-            "clone_token",
-            "repo_id",
-            "vcs",
-        ] {
+        for key in ["repo_path", "clone_url", "clone_token", "repo_id", "vcs"] {
             assert!(spec[key].is_null(), "{key} should be null: {}", spec[key]);
         }
         assert_eq!(

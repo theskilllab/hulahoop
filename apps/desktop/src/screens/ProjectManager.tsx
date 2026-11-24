@@ -18,7 +18,7 @@ export default function ProjectManager({ workspace, project, onChanged, onClose 
 }) {
   const [name, setName] = useState(project?.name ?? "");
   const [prefix, setPrefix] = useState(project?.prefix ?? "");
-  const [repoPath, setRepoPath] = useState("");
+  const [repoUrl, setRepoUrl] = useState("");
   const [githubRepos, setGithubRepos] = useState<GithubRepo[]>([]);
   const [githubChoice, setGithubChoice] = useState("");
   const [githubError, setGithubError] = useState<string | null>(null);
@@ -92,8 +92,7 @@ export default function ProjectManager({ workspace, project, onChanged, onClose 
           <h3>Repositories</h3>
           {project.repos.length ? <ul className="repos">
             {project.repos.map((repo) => <li key={repo.id}>
-              <strong>{repo.name}</strong> <span className="dim small">{repo.path ?? "mirror"}</span>
-              {repo.remoteUrl && <div className="dim small">{repo.remoteUrl}</div>}
+              <strong>{repo.name}</strong> <span className="dim small">{repo.remoteUrl ?? "no url"}</span>
               <div className="dim small">{repo.vcs} · base {repo.baseBookmark} · fetched {repo.fetchedAt
                 ? new Date(repo.fetchedAt).toLocaleString() : "never"}</div>
             </li>)}
@@ -115,14 +114,18 @@ export default function ProjectManager({ workspace, project, onChanged, onClose 
           </div>}
           {githubError && <p className="dim small">{githubError}</p>}
           <div className="row">
-            <input type="text" aria-label="Local repository path" placeholder="/absolute/path/to/repo"
-              value={repoPath} onChange={(event) => setRepoPath(event.target.value)} />
-            <button disabled={busy || repoPath.trim().length < 2} onClick={() => void action(async () => {
+            <input type="text" aria-label="Repository url" placeholder="https://github.com/owner/repo.git"
+              value={repoUrl} onChange={(event) => setRepoUrl(event.target.value)} />
+            <button disabled={busy || repoUrl.trim().length < 2} onClick={() => void action(async () => {
               await gql(
-                `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id } }`,
-                { projectId: project.id, name: repoPath.trim().split("/").filter(Boolean).pop() ?? "repo", path: repoPath.trim() },
+                `mutation ($projectId: UUID!, $name: String!, $remoteUrl: String!) { addRepo(projectId: $projectId, name: $name, remoteUrl: $remoteUrl) { id } }`,
+                {
+                  projectId: project.id,
+                  name: repoUrl.trim().split("/").filter(Boolean).pop()?.replace(/\.git$/, "") ?? "repo",
+                  remoteUrl: repoUrl.trim(),
+                },
               );
-              setRepoPath("");
+              setRepoUrl("");
             })}>Add repository</button>
           </div>
           {project.repos[0] && <div className="row">

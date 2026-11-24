@@ -307,8 +307,10 @@ projects
   id, workspace_id, name, created_at
 
 repos                   a project can have more than one
-  id, project_id, name, path, vcs, base_revision, contract, contract_version,
-  fetched_at, created_at
+  id, project_id, name, remote_url, vcs, base_bookmark, base_revision,
+  contract, contract_version, fetched_at, created_at
+                        remote_url: what the mirror is cloned from; there is no
+                          local path, a repository is always Hulahoop's own clone
                         contract: nix+just (v0), validated at add time
                         contract_version: the Hulahoop build's CONTRACT_VERSION,
                           nothing is declared by the repo
@@ -354,13 +356,8 @@ criteria              acceptance criteria, one row each, numbered from 1
                         test_name: filled by the freeze gate from the authored
                           report; one criterion maps to exactly one test
 
-checkouts              one per active run, replay, or preflight
-  id, project_id, repo_id, owner_kind, owner_id, provider, name, path, state,
-  created_at, cleaned_at
-                        owner_kind: run | replay | preflight; owner_id points at
-                          that row, so the base replay, the reviewer, the landing
-                          replay, and a preflight each get their own checkout
-                        state: creating | ready | cleaning | removed
+checkouts              unused since checkouts became one per task; a task's
+                          checkout is found by its path (§6), not by a row
 
 runs
   id, issue_id, repo_id, agent_id, attempt, base_bookmark, base_revision,
@@ -544,35 +541,30 @@ A run that exceeds its time limit is killed by process group and recorded as `ti
 
 ## 6. Checkouts
 
-A checkout is the per-run working copy: a jj workspace or a git worktree. It is separate from a Hulahoop workspace, which is the top-level container for projects.
+A checkout is the working copy a task's turns run in: a jj workspace of a repository Hulahoop owns. It is separate from a Hulahoop workspace, which is the top-level container for projects.
 
-Hulahoop detects `.jj` and uses a jj workspace per checkout.
+All of it lives under the data directory, and nothing outside it is ever worked in:
 
-```bash
-jj workspace add \
-  --name issue-<id>-<owner-id> \
-  -r <base> \
-  $DATA/checkouts/<project>/<issue-id>/<owner-id>
+```
+$DATA/mirrors/<repo-id>                  a clone of the repository's url (jj git clone --colocate)
+$DATA/checkouts/<project-id>/<issue-id>  the task's checkout, a workspace of that mirror
 ```
 
 `$DATA` is the data root: `~/.local/share/hulahoop` by default, `~/Library/Application Support/hulahoop` on macOS, overridable with `HULAHOOP_DATA`. Every path in this document is relative to it.
 
 Before migrations run, the server copies `hulahoop.sqlite` (and its `-wal`/`-shm` sidecars) to `$DATA/backups/hulahoop-<timestamp>.sqlite` and keeps the newest five. This exists because a migration that rebuilds a parent table — `drop table repos` to make `repos.path` nullable, for instance — performs an implicit delete while foreign keys are enforced, and every child row goes with it. A copy from the last start is the only thing that turns that from data loss into a slow start.
 
-`<base>` is `repo.base_revision` for the Test Author, the `tests/<issue>` bookmark for the Implementer, and the implementer's `issue/<id>/head/<attempt>` bookmark for the Reviewer — the review happens against the tree that contains the implementation. `jj workspace add -r` takes a bookmark name, so the workspace opens at whatever that bookmark points at when it is created.
-
 Rules:
 
-- One checkout per active run, replay, or preflight, keyed by `(owner_kind, owner_id)`. The base replay, the implementer, the reviewer, a landing replay, and a preflight never share one, and a landing replay and a preflight each have a checkout with no run behind it.
-- A base replay runs the candidate suite against the base revision: the checkout opens at `repos.base_revision` and the authored test files are restored from `tests/<issue>/cand/<run-id>` with `jj restore --from <that bookmark> -- <frozen paths>`. Without that step the base replay would run an empty diff and prove nothing, because the authored tests do not exist at base until they are applied.
-- A landing replay runs the approved head rebased onto the freshly fetched base, and writes the result to `landing/<issue>/<attempt>`. That bookmark is the revision `recordMerge` verifies, so the tree a human merges is the tree that was replayed.
-- One repo-level lock around `workspace add`, `workspace forget`, and `git fetch`, acquired through `POST /internal/repos/:id/lock`. The row lives in `repo_locks`, the server is its only writer, and a holder that stops renewing it loses the row at `expires_at`.
-- Fetch once per repo, not once per run. A fetch resolves the default branch and writes it to `repos.base_revision` with `repos.fetched_at`; that pair is "the current base" everywhere the spec says it. A fetch runs at add-repo time, when the human asks for it on the project screen, and before each landing replay, because the rebase has to target the branch as it is now. `recordMerge` then sets `repos.base_revision = mergeRevision`.
-- The Implementer may not touch frozen test files; the runner rejects a run whose diff reaches them, and the Reviewer sees that guard in the log.
-- Cleanup: `jj workspace forget issue-<id>-<owner-id>`, then remove the directory.
-- On cancel or crash, cleanup runs on the next server start.
-- `.hulahoop/` stays out of the diff through a fileset exclusion on every diff command (`~glob:.hulahoop/**`), which works in colocated, git, and pure jj repos alike. Where a `.git` directory exists, the runner also writes that pattern into `.git/info/exclude` so `git status` in the checkout stays clean for the agent.
-- The generated `.envrc` needs the same treatment, and only when the runner generated it: the runner creates the file, writes it into `.git/info/exclude`, and excludes it from the diff because it wrote the contents itself. A committed `.envrc` is tracked, appears in the diff like any other file, and raises `TOUCHED_CONTRACT` — the exclusion never hides a file the repo owns.
+- A repository is attached by its url (`https://`, `ssh://`, `git://`, `file://`, an absolute path, or `user@host:path`). The runner clones it into `mirrors/<repo-id>` the first time it is needed, into a temporary directory that is renamed into place, and fetches it before every run and job after that. One in-process lock per mirror keeps a clone, a fetch and a landing from interleaving. Changing a repository's url queues a `forget_mirror` job that deletes that mirror, so the next job clones the new url.
+- One checkout per task, at `checkouts/<project-id>/<issue-id>`, reused by every turn of the task. A later turn moves it to its start revision with `jj new` and keeps ignored build output (`target/`, `node_modules`, `.venv`), so a rework starts warm; tracked files are restored to that revision. A directory that cannot be reused is replaced by a fresh `jj workspace add`.
+- The runner derives the checkout path from the project and issue ids and refuses anything that is not exactly `checkouts/<uuid>/<uuid>` under the data directory, with no symlinked component, before it creates or deletes one.
+- A `cleanup` job forgets the workspace and deletes the directory once the task is Done or Cancelled and no run of it is live. Reopening the task drops a cleanup that has not run yet; moving the task to another project cleans up the checkout it left behind.
+- A fetch writes the base bookmark's revision to `repos.base_revision` with `repos.fetched_at`, and never moves it back to an ancestor of the recorded one. A merge without a pull request queues a `land` job: the runner moves the base bookmark forward to the merged head in the mirror and pushes it (`jj git push -b <base>`), and only then does the head become `repos.base_revision`. A landing that cannot move forward fails and says so on the task.
+- `.hulahoop/` stays out of the diff through a fileset exclusion on every diff command (`~glob:.hulahoop/**`). Where a `.git` directory exists, the runner also writes that pattern into `.git/info/exclude` so `git status` in the checkout stays clean for the agent.
+- The generated `.envrc` needs the same treatment, and only when the runner generated it. A committed `.envrc` is tracked, appears in the diff like any other file, and raises `TOUCHED_CONTRACT`.
+
+The sections below on bookmarks and replays describe the original test-first design. Replays and the `replays` table are gone (migration `0024_repos_from_urls.sql`).
 
 ### Bookmarks are the handles
 
@@ -1296,7 +1288,7 @@ difference between the spec and the code, and how to run it.
 | --- | --- |
 | `crates/core` | The state machine, the repo contract, the JUnit and diff rules, the run spec. No I/O, no framework. |
 | `crates/server` | SQLite, the transition engine, the GraphQL API, and the internal API the runner talks to. The only writer of state and artifacts. |
-| `crates/runner` | One loop: claim work, create a jj workspace, run `just setup`, spawn the adapter in its own process group, stream events, post the completion, run replays and jobs. |
+| `crates/runner` | One loop: claim work, bring the task's checkout onto its start revision, run `just setup`, spawn the adapter in its own process group, stream events, post the completion, run jobs (fetch, land, cleanup, forget_mirror, preflight). |
 | `crates/cli` | `hulahoop up`, `hulahoop serve`, `hulahoop runner`, `hulahoop seed <repo>`, `hulahoop doctor`. |
 | `apps/desktop` | Tauri 2 + React: connect screen, board, issue detail with criteria and gates, approval dialog, settings, run log. Spawns a server and runner for local mode, and is a plain client of whatever host it is pointed at. |
 | `fixtures/repo` | A contract-compliant repository with `flake.nix`, `.envrc`, `justfile` and a `calc.py` the loop can extend. |
@@ -1348,7 +1340,7 @@ value rather than shipping that mismatch.
 The desktop is a client in the strict sense: it holds no state. One machine does the
 work — the one with `nix`, `direnv`, `jj`, and the agent CLIs — and it runs two
 processes there. The server owns the database, the state machine, and the artifacts;
-the runner owns the checkouts, the agent processes, and the replays. They stay separate
+the runner owns the mirrors, the checkouts, and the agent processes. They stay separate
 so a crashed agent cannot take the server with it, and so each run is killed by process
 group. The laptop only needs the app.
 
@@ -1394,8 +1386,9 @@ way for exactly that reason, so the path is exercised on every CI run.
 
 Two limits worth knowing. The token is one bearer secret over plain HTTP: keep the port
 on a private network (Tailscale) or behind `ssh -L 9000:localhost:9000 workstation`.
-And the repo path the server stores is a path on the server's host, so the repo has to
-live there; two machines sharing one checkout is not a supported topology yet.
+Repositories are attached by url and cloned into the runner's data directory, so the
+runner needs to reach that url; a local path only works when it exists on the runner's
+host.
 
 `--listen` defaults to `127.0.0.1`. With `--listen 0.0.0.0` the connection file
 advertises the first outside address the host has, which is the address to give the
@@ -1436,63 +1429,22 @@ The order is deliberate: a GitHub app first, because attribution and pull reques
 how the loop's work reaches a human for review; agent subscriptions second, because a
 CLI that cannot log in produces nothing at all.
 
-### A runner that makes its own checkout
+### Where a run works
 
-The default runner borrows the repository at its path: `jj workspace add` inside your own
-clone, which is fast and leaves nothing behind beyond a workspace name. That only
-works when the runner and the repository are on the same machine.
+Every run works inside the data directory (§6): the repository is a mirror Hulahoop
+cloned from its url (`$DATA/mirrors/<repo-id>`), and the task has one jj workspace of
+it at `$DATA/checkouts/<project-id>/<issue-id>`, reused across the task's turns and
+deleted by a `cleanup` job once the task is Done or Cancelled. A checkout on the
+user's machine is never borrowed, and there is no other runner mode. Artifacts live
+under `$DATA/runs/<run-id>/` and outlive the checkout.
 
-`HULAHOOP_RUNNER_MODE=local` changes the root of the same mechanism. The server hands
-the runner a mirror it owns (`$DATA/mirrors/<repo-id>`, fetched on the first run and
-on every run after) and a checkout path under the data directory's `workspace/` tree:
+Why a workspace and not a clone per task: a workspace costs the working copy and
+nothing else, and the runs of one repository share one object store. Keeping the
+checkout across turns keeps what the project built, so a rework does not rebuild from
+nothing.
 
-```
-$DATA/workspace/<project>/<issue>/<run>/checkout
-```
-
-Four levels, because the numbers multiply: a project holds issues, an issue holds
-attempts, an attempt holds one run per turn. One project with ten issues and four
-attempts is 120 workspaces; the run directory is the unit of deletion, so a cleanup
-can never take a neighbour with it.
-
-The runner adds a workspace (`jj workspace add -r <base> --name run-<run-id>`), runs
-setup, the agent, and the replay there, and deletes the whole `<run>` directory when
-the run is over, forgetting the workspace name first so the mirror does not accumulate
-registrations for paths that are gone. Artifacts live under `$DATA/runs/<run-id>/` and
-are untouched by that deletion, which is what anyone reads afterwards. A runner that is
-killed mid-run leaves its directory; at startup the runner removes those older than six
-hours, which is longer than any wall clock the loop allows.
-
-Why a workspace and not a clone: a workspace costs the working copy and nothing else.
-Measured on a repository with a 50 MB binary — 99 MB of history and files — a clone was
-99 MB and a workspace 48 MB, and the ratio worsens with history, because a clone
-duplicates the object store. No fetch is needed at run time, and there are no bookmarks
-to push back: the run's bookmark (`tests/<issue>/cand/<run>`, `issue/<id>/head/<attempt>`)
-is written in the same repository the replay reads.
-
-The price of sharing is one op log for every workspace, so the repository pins history
-before the first run touches it:
-
-```toml
-[revset-aliases]
-"immutable_heads()" = "builtin_immutable_heads() | bookmarks() | tags()"
-```
-
-That file is written where `jj config path --repo` says it lives, and from then on every
-revision reachable from a bookmark or a tag is immutable for every workspace: `jj
-describe`, `jj abandon` and `jj rebase` refuse it with `Commit … is immutable`, while the
-run's own in-flight commits stay mutable, because they are not on a bookmark yet. The
-loop itself passes `--ignore-immutable` when it moves an approved head onto a newer base,
-which is the one rewrite that pin is meant to reserve for the runner.
-
-`tests/e2e/loop.sh` runs the whole loop in either mode, and CI runs it with
-`HULAHOOP_RUNNER_MODE=local`, so the workspace path, the mirror and the immutability pin
-are exercised on every push.
-
-The honest limits: immutability fences commit rewriting, so `jj op restore` (which
-rewinds the repository without touching a commit), `jj workspace forget`, and another
-run's not-yet-bookmarked commits remain reachable. The workspace mode inherits that same
-op-log exposure, which is the argument the docker mode answers with a container.
+One known limit: `just setup` and the format commands run with the runner's own
+`HOME`, so toolchain caches such as `~/.cargo` are written there.
 
 ### Projects, milestones and artifacts
 
@@ -1548,11 +1500,10 @@ be attached to a repository that has no checkout on this machine.
   installations; the repository list hangs off each installation, so the server lists
   installations first and then their repositories, one token at a time. An app with no
   installation gets a sentence saying so rather than an empty list.
-- **A repository attached by its remote has no checkout, and that is fine.** The server
-  gives it a mirror path it owns (`$DATA/mirrors/<repo-id>`), the first run clones into
-  it with a token minted for that one repository, later runs fetch, and the loop never
-  works inside a checkout the user is using. `repos.path` is null in that case, which
-  the screen shows as "mirror, cloned on the first run".
+- **Every repository is a mirror Hulahoop owns.** The server gives it a path under
+  `$DATA/mirrors/<repo-id>`, the first job clones into it (with a token minted for that
+  one repository when it is on GitHub), later runs fetch, and the loop never works
+  inside a checkout the user is using.
 
 ### Workspaces
 
@@ -1587,9 +1538,9 @@ above when the loop has run for a while.
 2. **No GraphQL subscriptions.** The desktop polls `issues` every 2.5s and the run log
    over `run_events(runId, afterSeq)`. A subscription needs a second transport for one
    screen; polling is one line and is trivially correct after a reconnect.
-3. **A `runner_jobs` table** for fetch, preflight, merge verification and bookmark
-   moves, instead of overloading `replays`. A replay is a suite run; a job is a piece
-   of VCS or process work. Both are claimed over the same internal API.
+3. **A `runner_jobs` table** for fetch, preflight, landing, checkout cleanup and
+   forgetting a mirror: each is a piece of VCS or file work the runner does in the
+   data directory, claimed over the internal API.
 4. **The candidate bookmark is written by the server at authoring time**
    (`tests/<issue>/cand/<run-id>`), not by `freezeSuite`. The freeze gate then reads
    the base replay that already exists, which keeps "freeze is a decision over stored
@@ -1608,8 +1559,8 @@ above when the loop has run for a while.
    review screen needs the transcript and the server only sees events.
 9. **The runner takes the repository from the project**, not from a constant. A
    project may hold several repositories; the issue records which one it is tested
-   against (`issues.repo_id`), and the clone URL comes from that repository's remote or
-   its path, never from a hardcoded default.
+   against (`issues.repo_id`), and the clone URL comes from that repository's url,
+   never from a hardcoded default.
 10. **The desktop connects to a URL, not a port.** The first build wired the app to
    `http://127.0.0.1:<port>`; the server now advertises a `url`, the shell passes it
    through, and a saved host in `localStorage` wins over the bundled one. Without that
@@ -1617,8 +1568,9 @@ above when the loop has run for a while.
 
 ### What is not built yet
 
-- Merging from inside Hulahoop: the human merges, then records it. `recordMerge`
-  verifies ancestry and the green landing replay at the merge revision.
+- Merging a pull request from inside Hulahoop: the human merges on GitHub and
+  Hulahoop reads it. A project without pull requests is merged by Hulahoop itself,
+  which pushes the reviewed head to the base branch.
 - `bwrap` and `sandbox-exec` profiles (M1). The v0 boundary is the environment
   allowlist plus a scratch `HOME`; `~/.ssh`, `~/.aws` and the rest are never passed.
 - Linux desktop builds and Windows. The flake builds and tests on Linux, the bundle

@@ -44,6 +44,10 @@ copy_fixture() {
   git -C "$REPO" -c user.email=e2e@example.test -c user.name=e2e commit -qm "initial"
   ( cd "$REPO" && jj git init --colocate >/dev/null 2>&1 || true )
   ( cd "$REPO" && jj bookmark create main -r @- 2>/dev/null || jj bookmark set main -r @- )
+  # The fixture stands in for a remote: a merge without a pull request pushes
+  # main to it, and a non-bare repository only takes that for the branch it has
+  # checked out when it may update the files too.
+  git -C "$REPO" config receive.denyCurrentBranch updateInstead
 }
 
 wait_status() {
@@ -89,7 +93,6 @@ setup() {
   [ -f "$CONN" ] || { echo "the server never wrote $CONN" >&2; cat "$WORK/server.log" >&2; return 1; }
 
   HULAHOOP_FAKE_SCRIPT="$ROOT/tests/e2e/fake_agent.sh" \
-  HULAHOOP_RUNNER_MODE=local \
     "$ROOT/target/debug/hulahoop" runner --server "http://127.0.0.1:$(port)" --token "$(token)" --data-dir "$DATA" \
     >"$WORK/runner.log" 2>&1 &
   RUNNER_PID=$!
@@ -102,8 +105,10 @@ main() {
   workspace="$(gql 'mutation { createWorkspace(name: "e2e") { id } }' '{}' | jq -r '.data.createWorkspace.id')"
   project="$(gql 'mutation ($w: UUID!) { createProject(workspaceId: $w, name: "Bali") { id } }' "{\"w\":\"$workspace\"}" \
     | jq -r '.data.createProject.id')"
-  repo="$(gql 'mutation ($p: UUID!, $path: String!) { addRepo(projectId: $p, name: "repo", path: $path) { id } }' \
-    "{\"p\":\"$project\",\"path\":\"$REPO\"}" | jq -r '.data.addRepo.id')"
+  # The fixture is attached by its url, as every repository is: the server clones
+  # it into its own mirror under $DATA and never works inside $REPO.
+  repo="$(gql 'mutation ($p: UUID!, $url: String!) { addRepo(projectId: $p, name: "repo", remoteUrl: $url) { id } }' \
+    "{\"p\":\"$project\",\"url\":\"$REPO\"}" | jq -r '.data.addRepo.id')"
 
   local agents="" name id
   for name in ada bram; do
@@ -254,6 +259,48 @@ DOC
     return 1
   fi
   echo "done: $(gql 'query ($id: UUID!) { issue(id: $id) { status runs { status } reviews { verdict } } }' "{\"id\":\"$issue\"}" | jq -c '.data.issue')"
+
+  # Everything happened inside $DATA: the task's one checkout goes once the task
+  # is done, the merge landed the reviewed head on the fixture's main (there is
+  # no pull request here), and the fixture the repository was cloned from never
+  # gained a workspace.
+  local checkout="$DATA/checkouts/$project/$issue" cleaned=""
+  for _ in $(seq 1 60); do
+    cleaned="$(sql "select status from runner_jobs where kind = 'cleanup' and lower(hex(issue_id)) = lower(replace('$issue', '-', '')) order by created_at desc limit 1;")"
+    [ "$cleaned" = "succeeded" ] && [ ! -e "$checkout" ] && break
+    sleep 1
+  done
+  if [ "$cleaned" != "succeeded" ] || [ -e "$checkout" ]; then
+    echo "the done task kept its checkout at $checkout (cleanup: '$cleaned')" >&2
+    sql "select kind, status, error from runner_jobs where kind = 'cleanup';" >&2
+    return 1
+  fi
+  echo "checkout removed: $checkout"
+  local landed="" main="" base=""
+  for _ in $(seq 1 60); do
+    landed="$(sql "select status from runner_jobs where kind = 'land' and lower(hex(issue_id)) = lower(replace('$issue', '-', '')) order by created_at desc limit 1;")"
+    case "$landed" in succeeded|failed) break ;; esac
+    sleep 1
+  done
+  main="$(git -C "$REPO" rev-parse refs/heads/main)"
+  base="$(sql "select coalesce(base_revision, '') from repos where lower(hex(id)) = lower(replace('$repo', '-', ''));")"
+  if [ "$landed" != "succeeded" ] || [ "$main" != "$head" ] || [ "$base" != "$head" ]; then
+    echo "the merge did not land $head (land: '$landed', fixture main: $main, base: $base)" >&2
+    sql "select kind, status, error from runner_jobs where kind in ('land', 'fetch');" >&2
+    return 1
+  fi
+  echo "landed: fixture main and the recorded base are $head"
+  local fetches
+  fetches="$(sql "select count(*) from runner_jobs where kind = 'fetch';")"
+  if [ "$fetches" -lt 1 ]; then
+    echo "the repository was never fetched (fetch jobs: $fetches)" >&2
+    return 1
+  fi
+  if [ "$(cd "$REPO" && jj workspace list 2>/dev/null | wc -l)" -ne 1 ]; then
+    echo "the fixture repository gained a workspace:" >&2
+    ( cd "$REPO" && jj workspace list ) >&2
+    return 1
+  fi
 
   # Lumi: a question goes through the runner like any job, the answer may carry
   # a proposal, and Apply is the only thing that changes the board.

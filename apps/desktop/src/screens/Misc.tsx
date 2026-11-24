@@ -129,7 +129,7 @@ export function Projects({
                   <li key={repo.id}>
                     <Icon name="branch" size={13} />
                     <span className="mono">{repo.name}</span>
-                    <span className="dim">{repo.path ?? "mirror"}</span>
+                    <span className="dim">{repo.remoteUrl ?? "no url"}</span>
                   </li>
                 ))}
                 {project.repos.length === 0 ? <li className="dim">No repository attached yet.</li> : null}

@@ -526,7 +526,7 @@ mod tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp', '1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
             .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();

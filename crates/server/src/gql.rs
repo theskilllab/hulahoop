@@ -754,66 +754,32 @@ impl Mutation {
         Ok(engine(ctx).clear_connection(&id).await?)
     }
 
-    /// Attach a repository either from a checkout on this machine or from the
-    /// GitHub app's listing. A remote-only repository is cloned by a local runner;
-    /// a checkout is used in place, which is what a workspace runner does.
+    /// Attach a repository by its url. Hulahoop clones it into a mirror under
+    /// its data directory and every task works in a checkout of that mirror, so
+    /// a checkout on this machine is never borrowed. Any url `jj git clone`
+    /// accepts works, a local path included; pull requests need a GitHub one.
     async fn add_repo(
         &self,
         ctx: &Context<'_>,
         project_id: Uuid,
         name: String,
-        path: Option<String>,
-        remote_url: Option<String>,
+        remote_url: String,
         vcs: Option<String>,
     ) -> async_graphql::Result<Repo> {
         let engine = engine(ctx);
-        let path = path
-            .map(|value| value.trim().to_string())
-            .filter(|v| !v.is_empty());
-        let remote_url = remote_url
-            .map(|value| value.trim().to_string())
-            .filter(|v| !v.is_empty());
-        if path.is_none() && remote_url.is_none() {
-            return Err(async_graphql::Error::new(
-                "attach a repository by path or by its GitHub remote; one of them is required",
-            ));
-        }
-        // Structural contract check before anything is stored when there is a
-        // checkout to look at: a repo without flake.nix and a justfile cannot run
-        // the loop at all. A remote-only repository is checked by the first clone.
-        if let Some(checkout) = &path {
-            hulahoop_core::contract::check_files(std::path::Path::new(checkout))
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        }
+        let remote_url = remote_url_to_clone(&remote_url)?;
 
         let id = Uuid::now_v7();
-        let vcs = vcs.unwrap_or_else(|| {
-            // A mirror is always cloned with jj (`jj git clone --colocate`), so a
-            // repository attached by its remote is jj before it exists on disk.
-            let checkout_is_jj = path
-                .as_ref()
-                .map(|checkout| std::path::Path::new(checkout).join(".jj").exists())
-                .unwrap_or(false);
-            if path.is_none() || checkout_is_jj {
-                "jj".to_string()
-            } else {
-                "git".to_string()
-            }
-        });
-        // The origin remote is what a pull request job pushes to and what a local
-        // runner clones. Reading it from the checkout means nobody has to guess.
-        let remote_url = match (&path, remote_url) {
-            (Some(checkout), None) => crate::vcs_remote(std::path::Path::new(checkout)),
-            (_, given) => given,
-        };
+        // A mirror is always cloned with jj (`jj git clone --colocate`), so a
+        // repository is jj before it exists on disk.
+        let vcs = vcs.unwrap_or_else(|| "jj".to_string());
         sqlx::query(
-            "insert into repos (id, project_id, name, path, remote_url, vcs, base_bookmark, contract, contract_version, created_at)
-             values (?, ?, ?, ?, ?, ?, 'main', 'nix+just', ?, ?)",
+            "insert into repos (id, project_id, name, remote_url, vcs, base_bookmark, contract, contract_version, created_at)
+             values (?, ?, ?, ?, ?, 'main', 'nix+just', ?, ?)",
         )
         .bind(id)
         .bind(project_id)
         .bind(&name)
-        .bind(&path)
         .bind(&remote_url)
         .bind(&vcs)
         .bind(hulahoop_core::CONTRACT_VERSION)
@@ -831,14 +797,42 @@ impl Mutation {
             .await?)
     }
 
+    /// Rename a repository, change its base bookmark, or point it at another
+    /// url. A new url forgets the mirror of the old one, so the next job clones
+    /// the new url, and forgets the base learned from the old one.
     async fn update_repo(
         &self,
         ctx: &Context<'_>,
         id: Uuid,
         name: Option<String>,
         base_bookmark: Option<String>,
+        remote_url: Option<String>,
     ) -> async_graphql::Result<Repo> {
         let engine = engine(ctx);
+        if let Some(remote_url) = remote_url {
+            let remote_url = remote_url_to_clone(&remote_url)?;
+            let current: Option<String> =
+                sqlx::query_scalar("select remote_url from repos where id = ?")
+                    .bind(id)
+                    .fetch_one(&engine.db.pool)
+                    .await?;
+            if current.as_deref() != Some(remote_url.as_str()) {
+                sqlx::query(
+                    "update repos set remote_url = ?, base_revision = null, fetched_at = null
+                     where id = ?",
+                )
+                .bind(&remote_url)
+                .bind(id)
+                .execute(&engine.db.pool)
+                .await?;
+                engine
+                    .queue_job(id, None, "forget_mirror", serde_json::json!({}))
+                    .await?;
+                engine
+                    .queue_job(id, None, "fetch", serde_json::json!({}))
+                    .await?;
+            }
+        }
         if let Some(name) = name {
             sqlx::query("update repos set name = ? where id = ?")
                 .bind(name)
@@ -1113,7 +1107,7 @@ impl Mutation {
         };
         if let Some(project) = project {
             if project != issue.project_id {
-                set_issue_project(&engine.db.pool, &issue, project).await?;
+                set_issue_project(engine, &issue, project).await?;
             }
         }
         let priority = match priority {
@@ -1295,9 +1289,8 @@ impl Mutation {
             .await?)
     }
 
-    /// The base replay reads a report the suite produced. When the report is missing
-    /// for a reason of the harness (a `just test` that only wrote its JUnit file after a
-    /// green run), asking again costs one suite run and no model call.
+    /// Asks the runner to read the pull request's checks again at the current
+    /// head. Costs one GitHub call and no model call.
     async fn recheck_pull_request(
         &self,
         ctx: &Context<'_>,
@@ -1683,14 +1676,48 @@ async fn first_repo_of(pool: &sqlx::SqlitePool, project_id: Uuid) -> sqlx::Resul
         .await
 }
 
+/// The url a repository is cloned from, checked before it reaches
+/// `jj git clone`: a web, ssh, git or file url, an absolute path, or the
+/// scp-like `user@host:path` form. Anything starting with `-` would be read as
+/// an option, so it is refused even where the clone separates it with `--`.
+fn remote_url_to_clone(raw: &str) -> async_graphql::Result<String> {
+    let url = raw.trim();
+    if url.is_empty() {
+        return Err(async_graphql::Error::new(
+            "attach a repository by its url; Hulahoop clones it from there",
+        ));
+    }
+    let schemes = ["http://", "https://", "ssh://", "git://", "file://"];
+    let with_scheme = schemes
+        .iter()
+        .any(|scheme| url.len() > scheme.len() && url.to_ascii_lowercase().starts_with(scheme));
+    let scp_like = url.split_once(':').is_some_and(|(login, path)| {
+        login
+            .split_once('@')
+            .is_some_and(|(user, host)| !user.is_empty() && !host.is_empty() && !host.contains('/'))
+            && !path.is_empty()
+    });
+    let plain = !url.starts_with('-') && !url.chars().any(char::is_control);
+    if plain && (with_scheme || std::path::Path::new(url).is_absolute() || scp_like) {
+        Ok(url.to_string())
+    } else {
+        Err(async_graphql::Error::new(format!(
+            "`{url}` is not a repository url Hulahoop can clone: use https://, ssh://, git:// or file://, an absolute path, or user@host:path"
+        )))
+    }
+}
+
 /// Moves a task into a project (taking its first repository) or out of every
 /// project (leaving it repo-less). Refused while a run is live: that run is
-/// working in the old place and would finish against the new one.
+/// working in the old place and would finish against the new one. The
+/// checkout the task had in the old place is deleted by a runner job, and one
+/// still queued for the place it moves back to is dropped.
 async fn set_issue_project(
-    pool: &sqlx::SqlitePool,
+    engine: &Engine,
     issue: &Issue,
     project_id: Option<Uuid>,
 ) -> async_graphql::Result<()> {
+    let pool = &engine.db.pool;
     let live: i64 = sqlx::query_scalar(
         "select count(*) from runs where issue_id = ? and status in ('queued', 'running')",
     )
@@ -1725,6 +1752,16 @@ async fn set_issue_project(
         .bind(issue.id)
         .execute(pool)
         .await?;
+    if let Err(error) = engine
+        .queue_cleanup(issue, crate::engine::CLEANUP_MOVED)
+        .await
+    {
+        tracing::warn!(issue = %issue.id, %error, "could not queue the cleanup of the old checkout");
+    }
+    let moved = engine.issue(issue.id).await?;
+    if let Err(error) = engine.keep_current_checkout(&moved).await {
+        tracing::warn!(issue = %issue.id, %error, "could not keep the checkout of the new place");
+    }
     Ok(())
 }
 
@@ -1762,7 +1799,7 @@ mod repo_less_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         let schema = build_schema(Arc::new(Engine::new(db)));
 
@@ -1857,6 +1894,193 @@ mod repo_less_tests {
             .await;
         assert_eq!(refused.errors.len(), 1);
         assert!(refused.errors[0].message.contains("another workspace"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod repo_url_tests {
+    use super::{build_schema, remote_url_to_clone};
+    use crate::db::Db;
+    use crate::engine::Engine;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    #[test]
+    fn only_urls_jj_can_clone_are_accepted() {
+        for url in [
+            "https://github.com/acme/app.git",
+            "http://git.local/app",
+            "ssh://git@github.com/acme/app",
+            "git://git.local/app",
+            "file:///srv/app",
+            "/srv/repos/app",
+            "git@github.com:acme/app.git",
+            "  https://github.com/acme/app  ",
+        ] {
+            assert!(remote_url_to_clone(url).is_ok(), "{url}");
+        }
+        for url in [
+            "",
+            "   ",
+            "-uhack",
+            "--upload-pack=touch /tmp/x",
+            "relative/path",
+            "github.com:acme/app",
+            "@host:path",
+            "user@:path",
+            "user@host:",
+            "https://",
+            "ftp://host/app",
+            "https://host/app\nmore",
+        ] {
+            assert!(remote_url_to_clone(url).is_err(), "{url:?}");
+        }
+    }
+
+    async fn workspace_with_repo(
+        name: &str,
+    ) -> (Arc<Engine>, Uuid, Uuid, Uuid, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!("hulahoop-{name}-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo) = (Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'App',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, remote_url, base_revision, contract_version, created_at) values (?,?, 'repo','/srv/old','abc','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        (
+            Arc::new(Engine::new(db)),
+            workspace,
+            project,
+            repo,
+            directory,
+        )
+    }
+
+    async fn job_kinds(engine: &Engine) -> Vec<(String, String)> {
+        sqlx::query_as("select kind, payload from runner_jobs order by created_at")
+            .fetch_all(&engine.db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A new url forgets the old mirror and the base learned from it, and
+    /// fetches again; the same url, or one that is not a url, changes nothing.
+    #[tokio::test]
+    async fn a_new_url_forgets_the_mirror() {
+        let (engine, _, project, repo, directory) = workspace_with_repo("repo-url").await;
+        let schema = build_schema(engine.clone());
+
+        let refused = schema
+            .execute(format!(
+                r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "--upload-pack=x") {{ id }} }}"#
+            ))
+            .await;
+        assert_eq!(refused.errors.len(), 1);
+        let refused = schema
+            .execute(format!(
+                r#"mutation {{ addRepo(projectId: "{project}", name: "bad", remoteUrl: "-uhack") {{ id }} }}"#
+            ))
+            .await;
+        assert_eq!(refused.errors.len(), 1);
+        let same = schema
+            .execute(format!(
+                r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "/srv/old") {{ id }} }}"#
+            ))
+            .await;
+        assert!(same.errors.is_empty(), "{:?}", same.errors);
+        assert!(job_kinds(&engine).await.is_empty());
+
+        let changed = schema
+            .execute(format!(
+                r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "https://github.com/acme/app") {{ remoteUrl baseRevision }} }}"#
+            ))
+            .await;
+        assert!(changed.errors.is_empty(), "{:?}", changed.errors);
+        let data = changed.data.into_json().unwrap();
+        assert_eq!(
+            data["updateRepo"]["remoteUrl"],
+            "https://github.com/acme/app"
+        );
+        assert!(data["updateRepo"]["baseRevision"].is_null());
+        let kinds: Vec<String> = job_kinds(&engine)
+            .await
+            .into_iter()
+            .map(|(kind, _)| kind)
+            .collect();
+        assert_eq!(kinds, ["forget_mirror", "fetch"]);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A task that moves to another project leaves its checkout behind, and a
+    /// runner job deletes it; moving back before that keeps it.
+    #[tokio::test]
+    async fn moving_a_task_cleans_up_its_old_checkout() {
+        let (engine, workspace, project, _, directory) = workspace_with_repo("move-cleanup").await;
+        let other = Uuid::now_v7();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Other',?)",
+        )
+        .bind(other)
+        .bind(workspace)
+        .bind(Utc::now())
+        .execute(&engine.db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'other','/srv/other','1',?)")
+            .bind(Uuid::now_v7()).bind(other).bind(Utc::now()).execute(&engine.db.pool).await.unwrap();
+        let schema = build_schema(engine.clone());
+        let filed = schema
+            .execute(format!(
+                r#"mutation {{ createIssue(projectId: "{project}", title: "Button", body: "") {{ id }} }}"#
+            ))
+            .await;
+        let id = filed.data.into_json().unwrap()["createIssue"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let issue = Uuid::parse_str(&id).unwrap();
+
+        let moved = schema
+            .execute(format!(
+                r#"mutation {{ updateIssue(id: "{id}", projectId: "{other}") {{ id }} }}"#
+            ))
+            .await;
+        assert!(moved.errors.is_empty(), "{:?}", moved.errors);
+        let jobs = job_kinds(&engine).await;
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].0, "cleanup");
+        let payload: serde_json::Value = serde_json::from_str(&jobs[0].1).unwrap();
+        let old = hulahoop_core::contract::checkout_dir(
+            &engine.db.data_dir,
+            &project.to_string(),
+            &issue,
+        );
+        assert_eq!(payload["checkout"].as_str(), old.to_str());
+        assert_eq!(payload["reason"], crate::engine::CLEANUP_MOVED);
+
+        let back = schema
+            .execute(format!(
+                r#"mutation {{ updateIssue(id: "{id}", projectId: "{project}") {{ id }} }}"#
+            ))
+            .await;
+        assert!(back.errors.is_empty(), "{:?}", back.errors);
+        let jobs = job_kinds(&engine).await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        let payload: serde_json::Value = serde_json::from_str(&jobs[0].1).unwrap();
+        assert_ne!(payload["checkout"].as_str(), old.to_str());
 
         let _ = std::fs::remove_dir_all(directory);
     }

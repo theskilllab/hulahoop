@@ -173,38 +173,66 @@ pub fn needs_generated_envrc(root: &Path) -> bool {
     !root.join(".envrc").exists()
 }
 
-pub fn checkout_dir(data_dir: &Path, project: &str, issue: &uuid::Uuid, owner: &str) -> PathBuf {
+/// The one checkout a task works in, shared by every turn of that task:
+/// `checkouts/<project>/<issue>`. Keeping it between turns keeps what the
+/// project built (target/, node_modules, .venv) so a rework starts warm. It is
+/// deleted when the task is merged, closed or cancelled.
+pub fn checkout_dir(data_dir: &Path, project: &str, issue: &uuid::Uuid) -> PathBuf {
     data_dir
         .join("checkouts")
         .join(project)
         .join(issue.to_string())
-        .join(owner)
 }
 
-/// Where a run works when the checkout has to be produced rather than borrowed.
-///
-/// The tree is `workspace/<project>/<issue>/<run>/checkout`, because the numbers
-/// multiply: a project holds issues, an issue holds attempts, an attempt holds one
-/// run per role, and every level has to be findable a year later. Deletion is by
-/// the run directory, so nothing above it can be caught by accident.
-pub fn workspace_checkout_dir(
-    data_dir: &Path,
-    project: &str,
-    issue: &uuid::Uuid,
-    run: &uuid::Uuid,
-) -> PathBuf {
-    data_dir
-        .join("workspace")
-        .join(project)
-        .join(issue.to_string())
-        .join(run.to_string())
-        .join("checkout")
+/// The Hulahoop-owned clone of a repository's url that every checkout of it is
+/// a workspace of.
+pub fn mirror_dir(data_dir: &Path, repo_id: &uuid::Uuid) -> PathBuf {
+    data_dir.join("mirrors").join(repo_id.to_string())
 }
 
-/// The repository a local runner clones from when the repo has no remote of its
-/// own. One constant while there is one project; it becomes a column the day a
-/// second project exists.
-pub const DEFAULT_CLONE_URL: &str = "https://github.com/theskilllab/hulahoop.git";
+/// Whether `path` is a task checkout this data directory owns, and so one a
+/// runner may rebuild or delete: exactly `checkouts/<project id>/<task id>`
+/// below the data directory, every part of it a plain name, and none of the
+/// parts that exist on disk a symlink that could lead somewhere else. The data
+/// directory itself is compared by its canonical path, so a data directory
+/// reached through a symlink still owns its checkouts.
+pub fn is_owned_checkout(data_dir: &Path, path: &Path) -> bool {
+    use std::path::Component;
+    let canonical = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    let Some(rest) = path
+        .strip_prefix(data_dir)
+        .or_else(|_| path.strip_prefix(&canonical))
+        .ok()
+    else {
+        return false;
+    };
+    let parts: Vec<_> = rest.components().collect();
+    let [Component::Normal(checkouts), Component::Normal(project), Component::Normal(issue)] =
+        parts.as_slice()
+    else {
+        return false;
+    };
+    let is_id = |part: &std::ffi::OsStr| {
+        part.to_str()
+            .is_some_and(|text| uuid::Uuid::parse_str(text).is_ok_and(|id| id.to_string() == text))
+    };
+    if *checkouts != "checkouts" || !is_id(project) || !is_id(issue) {
+        return false;
+    }
+    let mut below = canonical;
+    for part in [checkouts, project, issue] {
+        below.push(part);
+        match std::fs::symlink_metadata(&below) {
+            Ok(meta) if meta.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            // Not there yet: nothing below it can be a symlink either.
+            Err(_) => break,
+        }
+    }
+    true
+}
 
 pub fn run_artifact_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
     data_dir.join("runs").join(run_id.to_string())
@@ -214,10 +242,6 @@ pub fn run_artifact_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
 /// Private to the run, created fresh before the agent starts and deleted after.
 pub fn scratch_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
     data_dir.join("scratch").join(run_id.to_string())
-}
-
-pub fn replay_artifact_dir(data_dir: &Path, replay_id: &uuid::Uuid) -> PathBuf {
-    data_dir.join("replays").join(replay_id.to_string())
 }
 
 pub fn scratch_home(data_dir: &Path, adapter: crate::Adapter) -> PathBuf {
@@ -237,28 +261,82 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_workspace_checkout_is_findable_by_project_issue_and_run() {
+    fn a_task_has_one_checkout_findable_by_project_and_issue() {
         let project = uuid::Uuid::nil();
         let issue = uuid::Uuid::now_v7();
-        let run = uuid::Uuid::now_v7();
-        let path = workspace_checkout_dir(
-            std::path::Path::new("/data"),
-            &project.to_string(),
-            &issue,
-            &run,
-        );
-        assert!(path.ends_with("checkout"));
-        let text = path.to_string_lossy();
-        assert!(text.contains(&project.to_string()));
-        assert!(text.contains(&issue.to_string()));
-        assert!(text.contains(&run.to_string()));
-        // The run directory is what a cleanup deletes, so nothing above it can be
-        // caught by a parent-relative removal.
+        let path = checkout_dir(Path::new("/data"), &project.to_string(), &issue);
         assert_eq!(
-            path.parent()
-                .map(|dir| dir.file_name().unwrap().to_string_lossy().to_string()),
-            Some(run.to_string())
+            path,
+            Path::new("/data/checkouts")
+                .join(project.to_string())
+                .join(issue.to_string())
         );
+    }
+
+    #[test]
+    fn only_checkouts_named_by_project_and_task_ids_are_owned() {
+        let data = Path::new("/data");
+        let (p, i) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let owned = checkout_dir(data, &p.to_string(), &i);
+        assert!(is_owned_checkout(data, &owned));
+        let checkouts = data.join("checkouts");
+        for path in [
+            checkouts.clone(),
+            checkouts.join(p.to_string()),
+            owned.join("target"),
+            checkouts.join("p").join(i.to_string()),
+            checkouts.join(p.to_string()).join("i"),
+            checkouts
+                .join(p.to_string())
+                .join(i.to_string().to_uppercase()),
+            data.join("mirrors").join(p.to_string()).join(i.to_string()),
+            Path::new("/home/me/src/repo").to_path_buf(),
+            checkouts.join(p.to_string()).join("..").join(i.to_string()),
+            Path::new("/elsewhere/checkouts")
+                .join(p.to_string())
+                .join(i.to_string()),
+        ] {
+            assert!(!is_owned_checkout(data, &path), "{}", path.display());
+        }
+    }
+
+    /// A symlink anywhere below the data directory could point a deletion
+    /// somewhere else, so a checkout reached through one is not owned; a data
+    /// directory reached through one still owns its checkouts.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_checkout_is_not_owned() {
+        let root = std::env::temp_dir().join(format!("hulahoop-owned-{}", uuid::Uuid::now_v7()));
+        let data = root.join("data");
+        let (p, i) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let checkout = checkout_dir(&data, &p.to_string(), &i);
+        std::fs::create_dir_all(&checkout).unwrap();
+        assert!(is_owned_checkout(&data, &checkout));
+
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(is_owned_checkout(
+            &link,
+            &checkout_dir(&link, &p.to_string(), &i)
+        ));
+        assert!(is_owned_checkout(&link, &checkout));
+
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let other = uuid::Uuid::now_v7();
+        std::os::unix::fs::symlink(&elsewhere, data.join("checkouts").join(other.to_string()))
+            .unwrap();
+        assert!(!is_owned_checkout(
+            &data,
+            &checkout_dir(&data, &other.to_string(), &i)
+        ));
+        std::os::unix::fs::symlink(&elsewhere, checkout_dir(&data, &p.to_string(), &other))
+            .unwrap();
+        assert!(!is_owned_checkout(
+            &data,
+            &checkout_dir(&data, &p.to_string(), &other)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
