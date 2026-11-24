@@ -425,10 +425,17 @@ async fn unlock_repo(
 /// the database.
 async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let issue = engine.issue(run.issue_id).await?;
-    let repo: Repo = sqlx::query_as("select * from repos where id = ?")
-        .bind(run.repo_id)
-        .fetch_one(&engine.db.pool)
-        .await?;
+    // A run on a task with no repository has no checkout: the runner gives it an
+    // empty scratch directory instead.
+    let repo: Option<Repo> = match run.repo_id {
+        Some(repo_id) => Some(
+            sqlx::query_as("select * from repos where id = ?")
+                .bind(repo_id)
+                .fetch_one(&engine.db.pool)
+                .await?,
+        ),
+        None => None,
+    };
     let mut agent: Agent = sqlx::query_as("select * from agents where id = ?")
         .bind(run.agent_id)
         .fetch_one(&engine.db.pool)
@@ -438,12 +445,18 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     agent.adapter = run.adapter_snapshot.clone().unwrap_or(agent.adapter);
     agent.model = run.model.clone();
     agent.connector = run.connector_id.clone();
-    let project: Project = sqlx::query_as("select * from projects where id = ?")
-        .bind(issue.project_id)
-        .fetch_one(&engine.db.pool)
-        .await?;
-
-    let checkout_path = checkout_for(&engine.db.data_dir, &project.id, &issue.id, &run.id);
+    let checkout_path = match &repo {
+        Some(repo) => {
+            // A task attached to a repository before projects were required may
+            // still have none; the repository's own project names the checkout.
+            let project: Project = sqlx::query_as("select * from projects where id = ?")
+                .bind(issue.project_id.unwrap_or(repo.project_id))
+                .fetch_one(&engine.db.pool)
+                .await?;
+            checkout_for(&engine.db.data_dir, &project.id, &issue.id, &run.id)
+        }
+        None => hulahoop_core::contract::scratch_dir(&engine.db.data_dir, &run.id),
+    };
 
     // The parent run carries the review body the next attempt has to answer.
     let parent = match run.parent_run_id {
@@ -606,11 +619,11 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
             body: issue.body.clone(),
             priority: issue.priority.clone(),
         },
-        repo: hulahoop_core::runspec::RepoInput {
+        repo: repo.as_ref().map(|repo| hulahoop_core::runspec::RepoInput {
             name: repo.name.clone(),
             path: repo.path.as_ref().map(std::path::PathBuf::from),
             base_bookmark: repo.base_bookmark.clone(),
-        },
+        }),
         checkout: CheckoutInput {
             path: checkout_path.clone(),
             base_bookmark: run.base_bookmark.clone(),
@@ -628,8 +641,31 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    let prompt = engine.compose_prompt(&agent).await?;
+    let prompt = engine.compose_prompt(&agent, repo.is_some()).await?;
     std::fs::write(&prompt_path, &prompt)?;
+
+    // What the runner reads to find the repository. A repo-less run sends nulls
+    // and `checkout: "none"`, which tells the runner to skip the clone, the
+    // workspace, the checks, the diff and the push.
+    let (repo_path, repo_mirror, repo_clone_token, vcs, repo_id, repo_clone_url) = match &repo {
+        Some(repo) => (
+            json!(host_path(repo, &engine.db.data_dir)),
+            json!(is_mirror(repo)),
+            json!(clone_token(engine, repo).await),
+            json!(repo.vcs),
+            json!(repo.id),
+            json!(clone_url(repo)),
+        ),
+        None => (
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+            Value::Null,
+        ),
+    };
+    let checkout_mode = if repo.is_some() { "repo" } else { "none" };
 
     Ok(json!({
         "run_id": run.id,
@@ -641,14 +677,15 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "prompt": prompt,
         "prompt_path": prompt_path,
         "input_path": input_path,
-        "repo_path": host_path(&repo, &engine.db.data_dir),
-        "repo_mirror": is_mirror(&repo),
-        "clone_token": clone_token(engine, &repo).await,
-        "vcs": repo.vcs,
-        "repo_id": repo.id,
+        "repo_path": repo_path,
+        "repo_mirror": repo_mirror,
+        "clone_token": repo_clone_token,
+        "vcs": vcs,
+        "repo_id": repo_id,
+        "checkout": checkout_mode,
         "checkout_path": checkout_path,
         "runner_mode": runner_mode(),
-        "clone_url": clone_url(&repo),
+        "clone_url": repo_clone_url,
         "base_bookmark": run.base_bookmark,
         "base_revision": run.base_revision,
         "github_token": github_token,
@@ -1112,6 +1149,79 @@ mod claim_spec_tests {
                 ("Lumi".to_string(), "Lumi says: check the logs".to_string()),
             ]
         );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A task with no project has no repository: its claim spec names no
+    /// repository, no clone and no checkout to make, points the runner at a
+    /// scratch directory, and still carries the agent's skills and a prompt
+    /// that says where the work goes.
+    #[tokio::test]
+    async fn a_repo_less_claim_spec_names_no_repository() {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-claim-scratch-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (agent, issue, run_id) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'writer','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null, 'TSK-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("scratch-artifacts");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,null,?,1,'','prompt',?,'running','model-x',?)")
+            .bind(run_id).bind(issue).bind(agent)
+            .bind(artifacts.to_string_lossy().to_string()).bind(now)
+            .execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        let skill = engine
+            .create_skill(
+                workspace,
+                "report-style",
+                "How reports read.",
+                "# Report style\nShort sentences.",
+            )
+            .await
+            .unwrap();
+        engine.set_agent_skills(agent, &[skill.id]).await.unwrap();
+
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        let spec = build_run_spec(&engine, &run).await.unwrap();
+
+        assert_eq!(spec["checkout"], "none");
+        for key in [
+            "repo_path",
+            "repo_mirror",
+            "clone_url",
+            "clone_token",
+            "repo_id",
+            "vcs",
+        ] {
+            assert!(spec[key].is_null(), "{key} should be null: {}", spec[key]);
+        }
+        assert_eq!(
+            spec["checkout_path"].as_str().unwrap(),
+            hulahoop_core::contract::scratch_dir(&engine.db.data_dir, &run_id).to_string_lossy()
+        );
+        let skills = spec["skills"].as_array().expect("claim spec names skills");
+        assert!(skills.iter().any(|s| s["name"] == "report-style"));
+        assert!(spec["prompt"]
+            .as_str()
+            .unwrap()
+            .contains("This task has no repository"));
+
+        let input: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(spec["input_path"].as_str().unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(input["repo"].is_null(), "{}", input["repo"]);
 
         let _ = std::fs::remove_dir_all(directory);
     }

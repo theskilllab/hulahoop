@@ -19,6 +19,9 @@ second message, no waiting for an answer.
   turn started, oldest first. A comment can change the brief; read them all.
 - Your checkout is a workspace of the repository, parked on the current base.
   Work there. `jj` records it; you do not commit or push by hand.
+- When `repo` in the input is `null`, the task has no repository: your working
+  directory is an empty scratch directory, private to this turn and deleted when
+  it ends. See "No repository" below.
 
 ## House rules
 
@@ -29,6 +32,16 @@ second message, no waiting for an answer.
 - `just setup` has already run. If a dependency is genuinely missing, say so and
   stop.
 - Run the whole suite rather than a subset. A passing subset says little.
+
+## No repository
+
+A task that belongs to no project has no repository. Then there is no checkout,
+nothing to commit, no pull request, and no `just test`; the house rules above do
+not apply. Work in the current directory as scratch space. Your final message is
+the result: put the answer, findings or deliverable in it. A file a person needs
+goes into `$HULAHOOP_ARTIFACT_DIR` (kept with the run) or is attached to the task
+if your tools allow it; name it in the summary. End with the same last line as
+any turn.
 
 ## How a turn ends
 

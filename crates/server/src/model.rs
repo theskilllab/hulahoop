@@ -127,7 +127,9 @@ pub struct Issue {
     pub workspace_id: Uuid,
     /// Null when the issue is planning work that belongs to no project yet.
     pub project_id: Option<Uuid>,
-    pub repo_id: Uuid,
+    /// Null for a task with no repository: its runs work in an empty scratch
+    /// directory and never merge.
+    pub repo_id: Option<Uuid>,
     pub milestone_id: Option<Uuid>,
     /// The number inside its project (or workspace, when it has no project).
     pub number: i64,
@@ -198,7 +200,8 @@ pub struct Checkout {
 pub struct Run {
     pub id: Uuid,
     pub issue_id: Uuid,
-    pub repo_id: Uuid,
+    /// Null when the task has no repository.
+    pub repo_id: Option<Uuid>,
     pub agent_id: Uuid,
     pub attempt: i64,
     /// The agent's closing message: the only record of what it decided, and the
@@ -346,7 +349,9 @@ pub struct Approval {
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
 pub struct RunnerJob {
     pub id: Uuid,
-    pub repo_id: Uuid,
+    /// Null for jobs that touch no repository, such as Lumi questions about a
+    /// repo-less workspace.
+    pub repo_id: Option<Uuid>,
     pub issue_id: Option<Uuid>,
     pub kind: String,
     pub payload: String,

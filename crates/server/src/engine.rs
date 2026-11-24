@@ -201,20 +201,33 @@ impl Engine {
     /// otherwise the newest finished run that published a head. A second turn in
     /// a status reads the work of the turn before it, which is the point of a team
     /// in a column.
-    pub async fn run_under_review(&self, issue: &crate::model::Issue) -> Result<Uuid> {
-        if let Some(id) = issue.current_run_id {
+    ///
+    /// A task with no repository publishes no heads, so its work is the newest
+    /// finished turn other than the one doing the judging (`judging`).
+    pub async fn run_under_review(
+        &self,
+        issue: &crate::model::Issue,
+        judging: Option<Uuid>,
+    ) -> Result<Uuid> {
+        if let Some(id) = issue.current_run_id.filter(|id| Some(*id) != judging) {
             return Ok(id);
         }
-        sqlx::query_scalar::<_, Uuid>(
+        let query = if issue.repo_id.is_some() {
             "select id from runs
               where issue_id = ? and status = 'succeeded'
-                and head_bookmark is not null
-              order by created_at desc limit 1",
-        )
-        .bind(issue.id)
-        .fetch_optional(&self.db.pool)
-        .await?
-        .ok_or_else(|| anyhow!("there is no finished run on this issue to review yet"))
+                and head_bookmark is not null and id is not ?
+              order by created_at desc limit 1"
+        } else {
+            "select id from runs
+              where issue_id = ? and status = 'succeeded' and id is not ?
+              order by created_at desc limit 1"
+        };
+        sqlx::query_scalar::<_, Uuid>(query)
+            .bind(issue.id)
+            .bind(judging)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .ok_or_else(|| anyhow!("there is no finished run on this issue to review yet"))
     }
 
     async fn next_turn_agent(&self, issue: &Issue) -> Result<Option<String>> {
@@ -306,7 +319,7 @@ impl Engine {
     /// otherwise start turns on a task nobody can advance.
     pub(crate) async fn dispatch_if_agent_owns(&self, issue: &Issue) -> Result<()> {
         let status = issue.status_enum();
-        if status == IssueStatus::Blocked || status.is_terminal() || issue.project_id.is_none() {
+        if status == IssueStatus::Blocked || status.is_terminal() {
             return Ok(());
         }
         let workspace = issue.workspace_id;
@@ -1049,15 +1062,17 @@ impl Engine {
         parent_run_id: Option<Uuid>,
     ) -> Result<Run> {
         let issue = self.issue(issue_id).await?;
-        // A run needs somewhere to work. An issue without a project is planning,
-        // and planning is not running.
-        if issue.project_id.is_none() {
-            bail!("this issue belongs to no project, so there is nowhere to run. Move it into a project first.");
-        }
-        let repo: Repo = sqlx::query_as("select * from repos where id = ?")
-            .bind(issue.repo_id)
-            .fetch_one(&self.db.pool)
-            .await?;
+        // A task with no repository still runs: the agent works in an empty
+        // scratch directory, and its output is what it says and attaches.
+        let repo: Option<Repo> = match issue.repo_id {
+            Some(repo_id) => Some(
+                sqlx::query_as("select * from repos where id = ?")
+                    .bind(repo_id)
+                    .fetch_one(&self.db.pool)
+                    .await?,
+            ),
+            None => None,
+        };
 
         // The workflow decides who works a status. When it names an agent, that
         // agent runs; `any` means whichever agent in the workspace has waited
@@ -1100,19 +1115,25 @@ impl Engine {
         };
 
         // A probe is the only evidence about the CLI, so a run without one would
-        // be a bet on an unknown binary.
-        let preflight: Option<(i64, Option<String>)> = sqlx::query_as(
-            "select ok, detail from agent_preflight where agent_id = ? and repo_id = ?",
-        )
-        .bind(agent_id)
-        .bind(issue.repo_id)
-        .fetch_optional(&self.db.pool)
-        .await?;
-        match preflight {
-            None => {
+        // be a bet on an unknown binary. Probes run inside a checkout, so a
+        // repo-less task has nothing to probe against and skips the gate.
+        let preflight: Option<(i64, Option<String>)> = match issue.repo_id {
+            Some(repo_id) => {
+                sqlx::query_as(
+                    "select ok, detail from agent_preflight where agent_id = ? and repo_id = ?",
+                )
+                .bind(agent_id)
+                .bind(repo_id)
+                .fetch_optional(&self.db.pool)
+                .await?
+            }
+            None => Some((1, None)),
+        };
+        match (preflight, issue.repo_id) {
+            (None, Some(repo_id)) => {
                 let agent = self.agent(agent_id).await?;
                 self.queue_job(
-                    issue.repo_id,
+                    repo_id,
                     Some(issue_id),
                     "preflight",
                     serde_json::json!({
@@ -1126,17 +1147,23 @@ impl Engine {
                     "agent {agent_id} has not passed preflight on this repo yet. A probe was queued; retry when Settings shows it green."
                 );
             }
-            Some((0, detail)) => bail!(
+            (Some((0, detail)), _) => bail!(
                 "agent {agent_id} failed its preflight: {}. Fix the adapter setup in Settings, then re-run the probe.",
                 detail.unwrap_or_default()
             ),
-            Some(_) => {}
+            _ => {}
         }
 
         if let Some(live) = self.live_run_on_issue(issue_id).await? {
             bail!("a run is already active on this issue ({})", live.id);
         }
-        if let Some(live) = self.live_run_on_repo(issue.repo_id).await? {
+        // Repo-less runs share nothing, so only runs on a repository queue up
+        // behind each other.
+        let live_on_repo = match issue.repo_id {
+            Some(repo_id) => self.live_run_on_repo(repo_id).await?,
+            None => None,
+        };
+        if let Some(live) = live_on_repo {
             bail!(
                 "another run is active on this repo ({}). One agent per repo keeps the jj op log and the build cache uncontended; start this run when that one finishes.",
                 live.id
@@ -1170,7 +1197,11 @@ impl Engine {
         // workflow handed over from, so its head is the base; with no parent the
         // repository's own base bookmark is. A turn that reads and changes nothing
         // publishes nothing, so the next turn in line still starts from the last
-        // head that carried a change.
+        // head that carried a change. A repo-less run has no bookmarks at all.
+        let repo_base = repo
+            .as_ref()
+            .map(|repo| repo.base_bookmark.clone())
+            .unwrap_or_default();
         let base_bookmark = match parent_run_id {
             Some(parent_id) => {
                 let parent: Run = sqlx::query_as("select * from runs where id = ?")
@@ -1186,10 +1217,10 @@ impl Engine {
                     None => self
                         .newest_head(issue_id)
                         .await?
-                        .unwrap_or_else(|| repo.base_bookmark.clone()),
+                        .unwrap_or_else(|| repo_base.clone()),
                 }
             }
-            None => repo.base_bookmark.clone(),
+            None => repo_base.clone(),
         };
         let attempt = issue.attempt + 1;
 
@@ -1225,8 +1256,9 @@ impl Engine {
         // The base is a revision expression, not a frozen hash: a turn starts on the
         // bookmark its predecessor published, and resolving it here would mean a
         // second process to ask jj. Storing the bookmark keeps the run on the head
-        // that was reviewed, even after another attempt moves it.
-        .bind(&base_bookmark)
+        // that was reviewed, even after another attempt moves it. A repo-less run
+        // has no revision to start from.
+        .bind(repo.as_ref().map(|_| &base_bookmark))
         .bind(&prompt_revision)
         .bind(artifact_dir.display().to_string())
         .bind(crate::db::now_rfc3339())
@@ -1511,12 +1543,21 @@ impl Engine {
             .verdict
             .as_deref()
             .is_some_and(|verdict| !verdict.trim().is_empty());
-        if final_status == RunStatus::Succeeded && changed_paths.is_empty() && !asked && !answered {
+        // A task with no repository changes no files by design: its output is
+        // what it says, so a closing message is the work.
+        let reported = run.repo_id.is_none() && summary.is_some();
+        if final_status == RunStatus::Succeeded
+            && changed_paths.is_empty()
+            && !asked
+            && !answered
+            && !reported
+        {
             final_status = RunStatus::Failed;
             error = Some(match adapter_failure(&payload) {
                 Some(reason) => format!(
                     "the agent changed no files: {reason}. Nothing was run for this turn, so the issue stays where it is; fix the agent in Settings and retry."
                 ),
+                None if run.repo_id.is_none() => "the agent said nothing. A task with no repository reports its work in the closing message, so a silent turn did no work; check its transcript in the run log, then retry.".to_string(),
                 None => "the agent changed no files and said nothing. A turn that edits nothing did no work; check its transcript in the run log, then retry.".to_string(),
             });
         }
@@ -1569,7 +1610,7 @@ impl Engine {
         let judged = matches!(
             payload.verdict.as_deref(),
             Some("approved") | Some("changes_requested")
-        ) && self.run_under_review(&issue).await.is_ok();
+        ) && self.run_under_review(&issue, Some(run.id)).await.is_ok();
 
         // An agent that worked and said nothing leaves the next turn guessing. Its
         // closing message is the handover, so it is shown where a person reads the
@@ -1707,7 +1748,14 @@ impl Engine {
             .await?
             .unwrap_or(IssueStatus::InReview);
         if target == IssueStatus::InReview {
-            sqlx::query("update issues set current_run_id = (select id from runs where issue_id = ? and status = 'succeeded' and head_bookmark is not null order by created_at desc limit 1) where id = ?")
+            // A repo-less task publishes no heads; its newest finished turn is
+            // the work a reviewer reads.
+            let query = if issue.repo_id.is_some() {
+                "update issues set current_run_id = (select id from runs where issue_id = ? and status = 'succeeded' and head_bookmark is not null order by created_at desc limit 1) where id = ?"
+            } else {
+                "update issues set current_run_id = (select id from runs where issue_id = ? and status = 'succeeded' order by created_at desc limit 1) where id = ?"
+            };
+            sqlx::query(query)
                 .bind(issue_id)
                 .bind(issue_id)
                 .execute(&self.db.pool)
@@ -1728,6 +1776,11 @@ impl Engine {
     /// publishes none, and naming it asks the runner to push a branch that does not
     /// exist.
     async fn ensure_pull_request(&self, issue: &Issue) -> Result<()> {
+        // A task with no repository has nothing to push and nowhere to open a
+        // pull request; the transition is the whole handover.
+        let Some(repo_id) = issue.repo_id else {
+            return Ok(());
+        };
         if issue.pr_number.is_some() {
             return Ok(());
         }
@@ -1762,7 +1815,7 @@ impl Engine {
             return Ok(());
         };
         self.queue_job(
-            issue.repo_id,
+            repo_id,
             Some(issue.id),
             "open_pr",
             serde_json::json!({ "run_id": run_id }),
@@ -1846,7 +1899,7 @@ impl Engine {
             .verdict
             .clone()
             .unwrap_or_else(|| "changes_requested".to_string());
-        let reviewed_run_id = self.run_under_review(issue).await?;
+        let reviewed_run_id = self.run_under_review(issue, Some(run.id)).await?;
 
         sqlx::query(
             "insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at)
@@ -1864,9 +1917,9 @@ impl Engine {
 
         // The pull request exists before the review does, so the verdict is posted
         // where a human reads it, not only inside Hulahoop.
-        if let Some(number) = issue.pr_number {
+        if let (Some(number), Some(repo_id)) = (issue.pr_number, issue.repo_id) {
             self.queue_job(
-                issue.repo_id,
+                repo_id,
                 Some(issue.id),
                 "review_pr",
                 serde_json::json!({
@@ -1944,7 +1997,7 @@ impl Engine {
             "fetch" => {
                 if let (Some(revision), Some(job_repo)) = (
                     payload.get("base_revision").and_then(|v| v.as_str()),
-                    Some(job.repo_id),
+                    job.repo_id,
                 ) {
                     sqlx::query("update repos set base_revision = ?, fetched_at = ? where id = ?")
                         .bind(revision)
@@ -1955,13 +2008,14 @@ impl Engine {
                 }
             }
             "preflight" => {
-                if let (Some(agent_id), Some(ok), Some(detail)) = (
+                if let (Some(agent_id), Some(ok), Some(detail), Some(job_repo)) = (
                     payload
                         .get("agent_id")
                         .and_then(|v| v.as_str())
                         .and_then(|raw| Uuid::parse_str(raw).ok()),
                     payload.get("ok").and_then(|v| v.as_bool()),
                     payload.get("detail").and_then(|v| v.as_str()),
+                    job.repo_id,
                 ) {
                     sqlx::query(
                         "insert into agent_preflight (agent_id, repo_id, ok, detail, checked_at)
@@ -1969,7 +2023,7 @@ impl Engine {
                          on conflict(agent_id, repo_id) do update set ok = excluded.ok, detail = excluded.detail, checked_at = excluded.checked_at",
                     )
                     .bind(agent_id)
-                    .bind(job.repo_id)
+                    .bind(job_repo)
                     .bind(ok)
                     .bind(detail)
                     .bind(crate::db::now_rfc3339())
@@ -1979,7 +2033,7 @@ impl Engine {
                     // this, an agent saved a minute after a task was planned leaves
                     // that task sitting in a status it is supposed to work.
                     if ok {
-                        self.retry_owed_turns(job.repo_id, agent_id).await?;
+                        self.retry_owed_turns(job_repo, agent_id).await?;
                     }
                 }
             }
@@ -2472,6 +2526,344 @@ mod rework_tests {
         );
         // The rework was dispatched: the turn is counted against `Turns:`.
         assert_eq!(task.turns_used, 3);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod repo_less_tests {
+    use super::{Engine, RunCompletion};
+    use crate::db::Db;
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    const DOC: &str = "# Workflows\n\nTurns: 6\n\n## Backlog\n\nUsers: human\n\nNext: In progress\n\n## In progress\n\nUsers: @Developer\n\nNext: Done\n\n## Blocked\n\nUsers: human\n\nNext: In progress\n\n## Done\n\nUsers: human\n\nNext: none\n";
+
+    /// A workspace with one agent and no repository anywhere, and the
+    /// workflow above.
+    async fn fixture(tag: &str) -> (std::path::PathBuf, Engine, Uuid, Uuid) {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-repo-less-{tag}-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let developer = Uuid::now_v7();
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'Developer','pi','model-x',?,?)")
+            .bind(developer).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let engine = Engine::new(db);
+        engine.set_workflow(workspace, DOC).await.unwrap();
+        (directory, engine, workspace, developer)
+    }
+
+    /// A task with no project and no repository, in progress.
+    async fn task(engine: &Engine, workspace: Uuid, number: i64) -> Uuid {
+        let issue = Uuid::now_v7();
+        let now = Utc::now();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null,?,?,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(format!("TSK-{number}")).bind(number)
+            .bind(now).bind(now).execute(&engine.db.pool).await.unwrap();
+        issue
+    }
+
+    fn finished(body: &str, question: Option<&str>, verdict: Option<&str>) -> RunCompletion {
+        serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "body": body,
+            "question": question,
+            "verdict": verdict,
+        }))
+        .unwrap()
+    }
+
+    async fn jobs(engine: &Engine) -> i64 {
+        sqlx::query_scalar("select count(*) from runner_jobs where kind != 'preflight'")
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Repo-less runs need no preflight and take no repository slot: two
+    /// tasks each have a live run at once, and the issue still holds one.
+    #[tokio::test]
+    async fn two_repo_less_tasks_run_at_the_same_time() {
+        let (directory, engine, workspace, developer) = fixture("parallel").await;
+        let first = task(&engine, workspace, 1).await;
+        let second = task(&engine, workspace, 2).await;
+
+        let a = engine
+            .start_run(first, Some(developer), None)
+            .await
+            .unwrap();
+        let b = engine
+            .start_run(second, Some(developer), None)
+            .await
+            .unwrap();
+        assert_eq!(a.repo_id, None);
+        assert_eq!(b.repo_id, None);
+        assert_eq!(a.base_revision, None);
+        let preflights: i64 =
+            sqlx::query_scalar("select count(*) from runner_jobs where kind = 'preflight'")
+                .fetch_one(&engine.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(preflights, 0, "a repo-less run probes no repository");
+        assert!(
+            engine
+                .start_run(first, Some(developer), None)
+                .await
+                .is_err(),
+            "one live run per task still holds"
+        );
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A repo-less turn that ends `HULAHOOP_VERDICT: done` moves the task the
+    /// way the workflow says, with no pull request and no merge on the way.
+    #[tokio::test]
+    async fn a_repo_less_turn_moves_the_task_without_a_merge() {
+        let (directory, engine, workspace, developer) = fixture("done").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+
+        let run = engine
+            .complete_run(
+                run.id,
+                finished(
+                    "Wrote the report.\n\nHULAHOOP_VERDICT: done",
+                    None,
+                    Some("done"),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(run.status, "succeeded", "no changed files is normal here");
+
+        let task = engine.issue(issue).await.unwrap();
+        assert_eq!(task.status, "done");
+        assert_eq!(task.pr_number, None);
+        assert_eq!(jobs(&engine).await, 0, "no pull request, no checks");
+        let summary: Option<Uuid> = sqlx::query_scalar(
+            "select run_id from comments where issue_id = ? and author_type = 'agent'",
+        )
+        .bind(issue)
+        .fetch_optional(&engine.db.pool)
+        .await
+        .unwrap()
+        .flatten();
+        assert_eq!(summary, Some(run.id), "the summary is the run's output");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A question from a repo-less run blocks the task, as any run's would.
+    #[tokio::test]
+    async fn a_repo_less_question_blocks_the_task() {
+        let (directory, engine, workspace, developer) = fixture("question").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+
+        engine
+            .complete_run(
+                run.id,
+                finished("Which quarter?", Some("Which quarter?"), None),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(engine.issue(issue).await.unwrap().status, "blocked");
+        assert_eq!(jobs(&engine).await, 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A repo-less run that says nothing produced nothing: still a failure.
+    #[tokio::test]
+    async fn a_silent_repo_less_run_fails() {
+        let (directory, engine, workspace, developer) = fixture("silent").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+
+        let run = engine
+            .complete_run(run.id, finished("", None, None))
+            .await
+            .unwrap();
+        assert_eq!(run.status, "failed");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Merging a repo-less task is only the transition: nothing to merge.
+    #[tokio::test]
+    async fn merging_a_repo_less_task_only_closes_it() {
+        let (directory, engine, workspace, _) = fixture("merge").await;
+        let issue = task(&engine, workspace, 1).await;
+        sqlx::query("update issues set status = 'in_review' where id = ?")
+            .bind(issue)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+
+        let task = engine.merge_issue(issue).await.unwrap();
+        assert_eq!(task.status, "done");
+        assert!(task.merged_at.is_some());
+        assert_eq!(jobs(&engine).await, 0);
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod pull_request_comment_tests {
+    use super::Engine;
+    use crate::db::Db;
+    use chrono::{Duration, Utc};
+    use uuid::Uuid;
+
+    /// When the runner reports the pull request it opened, the task gets an
+    /// agent comment naming it, carrying the run's summary, linked to the run.
+    #[tokio::test]
+    async fn an_opened_pull_request_is_announced_on_the_run() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-pr-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, agent, issue, run) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'PR',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'Developer','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'PR-1',1,'Task','in_review',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, summary, created_at) values (?,?,?,?,1,'main','prompt','/tmp','succeeded','model-x','Added the button.',?)")
+            .bind(run).bind(issue).bind(repo).bind(agent).bind(now).execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        let job = engine
+            .queue_job(
+                repo,
+                Some(issue),
+                "open_pr",
+                serde_json::json!({ "run_id": run.to_string() }),
+            )
+            .await
+            .unwrap();
+        sqlx::query("update runner_jobs set status = 'running' where id = ?")
+            .bind(job)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        engine
+            .complete_job(
+                job,
+                serde_json::json!({
+                    "pr_number": 7,
+                    "pr_url": "https://github.com/acme/repo/pull/7",
+                    "pr_branch": "issue/7",
+                    "run_id": run.to_string(),
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let (body, author, linked): (String, String, Option<Uuid>) = sqlx::query_as(
+            "select body, author_type, run_id from comments where issue_id = ? and body like 'Opened pull request%'",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert!(body.starts_with("Opened pull request #7: https://github.com/acme/repo/pull/7"));
+        assert!(body.contains("Added the button."), "{body}");
+        assert_eq!(author, "agent");
+        assert_eq!(linked, Some(run));
+        assert_eq!(engine.issue(issue).await.unwrap().pr_number, Some(7));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// The summary an agent closes its turn with is posted as its comment and
+    /// carries the run it came from, so the thread links back to the run.
+    #[tokio::test]
+    async fn a_summary_comment_carries_its_run() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-summary-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, agent, issue, run) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Sum',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'Developer','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'SUM-1',1,'Task','in_progress',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        let artifacts = directory.join("summary-artifacts");
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at, started_at) values (?,?,?,?,1,'main','prompt',?,'running','model-x',?,?)")
+            .bind(run).bind(issue).bind(repo).bind(agent)
+            .bind(artifacts.to_string_lossy().to_string()).bind(now).bind(now)
+            .execute(&db.pool).await.unwrap();
+
+        let engine = Engine::new(db);
+        let completion: super::RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "body": "Added the button.\n\nHULAHOOP_VERDICT: done",
+            "verdict": "done",
+            "changed_paths": ["src/button.rs"],
+            "commit": "abc123",
+        }))
+        .unwrap();
+        engine.complete_run(run, completion).await.unwrap();
+
+        let (body, linked): (String, Option<Uuid>) = sqlx::query_as(
+            "select body, run_id from comments where issue_id = ? and author_type = 'agent' order by created_at limit 1",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert!(body.contains("Added the button."), "{body}");
+        assert_eq!(linked, Some(run));
 
         let _ = std::fs::remove_dir_all(directory);
     }

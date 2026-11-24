@@ -44,6 +44,18 @@ class Boundary extends React.Component<{ children: React.ReactNode }, { error: E
 
 installDrag();
 
+// The native drop handler is off (`dragDropEnabled: false`) so the drop zones can
+// read files through HTML5. A file let go anywhere else would make the webview
+// navigate to it and throw away the app and every draft in it. Real drop zones
+// handle the event on the way up and call `preventDefault` themselves; anywhere
+// else the drag shows "no drop", and a drop that still arrives opens nothing.
+window.addEventListener("dragover", (event) => {
+  if (event.defaultPrevented) return;
+  event.preventDefault();
+  if (event.dataTransfer) event.dataTransfer.dropEffect = "none";
+});
+window.addEventListener("drop", (event) => event.preventDefault());
+
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <Boundary>

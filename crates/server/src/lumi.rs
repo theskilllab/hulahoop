@@ -431,9 +431,9 @@ impl Engine {
                         .await?,
                         None => None,
                     };
-                let Some((repo_id,)) = repo else {
-                    bail!("the project has no repository, and an issue needs one");
-                };
+                // A project with no repository files a repo-less task: its runs
+                // work in a scratch directory.
+                let repo_id = repo.map(|(id,)| id);
                 let priority = crate::engine::priority(args["priority"].as_str())?;
                 let (number, issue_key) = self.next_issue_key(workspace_id, project_id).await?;
                 let id = Uuid::now_v7();

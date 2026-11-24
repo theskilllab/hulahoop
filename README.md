@@ -6,7 +6,7 @@ Hulahoop is a desktop-first, local-first workspace for running autonomous coding
 
 > backlog → to do → an agent works → in review → the pull request merges → done
 
-It is intentionally small. One workflow document per workspace, one repository per run, one active run per issue, one person who merges, almost no settings.
+It is intentionally small. One workflow document per workspace, at most one repository per run, one active run per issue, one person who merges, almost no settings.
 
 > **The shipped build runs a simpler loop than sections 2–17 describe.** Those
 > sections specify the frozen-suite model: a separate Test Author, a suite proven
@@ -1512,10 +1512,18 @@ Three deliberate rules:
 1. **An issue key is stored.** Renaming a project's prefix rewrites its issues' keys
    (`setProjectPrefix`), because a key is what people quote in a commit message and a
    ticket; recomputing it on read would silently rewrite history.
-2. **A run needs a project.** The workflow and the repository live on the project, so
-   `startRun` refuses an issue that belongs to none ("this issue belongs to no project,
-   so there is nowhere to run"). Filing an issue without a project is planning;
-   running it is not.
+2. **A run follows the repository, and a task may have none.** A task filed under a
+   project takes that project's first repository (`issues.repo_id`); a task with no
+   project, or under a project with no repository, has `repo_id` null. Its runs still
+   start: the runner gives the agent an empty private scratch directory
+   (`$DATA/scratch/<run-id>`, deleted afterwards) with no clone, no repository lock,
+   no preflight, no house checks, no diff and no pull request. The agent's output is
+   its closing summary, its question and the files it leaves in
+   `$HULAHOOP_ARTIFACT_DIR`; `HULAHOOP_VERDICT` / `HULAHOOP_QUESTION` move the task
+   through the workflow as usual, and merging it is only the transition to Done.
+   Repo-less runs take no repository slot, so several run at once (still one per
+   task). `updateIssue(projectId:)` moves a task into a project (taking its first
+   repository) or out of every project, while no run is live; the key is kept.
 3. **An artifact is a file with an index row, and a download is authenticated.** The
    mutation takes base64 (`createArtifact`), the server writes
    `$DATA/artifacts/<id>/<filename>` and stores size, sha256, mime and kind; the

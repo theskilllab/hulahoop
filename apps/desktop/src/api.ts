@@ -50,6 +50,35 @@ export interface Run {
   tokensOut: number;
   startedAt: string | null;
   finishedAt: string | null;
+  /** The agent's own closing note, markdown. Only the detail query asks for it. */
+  summary?: string | null;
+  model?: string | null;
+  actualModel?: string | null;
+  modelTurns?: number | null;
+  toolCalls?: number | null;
+  apiEquivalentUsd?: number | null;
+  cacheReadTokens?: number | null;
+  failureCategory?: string | null;
+  createdAt?: string;
+}
+
+/** One normalized line of a run's transcript. */
+export interface TranscriptEntry {
+  seq: number;
+  /** `prompt`, `thinking`, `text`, `tool_call`, `tool_result`, `error` or `done`. */
+  kind: string;
+  text: string;
+  tool: string | null;
+  input: string | null;
+  output: string | null;
+  toolId: string | null;
+  isError: boolean;
+}
+
+export interface TranscriptPage {
+  entries: TranscriptEntry[];
+  lastSeq: number;
+  live: boolean;
 }
 
 export interface Review {
@@ -104,15 +133,6 @@ export interface Replay {
   createdAt: string;
 }
 
-export interface Approval {
-  id: string;
-  headRevision: string;
-  diffSha: string;
-  landingBookmark: string | null;
-  flags: string[];
-  createdAt: string;
-}
-
 export interface Issue {
   id: string;
   /** `BAL-15`: the project's prefix and the number inside it. */
@@ -144,12 +164,22 @@ export interface Issue {
   /** Where the workflow document says this status may go. */
   moves?: IssueStatus[];
   turnsUsed?: number;
+  /** The task's attached files; only the detail query carries them. */
+  files?: Artifact[];
   runs: Run[];
   reviews: Review[];
   comments: Comment[];
-  approval: Approval | null;
   currentRun: Run | null;
 }
+
+/** What the board and the list draw: scalars, a file count, the declared moves and
+ *  whether a run is live. The body and the turn queue only matter to the open task. */
+export type IssueSummary = Omit<
+  Issue,
+  "body" | "turnRemaining" | "turnsUsed" | "runs" | "reviews" | "comments" | "currentRun" | "files" | "stats"
+> & {
+  currentRun: Pick<Run, "id" | "agentId" | "status"> | null;
+};
 
 export interface Repo {
   id: string;
@@ -472,24 +502,160 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
   }
 }
 
-export const ISSUE_FIELDS = `
+const RUN_FIELDS = `id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt`;
+
+/** The light shape every list of tasks asks for, every few seconds: no body,
+ *  no turn queue, no nested runs or comments. */
+export const ISSUE_SUMMARY_FIELDS = `
+  id key number projectId projectPrefix milestoneId
+  title status priority dueDate attempt runCount mergeRevision pinnedCommentId
+  blockedBy projectName prUrl prNumber fileCount
+  assignee { type id name }
+  moves
+  currentRun { id agentId status }
+`;
+
+/** Everything the task panel shows, fetched for the one task that is open. */
+export const ISSUE_DETAIL_FIELDS = `
   id key number projectId projectPrefix milestoneId
   title body status priority dueDate attempt runCount mergeRevision pinnedCommentId
   blockedBy projectName prUrl prNumber fileCount
   assignee { type id name }
-  runs { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
+  stats { runs failedRuns turns toolCalls tokens apiEquivalentUsd activeMinutes }
+  files { id projectId milestoneId issueId title kind filename mime size sha256 createdAt }
+  runs { ${RUN_FIELDS} summary model actualModel modelTurns toolCalls apiEquivalentUsd cacheReadTokens failureCategory createdAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
-  comments(newestFirst: false) { id author authorType body pinned createdAt runId mentions { type id name } }
+  comments(newestFirst: true) { id author authorType body pinned createdAt runId mentions { type id name } }
   turnRemaining turnsUsed moves
-  currentRun { id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt }
+  currentRun { ${RUN_FIELDS} }
 `;
 
-export async function loadBoard(workspaceId: string): Promise<Issue[]> {
-  const data = await gql<{ issues: Issue[] }>(
-    `query ($workspaceId: UUID!) { issues(workspaceId: $workspaceId, includeDone: true) { ${ISSUE_FIELDS} } }`,
-    { workspaceId },
+/** The workspace's tasks. Done and cancelled ones stay on the server unless asked for. */
+export async function loadBoard(workspaceId: string, includeDone = false): Promise<IssueSummary[]> {
+  const data = await gql<{ issues: IssueSummary[] }>(
+    `query ($workspaceId: UUID!, $includeDone: Boolean!) { issues(workspaceId: $workspaceId, includeDone: $includeDone) { ${ISSUE_SUMMARY_FIELDS} } }`,
+    { workspaceId, includeDone },
   );
   return data.issues;
+}
+
+/** How many done tasks the Active view leaves out. */
+export async function loadDoneIssueCount(workspaceId: string, projectId: string | null): Promise<number> {
+  const data = await gql<{ doneIssueCount: number }>(
+    `query ($workspaceId: UUID!, $projectId: UUID) { doneIssueCount(workspaceId: $workspaceId, projectId: $projectId) }`,
+    { workspaceId, projectId },
+  );
+  return data.doneIssueCount;
+}
+
+/** The task asked for is gone (deleted), as opposed to a failed request. */
+export class IssueGoneError extends Error {}
+
+export async function loadIssueDetail(id: string): Promise<Issue> {
+  const data = await gql<{ issue: Issue | null }>(`query ($id: UUID!) { issue(id: $id) { ${ISSUE_DETAIL_FIELDS} } }`, { id });
+  if (!data.issue) throw new IssueGoneError("This task no longer exists.");
+  return data.issue;
+}
+
+/** A page of a run's transcript after `afterSeq`; poll with `lastSeq` while `live`. */
+export async function loadTranscript(runId: string, afterSeq: number): Promise<TranscriptPage> {
+  const data = await gql<{ run: { transcript: TranscriptPage } | null }>(
+    `query ($id: UUID!, $afterSeq: Int!) { run(id: $id) { transcript(afterSeq: $afterSeq) { entries { seq kind text tool input output toolId isError } lastSeq live } } }`,
+    { id: runId, afterSeq },
+  );
+  return data.run?.transcript ?? { entries: [], lastSeq: afterSeq, live: false };
+}
+
+export interface CreateIssueInput {
+  workspaceId: string;
+  projectId: string | null;
+  repoId: string | null;
+  title: string;
+  body: string;
+  priority: string;
+  dueDate: string | null;
+  assigneeType: "human" | "agent" | null;
+  assigneeId: string | null;
+}
+
+export async function createIssue(input: CreateIssueInput): Promise<IssueSummary> {
+  const data = await gql<{ createIssue: IssueSummary }>(
+    `mutation ($workspaceId: UUID!, $projectId: UUID, $repoId: UUID, $title: String!, $body: String!, $priority: String, $dueDate: String, $assigneeType: String, $assigneeId: String) {
+      createIssue(workspaceId: $workspaceId, projectId: $projectId, repoId: $repoId, title: $title, body: $body, priority: $priority, dueDate: $dueDate, assigneeType: $assigneeType, assigneeId: $assigneeId) { ${ISSUE_SUMMARY_FIELDS} }
+    }`,
+    { ...input },
+  );
+  return data.createIssue;
+}
+
+/**
+ * Only the keys present change; `null` clears due date and assignee.
+ *
+ * The server reads an argument that is written into the document but has no
+ * variable as `null`, and for `dueDate` and `assigneeType` that means clear.
+ * So each group gets its own document that names only its own arguments.
+ */
+export async function updateIssue(
+  id: string,
+  patch: {
+    title?: string;
+    body?: string;
+    priority?: string;
+    dueDate?: string | null;
+    assigneeType?: string | null;
+    assigneeId?: string | null;
+    /** A project brings its first repository; `null` leaves the task with no project and no checkout. */
+    projectId?: string | null;
+  },
+): Promise<void> {
+  const { title, body, priority } = patch;
+  if (title !== undefined || body !== undefined || priority !== undefined) {
+    await gql(
+      `mutation ($id: UUID!, $title: String, $body: String, $priority: String) {
+        updateIssue(id: $id, title: $title, body: $body, priority: $priority) { id }
+      }`,
+      { id, title, body, priority },
+    );
+  }
+  if ("dueDate" in patch) {
+    await gql(`mutation ($id: UUID!, $dueDate: String) { updateIssue(id: $id, dueDate: $dueDate) { id } }`, {
+      id,
+      dueDate: patch.dueDate ?? null,
+    });
+  }
+  if ("assigneeType" in patch) {
+    await gql(
+      `mutation ($id: UUID!, $assigneeType: String, $assigneeId: String) {
+        updateIssue(id: $id, assigneeType: $assigneeType, assigneeId: $assigneeId) { id }
+      }`,
+      { id, assigneeType: patch.assigneeType ?? null, assigneeId: patch.assigneeId ?? null },
+    );
+  }
+  if ("projectId" in patch) {
+    await gql(`mutation ($id: UUID!, $projectId: UUID) { updateIssue(id: $id, projectId: $projectId) { id } }`, {
+      id,
+      projectId: patch.projectId ?? null,
+    });
+  }
+}
+
+export async function moveIssue(issueId: string, status: string): Promise<void> {
+  await gql(`mutation ($issueId: UUID!, $status: String!) { moveIssue(issueId: $issueId, status: $status) { id } }`, {
+    issueId,
+    status,
+  });
+}
+
+export async function addComment(issueId: string, body: string): Promise<void> {
+  await gql(`mutation ($issueId: UUID!, $body: String!) { addComment(issueId: $issueId, body: $body) { id } }`, {
+    issueId,
+    body,
+  });
+}
+
+export async function deleteArtifact(id: string): Promise<boolean> {
+  const data = await gql<{ deleteArtifact: boolean }>(`mutation ($id: UUID!) { deleteArtifact(id: $id) }`, { id });
+  return data.deleteArtifact;
 }
 
 export const SKILL_FIELDS = `id name description source builtin updatedAt`;
@@ -593,12 +759,13 @@ export interface RecentRun {
   error: string | null;
   startedAt: string | null;
   finishedAt: string | null;
+  headBookmark?: string | null;
 }
 
 export async function loadRecentRuns(workspaceId: string, limit = 120): Promise<RecentRun[]> {
   const data = await gql<{ recentRuns: RecentRun[] }>(
     `query ($w: UUID!, $n: Int) { recentRuns(workspaceId: $w, limit: $n) {
-      id issueId agentId status adapter model attempt tokensIn tokensOut error startedAt finishedAt
+      id issueId agentId status adapter model attempt tokensIn tokensOut error startedAt finishedAt headBookmark
     } }`,
     { w: workspaceId, n: limit },
   );
@@ -733,6 +900,7 @@ export async function uploadArtifact(input: {
   workspaceId: string;
   projectId: string | null;
   milestoneId: string | null;
+  issueId?: string | null;
   title: string;
   file: File;
 }): Promise<Artifact> {
@@ -743,13 +911,14 @@ export async function uploadArtifact(input: {
     binary += String.fromCharCode(...buffer.subarray(index, index + chunk));
   }
   const data = await gql<{ createArtifact: Artifact }>(
-    `mutation ($workspaceId: UUID!, $projectId: UUID, $milestoneId: UUID, $title: String, $filename: String!, $mime: String, $contentBase64: String!) {
-      createArtifact(workspaceId: $workspaceId, projectId: $projectId, milestoneId: $milestoneId, title: $title, filename: $filename, mime: $mime, contentBase64: $contentBase64) { ${ARTIFACT_FIELDS} }
+    `mutation ($workspaceId: UUID!, $projectId: UUID, $milestoneId: UUID, $issueId: UUID, $title: String, $filename: String!, $mime: String, $contentBase64: String!) {
+      createArtifact(workspaceId: $workspaceId, projectId: $projectId, milestoneId: $milestoneId, issueId: $issueId, title: $title, filename: $filename, mime: $mime, contentBase64: $contentBase64) { ${ARTIFACT_FIELDS} }
     }`,
     {
       workspaceId: input.workspaceId,
       projectId: input.projectId,
       milestoneId: input.milestoneId,
+      issueId: input.issueId ?? null,
       title: input.title,
       filename: input.file.name,
       mime: input.file.type || null,
@@ -759,25 +928,25 @@ export async function uploadArtifact(input: {
   return data.createArtifact;
 }
 
-/** Fetch the bytes with the bearer token, then hand them to the browser to save. */
-export async function downloadArtifact(artifact: Artifact): Promise<void> {
+/** The file's bytes, fetched with the bearer token; previews read these too. */
+export async function fetchArtifactBlob(artifact: Pick<Artifact, "id" | "filename">): Promise<Blob> {
   const current = await connect();
   const response = await fetch(`${current.url}/artifacts/${artifact.id}`, {
     headers: { authorization: `Bearer ${current.token}` },
   });
   if (!response.ok) throw new Error(`the server answered ${response.status} for ${artifact.filename}`);
-  const blob = await response.blob();
+  return response.blob();
+}
+
+/** Fetch the bytes with the bearer token, then hand them to the browser to save. */
+export async function downloadArtifact(artifact: Artifact): Promise<void> {
+  const blob = await fetchArtifactBlob(artifact);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
   link.download = artifact.filename;
   link.click();
   URL.revokeObjectURL(url);
-}
-
-export async function loadIssue(id: string): Promise<Issue> {
-  const data = await gql<{ issue: Issue }>(`query ($id: UUID!) { issue(id: $id) { ${ISSUE_FIELDS} } }`, { id });
-  return data.issue;
 }
 
 export interface WorkspaceSnapshot {
@@ -948,8 +1117,8 @@ export async function loadWorkspaceMembers(workspaceId: string): Promise<Workspa
   return data.workspaceMembers;
 }
 
-export async function loadWorkspaceIssues(workspaceId: string): Promise<Issue[]> {
-  return loadBoard(workspaceId);
+export async function loadWorkspaceIssues(workspaceId: string, includeDone = false): Promise<IssueSummary[]> {
+  return loadBoard(workspaceId, includeDone);
 }
 
 /** The harness's own catalogue; the server reads it from the harness, not from us. */

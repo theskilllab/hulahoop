@@ -4,7 +4,7 @@ import {
   loadRecentRuns,
   type Agent,
   type Artifact,
-  type Issue,
+  type IssueSummary as Issue,
   type Milestone,
   type Project,
   type RecentRun,

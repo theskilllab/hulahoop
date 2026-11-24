@@ -550,6 +550,31 @@ impl Engine {
 }
 
 impl Engine {
+    /// Closes a task that has no repository. There is no code to merge and no
+    /// base to move, so the merge is only the transition; `merged_at` still
+    /// dates the finish so cost reporting attributes the task's effort.
+    async fn close_without_repository(
+        &self,
+        issue: &crate::model::Issue,
+    ) -> anyhow::Result<crate::model::Issue> {
+        sqlx::query("update issues set merged_at = ?, updated_at = ? where id = ?")
+            .bind(crate::db::now_rfc3339())
+            .bind(crate::db::now_rfc3339())
+            .bind(issue.id)
+            .execute(&self.db.pool)
+            .await?;
+        self.comment(
+            issue.id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            "Closed. This task has no repository, so there is nothing to merge.",
+            false,
+        )
+        .await?;
+        self.transition(issue.id, hulahoop_core::IssueEvent::Merge)
+            .await
+    }
+
     /// Closes a task whose project has no pull request to read a merge from.
     ///
     /// A repository with no GitHub remote still has a loop in it: the head the
@@ -606,6 +631,9 @@ impl Engine {
     /// the kind of fact that is right once and stale afterwards.
     pub async fn merge_issue(&self, issue_id: uuid::Uuid) -> anyhow::Result<crate::model::Issue> {
         let issue = self.issue(issue_id).await?;
+        let Some(repo_id) = issue.repo_id else {
+            return self.close_without_repository(&issue).await;
+        };
         let Some(number) = issue.pr_number else {
             // No pull request: either the project has no GitHub remote at all, or
             // the handover never opened one. Both mean there is no GitHub side to
@@ -613,7 +641,7 @@ impl Engine {
             return self.merge_without_pull_request(&issue).await;
         };
         let repo: crate::model::Repo = sqlx::query_as("select * from repos where id = ?")
-            .bind(issue.repo_id)
+            .bind(repo_id)
             .fetch_one(&self.db.pool)
             .await?;
         let remote = crate::api::clone_url(&repo).ok_or_else(|| {

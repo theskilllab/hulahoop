@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   connect,
-  gql,
   loadArtifacts,
+  loadDoneIssueCount,
   loadMilestones,
   loadRecentRuns,
   loadSkills,
@@ -14,7 +14,7 @@ import {
   type Agent,
   type Artifact,
   type Connection,
-  type Issue,
+  type IssueSummary,
   type Milestone,
   type Project,
   type RecentRun,
@@ -27,15 +27,14 @@ import { applyTheme, resolvedTheme, savedPalette, themeOf, THEMES } from "./them
 import Artifacts from "./screens/Artifacts";
 import Agents from "./screens/Agents";
 import Icon from "./Icon";
-import Board from "./screens/Board";
 import Connect from "./screens/Connect";
 import Palette, { type PaletteTarget } from "./screens/Palette";
-import IssueDetail from "./screens/IssueDetail";
+import Tasks from "./screens/Tasks";
+import NewTaskDialog from "./components/NewTaskDialog";
 import Milestones from "./screens/Milestones";
 import Skills from "./screens/Skills";
 import WorkflowScreen from "./screens/Workflow";
 import Lumi from "./screens/Lumi";
-import NewIssue from "./screens/NewIssue";
 import Settings from "./screens/Settings";
 import CreateWorkspace from "./screens/CreateWorkspace";
 import { Connectors } from "./screens/Connectors";
@@ -56,12 +55,17 @@ type View =
   | { name: "prs" }
   | { name: "activity" }
   | { name: "issue"; id: string }
-  | { name: "new" }
   | { name: "connect" };
 
 const RAIL_KEY = "hulahoop.rail";
 
 /** The mark: a filled circle in the brand indigo, the same everywhere. */
+/** True when a key press belongs to a field the person is typing in. */
+function isTyping(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  return Boolean(target.closest("input, textarea, select, [contenteditable='true'], [contenteditable='']")) || target.isContentEditable;
+}
+
 function Logo() {
   return (
     <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
@@ -77,7 +81,7 @@ export default function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
-  const [issues, setIssues] = useState<Issue[]>([]);
+  const [issues, setIssues] = useState<IssueSummary[]>([]);
   const [milestones, setMilestones] = useState<Milestone[]>([]);
   const [workflow, setWorkflow] = useState<WorkflowDoc | null>(null);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -88,6 +92,14 @@ export default function App() {
   const [notice, setNotice] = useState<string | null>(null);
   /** `all` shows every project's tasks, including the ones filed under none. */
   const [projectFilter, setProjectFilter] = useState<string | "all">("all");
+  /** Tasks shows only active work by default; done tasks stay on the server. */
+  const [showDone, setShowDone] = useState(false);
+  const [doneCount, setDoneCount] = useState(0);
+  const [creatingTask, setCreatingTask] = useState(false);
+  /** The open task as its detail loaded it: found even when the list left it out. */
+  const [openDetail, setOpenDetail] = useState<{ id: string; key: string; title: string } | null>(null);
+  /** Every task, done ones too, fetched when the palette opens so it can find them. */
+  const [paletteIssues, setPaletteIssues] = useState<IssueSummary[] | null>(null);
   const [collapsed, setCollapsed] = useState(localStorage.getItem(RAIL_KEY) === "collapsed");
 
   /// On macOS the traffic lights sit inside the folded rail's 48px, so they go
@@ -122,19 +134,34 @@ export default function App() {
     return () => window.removeEventListener("hulahoop:search", open);
   }, [settingsTab]);
 
+  // Done tasks load only where something reads them: the All toggle on Tasks,
+  // and the screens that report finished work.
+  const onTaskScreen = view.name === "tasks" || view.name === "issue" || view.name === "inbox";
+  const includeDone = showDone || !onTaskScreen;
+
+  // Only the newest refresh may land, so a slow one started before the Active/All
+  // toggle or the project filter changed cannot paint the old list back.
+  const refreshTicket = useRef(0);
+  const refreshing = useRef(false);
+
   const refresh = useCallback(async () => {
     if (!workspace) return;
+    const ticket = ++refreshTicket.current;
+    refreshing.current = true;
     try {
-      const [nextIssues, nextMilestones, nextArtifacts, nextWorkflow, nextSkills, nextRuns] =
+      const [nextIssues, nextDone, nextMilestones, nextArtifacts, nextWorkflow, nextSkills, nextRuns] =
         await Promise.all([
-          loadWorkspaceIssues(workspace.id),
+          loadWorkspaceIssues(workspace.id, includeDone),
+          loadDoneIssueCount(workspace.id, projectFilter === "all" ? null : projectFilter),
           loadMilestones(workspace.id),
           loadArtifacts(workspace.id),
           loadWorkflow(workspace.id),
           loadSkills(workspace.id),
           loadRecentRuns(workspace.id, 150),
         ]);
+      if (ticket !== refreshTicket.current) return;
       setIssues(nextIssues);
+      setDoneCount(nextDone);
       setMilestones(nextMilestones);
       setArtifacts(nextArtifacts);
       setWorkflow(nextWorkflow);
@@ -142,9 +169,11 @@ export default function App() {
       setRunners(nextRuns);
       setError(null);
     } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
+      if (ticket === refreshTicket.current) setError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      if (ticket === refreshTicket.current) refreshing.current = false;
     }
-  }, [workspace]);
+  }, [workspace, includeDone, projectFilter]);
 
   const load = useCallback(async (preferred?: string | null) => {
     const info = await connect();
@@ -189,7 +218,9 @@ export default function App() {
 
   useEffect(() => {
     void refresh();
-    const timer = setInterval(() => void refresh(), 2500);
+    const timer = setInterval(() => {
+      if (!refreshing.current) void refresh();
+    }, 2500);
     return () => clearInterval(timer);
   }, [refresh]);
 
@@ -218,7 +249,14 @@ export default function App() {
       }
       if (meta && event.key.toLowerCase() === "n") {
         event.preventDefault();
-        setView({ name: "new" });
+        setCreatingTask(true);
+      }
+      // A bare `c` files a task too, unless the person is typing somewhere.
+      if (!meta && !event.altKey && !event.shiftKey && event.key === "c" && !event.defaultPrevented && !isTyping(event.target)) {
+        if (!document.querySelector("dialog[open]")) {
+          event.preventDefault();
+          setCreatingTask(true);
+        }
       }
       if (meta && event.key.toLowerCase() === "j") {
         event.preventDefault();
@@ -236,26 +274,30 @@ export default function App() {
     setAgents(loaded.agents);
   }, []);
 
-  const shown = useMemo(
-    () => (projectFilter === "all" ? issues : issues.filter((issue) => issue.projectId === projectFilter)),
-    [issues, projectFilter],
-  );
-  const openIssue = issues.find((issue) => view.name === "issue" && issue.id === view.id) ?? null;
+  useEffect(() => {
+    if (!palette || !workspace) {
+      setPaletteIssues(null);
+      return;
+    }
+    let live = true;
+    loadWorkspaceIssues(workspace.id, true)
+      .then((all) => live && setPaletteIssues(all))
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, [palette, workspace]);
+
+  const openIssue =
+    view.name !== "issue"
+      ? null
+      : openDetail?.id === view.id
+        ? openDetail
+        : (issues.find((issue) => issue.id === view.id) ?? null);
   const project = useMemo(
     () => projects.find((entry) => entry.id === projectFilter) ?? projects[0] ?? null,
     [projects, projectFilter],
   );
-
-  async function createRepo(path: string, projectId: string | null) {
-    const target = projects.find((entry) => entry.id === projectId) ?? project;
-    if (!target) return;
-    await gql(
-      `mutation ($projectId: UUID!, $name: String!, $path: String!) { addRepo(projectId: $projectId, name: $name, path: $path) { id name } }`,
-      { projectId: target.id, name: path.split("/").filter(Boolean).pop() ?? "repo", path },
-    );
-    await reload();
-    setNotice("Repository added. Probe the agents before starting work.");
-  }
 
   if (view.name === "connect" || !connected) {
     return (
@@ -347,20 +389,25 @@ export default function App() {
         </div>
 
         <nav>
-          {items.map((item) => (
-            <button
-              key={item.name}
-              className={view.name === item.name ? "on" : ""}
-              onClick={() => setView({ name: item.name } as View)}
-              title={collapsed ? item.label : undefined}
-            >
-              <Icon name={item.icon} />
-              {!collapsed ? <span className="label">{item.label}</span> : null}
-              {!collapsed && item.count ? (
-                <span className={item.hot && item.count > 0 ? "tally hot" : "tally"}>{item.count}</span>
-              ) : null}
-            </button>
-          ))}
+          {items.map((item) => {
+            // An open task is still the Tasks screen, with a panel over it.
+            const current = view.name === item.name || (item.name === "tasks" && view.name === "issue");
+            return (
+              <button
+                key={item.name}
+                className={current ? "on" : ""}
+                aria-current={current ? "page" : undefined}
+                onClick={() => setView({ name: item.name } as View)}
+                title={collapsed ? item.label : undefined}
+              >
+                <Icon name={item.icon} />
+                {!collapsed ? <span className="label">{item.label}</span> : null}
+                {!collapsed && item.count ? (
+                  <span className={item.hot && item.count > 0 ? "tally hot" : "tally"}>{item.count}</span>
+                ) : null}
+              </button>
+            );
+          })}
         </nav>
 
         <footer className="ws-foot">
@@ -470,7 +517,7 @@ export default function App() {
 
       {palette ? (
         <Palette
-          issues={issues}
+          issues={paletteIssues ?? issues}
           agents={agents}
           onClose={() => setPalette(false)}
           onPick={(target: PaletteTarget) => {
@@ -531,6 +578,7 @@ export default function App() {
             agents={agents}
             skills={skills}
             issues={issues}
+            runs={runners}
             repoId={projects.flatMap((entry) => entry.repos)[0]?.id ?? null}
             projectId={project?.id ?? null}
             onChanged={reload}
@@ -540,61 +588,28 @@ export default function App() {
 
         {view.name === "workflow" && <WorkflowScreen workspaceId={workspace.id} agents={agents} />}
 
-        {view.name === "tasks" && (
-          <>
-            <div className="tasks-bar">
-              <select
-                value={projectFilter}
-                onChange={(event) => setProjectFilter(event.target.value)}
-                aria-label="Project"
-              >
-                <option value="all">all projects</option>
-                {projects.map((entry) => (
-                  <option key={entry.id} value={entry.id}>
-                    {entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name}
-                  </option>
-                ))}
-              </select>
-              <span className="dim">{shown.filter((issue) => !["done", "cancelled"].includes(issue.status)).length} open</span>
-              <span className="fill" />
-              <button className="primary" onClick={() => setView({ name: "new" })}>
-                <Icon name="plus" size={14} /> New task
-              </button>
-            </div>
-            <Board
-              issues={shown}
-              columns={workflow?.sections.map((section) => ({
-                status: section.status,
-                title: section.title,
-                owner: section.owner,
-              }))}
-              onOpen={(id) => setView({ name: "issue", id })}
-              onNew={() => setView({ name: "new" })}
-              hasRepo={Boolean(project?.repos.length)}
-            />
-          </>
-        )}
-
-        {view.name === "issue" && openIssue && (
-          <IssueDetail
-            issue={openIssue}
-            milestones={milestones}
-            onBack={() => setView({ name: "tasks" })}
-            onChanged={refresh}
-          />
-        )}
-        {view.name === "issue" && !openIssue && <p className="hint">loading task…</p>}
-
-        {view.name === "new" && (
-          <NewIssue
+        {(view.name === "tasks" || view.name === "issue") && (
+          <Tasks
             workspaceId={workspace.id}
+            issues={issues}
             projects={projects}
-            onAddRepo={createRepo}
-            onCreated={async (id) => {
-              await refresh();
-              setView({ name: "issue", id });
-            }}
-            onCancel={() => setView({ name: "tasks" })}
+            agents={agents}
+            milestones={milestones}
+            columns={workflow?.sections.map((section) => ({
+              status: section.status,
+              title: section.title,
+              owner: section.owner,
+            }))}
+            projectFilter={projectFilter}
+            onProjectFilter={setProjectFilter}
+            showDone={showDone}
+            onShowDone={setShowDone}
+            doneCount={doneCount}
+            openId={view.name === "issue" ? view.id : null}
+            onOpen={(id) => setView(id ? { name: "issue", id } : { name: "tasks" })}
+            onNew={() => setCreatingTask(true)}
+            onChanged={refresh}
+            onDetail={setOpenDetail}
           />
         )}
 
@@ -628,6 +643,20 @@ export default function App() {
           initialTab={settingsTab}
           onChanged={reload}
           onClose={closeSettings}
+        />
+      )}
+
+      {creatingTask && (
+        <NewTaskDialog
+          workspaceId={workspace.id}
+          projects={projects}
+          agents={agents}
+          defaultProjectId={projectFilter === "all" ? null : projectFilter}
+          onCreated={async (issue) => {
+            await refresh();
+            setView({ name: "issue", id: issue.id });
+          }}
+          onClose={() => setCreatingTask(false)}
         />
       )}
 

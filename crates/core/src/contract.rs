@@ -210,6 +210,12 @@ pub fn run_artifact_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
     data_dir.join("runs").join(run_id.to_string())
 }
 
+/// The empty working directory a run on a task with no repository works in.
+/// Private to the run, created fresh before the agent starts and deleted after.
+pub fn scratch_dir(data_dir: &Path, run_id: &uuid::Uuid) -> PathBuf {
+    data_dir.join("scratch").join(run_id.to_string())
+}
+
 pub fn replay_artifact_dir(data_dir: &Path, replay_id: &uuid::Uuid) -> PathBuf {
     data_dir.join("replays").join(replay_id.to_string())
 }

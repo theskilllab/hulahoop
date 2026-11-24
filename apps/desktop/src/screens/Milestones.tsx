@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { gql, type Artifact, type Issue, type Milestone, type Project } from "../api";
+import { gql, type Artifact, type IssueSummary as Issue, type Milestone, type Project } from "../api";
 import PageHeader from "../PageHeader";
 
 interface Props {

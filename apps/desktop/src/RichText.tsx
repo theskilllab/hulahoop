@@ -1,9 +1,7 @@
 import type { Extensions } from "@tiptap/core";
-import Placeholder from "@tiptap/extension-placeholder";
 import { EditorContent, useEditor } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
 import { useEffect, useRef } from "react";
-import { Markdown } from "tiptap-markdown";
+import { editorMarkdown, markdownExtensions } from "./components/markdown";
 
 /**
  * A markdown editor that shows the formatted text while typing.
@@ -46,12 +44,7 @@ export default function RichText({
   const emitted = useRef(value);
 
   const editor = useEditor({
-    extensions: [
-      StarterKit.configure({ heading: { levels: [1, 2, 3] } }),
-      Placeholder.configure({ placeholder: placeholder ?? "" }),
-      Markdown.configure({ html: false, tightLists: true, linkify: true, breaks: false }),
-      ...extensions,
-    ],
+    extensions: [...markdownExtensions({ placeholder }), ...extensions],
     content: value,
     autofocus: autoFocus,
     editable,
@@ -65,8 +58,7 @@ export default function RichText({
       },
     },
     onUpdate: ({ editor: live }) => {
-      const storage = live.storage as unknown as { markdown: { getMarkdown: () => string } };
-      const markdown = storage.markdown.getMarkdown();
+      const markdown = editorMarkdown(live);
       emitted.current = markdown;
       onChange(markdown);
     },

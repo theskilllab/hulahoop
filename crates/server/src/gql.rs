@@ -1004,38 +1004,13 @@ impl Mutation {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         let due_date = crate::engine::due_date(due_date.as_deref().unwrap_or_default())
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
-        // A repository always exists, because a run has to know where to work: the
-        // caller may name one, a project with a single repository supplies it, and
-        // otherwise the workspace's first repository is the honest default.
-        let repo_id = match repo_id {
-            Some(id) => id,
-            None => {
-                let row: Option<(Uuid,)> = match project_id {
-                    Some(project) => {
-                        sqlx::query_as(
-                            "select id from repos where project_id = ? order by created_at limit 1",
-                        )
-                        .bind(project)
-                        .fetch_optional(&engine.db.pool)
-                        .await?
-                    }
-                    None => {
-                        let workspace: Option<(Uuid,)> = sqlx::query_as(
-                            "select r.id from repos r join projects p on p.id = r.project_id where p.workspace_id = ? order by r.created_at limit 1",
-                        )
-                        .bind(workspace_id)
-                        .fetch_optional(&engine.db.pool)
-                        .await?;
-                        workspace
-                    }
-                };
-                row.map(|(id,)| id)
-                    .ok_or_else(|| {
-                        async_graphql::Error::new(
-                            "no repository is attached yet, and a run needs one. Add a repository on the project first.",
-                        )
-                    })?
-            }
+        // The repository follows the project: a caller may name one, a project
+        // supplies its first, and a task with no project (or a project with no
+        // repository) has none. Its runs work in an empty scratch directory.
+        let repo_id = match (repo_id, project_id) {
+            (Some(id), _) => Some(id),
+            (None, Some(project)) => first_repo_of(&engine.db.pool, project).await?,
+            (None, None) => None,
         };
         let workspace_id = match workspace_id {
             Some(id) => id,
@@ -1047,14 +1022,17 @@ impl Mutation {
                             .fetch_optional(&engine.db.pool)
                             .await?
                     }
-                    None => {
-                        sqlx::query_as(
-                            "select p.workspace_id from repos r join projects p on p.id = r.project_id where r.id = ?",
-                        )
-                        .bind(repo_id)
-                        .fetch_optional(&engine.db.pool)
-                        .await?
-                    }
+                    None => match repo_id {
+                        Some(repo_id) => {
+                            sqlx::query_as(
+                                "select p.workspace_id from repos r join projects p on p.id = r.project_id where r.id = ?",
+                            )
+                            .bind(repo_id)
+                            .fetch_optional(&engine.db.pool)
+                            .await?
+                        }
+                        None => None,
+                    },
                 };
                 match derived.map(|(id,)| id) {
                     Some(id) => id,
@@ -1110,9 +1088,23 @@ impl Mutation {
         // `assigneeType: null` clears the assignee; leaving it out keeps it.
         assignee_type: MaybeUndefined<String>,
         assignee_id: Option<String>,
+        // A project brings its first repository; `null` takes the task out of
+        // any project and leaves it repo-less. Leaving it out keeps both. Only
+        // while no run is live, because a run is working in the old place.
+        project_id: MaybeUndefined<Uuid>,
     ) -> async_graphql::Result<Issue> {
         let engine = engine(ctx);
-        engine.issue(id).await?;
+        let issue = engine.issue(id).await?;
+        let project = match project_id {
+            MaybeUndefined::Undefined => None,
+            MaybeUndefined::Null => Some(None),
+            MaybeUndefined::Value(project) => Some(Some(project)),
+        };
+        if let Some(project) = project {
+            if project != issue.project_id {
+                set_issue_project(&engine.db.pool, &issue, project).await?;
+            }
+        }
         let priority = match priority {
             Some(value) => Some(
                 crate::engine::priority(Some(&value))
@@ -1153,6 +1145,7 @@ impl Mutation {
     }
 
     /// The pull request merged, which is what closes a task.
+    /// A task with no repository just closes.
     /// Reads the merge from GitHub and records it: the revision a merge produced
     /// is GitHub's fact, so pressing the button asks GitHub rather than a person.
     async fn merge_issue(&self, ctx: &Context<'_>, issue_id: Uuid) -> async_graphql::Result<Issue> {
@@ -1304,6 +1297,9 @@ impl Mutation {
         let number = issue
             .pr_number
             .ok_or_else(|| async_graphql::Error::new("this issue has no pull request yet"))?;
+        let repo_id = issue.repo_id.ok_or_else(|| {
+            async_graphql::Error::new("this issue has no repository, so it has no pull request")
+        })?;
         // The revision GitHub has to look at is the head the pull request points
         // at, which is the current run's head.
         let sha: Option<String> = match issue.current_run_id {
@@ -1318,7 +1314,7 @@ impl Mutation {
         };
         engine
             .queue_job(
-                issue.repo_id,
+                repo_id,
                 Some(issue_id),
                 "watch_checks",
                 serde_json::json!({ "number": number, "sha": sha }),
@@ -1650,5 +1646,142 @@ impl Approval {
     /// The gate flags the human acknowledged when approving this diff.
     async fn flags(&self) -> Vec<String> {
         crate::db::json_list(&self.acknowledged_flags)
+    }
+}
+
+/// The repository a task in this project works in: the project's first, or
+/// none when the project has no repository yet.
+async fn first_repo_of(pool: &sqlx::SqlitePool, project_id: Uuid) -> sqlx::Result<Option<Uuid>> {
+    sqlx::query_scalar("select id from repos where project_id = ? order by created_at limit 1")
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await
+}
+
+/// Moves a task into a project (taking its first repository) or out of every
+/// project (leaving it repo-less). Refused while a run is live: that run is
+/// working in the old place and would finish against the new one.
+async fn set_issue_project(
+    pool: &sqlx::SqlitePool,
+    issue: &Issue,
+    project_id: Option<Uuid>,
+) -> async_graphql::Result<()> {
+    let live: i64 = sqlx::query_scalar(
+        "select count(*) from runs where issue_id = ? and status in ('queued', 'running')",
+    )
+    .bind(issue.id)
+    .fetch_one(pool)
+    .await?;
+    if live > 0 {
+        return Err(async_graphql::Error::new(
+            "a run is live on this task; cancel it or let it finish before changing the project",
+        ));
+    }
+    let repo_id = match project_id {
+        Some(project) => {
+            let workspace: Option<Uuid> =
+                sqlx::query_scalar("select workspace_id from projects where id = ?")
+                    .bind(project)
+                    .fetch_optional(pool)
+                    .await?;
+            if workspace != Some(issue.workspace_id) {
+                return Err(async_graphql::Error::new(
+                    "that project is not in this task's workspace",
+                ));
+            }
+            first_repo_of(pool, project).await?
+        }
+        None => None,
+    };
+    sqlx::query("update issues set project_id = ?, repo_id = ?, updated_at = ? where id = ?")
+        .bind(project_id)
+        .bind(repo_id)
+        .bind(crate::db::now_rfc3339())
+        .bind(issue.id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod repo_less_tests {
+    use super::build_schema;
+    use crate::db::Db;
+    use crate::engine::Engine;
+    use chrono::Utc;
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    async fn run(schema: &super::HulahoopSchema, query: String) -> serde_json::Value {
+        let response = schema.execute(query).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()
+    }
+
+    /// A task filed with no project has no repository; one filed under a
+    /// project takes that project's repository; moving a task between the two
+    /// takes or drops the repository with it.
+    #[tokio::test]
+    async fn the_repository_follows_the_project() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-gql-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo) = (Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'App',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        let schema = build_schema(Arc::new(Engine::new(db)));
+
+        let loose = run(
+            &schema,
+            format!(r#"mutation {{ createIssue(workspaceId: "{workspace}", title: "Research", body: "") {{ id repoId projectId }} }}"#),
+        )
+        .await;
+        assert!(loose["createIssue"]["repoId"].is_null());
+        assert!(loose["createIssue"]["projectId"].is_null());
+
+        let filed = run(
+            &schema,
+            format!(r#"mutation {{ createIssue(projectId: "{project}", title: "Button", body: "") {{ id repoId }} }}"#),
+        )
+        .await;
+        assert_eq!(filed["createIssue"]["repoId"], repo.to_string());
+
+        let id = loose["createIssue"]["id"].as_str().unwrap().to_string();
+        let moved = run(
+            &schema,
+            format!(r#"mutation {{ updateIssue(id: "{id}", projectId: "{project}") {{ repoId projectId }} }}"#),
+        )
+        .await;
+        assert_eq!(moved["updateIssue"]["repoId"], repo.to_string());
+        assert_eq!(moved["updateIssue"]["projectId"], project.to_string());
+
+        let cleared = run(
+            &schema,
+            format!(
+                r#"mutation {{ updateIssue(id: "{id}", projectId: null) {{ repoId projectId }} }}"#
+            ),
+        )
+        .await;
+        assert!(cleared["updateIssue"]["repoId"].is_null());
+        assert!(cleared["updateIssue"]["projectId"].is_null());
+
+        let untouched = run(
+            &schema,
+            format!(r#"mutation {{ updateIssue(id: "{id}", title: "Research, again") {{ repoId title }} }}"#),
+        )
+        .await;
+        assert!(untouched["updateIssue"]["repoId"].is_null());
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

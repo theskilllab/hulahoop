@@ -26,7 +26,10 @@ pub struct RunSpec {
     pub issue_id: Uuid,
     pub attempt: i64,
     pub issue: IssueInput,
-    pub repo: RepoInput,
+    /// `None` for a task with no repository: the run works in an empty scratch
+    /// directory (`checkout.path`), with nothing to commit and no pull request.
+    #[serde(default)]
+    pub repo: Option<RepoInput>,
     pub checkout: CheckoutInput,
     pub parent: Option<ParentInput>,
     pub blocked_answer: Option<BlockedAnswer>,
@@ -196,11 +199,11 @@ mod tests {
                 body: body.into(),
                 priority: "high".into(),
             },
-            repo: RepoInput {
+            repo: Some(RepoInput {
                 name: "fixture".into(),
                 path: Some("/tmp/fixture".into()),
                 base_bookmark: "main".into(),
-            },
+            }),
             checkout: CheckoutInput {
                 path: "/tmp/checkout".into(),
                 base_bookmark: "main".into(),
@@ -231,6 +234,21 @@ mod tests {
         let path = dir.join("input.json");
         let original = spec("body");
         original.write(&path).unwrap();
+        assert_eq!(RunSpec::read(&path).unwrap(), original);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_repo_less_spec_round_trips_with_no_repository() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-spec-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("input.json");
+        let mut original = spec("body");
+        original.repo = None;
+        original.write(&path).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(raw["repo"].is_null());
         assert_eq!(RunSpec::read(&path).unwrap(), original);
         std::fs::remove_dir_all(&dir).ok();
     }

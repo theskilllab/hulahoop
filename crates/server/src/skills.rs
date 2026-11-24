@@ -11,6 +11,22 @@ use crate::model::{Skill, SkillUsage};
 pub const CONTRACT_SKILL: &str = include_str!("../skills/run-contract.md");
 pub const CONTRACT_NAME: &str = "run-contract";
 
+/// Told to every agent whose task has no repository. The run contract covers the
+/// same case; this says it for the turn at hand, so nothing hinges on the agent
+/// noticing a null in `input.json`.
+pub const NO_REPOSITORY: &str = "# This task has no repository
+
+This task belongs to no repository, so there is no checkout. Your working \
+directory is an empty scratch directory that is yours for this turn only and is \
+deleted when the turn ends. Work there freely. There is nothing to commit, no \
+pull request, and no `just test` to run; skip the house rules about the suite. \
+Your result is your final message: put the answer, the findings or the \
+deliverable in it. If you produce a file a person needs, copy it into \
+`$HULAHOOP_ARTIFACT_DIR` (kept with the run) or attach it to the task if your \
+tools allow it, name it in the summary, and include its content when it is \
+short. End with the \
+usual `HULAHOOP_VERDICT:` or `HULAHOOP_QUESTION:` line.";
+
 impl Engine {
     /// Give a workspace the skills it is born with, and give every agent the
     /// contract. Idempotent: it runs at startup and after a workspace is created,
@@ -279,12 +295,23 @@ impl Engine {
     /// named by their description only — the runner writes them into the checkout,
     /// and the harness opens the one that fits the work. Inlining every body would
     /// spend the same context on the four skills this task never needed.
-    pub async fn compose_prompt(&self, agent: &crate::model::Agent) -> anyhow::Result<String> {
+    ///
+    /// `has_repo` is false for a task with no repository: the agent is told it
+    /// works in an empty scratch directory and reports through its summary.
+    pub async fn compose_prompt(
+        &self,
+        agent: &crate::model::Agent,
+        has_repo: bool,
+    ) -> anyhow::Result<String> {
         let skills = self.agent_skills(agent.id).await?;
         let mut prompt = String::new();
         for skill in skills.iter().filter(|skill| skill.builtin == 1) {
             prompt.push_str(&format!("# {}\n\n", skill.name));
             prompt.push_str(skill.source.trim());
+            prompt.push_str("\n\n");
+        }
+        if !has_repo {
+            prompt.push_str(NO_REPOSITORY);
             prompt.push_str("\n\n");
         }
         if !agent.agents_md.trim().is_empty() {
