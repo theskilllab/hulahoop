@@ -620,7 +620,14 @@ export default function App() {
             milestones={milestones}
             issues={issues}
             artifacts={artifacts}
+            columns={workflow?.sections.map((section) => ({
+              status: section.status,
+              title: section.title,
+              owner: section.owner,
+            }))}
             onChanged={refresh}
+            onOpenIssue={(id) => setView({ name: "issue", id })}
+            onOpenArtifacts={() => setView({ name: "artifacts" })}
           />
         )}
 
