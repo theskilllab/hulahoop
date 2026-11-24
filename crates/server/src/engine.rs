@@ -1782,6 +1782,13 @@ impl Engine {
                             .bind(run_id)
                             .execute(&self.db.pool)
                             .await?;
+                        // An open pull request follows the work: a rework that
+                        // publishes a new head pushes it there, so what a person
+                        // reads and merges is never an older version.
+                        let issue = self.issue(issue.id).await?;
+                        if issue.pr_number.is_some() {
+                            self.ensure_pull_request(&issue).await?;
+                        }
                     }
                     // The newest work is what the next reviewer judges and what a
                     // pull request shows. Without this the task keeps pointing at
@@ -1980,33 +1987,41 @@ impl Engine {
         Ok(())
     }
 
-    /// The pull request the work needs, opened once.
+    /// The pull request the work needs, carrying its newest head.
     ///
     /// A review that approves is the moment the work is ready for a person to read
     /// on GitHub, so approval opens the pull request even when the task stays in its
-    /// column. The turn named is the newest one that published a head: a reviewer
-    /// publishes none, and naming it asks the runner to push a branch that does not
-    /// exist.
+    /// column. Once it is open, every newer published head is pushed to the same
+    /// pull request. The turn named is the newest one that published a head: a
+    /// reviewer publishes none, and naming it asks the runner to push a branch that
+    /// does not exist.
     async fn ensure_pull_request(&self, issue: &Issue) -> Result<()> {
         // A task with no repository has nothing to push and nowhere to open a
         // pull request; the transition is the whole handover.
         let Some(repo_id) = issue.repo_id else {
             return Ok(());
         };
-        if issue.pr_number.is_some() {
-            return Ok(());
-        }
-        let opened: i64 = sqlx::query_scalar(
+        // One push at a time: a job pushes the head it was queued with, and its
+        // completion asks again, so a head published meanwhile follows it.
+        let pending: i64 = sqlx::query_scalar(
             "select count(*) from runner_jobs
-              where issue_id = ? and kind = 'open_pr'
-                and status in ('queued', 'running', 'succeeded')",
+              where issue_id = ? and kind = 'open_pr' and status in ('queued', 'running')",
         )
         .bind(issue.id)
         .fetch_one(&self.db.pool)
         .await?;
-        if opened > 0 {
+        if pending > 0 {
             return Ok(());
         }
+        let pushed: Option<String> = sqlx::query_scalar(
+            "select json_extract(payload, '$.run_id') from runner_jobs
+              where issue_id = ? and kind = 'open_pr' and status = 'succeeded'
+              order by created_at desc limit 1",
+        )
+        .bind(issue.id)
+        .fetch_optional(&self.db.pool)
+        .await?
+        .flatten();
         let head: Option<Uuid> = sqlx::query_scalar(
             "select id from runs
               where issue_id = ? and status = 'succeeded' and head_bookmark is not null
@@ -2026,6 +2041,9 @@ impl Engine {
             .await?;
             return Ok(());
         };
+        if pushed.as_deref() == Some(run_id.to_string().as_str()) {
+            return Ok(());
+        }
         self.queue_job(
             repo_id,
             Some(issue.id),
@@ -2295,6 +2313,8 @@ impl Engine {
                         self.announce_pull_request(issue_id, run_id, number, url)
                             .await?;
                     }
+                    let issue = self.issue(issue_id).await?;
+                    self.ensure_pull_request(&issue).await?;
                 }
             }
             _ => {}
@@ -3461,6 +3481,69 @@ mod checkout_lifecycle_tests {
                 return job.id;
             }
         }
+    }
+
+    /// An open pull request follows the work: a newer published head is pushed
+    /// to it, one push at a time, and a head already pushed is not pushed again.
+    #[tokio::test]
+    async fn a_rework_pushes_its_head_to_the_open_pull_request() {
+        let (engine, _project, repo, issue) = task_in_review("pr-follows").await;
+        let first: Uuid = sqlx::query_scalar("select id from runs where issue_id = ?")
+            .bind(issue)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("update runs set head_bookmark = 'issue/x/head/1' where id = ?")
+            .bind(first)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("update issues set pr_number = 7, pr_branch = 'b' where id = ?")
+            .bind(issue)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        let pushed = engine
+            .queue_job(
+                repo,
+                Some(issue),
+                "open_pr",
+                serde_json::json!({ "run_id": first }),
+            )
+            .await
+            .unwrap();
+        sqlx::query("update runner_jobs set status = 'succeeded' where id = ?")
+            .bind(pushed)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+
+        // The head already on the pull request is not pushed again.
+        let task = engine.issue(issue).await.unwrap();
+        engine.ensure_pull_request(&task).await.unwrap();
+        assert_eq!(jobs(&engine, "open_pr").await.len(), 1);
+
+        // A rework publishes a newer head: it goes to the same pull request.
+        let second = Uuid::now_v7();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, head_bookmark, head_revision, created_at) select ?, issue_id, repo_id, agent_id, 2, 'main', 'prompt', '/tmp', 'succeeded', 'model-x', 'issue/x/head/2', 'fedcba', ? from runs where id = ?")
+            .bind(second)
+            .bind(Utc::now() + chrono::Duration::minutes(1))
+            .bind(first)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        engine.ensure_pull_request(&task).await.unwrap();
+        let queued = jobs(&engine, "open_pr").await;
+        assert_eq!(queued.len(), 2);
+        let payload: serde_json::Value = serde_json::from_str(&queued[1].2).unwrap();
+        assert_eq!(
+            payload["run_id"].as_str(),
+            Some(second.to_string().as_str())
+        );
+
+        // While that push is pending, asking again queues nothing more.
+        engine.ensure_pull_request(&task).await.unwrap();
+        assert_eq!(jobs(&engine, "open_pr").await.len(), 2);
     }
 
     /// A merge without a pull request lands the head on the remote's base
