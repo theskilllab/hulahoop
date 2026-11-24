@@ -33,7 +33,6 @@ pub struct RunSpec {
     pub checkout: CheckoutInput,
     pub parent: Option<ParentInput>,
     pub blocked_answer: Option<BlockedAnswer>,
-    pub replays: Vec<ReplayInput>,
     pub limits: Limits,
     /// The skills this agent carries, so the runner can write them into the
     /// checkout where the harness looks for them.
@@ -85,9 +84,6 @@ pub struct IssueInput {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepoInput {
     pub name: String,
-    /// Absent when the repository was attached by its remote and never checked out
-    /// on this machine; a runner then clones instead of borrowing.
-    pub path: Option<PathBuf>,
     pub base_bookmark: String,
 }
 
@@ -108,16 +104,6 @@ pub struct ParentInput {
 pub struct BlockedAnswer {
     pub question: String,
     pub answer: String,
-}
-
-/// What the reviewer is told about the replays, so it can quote them instead of
-/// re-running the suite itself.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ReplayInput {
-    pub kind: String,
-    pub status: String,
-    pub report_path: Option<PathBuf>,
-    pub failed: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -201,7 +187,6 @@ mod tests {
             },
             repo: Some(RepoInput {
                 name: "fixture".into(),
-                path: Some("/tmp/fixture".into()),
                 base_bookmark: "main".into(),
             }),
             checkout: CheckoutInput {
@@ -210,7 +195,6 @@ mod tests {
             },
             parent: None,
             blocked_answer: None,
-            replays: vec![],
             limits: Limits::default(),
             skills: vec![],
             files: vec![FileInput {

@@ -53,10 +53,8 @@ pub struct Repo {
     pub id: Uuid,
     pub project_id: Uuid,
     pub name: String,
-    /// A checkout on this machine. Null when the repository was attached from the
-    /// GitHub listing and only a runner that clones can use it.
-    pub path: Option<String>,
-    /// The `origin` remote, when the repo has one. A pull request needs it.
+    /// The url Hulahoop clones the repository from into its own mirror. A
+    /// pull request needs it to be a GitHub one.
     pub remote_url: Option<String>,
     pub vcs: String,
     pub base_revision: Option<String>,
@@ -279,27 +277,6 @@ impl Run {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
-pub struct Replay {
-    pub id: Uuid,
-    pub issue_id: Uuid,
-    pub repo_id: Uuid,
-    pub run_id: Option<Uuid>,
-    pub candidate_run_id: Option<Uuid>,
-    pub approval_id: Option<Uuid>,
-    pub kind: String,
-    pub attempt: i64,
-    pub revision: Option<String>,
-    pub tests_bookmark: Option<String>,
-    pub status: String,
-    pub exit_code: Option<i64>,
-    pub ancestry_ok: Option<bool>,
-    pub artifact_dir: String,
-    pub error: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub finished_at: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
 pub struct Review {
     pub id: Uuid,
     pub issue_id: Uuid,
@@ -343,9 +320,8 @@ pub struct Approval {
     pub created_at: DateTime<Utc>,
 }
 
-/// Runner work that is not a suite execution: preflight probes, fetches, and
-/// merge verification. Keeping these out of `replays` keeps replay counts
-/// meaningful.
+/// Runner work that is not an agent turn: preflight probes, fetches, pull
+/// request chores, Lumi answers and checkout cleanups.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
 pub struct RunnerJob {
     pub id: Uuid,

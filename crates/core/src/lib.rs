@@ -23,7 +23,6 @@ pub const HEARTBEAT_INTERVAL_SECS: i64 = 5;
 pub const HEARTBEAT_DEAD_SECS: i64 = 30;
 pub const AGENT_WALL_CLOCK_MINUTES: i64 = 30;
 pub const SETUP_WALL_CLOCK_MINUTES: i64 = 20;
-pub const REPLAY_WALL_CLOCK_MINUTES: i64 = 15;
 /// A Lumi answer is one model call, not a work session.
 pub const LUMI_WALL_CLOCK_MINUTES: i64 = 10;
 pub const RUNS_PER_ISSUE: i64 = 12;
@@ -142,14 +141,6 @@ impl RunStatus {
     }
 }
 
-string_enum!(ReplayStatus {
-    Queued => "queued",
-    Running => "running",
-    Succeeded => "succeeded",
-    Failed => "failed",
-    TimedOut => "timed_out",
-});
-
 /// The author name a run's commits carry: the app's slug and the agent's own
 /// name, so `jj log` answers "who wrote this" without a role anywhere. The team
 /// a task passes through is named in the workflow, and those names are the ones
@@ -209,12 +200,6 @@ string_enum!(Adapter {
     Fake => "fake",
 });
 
-string_enum!(ReplayKind {
-    Base => "base",
-    Head => "head",
-    Landing => "landing",
-});
-
 string_enum!(RunFlag {
     TouchedContract => "touched_contract",
     LargeDiff => "large_diff",
@@ -241,7 +226,6 @@ string_enum!(CheckoutState {
 
 string_enum!(OwnerKind {
     Run => "run",
-    Replay => "replay",
     Preflight => "preflight",
 });
 

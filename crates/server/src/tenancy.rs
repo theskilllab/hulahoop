@@ -604,17 +604,25 @@ impl Engine {
         .bind(issue.id)
         .execute(&self.db.pool)
         .await?;
-        sqlx::query("update repos set base_revision = ? where id = ?")
-            .bind(&revision)
-            .bind(issue.repo_id)
-            .execute(&self.db.pool)
+        // The base only becomes the merged head once the remote has it: a
+        // runner moves the base bookmark forward in the mirror and pushes it,
+        // and that landing records the new base. Recording it here first would
+        // let the next fetch, which still sees the old remote, contradict it.
+        if let Some(repo_id) = issue.repo_id {
+            self.queue_job(
+                repo_id,
+                Some(issue.id),
+                "land",
+                serde_json::json!({ "revision": revision }),
+            )
             .await?;
+        }
         self.comment(
             issue.id,
             hulahoop_core::AuthorType::Server,
             None,
             &format!(
-                "Merged as {}. There is no pull request on this project, so the head the review looked at became the base.",
+                "Merged as {}. There is no pull request on this project, so the head the review looked at is pushed to the base branch.",
                 &revision[..12.min(revision.len())]
             ),
             false,
@@ -704,7 +712,26 @@ impl Engine {
             false,
         )
         .await?;
-        self.transition(issue_id, hulahoop_core::IssueEvent::Merge)
+        let merged = self
+            .transition(issue_id, hulahoop_core::IssueEvent::Merge)
+            .await?;
+        self.fetch_after_merge(Some(repo_id)).await;
+        Ok(merged)
+    }
+
+    /// A merge moves the base, so the mirror fetches: the next task's checkout
+    /// starts from the newest revision instead of the one before the merge. The
+    /// merge is already recorded, so a fetch that cannot be queued is logged
+    /// rather than reported as a failed merge.
+    async fn fetch_after_merge(&self, repo_id: Option<uuid::Uuid>) {
+        let Some(repo_id) = repo_id else {
+            return;
+        };
+        if let Err(error) = self
+            .queue_job(repo_id, None, "fetch", serde_json::json!({}))
             .await
+        {
+            tracing::warn!(repo = %repo_id, %error, "could not queue the fetch after a merge");
+        }
     }
 }

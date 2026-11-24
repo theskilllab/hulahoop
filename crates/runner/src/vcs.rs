@@ -72,7 +72,23 @@ impl Vcs {
         )
     }
 
+    /// Puts a task's checkout on `revision`, with a fresh working-copy commit on
+    /// top of it.
+    ///
+    /// A task keeps one checkout for all of its turns, so one that already exists
+    /// and is still a workspace of this repository is reused: what the project
+    /// built there (target/, node_modules, .venv) survives, and the next turn
+    /// starts warm. Anything else in the way, a directory jj does not know or a
+    /// workspace that cannot be brought back, is replaced by a new workspace.
     pub fn add_workspace(&self, checkout: &Path, revision: &str) -> Result<()> {
+        let revision = self.resolve(revision)?;
+        match self.reuse_workspace(checkout, &revision) {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, checkout = %checkout.display(), "replacing a checkout that could not be reused");
+            }
+        }
         if let Some(parent) = checkout.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -81,7 +97,6 @@ impl Vcs {
         }
         let name = workspace_name(checkout);
         let _ = self.run(&self.root, "jj", &["workspace", "forget", &name]);
-        let revision = self.resolve(revision)?;
         self.run(
             &self.root,
             "jj",
@@ -98,13 +113,96 @@ impl Vcs {
         Ok(())
     }
 
+    /// Moves an existing checkout onto `revision` for a new turn. `false` when
+    /// there is no workspace to reuse.
+    ///
+    /// The previous turn's working copy stays where it was: a published head
+    /// keeps its bookmark, and whatever a crashed turn left uncommitted was
+    /// snapshotted into that commit by jj, so none of it reaches the new turn.
+    /// Only an empty leftover is abandoned, through the guarded [`Vcs::abandon`].
+    ///
+    /// Ignored files stay on disk between turns, and one of them can sit where
+    /// the new start revision tracks a file: jj then skips that update and the
+    /// stale file reads as a change of the new turn. A fresh turn has changed
+    /// nothing, so its working copy is put back to the start revision's tree;
+    /// one that still differs afterwards is an error, and the caller replaces
+    /// the checkout.
+    fn reuse_workspace(&self, checkout: &Path, revision: &str) -> Result<bool> {
+        let name = workspace_name(checkout);
+        if !checkout.join(".jj").exists() || !self.has_workspace(&name)? {
+            return Ok(false);
+        }
+        // A turn that changed nothing abandons its working copy from the
+        // repository root, which leaves this checkout stale until it is updated.
+        let _ = self.run(checkout, "jj", &["workspace", "update-stale"]);
+        let previous = self.working_copy_revision(checkout)?;
+        self.run(checkout, "jj", &["new", revision])?;
+        if previous != revision {
+            let _ = self.abandon(&format!("{previous} & empty()"));
+        }
+        if !self.working_copy_diff(checkout)?.is_empty() {
+            self.run(checkout, "jj", &["restore", "--from", revision])?;
+            let left = self.working_copy_diff(checkout)?;
+            if !left.is_empty() {
+                bail!(
+                    "the reused checkout still differs from its start revision: {}",
+                    left.trim()
+                );
+            }
+        }
+        Ok(true)
+    }
+
+    /// What the checkout's working-copy commit changes, one path per line;
+    /// empty when it changes nothing.
+    fn working_copy_diff(&self, checkout: &Path) -> Result<String> {
+        let summary = self.run(checkout, "jj", &["diff", "-r", "@", "--summary"])?;
+        Ok(summary.trim().to_string())
+    }
+
+    /// Whether the repository has a workspace by this name.
+    fn has_workspace(&self, name: &str) -> Result<bool> {
+        let listed = self.run(
+            &self.root,
+            "jj",
+            &["workspace", "list", "-T", "name ++ \"\\n\""],
+        )?;
+        Ok(listed.lines().any(|line| line.trim() == name))
+    }
+
+    /// Forgets a checkout's workspace in this repository and deletes its
+    /// directory, once the task it belonged to is over.
     pub fn remove_workspace(&self, checkout: &Path) -> Result<()> {
         let name = workspace_name(checkout);
         let _ = self.run(&self.root, "jj", &["workspace", "forget", &name]);
         if checkout.exists() {
-            let _ = std::fs::remove_dir_all(checkout);
+            std::fs::remove_dir_all(checkout)
+                .with_context(|| format!("removing {}", checkout.display()))?;
         }
         Ok(())
+    }
+
+    /// The first of `candidates` that names a revision in this repository,
+    /// resolved to its commit id. A task that was in flight when its repository
+    /// moved to a fresh mirror may name a revision the mirror never had; its
+    /// bookmark on the remote, or the repository's base there, still does.
+    pub fn resolve_first(&self, candidates: &[String]) -> Result<String> {
+        let mut tried = Vec::new();
+        for candidate in candidates.iter().map(|c| c.trim()) {
+            if candidate.is_empty() || tried.contains(&candidate) {
+                continue;
+            }
+            tried.push(candidate);
+            if let Ok(commit) = self.resolve(candidate) {
+                if !commit.is_empty() {
+                    return Ok(commit);
+                }
+            }
+        }
+        bail!(
+            "none of {} exists in the repository, so the turn has nothing to start from",
+            tried.join(", ")
+        )
     }
 
     /// Bookmarks are the only handles that survive a rebase, so every revision
@@ -428,6 +526,31 @@ impl Vcs {
         }
     }
 
+    /// Moves a bookmark forward to `revision`. jj refuses to move one backwards
+    /// or sideways without being told to, and that refusal is kept: landing a
+    /// merge must never drop work the bookmark already carries.
+    pub fn advance_bookmark(&self, name: &str, revision: &str) -> Result<String> {
+        let resolved = self.resolve(revision)?;
+        self.run(
+            &self.root,
+            "jj",
+            &["bookmark", "set", name, "-r", &resolved],
+        )?;
+        Ok(resolved)
+    }
+
+    /// Whether `ancestor` comes strictly before `descendant` in history. A
+    /// revision this repository does not have is an error.
+    pub fn is_strict_ancestor(&self, ancestor: &str, descendant: &str) -> Result<bool> {
+        let revset = format!("({ancestor}) & ::({descendant}) & ~({descendant})");
+        let output = self.run(
+            &self.root,
+            "jj",
+            &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        )?;
+        Ok(!output.trim().is_empty())
+    }
+
     pub fn base_revision(&self, bookmark: &str) -> Result<Option<String>> {
         let output = self.run(
             &self.root,
@@ -470,11 +593,14 @@ pub struct Carried {
     pub conflicts: Vec<String>,
 }
 
+/// The name a checkout is registered under in the mirror. A task's checkout
+/// directory is named after the task, so this is `issue-<task id>`.
 fn workspace_name(checkout: &Path) -> String {
-    checkout
+    let dir = checkout
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "workspace".to_string())
+        .unwrap_or_else(|| "workspace".to_string());
+    format!("issue-{dir}")
 }
 
 #[cfg(test)]
@@ -555,6 +681,140 @@ mod carry_tests {
         // A bookmarked commit never goes, whatever asks for it.
         let _ = vcs.abandon(&newest);
         assert_eq!(vcs.resolve("main").unwrap(), newest);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn parent_of_working_copy(checkout: &Path) -> String {
+        jj(
+            checkout,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+        )
+        .trim()
+        .to_string()
+    }
+
+    /// A task's second turn reuses its checkout: what the project built there
+    /// survives, the turn starts on its own start revision, and what a crashed
+    /// turn left uncommitted stays in that turn's commit.
+    #[test]
+    fn a_second_turn_reuses_the_checkout_and_keeps_the_build() {
+        let root = std::env::temp_dir().join(format!("hh-reuse-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        jj(&root, &["git", "init"]);
+        commit(&root, ".gitignore", "target/\n", "ignore builds");
+        commit(&root, "a.txt", "one\n", "base");
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let vcs = Vcs::detect(&root).unwrap();
+        let checkout = root.join("checkouts").join("task");
+
+        vcs.add_workspace(&checkout, "main").unwrap();
+        assert_eq!(
+            parent_of_working_copy(&checkout),
+            vcs.resolve("main").unwrap()
+        );
+        std::fs::create_dir_all(checkout.join("target")).unwrap();
+        std::fs::write(checkout.join("target/build.out"), "warm").unwrap();
+        // A turn that crashed halfway through an edit.
+        std::fs::write(checkout.join("a.txt"), "half done\n").unwrap();
+
+        // The next turn starts somewhere else: a head the task published.
+        jj(&root, &["new", "main"]);
+        commit(&root, "b.txt", "b\n", "task work");
+        jj(&root, &["bookmark", "create", "next", "-r", "@-"]);
+        let next = vcs.resolve("next").unwrap();
+
+        vcs.add_workspace(&checkout, "next").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("target/build.out")).unwrap(),
+            "warm"
+        );
+        assert_eq!(parent_of_working_copy(&checkout), next);
+        assert!(checkout.join("b.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("a.txt")).unwrap(),
+            "one\n"
+        );
+        let listed = jj(&root, &["workspace", "list"]);
+        assert!(listed.contains("issue-task"), "{listed}");
+
+        // A turn that changed nothing abandons its empty working copy from the
+        // repository root; the stale checkout comes back on the next turn.
+        let empty = vcs.working_copy_revision(&checkout).unwrap();
+        vcs.abandon(&empty).unwrap();
+        vcs.add_workspace(&checkout, "main").unwrap();
+        assert_eq!(
+            parent_of_working_copy(&checkout),
+            vcs.resolve("main").unwrap()
+        );
+        assert!(checkout.join("target/build.out").exists());
+        assert!(!checkout.join("b.txt").exists());
+
+        vcs.remove_workspace(&checkout).unwrap();
+        assert!(!checkout.exists());
+        let listed = jj(&root, &["workspace", "list"]);
+        assert!(!listed.contains("issue-task"), "{listed}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A file the old start revision ignored, left on disk by a build, sits
+    /// where the new start revision tracks one. jj skips writing it, and the
+    /// stale copy must not become the new turn's work.
+    #[test]
+    fn a_stale_ignored_file_does_not_leak_into_the_next_turn() {
+        let root = std::env::temp_dir().join(format!("hh-stale-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        jj(&root, &["git", "init"]);
+        commit(&root, ".gitignore", "gen.txt\n", "ignore generated");
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let vcs = Vcs::detect(&root).unwrap();
+        let checkout = root.join("checkouts").join("task");
+
+        vcs.add_workspace(&checkout, "main").unwrap();
+        std::fs::write(checkout.join("gen.txt"), "stale\n").unwrap();
+        // Snapshot: the ignored file stays out of the turn's commit.
+        jj(&checkout, &["status"]);
+
+        // The base moves on and starts tracking the generated file.
+        jj(&root, &["new", "main"]);
+        commit(&root, ".gitignore", "\n", "track generated");
+        commit(&root, "gen.txt", "fresh\n", "generated");
+        jj(&root, &["bookmark", "set", "main", "-r", "@-"]);
+        let main = vcs.resolve("main").unwrap();
+
+        vcs.add_workspace(&checkout, "main").unwrap();
+        assert_eq!(parent_of_working_copy(&checkout), main);
+        let diff = jj(&checkout, &["diff", "-r", "@", "--summary"]);
+        assert!(diff.trim().is_empty(), "the new turn starts dirty: {diff}");
+        assert_eq!(
+            std::fs::read_to_string(checkout.join("gen.txt")).unwrap(),
+            "fresh\n"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A start revision the mirror does not have falls back to the next name
+    /// that it does.
+    #[test]
+    fn a_missing_start_falls_back_to_the_next_candidate() {
+        let root = std::env::temp_dir().join(format!("hh-start-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        jj(&root, &["git", "init"]);
+        commit(&root, "a.txt", "one\n", "base");
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let vcs = Vcs::detect(&root).unwrap();
+        let main = vcs.resolve("main").unwrap();
+        let candidates = [
+            "0123456789abcdef0123456789abcdef01234567".to_string(),
+            "issue/x/head/1@origin".to_string(),
+            String::new(),
+            "main".to_string(),
+        ];
+        assert_eq!(vcs.resolve_first(&candidates).unwrap(), main);
+        let error = vcs.resolve_first(&candidates[..2]).unwrap_err();
+        assert!(
+            error.to_string().contains("nothing to start from"),
+            "{error}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

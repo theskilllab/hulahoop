@@ -13,8 +13,8 @@ setup:
 
 # Run the whole suite and write the machine-readable verdict.
 # The JUnit report is the verdict every gate reads, so it has to exist after a red run
-# too. A red suite is the wanted outcome of the base replay, and a recipe that copies the
-# report only after a green run leaves that replay with no evidence to read.
+# too: a recipe that copies the report only after a green run leaves a red suite with no
+# evidence to read.
 test:
     #!/usr/bin/env bash
     set -uo pipefail

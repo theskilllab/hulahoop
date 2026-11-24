@@ -29,6 +29,15 @@ fn adapter_failure(payload: &RunCompletion) -> Option<String> {
     Some(reason.to_string())
 }
 
+/// A cleanup of a task that takes no more turns: merged, closed or cancelled.
+pub const CLEANUP_FINISHED: &str = "finished";
+/// A cleanup of the checkout a task left behind when it changed project.
+pub const CLEANUP_MOVED: &str = "moved";
+/// How long a cleanup waits after a run of its task was cancelled. The runner
+/// learns of the cancel only when the agent dies, and still formats, diffs and
+/// reports in the checkout after that.
+const CLEANUP_AFTER_CANCEL_SECS: i64 = 5 * 60;
+
 /// The priority ladder, highest first. A fixed set, so a board can sort by it
 /// and a filter can name every value.
 pub const PRIORITIES: [&str; 4] = ["urgent", "high", "medium", "low"];
@@ -119,6 +128,7 @@ impl Engine {
             let _ = self.reset_turns(issue_id, to).await;
         }
         let issue = self.issue(issue_id).await?;
+        self.retire_checkout_when_finished(&issue, from).await;
         // A run that failed or was cancelled leaves the task where it is, for a
         // person to decide: starting the next attempt here retried at once, and a
         // broken host (a full disk) burned a run every second.
@@ -140,6 +150,95 @@ impl Engine {
                 .await;
         }
         self.issue(issue_id).await
+    }
+
+    /// A task that just became Done or Cancelled takes no more turns, so its
+    /// checkout goes: a runner job forgets the workspace in the mirror and
+    /// deletes the directory, because the runner owns the checkouts. A task
+    /// that is reopened before that job ran keeps its checkout. A failure to
+    /// queue or drop the job costs disk space and nothing else, so it is
+    /// logged, not raised into the move.
+    async fn retire_checkout_when_finished(&self, issue: &Issue, from: IssueStatus) {
+        let finished = issue.status_enum().is_terminal();
+        if from.is_terminal() && !finished {
+            if let Err(error) = self.keep_current_checkout(issue).await {
+                tracing::warn!(issue = %issue.id, %error, "could not drop the checkout cleanup");
+            }
+            return;
+        }
+        if from.is_terminal() || !finished {
+            return;
+        }
+        if let Err(error) = self.queue_cleanup(issue, CLEANUP_FINISHED).await {
+            tracing::warn!(issue = %issue.id, %error, "could not queue the checkout cleanup");
+        }
+    }
+
+    /// The checkout a task with a repository works in, and the project and
+    /// repository that place it. A task with no repository works in scratch
+    /// directories the runner removes itself.
+    async fn task_checkout(
+        &self,
+        issue: &Issue,
+    ) -> Result<Option<(Uuid, Uuid, std::path::PathBuf)>> {
+        let Some(repo_id) = issue.repo_id else {
+            return Ok(None);
+        };
+        let project_id = match issue.project_id {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar::<_, Uuid>("select project_id from repos where id = ?")
+                    .bind(repo_id)
+                    .fetch_one(&self.db.pool)
+                    .await?
+            }
+        };
+        let checkout =
+            contract::checkout_dir(&self.db.data_dir, &project_id.to_string(), &issue.id);
+        Ok(Some((repo_id, project_id, checkout)))
+    }
+
+    /// Queue the job that deletes a task's checkout as `issue` places it.
+    /// `reason` is [`CLEANUP_FINISHED`] for a task that takes no more turns, or
+    /// [`CLEANUP_MOVED`] for the checkout a task left behind when it changed
+    /// project. The runner derives the path from the ids again, so the payload
+    /// cannot point it anywhere else.
+    pub(crate) async fn queue_cleanup(&self, issue: &Issue, reason: &str) -> Result<Option<Uuid>> {
+        let Some((repo_id, project_id, checkout)) = self.task_checkout(issue).await? else {
+            return Ok(None);
+        };
+        let id = self
+            .queue_job(
+                repo_id,
+                Some(issue.id),
+                "cleanup",
+                serde_json::json!({
+                    "checkout": checkout,
+                    "project_id": project_id,
+                    "issue_id": issue.id,
+                    "reason": reason,
+                }),
+            )
+            .await?;
+        Ok(Some(id))
+    }
+
+    /// Drops any queued cleanup of the checkout the task works in now: the
+    /// task was reopened, or moved back to a project it left, and its next
+    /// turn needs that checkout.
+    pub(crate) async fn keep_current_checkout(&self, issue: &Issue) -> Result<()> {
+        let Some((_, _, checkout)) = self.task_checkout(issue).await? else {
+            return Ok(());
+        };
+        sqlx::query(
+            "delete from runner_jobs where kind = 'cleanup' and status = 'queued'
+               and issue_id = ? and json_extract(payload, '$.checkout') = ?",
+        )
+        .bind(issue.id)
+        .bind(checkout.to_string_lossy().to_string())
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
     }
 
     /// Fill the turn queue for the status a task just entered.
@@ -285,9 +384,9 @@ impl Engine {
     /// the shape — clearing a block, dispatching whoever owns the new status —
     /// happens here too, because the workflow is the source of truth.
     pub async fn move_to(&self, issue_id: Uuid, target: IssueStatus) -> Result<Issue> {
-        let issue = self.issue(issue_id).await?;
-        if issue.status_enum() == target {
-            return Ok(issue);
+        let issue_before = self.issue(issue_id).await?;
+        if issue_before.status_enum() == target {
+            return Ok(issue_before);
         }
         sqlx::query(
             "update issues set status = ?, status_before_blocked = null, updated_at = ? where id = ?",
@@ -300,6 +399,8 @@ impl Engine {
 
         let _ = self.reset_turns(issue_id, target).await;
         let issue = self.issue(issue_id).await?;
+        self.retire_checkout_when_finished(&issue, issue_before.status_enum())
+            .await;
         if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
             let _ = self
                 .comment(
@@ -1489,9 +1590,7 @@ impl Engine {
         Ok(())
     }
 
-    /// A run finishing is not the same as an issue moving: a successful
-    /// implementer run waits for its head replay, and a test author run waits for
-    /// the human's freeze.
+    /// Records what a run reported and moves its task on from there.
     pub async fn complete_run(&self, run_id: Uuid, payload: RunCompletion) -> Result<Run> {
         let run = self.run(run_id).await?;
         let issue = self.issue(run.issue_id).await?;
@@ -2063,12 +2162,9 @@ impl Engine {
         Ok(verdict)
     }
 
-    /// Runs the base replay again for the current candidate suite.
-    ///
-    /// The proof is the report, and the report can be missing for reasons the agent
-    /// had nothing to do with: a `just test` that only copied its JUnit file after a
-    /// green run left the base replay with nothing to read. The candidate tests still
-    /// exist on their bookmark, so asking again costs one suite run and no model call.
+    /// Records what a runner job reported and applies what its kind changes: a
+    /// fetch moves the repository's base revision, a pull request job stores the
+    /// number it opened, and so on. A cleanup has nothing to record.
     pub async fn complete_job(
         &self,
         job_id: Uuid,
@@ -2112,14 +2208,34 @@ impl Engine {
                     payload.get("base_revision").and_then(|v| v.as_str()),
                     job.repo_id,
                 ) {
-                    sqlx::query("update repos set base_revision = ?, fetched_at = ? where id = ?")
-                        .bind(revision)
-                        .bind(crate::db::now_rfc3339())
-                        .bind(job_repo)
-                        .execute(&self.db.pool)
-                        .await?;
+                    // A fetch never moves the base back. A remote that is
+                    // behind the base the runner compared with keeps it, and so
+                    // does a base that changed while the fetch ran (a landing
+                    // recorded in between): the fetch only knew the older one.
+                    let behind = payload
+                        .get("behind")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let compared_with = payload
+                        .get("compared_with")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default();
+                    sqlx::query(
+                        "update repos set base_revision = case
+                           when ? or coalesce(base_revision, '') != ? then base_revision
+                           else ? end,
+                           fetched_at = ? where id = ?",
+                    )
+                    .bind(behind)
+                    .bind(compared_with)
+                    .bind(revision)
+                    .bind(crate::db::now_rfc3339())
+                    .bind(job_repo)
+                    .execute(&self.db.pool)
+                    .await?;
                 }
             }
+            "land" => self.landed(&job, &payload, error.as_deref()).await?,
             "preflight" => {
                 if let (Some(agent_id), Some(ok), Some(detail), Some(job_repo)) = (
                     payload
@@ -2186,11 +2302,71 @@ impl Engine {
         Ok(())
     }
 
+    /// Records how a landing (a merge without a pull request) went. Once the
+    /// remote has the merged head it becomes the repository's base, so the next
+    /// task starts on top of it. A landing that failed leaves the base where it
+    /// was and says why on the task, since the merge is then only in Hulahoop.
+    async fn landed(
+        &self,
+        job: &RunnerJob,
+        payload: &serde_json::Value,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let revision = payload.get("base_revision").and_then(|v| v.as_str());
+        match (error, revision, job.repo_id) {
+            (None, Some(revision), Some(repo_id)) => {
+                sqlx::query("update repos set base_revision = ? where id = ?")
+                    .bind(revision)
+                    .bind(repo_id)
+                    .execute(&self.db.pool)
+                    .await?;
+            }
+            _ => {
+                if let Some(issue_id) = job.issue_id {
+                    let reason = error.unwrap_or("the runner reported no landed revision");
+                    let body = format!(
+                        "The merge could not be pushed to the repository: {reason}. \
+                         The base branch there is unchanged; land the work by hand or rework the task."
+                    );
+                    self.comment(
+                        issue_id,
+                        hulahoop_core::AuthorType::Server,
+                        None,
+                        &body,
+                        false,
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn claim_job(&self, lumi: bool) -> Result<Option<RunnerJob>> {
         let candidate: Option<RunnerJob> = sqlx::query_as(
-            "select * from runner_jobs where status = 'queued' and (kind = 'lumi') = ? order by created_at limit 1",
+            // A cleanup waits while a run of its task is still live or was just
+            // cancelled, so a turn never loses its checkout halfway; and the
+            // cleanup of a finished task waits for the task to be finished.
+            // Forgetting a mirror waits for every live run of the repository,
+            // whose checkouts are workspaces of it.
+            "select * from runner_jobs where status = 'queued' and (kind = 'lumi') = ?
+               and not (kind = 'forget_mirror' and exists (
+                 select 1 from runs where runs.repo_id = runner_jobs.repo_id
+                   and runs.status in ('queued', 'running')))
+               and not (kind = 'cleanup' and (
+                 exists (
+                   select 1 from runs where runs.issue_id = runner_jobs.issue_id
+                     and (runs.status in ('queued', 'running')
+                       or (runs.status = 'cancelled' and runs.finished_at > ?)))
+                 or (json_extract(payload, '$.reason') is not ?
+                   and not exists (
+                     select 1 from issues where issues.id = runner_jobs.issue_id
+                       and issues.status in ('done', 'cancelled')))))
+             order by created_at limit 1",
         )
         .bind(lumi)
+        .bind((Utc::now() - chrono::Duration::seconds(CLEANUP_AFTER_CANCEL_SECS)).to_rfc3339())
+        .bind(CLEANUP_MOVED)
         .fetch_optional(&self.db.pool)
         .await?;
         let Some(job) = candidate else {
@@ -2299,7 +2475,7 @@ mod lumi_claim_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(crate::db::now_rfc3339())
             .execute(&db.pool).await.unwrap();
         let engine = Engine::new(db);
@@ -2476,25 +2652,6 @@ pub struct RunCompletion {
     pub commit_email: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct ReplayCompletion {
-    pub status: String,
-    #[serde(default)]
-    pub exit_code: Option<i64>,
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub junit_xml: Option<String>,
-    #[serde(default)]
-    pub ancestry_ok: Option<bool>,
-    /// The `fmt-check`/`lint` recipes the repository declares, run at the same
-    /// revision as the suite. A head that fails them is not finished.
-    #[serde(default)]
-    pub house_rules: Option<serde_json::Value>,
-    #[serde(default)]
-    pub revision: Option<String>,
-}
-
 /// Twelve characters of a revision, which is what a human reads in a comment.
 /// The prompt files are embedded so a run never depends on the checkout's
 /// contents, and the revision is a hash of exactly what was sent.
@@ -2615,7 +2772,7 @@ mod rework_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         for (id, name) in [(developer, "Developer"), (reviewer, "Reviewer")] {
             sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi','model-x',?,?)")
@@ -2669,7 +2826,7 @@ mod rework_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         for (id, name) in [(developer, "Developer"), (reviewer, "Reviewer")] {
             sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi','model-x',?,?)")
@@ -3120,7 +3277,7 @@ mod pull_request_comment_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'Developer','pi','model-x',?,?)")
             .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
@@ -3198,7 +3355,7 @@ mod pull_request_comment_tests {
         .execute(&db.pool)
         .await
         .unwrap();
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
         sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'Developer','pi','model-x',?,?)")
             .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
@@ -3232,5 +3389,239 @@ mod pull_request_comment_tests {
         assert_eq!(linked, Some(run));
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod checkout_lifecycle_tests {
+    use super::Engine;
+    use crate::db::Db;
+    use chrono::Utc;
+    use hulahoop_core::IssueEvent;
+    use uuid::Uuid;
+
+    /// A task in review on a repository with one published head, ready to merge.
+    async fn task_in_review(name: &str) -> (Engine, Uuid, Uuid, Uuid) {
+        let directory = std::env::temp_dir().join(format!("hulahoop-{name}-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, agent, issue, run) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now();
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Keep',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'Developer','pi','model-x',?,?)")
+            .bind(agent).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,?,?, 'KEP-1',1,'Task','in_review',?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, head_revision, created_at) values (?,?,?,?,1,'main','prompt','/tmp','succeeded','model-x','0123456789abcdef0123456789abcdef01234567',?)")
+            .bind(run).bind(issue).bind(repo).bind(agent).bind(now).execute(&db.pool).await.unwrap();
+        (Engine::new(db), project, repo, issue)
+    }
+
+    async fn jobs(engine: &Engine, kind: &str) -> Vec<(Option<Uuid>, Option<Uuid>, String)> {
+        sqlx::query_as(
+            "select repo_id, issue_id, payload from runner_jobs where kind = ? order by created_at",
+        )
+        .bind(kind)
+        .fetch_all(&engine.db.pool)
+        .await
+        .unwrap()
+    }
+
+    const HEAD: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    async fn base_revision(engine: &Engine, repo: Uuid) -> Option<String> {
+        sqlx::query_scalar("select base_revision from repos where id = ?")
+            .bind(repo)
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Claims queued jobs until one of `kind` comes up.
+    async fn claim(engine: &Engine, kind: &str) -> Uuid {
+        loop {
+            let job = engine.claim_job(false).await.unwrap().expect(kind);
+            if job.kind == kind {
+                return job.id;
+            }
+        }
+    }
+
+    /// A merge without a pull request lands the head on the remote's base
+    /// branch through a runner, and deletes the task's checkout, which no turn
+    /// will use again. The base only moves once the landing succeeded.
+    #[tokio::test]
+    async fn a_merge_without_a_pull_request_lands_and_cleans_up() {
+        let (engine, project, repo, issue) = task_in_review("merge-cleanup").await;
+        let merged = engine.merge_issue(issue).await.unwrap();
+        assert_eq!(merged.status, "done");
+
+        assert!(jobs(&engine, "fetch").await.is_empty());
+        let lands = jobs(&engine, "land").await;
+        assert_eq!(lands.len(), 1);
+        assert_eq!((lands[0].0, lands[0].1), (Some(repo), Some(issue)));
+        let payload: serde_json::Value = serde_json::from_str(&lands[0].2).unwrap();
+        assert_eq!(payload["revision"].as_str(), Some(HEAD));
+        assert_eq!(base_revision(&engine, repo).await, None);
+
+        let land = claim(&engine, "land").await;
+        engine
+            .complete_job(land, serde_json::json!({ "base_revision": HEAD }), None)
+            .await
+            .unwrap();
+        assert_eq!(base_revision(&engine, repo).await.as_deref(), Some(HEAD));
+
+        let cleanups = jobs(&engine, "cleanup").await;
+        assert_eq!(cleanups.len(), 1);
+        let (cleanup_repo, cleanup_issue, payload) = &cleanups[0];
+        assert_eq!((*cleanup_repo, *cleanup_issue), (Some(repo), Some(issue)));
+        let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let expected = hulahoop_core::contract::checkout_dir(
+            &engine.db.data_dir,
+            &project.to_string(),
+            &issue,
+        );
+        assert_eq!(payload["checkout"].as_str(), expected.to_str());
+    }
+
+    /// A landing that fails leaves the base alone and says why on the task.
+    #[tokio::test]
+    async fn a_failed_landing_is_reported_on_the_task() {
+        let (engine, _, repo, issue) = task_in_review("land-failed").await;
+        engine.merge_issue(issue).await.unwrap();
+        let land = claim(&engine, "land").await;
+        engine
+            .complete_job(
+                land,
+                serde_json::json!({}),
+                Some("main could not move forward".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(base_revision(&engine, repo).await, None);
+        let bodies: Vec<String> =
+            sqlx::query_scalar("select body from comments where issue_id = ? order by created_at")
+                .bind(issue)
+                .fetch_all(&engine.db.pool)
+                .await
+                .unwrap();
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("main could not move forward")),
+            "{bodies:?}"
+        );
+    }
+
+    /// A fetch never moves the base back: neither when the remote is behind the
+    /// base it was compared with, nor when the base changed (a landing) while
+    /// the fetch was out.
+    #[tokio::test]
+    async fn a_fetch_never_replaces_a_newer_base() {
+        let (engine, _, repo, _) = task_in_review("fetch-newer").await;
+        let fetch = engine
+            .queue_job(repo, None, "fetch", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(claim(&engine, "fetch").await, fetch);
+        sqlx::query("update repos set base_revision = ? where id = ?")
+            .bind(HEAD)
+            .bind(repo)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        engine
+            .complete_job(
+                fetch,
+                serde_json::json!({ "base_revision": "older", "behind": false, "compared_with": "" }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(base_revision(&engine, repo).await.as_deref(), Some(HEAD));
+
+        let behind = engine
+            .queue_job(repo, None, "fetch", serde_json::json!({}))
+            .await
+            .unwrap();
+        claim(&engine, "fetch").await;
+        engine
+            .complete_job(
+                behind,
+                serde_json::json!({ "base_revision": "older", "behind": true, "compared_with": HEAD }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(base_revision(&engine, repo).await.as_deref(), Some(HEAD));
+
+        let ahead = engine
+            .queue_job(repo, None, "fetch", serde_json::json!({}))
+            .await
+            .unwrap();
+        claim(&engine, "fetch").await;
+        engine
+            .complete_job(
+                ahead,
+                serde_json::json!({ "base_revision": "newer", "behind": false, "compared_with": HEAD }),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(base_revision(&engine, repo).await.as_deref(), Some("newer"));
+    }
+
+    /// Reopening a finished task keeps its checkout: the cleanup still queued
+    /// for it is dropped before a runner deletes what the next turn needs.
+    #[tokio::test]
+    async fn reopening_a_task_drops_its_queued_cleanup() {
+        let (engine, _, _, issue) = task_in_review("reopen-cleanup").await;
+        engine.transition(issue, IssueEvent::Abandon).await.unwrap();
+        assert_eq!(jobs(&engine, "cleanup").await.len(), 1);
+        engine.transition(issue, IssueEvent::Reopen).await.unwrap();
+        assert!(jobs(&engine, "cleanup").await.is_empty());
+    }
+
+    /// A cancelled task loses its checkout too, but only once no run of it is
+    /// live: a turn never has its checkout deleted under it.
+    #[tokio::test]
+    async fn a_cancelled_task_is_cleaned_up_after_its_last_run() {
+        let (engine, _, _, issue) = task_in_review("cancel-cleanup").await;
+        sqlx::query("update runs set status = 'running' where issue_id = ?")
+            .bind(issue)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        let cancelled = engine.transition(issue, IssueEvent::Abandon).await.unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert_eq!(jobs(&engine, "cleanup").await.len(), 1);
+        assert!(engine.claim_job(false).await.unwrap().is_none());
+
+        sqlx::query("update runs set status = 'cancelled' where issue_id = ?")
+            .bind(issue)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        let claimed = engine.claim_job(false).await.unwrap().expect("cleanup");
+        assert_eq!(claimed.kind, "cleanup");
+        // Moving a finished task again queues nothing more.
+        assert!(engine.transition(issue, IssueEvent::Abandon).await.is_err());
+        assert_eq!(jobs(&engine, "cleanup").await.len(), 1);
     }
 }

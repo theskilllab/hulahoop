@@ -160,7 +160,6 @@ impl Db {
     pub async fn open(data_dir: &Path) -> anyhow::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         std::fs::create_dir_all(data_dir.join("runs"))?;
-        std::fs::create_dir_all(data_dir.join("replays"))?;
         std::fs::create_dir_all(data_dir.join("checkouts"))?;
         std::fs::create_dir_all(data_dir.join("home"))?;
 
@@ -386,7 +385,7 @@ mod backup_tests {
         .execute(&db.pool)
         .await
         .expect("project");
-        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
             .bind(repo).bind(project).bind(&now).execute(&db.pool).await.expect("repo");
         sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?, 'builder','pi','model-x',?,?)")
             .bind(agent).bind(workspace).bind(&now).bind(&now).execute(&db.pool).await.expect("agent");

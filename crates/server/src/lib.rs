@@ -282,39 +282,3 @@ fn restrict_permissions(path: &std::path::Path) -> std::io::Result<()> {
     }
     Ok(())
 }
-
-/// The `origin` remote of a repository, whichever VCS answers first.
-///
-/// git is asked directly because a colocated checkout has one; jj is the fallback
-/// for a repo that only jj knows about. A repo without a remote returns `None`,
-/// which a pull request job reports rather than guessing a URL.
-pub fn vcs_remote(root: &std::path::Path) -> Option<String> {
-    let run = |program: &str, args: &[&str]| -> Option<String> {
-        let output = std::process::Command::new(program)
-            .args(args)
-            .current_dir(root)
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        }
-    };
-    if let Some(url) = run("git", &["remote", "get-url", "origin"]) {
-        return Some(url);
-    }
-    // `jj git remote list` prints one line per remote, "origin <url>".
-    let listed = run("jj", &["git", "remote", "list"])?;
-    listed.lines().find_map(|line| {
-        let mut parts = line.split_whitespace();
-        match (parts.next(), parts.next()) {
-            (Some("origin"), Some(url)) => Some(url.to_string()),
-            _ => None,
-        }
-    })
-}

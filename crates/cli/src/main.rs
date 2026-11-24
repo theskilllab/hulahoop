@@ -33,7 +33,7 @@ async fn main() -> Result<()> {
                  hulahoop up [--listen ADDR] [--port N] [--data-dir DIR]   server and runner\n  \
                  hulahoop serve [--data-dir DIR] [--port N]                just the server\n  \
                  hulahoop runner [--server URL --token T]                  just the runner\n  \
-                 hulahoop seed --repo PATH [--name NAME]                   register a repo\n  \
+                 hulahoop seed --repo URL|PATH [--name NAME]               register a repo\n  \
                  hulahoop doctor                                           check this machine"
             );
             Ok(())
@@ -43,7 +43,7 @@ async fn main() -> Result<()> {
 }
 
 /// The host that does the work runs two processes: the server owns the state, and
-/// the runner owns the checkouts, the agents, and the replays. `up` starts both,
+/// the runner owns the mirrors, the checkouts, and the agents. `up` starts both,
 /// waits for the server's connection file, points the runner at it, and shuts the
 /// other one down when either exits.
 async fn up(args: &[String]) -> Result<()> {
@@ -369,7 +369,7 @@ async fn seed(args: &[String]) -> Result<()> {
         match args[index].as_str() {
             "--repo" => {
                 index += 1;
-                repo = args.get(index).map(PathBuf::from);
+                repo = args.get(index).cloned();
             }
             "--name" => {
                 index += 1;
@@ -382,20 +382,22 @@ async fn seed(args: &[String]) -> Result<()> {
                     .map(PathBuf::from)
                     .context("--data-dir needs a path")?;
             }
-            // A bare path is the repo, so `hulahoop seed ~/src/thing` works.
+            // A bare argument is the repo, so `hulahoop seed ~/src/thing` works.
             other if !other.starts_with('-') && repo.is_none() => {
-                repo = Some(PathBuf::from(other));
+                repo = Some(other.to_string());
             }
             other => bail!("unknown argument {other}"),
         }
         index += 1;
     }
 
-    let repo = repo.context("--repo is required")?;
-    let repo = repo.canonicalize().context("repo path does not exist")?;
+    let repo = clone_source(&repo.context("--repo is required")?)?;
     let name = name.unwrap_or_else(|| {
-        repo.file_name()
-            .map(|n| n.to_string_lossy().to_string())
+        repo.trim_end_matches('/')
+            .rsplit(['/', ':'])
+            .next()
+            .map(|n| n.trim_end_matches(".git").to_string())
+            .filter(|n| !n.is_empty())
             .unwrap_or_else(|| "project".into())
     });
 
@@ -451,8 +453,8 @@ async fn seed(args: &[String]) -> Result<()> {
         .to_string();
 
     let repo_json = gql(format!(
-        "mutation {{ addRepo(projectId: \"{project_id}\", name: \"{name}\", path: \"{}\") {{ id vcs contractVersion }} }}",
-        repo.display()
+        "mutation {{ addRepo(projectId: \"{project_id}\", name: \"{name}\", remoteUrl: {}) {{ id vcs contractVersion }} }}",
+        serde_json::to_string(&repo)?
     ))
     .await?;
     let repo_id = repo_json["data"]["addRepo"]["id"]
@@ -485,9 +487,23 @@ async fn seed(args: &[String]) -> Result<()> {
     }
 
     println!("agents created: {}", agent_ids.len());
-    println!(
-        "repo root: {}\nnext: create an issue in the app, or open it and press Start",
-        repo.display()
-    );
+    println!("cloned from: {repo}\nnext: create an issue in the app, or open it and press Start");
     Ok(())
+}
+
+/// What the server clones a seeded repository from. Hulahoop never works in the
+/// given directory: a local repository is named by its absolute path, which
+/// `jj git clone` takes like any url, and anything else is used as the url.
+fn clone_source(repo: &str) -> Result<String> {
+    let local = PathBuf::from(repo);
+    if local.exists() {
+        let absolute = local
+            .canonicalize()
+            .with_context(|| format!("reading the repository path {repo}"))?;
+        return Ok(absolute.to_string_lossy().to_string());
+    }
+    if repo.contains("://") || repo.contains('@') {
+        return Ok(repo.to_string());
+    }
+    bail!("{repo} is neither a local repository nor a url to clone from")
 }
