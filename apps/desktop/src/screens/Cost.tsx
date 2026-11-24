@@ -4,6 +4,7 @@ import {
   type Agent, type CostReport, type CostTotals,
 } from "../api";
 import PageHeader from "../PageHeader";
+import Seg from "../components/Seg";
 
 const number = (value: number) => value.toLocaleString("en-US", { maximumFractionDigits: 1 });
 const money = (value: number | null) => value === null ? "—" : `$${value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: value < 1 ? 4 : 2 })}`;
@@ -120,23 +121,27 @@ export default function Cost({ workspaceId, agents, onOpen }: {
     .sort((a, b) => a.equivalentUsd / a.succeeded - b.equivalentUsd / b.succeeded)[0];
 
   return <section className="screen cost-control">
-    <PageHeader title="Cost control" subtitle="Task efficiency · UTC periods" />
-    <div className="cost-body">
-      <div className="cost-filters" aria-label="Cost report filters">
-        <label>Period <select value={period} onChange={(event) => setPeriod(event.target.value as Period)}>
+    <PageHeader
+      title="Cost control"
+      subtitle={report ? `${report.start.slice(0, 10)} – ${report.end.slice(0, 10)} · UTC` : "Task efficiency · UTC periods"}
+      actions={<>
+        <select className="cost-period" aria-label="Date range" value={period} onChange={(event) => setPeriod(event.target.value as Period)}>
           {Object.entries(periodName).map(([value, label]) => <option value={value} key={value}>{label}</option>)}
-        </select></label>
-        <label>Agent <select value={agent} onChange={(event) => setAgent(event.target.value)}>
+        </select>
+        <select className="cost-agent" aria-label="Agent" value={agent} onChange={(event) => setAgent(event.target.value)}>
           <option value="">All agents</option>
           {agents.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
-        </select></label>
-        <label>Model <select value={model} onChange={(event) => setModel(event.target.value)}>
+        </select>
+        <select className="cost-model" aria-label="Model" value={model} onChange={(event) => setModel(event.target.value)}>
           <option value="">All models</option>
           {[...new Set([...agents.map((item) => item.model), ...modelNames, model].filter(Boolean))].sort()
             .map((name) => <option value={name} key={name}>{name}</option>)}
-        </select></label>
-        <span className="dim">{report ? `${report.start.slice(0, 10)} – ${report.end.slice(0, 10)}` : "Loading…"}</span>
-      </div>
+        </select>
+        <Seg<Measure> label="Usage measure" value={measure} onChange={setMeasure}
+          options={[{ value: "tokens", label: "Tokens" }, { value: "cost", label: "Cost" }]} />
+      </>}
+    />
+    <div className="cost-body">
       {error ? <p role="alert" className="cost-error">{error}</p> : null}
       {!report ? <p className="dim">Loading cost report…</p> : <>
         <div className="cost-section-heading"><h2>Task efficiency</h2><span>Completed = issue merged in this period; all its runs count, including failed and timed-out attempts.</span></div>
@@ -165,9 +170,7 @@ export default function Cost({ workspaceId, agents, onOpen }: {
 
         <section className="cost-panel">
           <header className="cost-panel-head"><div><h2>Usage over time</h2><p>Daily finish-date totals, stacked by provider-observed model when available</p></div>
-            <div className="cost-actions"><div className="seg" aria-label="Usage measure">
-              {(["cost", "tokens"] as Measure[]).map((value) => <button key={value} aria-pressed={measure === value} onClick={() => setMeasure(value)}>{value === "cost" ? "Cost" : "Tokens"}</button>)}
-            </div><div className="seg" aria-label="Usage display">
+            <div className="cost-actions"><div className="seg" aria-label="Usage display">
               {(["chart", "table"] as View[]).map((value) => <button key={value} aria-pressed={trendView === value} onClick={() => setTrendView(value)}>{value}</button>)}
             </div></div></header>
           {trendView === "chart" ? <div className="cost-bars" role="img" aria-label={`Daily ${measure === "cost" ? "known API-equivalent subtotal" : "tokens"} by model`}>

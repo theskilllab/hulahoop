@@ -998,6 +998,8 @@ impl Mutation {
         due_date: Option<String>,
         assignee_type: Option<String>,
         assignee_id: Option<String>,
+        // Optional; it has to be a milestone of the same workspace.
+        milestone_id: Option<Uuid>,
     ) -> async_graphql::Result<Issue> {
         let engine = engine(ctx);
         let priority = crate::engine::priority(priority.as_deref())
@@ -1042,6 +1044,14 @@ impl Mutation {
                 }
             }
         };
+        if let Some(milestone_id) = milestone_id {
+            let milestone = engine.milestone(milestone_id).await?;
+            if milestone.workspace_id != workspace_id {
+                return Err(async_graphql::Error::new(
+                    "that milestone belongs to another workspace",
+                ));
+            }
+        }
         let (number, issue_key) = engine
             .next_issue_key(workspace_id, project_id)
             .await
@@ -1049,13 +1059,14 @@ impl Mutation {
         let id = Uuid::now_v7();
         let now = crate::db::now_rfc3339();
         sqlx::query(
-            "insert into issues (id, workspace_id, project_id, repo_id, number, issue_key, title, body, status, priority, due_date, created_at, updated_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?)",
+            "insert into issues (id, workspace_id, project_id, repo_id, milestone_id, number, issue_key, title, body, status, priority, due_date, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, 'backlog', ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
         .bind(project_id)
         .bind(repo_id)
+        .bind(milestone_id)
         .bind(number)
         .bind(&issue_key)
         .bind(&title)
@@ -1328,14 +1339,7 @@ impl Mutation {
         ctx: &Context<'_>,
         issue_id: Uuid,
     ) -> async_graphql::Result<Issue> {
-        let engine = engine(ctx);
-        sqlx::query("update issues set run_cap_cleared_at = ?, updated_at = ? where id = ?")
-            .bind(crate::db::now_rfc3339())
-            .bind(crate::db::now_rfc3339())
-            .bind(issue_id)
-            .execute(&engine.db.pool)
-            .await?;
-        Ok(engine.issue(issue_id).await?)
+        Ok(engine(ctx).clear_run_cap(issue_id).await?)
     }
 }
 
@@ -1468,6 +1472,16 @@ impl Issue {
         Ok(engine(ctx).assignee(self).await?)
     }
 
+    /// Runs used since a person last allowed more; at `runLimit` no agent starts
+    /// until somebody calls `clearRunCap`.
+    async fn runs_since_cap(&self, ctx: &Context<'_>) -> async_graphql::Result<i64> {
+        Ok(engine(ctx).runs_since_cap(self).await?)
+    }
+
+    async fn run_limit(&self) -> i64 {
+        hulahoop_core::RUNS_PER_ISSUE
+    }
+
     /// The effort the task has cost so far, in one aggregate over its runs.
     async fn stats(&self, ctx: &Context<'_>) -> async_graphql::Result<crate::tasks::IssueStats> {
         Ok(engine(ctx).issue_stats(self.id).await?)
@@ -1498,7 +1512,18 @@ impl Issue {
 
     /// The run the task is on. A task carries the newest attempt even when no run
     /// is live, so a screen never has to guess which attempt it is reading.
+    /// A live run comes first: it is what a person can watch or cancel.
     async fn current_run(&self, ctx: &Context<'_>) -> async_graphql::Result<Option<Run>> {
+        let live: Option<Run> = sqlx::query_as(
+            "select * from runs where issue_id = ? and status in ('queued', 'running')
+              order by created_at desc limit 1",
+        )
+        .bind(self.id)
+        .fetch_optional(&engine(ctx).db.pool)
+        .await?;
+        if live.is_some() {
+            return Ok(live);
+        }
         if let Some(id) = self.current_run_id {
             let run: Option<Run> = sqlx::query_as("select * from runs where id = ?")
                 .bind(id)
@@ -1781,6 +1806,57 @@ mod repo_less_tests {
         )
         .await;
         assert!(untouched["updateIssue"]["repoId"].is_null());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// The New task sheet can file a task under a milestone, but only one of
+    /// the task's own workspace.
+    #[tokio::test]
+    async fn a_new_task_can_start_in_a_milestone_of_its_workspace() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-gql-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let engine = Arc::new(Engine::new(db));
+        let ours = engine
+            .create_milestone(workspace, None, "Beta".into(), String::new(), None)
+            .await
+            .unwrap();
+        let other = engine
+            .create_workspace("Elsewhere", Some("ELS"))
+            .await
+            .unwrap();
+        let theirs = engine
+            .create_milestone(other.id, None, "Launch".into(), String::new(), None)
+            .await
+            .unwrap();
+        let schema = build_schema(engine);
+
+        let filed = run(
+            &schema,
+            format!(
+                r#"mutation {{ createIssue(workspaceId: "{workspace}", title: "Docs", body: "", milestoneId: "{}") {{ milestoneId }} }}"#,
+                ours.id
+            ),
+        )
+        .await;
+        assert_eq!(filed["createIssue"]["milestoneId"], ours.id.to_string());
+
+        let loose = run(
+            &schema,
+            format!(r#"mutation {{ createIssue(workspaceId: "{workspace}", title: "Notes", body: "") {{ milestoneId }} }}"#),
+        )
+        .await;
+        assert!(loose["createIssue"]["milestoneId"].is_null());
+
+        let refused = schema
+            .execute(format!(
+                r#"mutation {{ createIssue(workspaceId: "{workspace}", title: "Leak", body: "", milestoneId: "{}") {{ id }} }}"#,
+                theirs.id
+            ))
+            .await;
+        assert_eq!(refused.errors.len(), 1);
+        assert!(refused.errors[0].message.contains("another workspace"));
 
         let _ = std::fs::remove_dir_all(directory);
     }

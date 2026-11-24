@@ -164,6 +164,9 @@ export interface Issue {
   /** Where the workflow document says this status may go. */
   moves?: IssueStatus[];
   turnsUsed?: number;
+  /** Runs used since a person last allowed more; at `runLimit` no agent starts. */
+  runsSinceCap?: number;
+  runLimit?: number;
   /** The task's attached files; only the detail query carries them. */
   files?: Artifact[];
   runs: Run[];
@@ -176,7 +179,7 @@ export interface Issue {
  *  whether a run is live. The body and the turn queue only matter to the open task. */
 export type IssueSummary = Omit<
   Issue,
-  "body" | "turnRemaining" | "turnsUsed" | "runs" | "reviews" | "comments" | "currentRun" | "files" | "stats"
+  "body" | "turnRemaining" | "turnsUsed" | "runsSinceCap" | "runLimit" | "runs" | "reviews" | "comments" | "currentRun" | "files" | "stats"
 > & {
   currentRun: Pick<Run, "id" | "agentId" | "status"> | null;
 };
@@ -526,7 +529,7 @@ export const ISSUE_DETAIL_FIELDS = `
   runs { ${RUN_FIELDS} summary model actualModel modelTurns toolCalls apiEquivalentUsd cacheReadTokens failureCategory createdAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments(newestFirst: true) { id author authorType body pinned createdAt runId mentions { type id name } }
-  turnRemaining turnsUsed moves
+  turnRemaining turnsUsed runsSinceCap runLimit moves
   currentRun { ${RUN_FIELDS} }
 `;
 
@@ -576,12 +579,14 @@ export interface CreateIssueInput {
   dueDate: string | null;
   assigneeType: "human" | "agent" | null;
   assigneeId: string | null;
+  /** A milestone of the same workspace, or none. */
+  milestoneId: string | null;
 }
 
 export async function createIssue(input: CreateIssueInput): Promise<IssueSummary> {
   const data = await gql<{ createIssue: IssueSummary }>(
-    `mutation ($workspaceId: UUID!, $projectId: UUID, $repoId: UUID, $title: String!, $body: String!, $priority: String, $dueDate: String, $assigneeType: String, $assigneeId: String) {
-      createIssue(workspaceId: $workspaceId, projectId: $projectId, repoId: $repoId, title: $title, body: $body, priority: $priority, dueDate: $dueDate, assigneeType: $assigneeType, assigneeId: $assigneeId) { ${ISSUE_SUMMARY_FIELDS} }
+    `mutation ($workspaceId: UUID!, $projectId: UUID, $repoId: UUID, $title: String!, $body: String!, $priority: String, $dueDate: String, $assigneeType: String, $assigneeId: String, $milestoneId: UUID) {
+      createIssue(workspaceId: $workspaceId, projectId: $projectId, repoId: $repoId, title: $title, body: $body, priority: $priority, dueDate: $dueDate, assigneeType: $assigneeType, assigneeId: $assigneeId, milestoneId: $milestoneId) { ${ISSUE_SUMMARY_FIELDS} }
     }`,
     { ...input },
   );

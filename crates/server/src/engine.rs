@@ -119,6 +119,12 @@ impl Engine {
             let _ = self.reset_turns(issue_id, to).await;
         }
         let issue = self.issue(issue_id).await?;
+        // A run that failed or was cancelled leaves the task where it is, for a
+        // person to decide: starting the next attempt here retried at once, and a
+        // broken host (a full disk) burned a run every second.
+        if matches!(event, IssueEvent::CancelRun) && from == to {
+            return Ok(issue);
+        }
         // Moving a task into a status an agent owns is the dispatch: nobody has
         // to press start, and nothing starts twice because the run table allows
         // one live run per issue.
@@ -187,7 +193,7 @@ impl Engine {
 
     /// The newest head the issue published, whoever published it: the work a
     /// review judged stays the base of the turns that follow it.
-    async fn newest_head(&self, issue_id: Uuid) -> Result<Option<String>> {
+    pub(crate) async fn newest_head(&self, issue_id: Uuid) -> Result<Option<String>> {
         Ok(sqlx::query_scalar::<_, String>(
             "select head_bookmark from runs where issue_id = ? and head_bookmark is not null \
              order by created_at desc limit 1",
@@ -343,14 +349,22 @@ impl Engine {
         // turn turns out to be is read from what it does, not from who did it.
         let named = self.next_turn_agent(issue).await?;
         let agent = self.agent_for_name(workspace, named.as_deref()).await?;
-        // A head that already carries a verdict is not judged twice; the next turn
-        // there has nothing to add until the work changes.
-        if issue.current_run_id.is_some() {
-            let reviewed: Option<(Uuid,)> =
-                sqlx::query_as("select id from reviews where reviewed_run_id = ? limit 1")
-                    .bind(issue.current_run_id)
-                    .fetch_optional(&self.db.pool)
-                    .await?;
+        // A head that already carries a verdict is not judged twice: the agent
+        // who judged it has nothing to add until the work changes. Anyone else
+        // still takes the turn, so a rework asked for after an approval (a
+        // person's "request changes") reaches the agent who does the work.
+        // With nobody named, there is no telling who would judge, so any verdict
+        // on the head holds the turn as before.
+        if let Some(head) = issue.current_run_id {
+            let reviewed: Option<(Uuid,)> = sqlx::query_as(
+                "select reviews.id from reviews join runs on runs.id = reviews.reviewer_run_id
+                  where reviews.reviewed_run_id = ? and (? is null or runs.agent_id = ?) limit 1",
+            )
+            .bind(head)
+            .bind(agent)
+            .bind(agent)
+            .fetch_optional(&self.db.pool)
+            .await?;
             if reviewed.is_some() {
                 return Ok(());
             }
@@ -1172,16 +1186,7 @@ impl Engine {
 
         // The cap counts runs since the last human override, so clearing it is a
         // deliberate act rather than a side effect of a new attempt.
-        let since = issue
-            .run_cap_cleared_at
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-        let (count,): (i64,) =
-            sqlx::query_as("select count(*) from runs where issue_id = ? and created_at >= ?")
-                .bind(issue_id)
-                .bind(&since)
-                .fetch_one(&self.db.pool)
-                .await?;
+        let count = self.runs_since_cap(&issue).await?;
         if count >= hulahoop_core::RUNS_PER_ISSUE {
             bail!(
                 "this issue has used {count} of {} runs. Human override required: call clearRunCap to continue.",
@@ -1239,8 +1244,8 @@ impl Engine {
         sqlx::query(
             "insert into runs (id, issue_id, repo_id, agent_id, model, adapter_snapshot, connector_id,
                 price_in_per_million, price_out_per_million, attempt, base_bookmark, base_revision,
-                prompt_revision, artifact_dir, status, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                prompt_revision, artifact_dir, parent_run_id, status, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
         )
         .bind(run_id)
         .bind(issue_id)
@@ -1261,6 +1266,9 @@ impl Engine {
         .bind(repo.as_ref().map(|_| &base_bookmark))
         .bind(&prompt_revision)
         .bind(artifact_dir.display().to_string())
+        // The parent is how the next turn reads the one before it (a review's
+        // findings, a handover); dropping it left reworks without the review.
+        .bind(parent_run_id)
         .bind(crate::db::now_rfc3339())
         .execute(&self.db.pool)
         .await?;
@@ -1676,6 +1684,17 @@ impl Engine {
                             .execute(&self.db.pool)
                             .await?;
                     }
+                    // The newest work is what the next reviewer judges and what a
+                    // pull request shows. Without this the task keeps pointing at
+                    // the head from its last trip through review: the reviewer
+                    // would judge stale work, or be held back as having judged it.
+                    if payload.commit.is_some() || issue.repo_id.is_none() {
+                        sqlx::query("update issues set current_run_id = ? where id = ?")
+                            .bind(run_id)
+                            .bind(run.issue_id)
+                            .execute(&self.db.pool)
+                            .await?;
+                    }
                     // Where the work goes next is the document's decision, not a
                     // constant in here: take the status's first move. A move into
                     // review is what earns a pull request — everything else is just
@@ -1697,10 +1716,38 @@ impl Engine {
         self.run(run_id).await
     }
 
-    /// What happens when a turn is spent and the work is not blocked: the status
-    /// hands over to the next agent it names, or to the first move the document
-    /// declares out of it. A handover into review is what earns a pull request,
-    /// and the reviewer is shown the run that put it there.
+    /// Runs the task has used since a person last allowed more. Every run counts,
+    /// failed ones too, across every agent and status.
+    pub async fn runs_since_cap(&self, issue: &Issue) -> Result<i64> {
+        let since = issue
+            .run_cap_cleared_at
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        let (count,): (i64,) =
+            sqlx::query_as("select count(*) from runs where issue_id = ? and created_at >= ?")
+                .bind(issue.id)
+                .bind(&since)
+                .fetch_one(&self.db.pool)
+                .await?;
+        Ok(count)
+    }
+
+    /// A person allows another round of runs. The count starts again, and the
+    /// agent the workflow was waiting on starts now instead of on the next
+    /// event, which may never come.
+    pub async fn clear_run_cap(&self, issue_id: Uuid) -> Result<Issue> {
+        let now = crate::db::now_rfc3339();
+        sqlx::query("update issues set run_cap_cleared_at = ?, updated_at = ? where id = ?")
+            .bind(&now)
+            .bind(&now)
+            .bind(issue_id)
+            .execute(&self.db.pool)
+            .await?;
+        let issue = self.issue(issue_id).await?;
+        Box::pin(self.dispatch_if_agent_owns(&issue)).await?;
+        self.issue(issue_id).await
+    }
+
     /// A review asked for changes: everybody in the status is owed a turn again,
     /// in the document's order, and the first of them starts now.
     async fn hand_back_for_rework(&self, issue_id: Uuid) -> Result<()> {
@@ -1725,11 +1772,15 @@ impl Engine {
         Ok(())
     }
 
+    /// What happens when a turn is spent and the work is not blocked: the status
+    /// hands over to the next agent it names, or to the first move the document
+    /// declares out of it. A handover into review is what earns a pull request,
+    /// and the reviewer is shown the run that put it there.
     async fn advance_after_turn(&self, issue_id: Uuid, agent_id: Uuid) -> Result<()> {
         let issue = self.issue(issue_id).await?;
         let _ = self.mark_served(&issue, agent_id).await;
         let issue = self.issue(issue_id).await?;
-        if self.next_turn_agent(&issue).await?.is_some() {
+        if let Some(next) = self.next_turn_agent(&issue).await? {
             if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
                 let _ = self
                     .comment(
@@ -1740,7 +1791,9 @@ impl Engine {
                         false,
                     )
                     .await;
+                return Ok(());
             }
+            self.block_if_stalled(issue_id, agent_id, &next).await?;
             return Ok(());
         }
         let target = self
@@ -1765,6 +1818,66 @@ impl Engine {
         if issue.status_enum() == IssueStatus::InReview {
             self.ensure_pull_request(&issue).await?;
         }
+        Ok(())
+    }
+
+    /// A handover that started nobody leaves the task idle in a status agents
+    /// own, with nothing on the board to say so. Waiting helps nobody, so the
+    /// task goes to a person with the reason. The usual case: a rework that
+    /// changed nothing, handing the reviewer the head it already judged.
+    async fn block_if_stalled(&self, issue_id: Uuid, agent_id: Uuid, next: &str) -> Result<()> {
+        let issue = self.issue(issue_id).await?;
+        if issue.status_enum() == IssueStatus::Blocked || issue.status_enum().is_terminal() {
+            return Ok(());
+        }
+        let live: Option<(Uuid,)> = sqlx::query_as(
+            "select id from runs where issue_id = ? and status in ('queued', 'running')",
+        )
+        .bind(issue_id)
+        .fetch_optional(&self.db.pool)
+        .await?;
+        if live.is_some() {
+            return Ok(());
+        }
+        let finished: String = sqlx::query_scalar("select name from agents where id = ?")
+            .bind(agent_id)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .unwrap_or_else(|| "The last agent".to_string());
+        let next = next.trim().trim_start_matches('@');
+        let judged = match (
+            issue.current_run_id,
+            self.agent_for_name(issue.workspace_id, Some(next)).await?,
+        ) {
+            (Some(head), Some(judge)) => sqlx::query_scalar::<_, String>(
+                "select reviews.verdict from reviews join runs on runs.id = reviews.reviewer_run_id
+                  where reviews.reviewed_run_id = ? and runs.agent_id = ?
+                  order by reviews.created_at desc limit 1",
+            )
+            .bind(head)
+            .bind(judge)
+            .fetch_optional(&self.db.pool)
+            .await?,
+            _ => None,
+        };
+        let reason = match judged.as_deref() {
+            Some("changes_requested") => format!(
+                "{finished} finished without changing the work {next} already reviewed, so {next} has nothing new to judge and its change request is still open."
+            ),
+            Some(_) => format!(
+                "{finished} finished without changing the work {next} already reviewed, so {next} has nothing new to judge."
+            ),
+            None => format!("The workflow names {next} next, but no turn started."),
+        };
+        self.comment(
+            issue_id,
+            hulahoop_core::AuthorType::Server,
+            None,
+            &format!("{reason} Somebody has to look at it."),
+            false,
+        )
+        .await?;
+        self.move_to(issue_id, IssueStatus::Blocked).await?;
         Ok(())
     }
 
@@ -2529,6 +2642,194 @@ mod rework_tests {
 
         let _ = std::fs::remove_dir_all(directory);
     }
+
+    /// A rework that changes nothing hands the reviewer the head it already
+    /// judged. Nobody can take that turn, so the task goes to a person with the
+    /// reason instead of idling in a status agents own.
+    #[tokio::test]
+    async fn a_rework_without_changes_blocks_the_task() {
+        let directory = std::env::temp_dir().join(format!("hulahoop-stall-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo, developer, reviewer, issue) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let (head, review_run, rework) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Stall',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, path, contract_version, created_at) values (?,?, 'repo','/tmp','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        for (id, name) in [(developer, "Developer"), (reviewer, "Reviewer")] {
+            sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi','model-x',?,?)")
+                .bind(id).bind(workspace).bind(name).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, turn_queue, turn_served, turns_used, created_at, updated_at) values (?,?,?,?, 'STL-1',1,'Task','in_progress','[\"Developer\",\"Reviewer\"]','[]',3,?,?)")
+            .bind(issue).bind(workspace).bind(project).bind(repo)
+            .bind(now).bind(now).execute(&db.pool).await.unwrap();
+        for (id, agent, status, bookmark) in [
+            (head, developer, "succeeded", Some("issue/x/head/1")),
+            (review_run, reviewer, "succeeded", None),
+            (rework, developer, "running", None),
+        ] {
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, head_bookmark, created_at) values (?,?,?,?,1,'main','prompt','/tmp',?,'model-x',?,?)")
+                .bind(id).bind(issue).bind(repo).bind(agent).bind(status).bind(bookmark).bind(now)
+                .execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at) values (?,?,?,?,'changes_requested','Fix the date field.',?)")
+            .bind(Uuid::now_v7()).bind(issue).bind(head).bind(review_run).bind(now)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("update issues set current_run_id = ? where id = ?")
+            .bind(head)
+            .bind(issue)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let engine = Engine::new(db);
+        engine.set_workflow(workspace, DOC).await.unwrap();
+        let unchanged: super::RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "body": "The work was already in place.",
+            "verdict": "done",
+        }))
+        .unwrap();
+        engine.complete_run(rework, unchanged).await.unwrap();
+
+        let task = engine.issue(issue).await.unwrap();
+        assert_eq!(task.status, "blocked");
+        let said: String = sqlx::query_scalar(
+            "select body from comments where issue_id = ? and author_type = 'server' order by created_at desc limit 1",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert!(
+            said.contains("Developer finished without changing the work Reviewer already reviewed"),
+            "got {said}"
+        );
+        assert!(said.contains("change request is still open"), "got {said}");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A person asking for changes after the reviewer approved sends the task
+    /// back to the developer, even though the head already carries a verdict:
+    /// only the reviewer who gave it is held back.
+    #[tokio::test]
+    async fn requesting_changes_after_an_approval_starts_the_developer() {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-human-rework-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (developer, reviewer, issue, head, review_run) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        let now = Utc::now() - Duration::seconds(3);
+        for (id, name) in [(developer, "Developer"), (reviewer, "Reviewer")] {
+            sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi','model-x',?,?)")
+                .bind(id).bind(workspace).bind(name).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null,'RWK-2',2,'Task','in_review',?,?)")
+            .bind(issue).bind(workspace).bind(now).bind(now).execute(&db.pool).await.unwrap();
+        for (id, agent) in [(head, developer), (review_run, reviewer)] {
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,null,?,1,'main','prompt','/tmp','succeeded','model-x',?)")
+                .bind(id).bind(issue).bind(agent).bind(now).execute(&db.pool).await.unwrap();
+        }
+        sqlx::query("insert into reviews (id, issue_id, reviewed_run_id, reviewer_run_id, verdict, body, created_at) values (?,?,?,?,'approved','Looks good.',?)")
+            .bind(Uuid::now_v7()).bind(issue).bind(head).bind(review_run).bind(now)
+            .execute(&db.pool).await.unwrap();
+        sqlx::query("update issues set current_run_id = ? where id = ?")
+            .bind(head)
+            .bind(issue)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let engine = Engine::new(db);
+        engine.set_workflow(workspace, DOC).await.unwrap();
+        engine
+            .transition(issue, hulahoop_core::IssueEvent::RequestChanges)
+            .await
+            .unwrap();
+
+        let agent: Uuid = sqlx::query_scalar(
+            "select agent_id from runs where issue_id = ? and status = 'queued'",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(agent, developer);
+
+        // The rework finishes: the reviewer judges it, the newest work, and is
+        // not held back by the verdict it gave the old head.
+        let rework: Uuid =
+            sqlx::query_scalar("select id from runs where issue_id = ? and status = 'queued'")
+                .bind(issue)
+                .fetch_one(&engine.db.pool)
+                .await
+                .unwrap();
+        let completion: super::RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "body": "Rebased on main.",
+        }))
+        .unwrap();
+        engine.complete_run(rework, completion).await.unwrap();
+        let task = engine.issue(issue).await.unwrap();
+        assert_eq!(task.current_run_id, Some(rework));
+        let agent: Uuid = sqlx::query_scalar(
+            "select agent_id from runs where issue_id = ? and status = 'queued'",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(agent, reviewer);
+
+        // The reviewer asks for changes: the developer's next turn names the
+        // review as its parent, so the findings reach the run that fixes them.
+        let review: Uuid =
+            sqlx::query_scalar("select id from runs where issue_id = ? and status = 'queued'")
+                .bind(issue)
+                .fetch_one(&engine.db.pool)
+                .await
+                .unwrap();
+        let verdict: super::RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "succeeded",
+            "body": "Fix the target date field.",
+            "verdict": "changes_requested",
+        }))
+        .unwrap();
+        engine.complete_run(review, verdict).await.unwrap();
+        let (agent, parent): (Uuid, Option<Uuid>) = sqlx::query_as(
+            "select agent_id, parent_run_id from runs where issue_id = ? and status = 'queued'",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(agent, developer);
+        assert_eq!(parent, Some(review));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
 
 #[cfg(test)]
@@ -2581,6 +2882,71 @@ mod repo_less_tests {
             .fetch_one(&engine.db.pool)
             .await
             .unwrap()
+    }
+
+    /// A failed run leaves the task for a person: nothing retries on its own,
+    /// so a broken host cannot burn through the task's runs.
+    #[tokio::test]
+    async fn a_failed_run_does_not_start_another() {
+        let (directory, engine, workspace, developer) = fixture("no-retry").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+        let failed: RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "error": "No space left on device",
+        }))
+        .unwrap();
+        engine.complete_run(run.id, failed).await.unwrap();
+
+        let live: i64 = sqlx::query_scalar(
+            "select count(*) from runs where issue_id = ? and status in ('queued', 'running')",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 0);
+        assert_eq!(engine.issue(issue).await.unwrap().status, "in_progress");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// The run limit stops every agent; allowing more runs resets the count
+    /// and starts the agent the workflow was waiting on.
+    #[tokio::test]
+    async fn allowing_more_runs_restarts_the_waiting_agent() {
+        let (directory, engine, workspace, developer) = fixture("run-cap").await;
+        let issue = task(&engine, workspace, 1).await;
+        let earlier = Utc::now() - Duration::seconds(30);
+        for _ in 0..hulahoop_core::RUNS_PER_ISSUE {
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,null,?,1,'main','prompt','/tmp','failed','model-x',?)")
+                .bind(Uuid::now_v7()).bind(issue).bind(developer).bind(earlier)
+                .execute(&engine.db.pool).await.unwrap();
+        }
+        let task_row = engine.issue(issue).await.unwrap();
+        assert_eq!(
+            engine.runs_since_cap(&task_row).await.unwrap(),
+            hulahoop_core::RUNS_PER_ISSUE
+        );
+        let refused = engine.start_run(issue, Some(developer), None).await;
+        assert!(refused.unwrap_err().to_string().contains("clearRunCap"));
+
+        let task_row = engine.clear_run_cap(issue).await.unwrap();
+        // The waiting agent started: its run is the first of the new round.
+        assert_eq!(engine.runs_since_cap(&task_row).await.unwrap(), 1);
+        let (status,): (String,) = sqlx::query_as(
+            "select status from runs where issue_id = ? order by created_at desc limit 1",
+        )
+        .bind(issue)
+        .fetch_one(&engine.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(status, "queued");
+
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     /// Repo-less runs need no preflight and take no repository slot: two

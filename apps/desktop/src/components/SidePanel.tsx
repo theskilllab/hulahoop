@@ -1,6 +1,17 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import Icon from "../Icon";
 
+/** Whether a press landed on its target's own scrollbar, outside its content box. */
+function onScrollbar(event: MouseEvent): boolean {
+  const target = event.target;
+  if (!(target instanceof Element)) return false;
+  if (target.scrollHeight <= target.clientHeight && target.scrollWidth <= target.clientWidth) return false;
+  const rect = target.getBoundingClientRect();
+  const x = event.clientX - rect.left - target.clientLeft;
+  const y = event.clientY - rect.top - target.clientTop;
+  return x >= target.clientWidth || y >= target.clientHeight || x < 0 || y < 0;
+}
+
 /**
  * A slide-over from the right edge of the work area: 80% wide, or the whole
  * area when maximized. It sits over the screen without a backdrop, so the list
@@ -10,6 +21,13 @@ import Icon from "../Icon";
  * view such as a transcript returns `true` to keep the panel), then a maximized
  * panel shrinks back, then the panel closes. Focus moves into the panel when it
  * opens and back to `returnFocus()` (or whatever had focus) when it closes.
+ *
+ * A click on the area the panel covers, outside the panel, puts it away the
+ * same way: a maximized panel shrinks back first, then the panel closes. Only
+ * a click that was pressed and released on the same element counts, and a
+ * press on a scrollbar never does. Closed this way, focus stays where the
+ * click put it. A click on another task (`[data-panel-opener]`) opens that
+ * task instead.
  *
  * The parent must be `position: relative`; the panel covers it.
  */
@@ -80,6 +98,37 @@ export default function SidePanel({
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  useEffect(() => {
+    // The element the primary button went down on, unless that was a scrollbar.
+    let pressed: EventTarget | null = null;
+    const onPointerDown = (event: PointerEvent) => {
+      pressed = event.button === 0 && !onScrollbar(event) ? event.target : null;
+    };
+    const onClick = (event: MouseEvent) => {
+      const start = pressed;
+      pressed = null;
+      if (event.button !== 0 || event.target !== start) return;
+      const panel = ref.current;
+      const target = event.target;
+      if (!panel || !(target instanceof Element) || panel.contains(target)) return;
+      // Only the area the panel slides over counts; the rail, the page bar and
+      // portalled menus are elsewhere in the document.
+      if (!panel.parentElement?.contains(target)) return;
+      // A task row beside the panel opens that task in its place.
+      if (target.closest("[data-panel-opener]")) return;
+      if (document.querySelector("dialog[open], .ctx-menu, .palette")) return;
+      // Anywhere else in the strip beside the panel is its backdrop: a click there
+      // closes the panel exactly like its close button.
+      escape.current.onClose();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("click", onClick);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("click", onClick);
+    };
+  }, []);
+
   return (
     <aside
       ref={ref}
@@ -102,7 +151,13 @@ export default function SidePanel({
         >
           <Icon name={maximized ? "shrink" : "expand"} size={14} />
         </button>
-        <button type="button" className="icon-btn" aria-label="Close (Esc)" title="Close (Esc)" onClick={onClose}>
+        <button
+          type="button"
+          className="icon-btn"
+          aria-label="Close (Esc)"
+          title="Close (Esc)"
+          onClick={onClose}
+        >
           <Icon name="close" size={14} />
         </button>
       </header>

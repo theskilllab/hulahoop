@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { addComment, gql, type Agent, type Comment, type Issue, type IssueStats, type Run } from "../api";
 import MarkdownView from "./MarkdownView";
 import MentionEditor, { type MentionCandidate } from "./MentionEditor";
@@ -51,6 +51,84 @@ function commentKind(comment: Comment): "agent" | "lumi" | "server" | "human" {
 
 const CHIP: Record<string, string | null> = { agent: "agent", lumi: "assistant", server: "server", human: null };
 
+/// A long comment shows its first lines; `.cm-clamp` in styles.css sets the
+/// same numbers (6 lines of 1.55) as its `max-height`.
+const CLAMP_LINES = 6;
+const CLAMP_LINE_HEIGHT = 1.55;
+
+/**
+ * A comment body cut to its first few lines, with a Show more / Show less
+ * toggle that appears only when the text is actually longer than that. It
+ * measures again whenever the column or the content changes size, including
+ * when MarkdownView swaps its root element. With `clamp` off (a pinned
+ * question) the whole text always shows.
+ */
+function ClampedMarkdown({ value, mentions, clamp = true }: { value: string; mentions: string[]; clamp?: boolean }) {
+  const box = useRef<HTMLDivElement>(null);
+  const id = useId();
+  const [open, setOpen] = useState(false);
+  const [overflows, setOverflows] = useState(false);
+
+  useLayoutEffect(() => {
+    const el = box.current;
+    if (!el || !clamp) {
+      setOverflows(false);
+      return;
+    }
+    const measure = () => {
+      const limit = parseFloat(getComputedStyle(el).fontSize) * CLAMP_LINE_HEIGHT * CLAMP_LINES;
+      setOverflows(el.scrollHeight > limit + 1);
+    };
+    // The box itself stops growing once clamped, so its content's root is
+    // watched too, and watched afresh whenever that root is replaced.
+    const resize = new ResizeObserver(measure);
+    let root: Element | null = null;
+    const attach = () => {
+      if (el.firstElementChild === root) return;
+      if (root) resize.unobserve(root);
+      root = el.firstElementChild;
+      if (root) resize.observe(root);
+      measure();
+    };
+    resize.observe(el);
+    attach();
+    measure();
+    const swaps = new MutationObserver(attach);
+    swaps.observe(el, { childList: true });
+    return () => {
+      resize.disconnect();
+      swaps.disconnect();
+    };
+  }, [value, clamp]);
+
+  const clamped = overflows && !open;
+  return (
+    <>
+      <div
+        ref={box}
+        id={id}
+        className={`cm-clamp${clamped ? " clamped" : ""}`}
+        // A link tabbed to in the hidden part opens the text, so keyboard
+        // focus never lands somewhere out of sight.
+        onFocus={clamped ? (event) => event.target.matches(":focus-visible") && setOpen(true) : undefined}
+      >
+        <MarkdownView className="cm-body" value={value} mentions={mentions} />
+      </div>
+      {overflows ? (
+        <button
+          type="button"
+          className="cm-more"
+          aria-expanded={open}
+          aria-controls={id}
+          onClick={() => setOpen((shown) => !shown)}
+        >
+          {open ? "Show less" : "Show more"}
+        </button>
+      ) : null}
+    </>
+  );
+}
+
 export function CommentItem({
   comment,
   mentions,
@@ -80,12 +158,12 @@ export function CommentItem({
           {comment.pinned ? <span className="chip warn">question</span> : null}
           <time className="dim">{fmtWhen(comment.createdAt)}</time>
           {comment.runId && onOpenRun ? (
-            <button type="button" className="link" onClick={() => onOpenRun(comment.runId as string)}>
-              View run
+            <button type="button" className="linkbtn" onClick={() => onOpenRun(comment.runId as string)}>
+              Open transcript
             </button>
           ) : null}
         </div>
-        <MarkdownView className="cm-body" value={comment.body} mentions={mentions} />
+        <ClampedMarkdown value={comment.body} mentions={mentions} clamp={!comment.pinned} />
       </div>
     </li>
   );
@@ -94,10 +172,13 @@ export function CommentItem({
 export function RunCard({
   run,
   agentName,
+  showSummary = true,
   onOpenTranscript,
 }: {
   run: Run;
   agentName: string;
+  /** Off when the agent posted the summary as its own comment, so it shows once. */
+  showSummary?: boolean;
   onOpenTranscript: (run: Run) => void;
 }) {
   const live = isLiveRun(run.status);
@@ -118,7 +199,7 @@ export function RunCard({
           <span className="dim">· run {run.attempt} · {fmtWhen(run.startedAt ?? run.createdAt)}</span>
           <RunStatusChip status={run.status} />
         </div>
-        {run.summary ? <MarkdownView className="run-sum" value={run.summary} /> : null}
+        {showSummary && run.summary ? <MarkdownView className="run-sum" value={run.summary} /> : null}
         {run.error && (run.status === "failed" || run.status === "timed_out") ? (
           <p className="run-why">
             {run.failureCategory ? <strong>{run.failureCategory.replace(/_/g, " ")}: </strong> : null}
@@ -245,6 +326,18 @@ export default function Activity({
     if (filter !== "comments") for (const run of issue.runs) list.push({ at: run.startedAt ?? run.createdAt ?? "", run });
     return list.sort((a, b) => b.at.localeCompare(a.at));
   }, [issue.comments, issue.runs, filter]);
+  // Runs whose summary the agent also posted as a comment: the comment carries
+  // the text (and its Open transcript link), the run card only the run. A
+  // pinned question or a server note from the run is not its summary.
+  const commented = useMemo(
+    () =>
+      new Set(
+        issue.comments.flatMap((comment) =>
+          comment.runId && comment.authorType === "agent" && !comment.pinned ? [comment.runId] : [],
+        ),
+      ),
+    [issue.comments],
+  );
 
   async function send() {
     const sent = draft;
@@ -310,6 +403,7 @@ export default function Activity({
                 key={`r-${entry.run.id}`}
                 run={entry.run}
                 agentName={agentName.get(entry.run.agentId) ?? "Agent"}
+                showSummary={filter === "runs" || !commented.has(entry.run.id)}
                 onOpenTranscript={onOpenTranscript}
               />
             ) : null,

@@ -153,8 +153,8 @@ fn rows_are_keyboard_operable_buttons() {
 fn task_status_uses_the_shared_status_dots() {
     let tsx = page();
     assert!(
-        tsx.contains("status-dot ${issue.status}"),
-        "task statuses must use the workflow status colours"
+        tsx.contains("<StatusIcon status={issue.status} />"),
+        "task statuses must use the shared status icons"
     );
 }
 

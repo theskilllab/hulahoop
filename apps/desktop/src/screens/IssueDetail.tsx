@@ -556,9 +556,32 @@ function Actions({ issue, busy, run }: { issue: Issue; busy: string | null; run:
   const live = issue.currentRun && isLiveRun(issue.currentRun.status) ? issue.currentRun : null;
   const verdict = issue.reviews[issue.reviews.length - 1];
   const disabled = busy !== null;
+  const limit = issue.runLimit ?? 0;
+  const capped = limit > 0 && (issue.runsSinceCap ?? 0) >= limit && !live;
 
   return (
     <div className="tpage-actions">
+      {capped ? (
+        <div className="tpage-form" role="status">
+          <p className="small">
+            This task has used <strong>{issue.runsSinceCap} of {limit} runs</strong>. No agent starts until you allow more.
+          </p>
+          <button
+            type="button"
+            className="primary"
+            disabled={disabled}
+            onClick={() =>
+              void run(
+                "runcap",
+                () => gql(`mutation ($id: UUID!) { clearRunCap(issueId: $id) { id status } }`, { id: issue.id }),
+                `Allowed ${limit} more runs`,
+              )
+            }
+          >
+            Allow {limit} more runs
+          </button>
+        </div>
+      ) : null}
       {issue.status === "backlog" ? (
         <button
           type="button"

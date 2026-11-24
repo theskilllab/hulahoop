@@ -1,6 +1,7 @@
 import { useState, type MouseEvent } from "react";
 import type { IssueStatus, IssueSummary } from "../api";
 import TaskCard, { TASK_DRAG_TYPE } from "./TaskCard";
+import { StatusIcon } from "./TaskBits";
 
 export type Column = { status: IssueStatus; title: string; owner: string };
 
@@ -85,7 +86,7 @@ export default function TaskBoard({
             }}
           >
             <h2 className="task-col-head" title={column.owner === "agent" ? "An agent works this column" : "A person works this column"}>
-              <i className={`status-dot ${column.status}`} aria-hidden="true" />
+              <StatusIcon status={column.status} />
               {column.title}
               <span className="n">{items.length}</span>
             </h2>

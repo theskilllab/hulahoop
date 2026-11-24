@@ -3074,7 +3074,7 @@ table.transitions td {
   overflow: auto;
   background: var(--bg);
   border: 1px solid var(--line);
-  border-radius: var(--r);
+  border-radius: var(--r-md);
   box-shadow: var(--shadow);
 }
 
@@ -3103,7 +3103,7 @@ table.transitions td {
    surface matches `.input`, so a prose field and a one-line field sit together. */
 .richtext {
   border: 1px solid var(--line);
-  border-radius: var(--r);
+  border-radius: var(--r-md);
   background: var(--bg);
   overflow: auto;
 }
@@ -3159,7 +3159,7 @@ table.transitions td {
 
 .richtext-prose pre {
   background: var(--bg-2);
-  border-radius: var(--r);
+  border-radius: var(--r-md);
   padding: var(--s3);
   overflow: auto;
 }
@@ -3826,7 +3826,7 @@ table.transitions td {
   gap: var(--s4);
 }
 
-.cost-filters, .cost-panel-head, .cost-actions, .cost-edit, .cost-legend,
+.cost-panel-head, .cost-actions, .cost-edit, .cost-legend,
 .cost-reasons, .cost-plans {
   display: flex;
   align-items: center;
@@ -3834,9 +3834,8 @@ table.transitions td {
   flex-wrap: wrap;
 }
 
-.cost-filters { font-size: var(--fs-xs); }
-.cost-filters label, .cost-edit label { display: grid; gap: var(--s1); color: var(--text-2); }
-.cost-filters select, .cost-edit select, .cost-edit input {
+.cost-edit label { display: grid; gap: var(--s1); color: var(--text-2); }
+.cost-edit select, .cost-edit input {
   min-width: 120px;
   height: var(--h-control);
   border: 1px solid var(--line);
@@ -3845,7 +3844,10 @@ table.transitions td {
   color: var(--text);
   padding: 0 var(--s2);
 }
-.cost-filters > .dim { margin-left: auto; }
+/* The report's filters sit in the page bar, sized like the prototype's. */
+.page-tools > .cost-period,
+.page-tools > .cost-agent { width: 150px; }
+.page-tools > .cost-model { width: 190px; }
 .cost-error { color: var(--bad); }
 .cost-section-heading { display: flex; align-items: baseline; gap: var(--s3); flex-wrap: wrap; }
 .cost-section-heading h2, .cost-panel h2 { font-size: var(--fs-md); margin: 0; }
@@ -3899,7 +3901,6 @@ table.transitions td {
 }
 @media (max-width: 600px) {
   .cost-kpis, .cost-budget { grid-template-columns: minmax(0, 1fr); }
-  .cost-filters > .dim { margin-left: 0; }
   .cost-panel-head { align-items: start; }
 }
 
@@ -3911,29 +3912,35 @@ table.transitions td {
 .row.end { justify-content: flex-end; }
 button.small-btn { height: var(--h-compact); padding: 0 var(--s2); font-size: var(--fs-xs); }
 button.link.danger-link { color: var(--bad); }
-.page-tools > select { height: var(--tb-h); min-height: var(--tb-h); padding-top: 0; padding-bottom: 0; }
+/* The prototype's `.bar .select`: a filled control with its own chevron. */
+.page-tools > select {
+  -webkit-appearance: none;
+  appearance: none;
+  height: var(--tb-h);
+  min-height: var(--tb-h);
+  padding: 0 26px 0 var(--s2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M2 3.5l3 3 3-3'/%3E%3C/svg%3E") no-repeat right 8px center;
+  font-size: var(--fs-sm);
+  text-overflow: ellipsis;
+}
 .page-tools > .primary kbd {
   font-family: var(--font-ui);
   font-size: var(--fs-2xs);
   opacity: 0.75;
 }
 
-/* Workflow status colours, shared by column heads, list rows and dots. */
-.status-dot {
-  --dot: var(--muted);
-  width: 8px;
-  height: 8px;
-  flex: none;
-  border-radius: 50%;
-  border: 1.5px solid var(--dot);
-  box-sizing: border-box;
-}
-.status-dot.todo { --dot: var(--text-2); }
-.status-dot.in_progress { --dot: var(--warn); background: linear-gradient(90deg, var(--dot) 50%, transparent 50%); }
-.status-dot.blocked { --dot: var(--bad); background: var(--dot); }
-.status-dot.in_review { --dot: var(--accent); background: linear-gradient(90deg, var(--dot) 50%, transparent 50%); }
-.status-dot.done { --dot: var(--ok); background: var(--dot); }
-.status-dot.cancelled { --dot: var(--muted); background: var(--bg-3); }
+/* Status glyphs (the prototype's `.sg`), shared by column heads, list rows
+   and milestone counts. Backlog and todo stay muted. */
+.sg { flex: none; color: var(--muted); vertical-align: -3px; }
+.sg.in_progress { color: var(--warn); }
+.sg.blocked { color: var(--bad); }
+.sg.in_review { color: var(--accent-text); }
+.sg.done { color: var(--ok); }
+/* The done check is drawn in the page colour; a CSS `var()` in an SVG
+   presentation attribute is unreliable in WKWebView, so it lives here. */
+.sg .sg-check { stroke: var(--bg); }
 
 /* Avatars: an initial in a circle. */
 .av {
@@ -3950,7 +3957,9 @@ button.link.danger-link { color: var(--bad); }
   line-height: 1;
 }
 .av.sm { width: 16px; height: 16px; font-size: 9px; }
-.av.agent { background: var(--accent-soft); color: var(--accent-text); }
+/* An agent is the prototype's `.av.bot`: the robot in a rounded square. */
+.av.agent { border-radius: var(--r-sm); background: var(--accent-soft); color: var(--accent-text); }
+.av.agent.sm { border-radius: var(--r-xs); }
 .av.lumi { background: color-mix(in srgb, var(--brand) 22%, var(--bg)); color: var(--text); }
 .av.server { background: var(--bg-2); color: var(--muted); }
 
@@ -4110,7 +4119,8 @@ button.link.danger-link { color: var(--bad); }
 .task-row[aria-current="true"] { background: var(--accent-soft); }
 .task-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .task-row > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.task-row-title { font-weight: 500; }
+.task-row-title { display: flex; align-items: center; gap: var(--s2); font-weight: 500; }
+.task-row-title .running-dot { flex: none; }
 .task-row-status,
 .task-row-prio,
 .task-row-who { display: flex; align-items: center; gap: 6px; color: var(--text-2); }
@@ -4172,7 +4182,7 @@ button.link.danger-link { color: var(--bad); }
   margin: 0 auto;
   align-items: start;
 }
-.tpage-main { display: grid; gap: var(--s5); max-width: 760px; min-width: 0; }
+.tpage-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s5); max-width: 760px; min-width: 0; }
 .tpage-side { position: sticky; top: 0; display: grid; gap: var(--s4); min-width: 0; }
 @container (max-width: 720px) {
   .tpage { grid-template-columns: minmax(0, 1fr); gap: var(--s4); }
@@ -4202,7 +4212,7 @@ button.link.danger-link { color: var(--bad); }
 .tpage-actions > button:not(.link) { width: 100%; justify-content: center; }
 .tpage-form { display: grid; gap: var(--s2); width: 100%; }
 
-.tsec { display: grid; gap: var(--s3); min-width: 0; }
+.tsec { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s3); min-width: 0; }
 .tsec-head { display: flex; align-items: center; justify-content: space-between; gap: var(--s2); flex-wrap: wrap; }
 .tsec-head h3 { margin: 0; font-size: var(--fs-sm); font-weight: 600; color: var(--text); }
 .tsec-tools { display: flex; align-items: center; gap: var(--s1); }
@@ -4328,13 +4338,40 @@ button.link.danger-link { color: var(--bad); }
 .blocked-q textarea { width: 100%; background: var(--bg); }
 
 /* Activity list */
-.act-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s4); }
-.act { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: var(--s2) var(--s3); align-items: start; }
-.act-main { display: grid; gap: var(--s1); min-width: 0; }
+/* Like the prototype's `.acts`: no boxes, each entry closed by a hairline.
+   Every grid here pins its column to `minmax(0, 1fr)`, so a long code line
+   scrolls inside its block and never widens the column. */
+.act-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); min-width: 0; }
+.act {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: var(--s2) var(--s3);
+  align-items: start;
+  min-width: 0;
+  padding: var(--s3) 0;
+  border-bottom: 0.5px solid var(--line);
+}
+.act-main { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s1); min-width: 0; }
 .act-head { display: flex; align-items: center; gap: var(--s2); flex-wrap: wrap; font-size: var(--fs-sm); }
 .act-head time { font-size: var(--fs-xs); }
-.act.pinned .act-main { padding: var(--s2); border-radius: var(--r-sm); background: var(--warn-soft); }
 .cm-body { font-size: var(--fs-md); }
+/* 6 lines of 1.55: keep in step with CLAMP_LINES / CLAMP_LINE_HEIGHT in Activity.tsx. */
+.cm-clamp { min-width: 0; font-size: var(--fs-md); line-height: 1.55; }
+.cm-clamp .cm-body { line-height: inherit; }
+.cm-clamp.clamped { max-height: calc(6 * 1.55em); overflow: hidden; }
+.cm-more {
+  justify-self: end;
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.cm-more:hover { background: none; text-decoration-thickness: 2px; }
 .act.cm-note {
   display: flex;
   align-items: baseline;
@@ -4344,19 +4381,14 @@ button.link.danger-link { color: var(--bad); }
   font-size: var(--fs-xs);
 }
 .act.cm-note .md { font-size: var(--fs-xs); color: var(--muted); }
-.run-card .act-main {
-  padding: var(--s3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg);
-}
-.run-card.live .act-main { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); }
 .run-sum { font-size: var(--fs-md); }
 .run-why { margin: 0; font-size: var(--fs-sm); }
 .run-meta { margin: 0; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* Read-only markdown: tighter than the editor surface. */
-.md.richtext-prose { min-width: 0; overflow-wrap: anywhere; }
+.md.richtext-prose { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.md.richtext-prose pre { max-width: 100%; overflow-x: auto; white-space: pre; overflow-wrap: normal; }
+.md.richtext-prose :not(pre) > code { overflow-wrap: anywhere; word-break: break-word; }
 .md.richtext-prose > :first-child { margin-top: 0; }
 .md.richtext-prose > :last-child { margin-bottom: 0; }
 .richtext-prose ul[data-type="taskList"] { list-style: none; padding-left: var(--s1); }
@@ -4371,8 +4403,12 @@ button.link.danger-link { color: var(--bad); }
 .richtext-prose td p { margin: 0; }
 
 /* --- transcript --- */
-.transcript { display: grid; gap: var(--s3); max-width: 860px; margin: 0 auto; }
+/* The prototype's 880px reading column. Grids pin their column to
+   `minmax(0, 1fr)` so a long line scrolls inside its own block. */
+.transcript { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s3); width: 100%; max-width: 880px; min-width: 0; margin: 0 auto; }
 .tx-head { display: flex; align-items: center; gap: var(--s3); flex-wrap: wrap; }
+.tx-back { font-size: var(--fs-sm); color: var(--text-2); }
+.tx-back:hover { background: none; color: var(--text); }
 .tx-head h2 { margin: 0; font-size: var(--fs-lg); }
 .tx-bar {
   position: sticky;
@@ -4385,7 +4421,8 @@ button.link.danger-link { color: var(--bad); }
   background: var(--bg);
   border-bottom: 1px solid var(--line);
 }
-.tx-list { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s2); }
+.tx-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--s2); min-width: 0; }
+.tx-list > li { min-width: 0; }
 .tx-prompt details,
 .tx-think details { border-radius: var(--r-md); }
 .tx-prompt details { padding: var(--s2) var(--s3); background: var(--accent-soft); }
@@ -4394,8 +4431,10 @@ button.link.danger-link { color: var(--bad); }
 .tx-prompt pre { margin: var(--s2) 0 0; white-space: pre-wrap; word-break: break-word; font: var(--fs-sm) / 1.5 var(--font-ui); }
 .tx-think p { margin: var(--s1) 0 0; color: var(--muted); font-style: italic; font-size: var(--fs-sm); white-space: pre-wrap; }
 .tx-text { font-size: var(--fs-md); }
+.tx-agent { display: grid; grid-template-columns: 22px minmax(0, 1fr); gap: var(--s3); align-items: start; }
+.tx-agent .av { margin-top: 1px; }
+.tx-note { margin: 0; font-size: var(--fs-md); text-align: left; }
 .tx-error { padding: var(--s2) var(--s3); border-radius: var(--r-sm); background: var(--bad-soft); color: var(--bad); font-size: var(--fs-sm); white-space: pre-wrap; }
-.tx-done { text-align: center; }
 .tx-tool { border: 1px solid var(--line); border-radius: var(--r-sm); background: var(--bg-2); }
 .tx-tool.bad { border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
 .tx-tool-head {
@@ -4488,42 +4527,53 @@ pre.tx-out {
 
 /* --- new task sheet --- */
 .new-task-dialog { width: min(600px, calc(100vw - 2 * var(--s4))); }
-.new-task-dialog.over { outline: 2px dashed var(--accent); outline-offset: -6px; }
-.new-task-text {
-  width: 100%;
-  min-height: 120px;
-  resize: vertical;
-  font: var(--fs-md) / 1.5 var(--font-ui);
+/* The text box is the prototype's `.nt-title`: no frame until hovered or
+   focused, and the drop target for files (`.nt.over`). */
+.new-task-text { margin: 0 calc(-1 * var(--s3)); border-radius: var(--r-md); }
+.new-task-text .richtext {
+  border: 1px solid transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+  transition: background var(--t-fast), border-color var(--t-fast), box-shadow var(--t-fast);
 }
-.new-task-preview { margin: 0; font-size: var(--fs-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.new-task-text .richtext .tiptap { padding: var(--s2) var(--s3); font-size: var(--fs-md); line-height: 1.55; }
+@media (hover: hover) { .new-task-text .richtext:hover:not(:focus-within) { background: var(--bg-2); } }
+.new-task-text .richtext:focus-within { outline: none; background: var(--bg-2); border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.new-task-text.over { box-shadow: inset 0 0 0 2px var(--accent); background: var(--accent-soft); }
+.new-task-text.over .richtext { background: transparent; }
+/* The keyboard's way to attach files: a quiet link tucked under the text box. */
+button.link.new-task-choose { justify-self: start; margin-top: calc(-1 * var(--s2)); font-size: var(--fs-xs); }
+.new-task-preview { margin: 0; font-size: var(--fs-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .new-task-files { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--s1); }
 .new-task-files li { display: flex; align-items: center; gap: var(--s2); font-size: var(--fs-sm); }
-.new-task-pills { display: flex; flex-wrap: wrap; gap: var(--s2); }
-.pill-field {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s1);
-  height: var(--h-control);
-  padding: 0 var(--s1) 0 var(--s3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-pill);
-  background: var(--bg-2);
-  font-size: var(--fs-sm);
-  color: var(--muted);
-}
-.pill-field select,
-.pill-field input {
-  height: 22px;
-  min-width: 0;
-  max-width: 180px;
-  border: 0;
-  background: transparent;
+/* The prototype's `.nt-pills`: on the right, wrapping leftwards. */
+.new-task-pills { display: flex; flex-wrap: wrap; gap: var(--s2); justify-content: flex-end; margin-left: auto; }
+.pill.nt-pill {
+  gap: 6px;
+  padding: 0 var(--s1) 0 10px;
   color: var(--text);
-  font-size: var(--fs-sm);
+  font-weight: 400;
+  cursor: default;
+  transition: background var(--t-fast);
 }
-.pill-field:focus-within { border-color: var(--accent); }
-.pill-field.file-pick { position: relative; padding-right: var(--s3); cursor: default; }
-.pill-field.file-pick input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+@media (hover: hover) { .pill.nt-pill:hover { background: var(--bg-2); } }
+.pill.nt-pill:focus-within { outline: 2px solid var(--accent); outline-offset: 2px; }
+.pill-ic { display: inline-flex; align-items: center; color: var(--text-2); }
+.pill-ic .av { width: 18px; height: 18px; }
+.pill.nt-pill select {
+  -webkit-appearance: none;
+  appearance: none;
+  height: calc(var(--h-control) - 2px);
+  max-width: 220px;
+  padding: 0 20px 0 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M2 3.5l3 3 3-3'/%3E%3C/svg%3E") no-repeat right 6px center;
+  color: var(--text);
+  font: inherit;
+  text-overflow: ellipsis;
+  outline: none;
+}
 .new-task-created { display: flex; flex-wrap: wrap; gap: var(--s1); margin-right: auto; }
 
 /* ---------- Milestones: a list beside the one you are reading ---------- */

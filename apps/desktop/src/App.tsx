@@ -658,6 +658,7 @@ export default function App() {
           workspaceId={workspace.id}
           projects={projects}
           agents={agents}
+          milestones={milestones}
           defaultProjectId={projectFilter === "all" ? null : projectFilter}
           onCreated={async (issue) => {
             await refresh();
