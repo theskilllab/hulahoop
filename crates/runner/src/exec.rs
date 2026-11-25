@@ -298,6 +298,10 @@ impl Executor {
 
         // Every adapter goes through the same spawn path, the fake one included:
         // a test that does not exercise the real plumbing proves nothing about it.
+        let system_prompt = format!(
+            "{system_prompt}{}",
+            adapter::repo_instructions(adapter, &checkout)
+        );
         let prompt_file = adapter::write_system_prompt(&artifact_dir, &system_prompt)?;
         let invocation = adapter::invocation(adapter, &model, &prompt_file, &message)?;
         // The base is resolved once, before the agent starts: from here on the
@@ -1738,23 +1742,44 @@ fn dev_shell_path(checkout: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// What a harness may keep in its home under `.pi/agent`: the login and Pi's
+/// model catalogue. Settings, packages, extensions, skills, prompts and MCP
+/// configuration are the user's own setup and stay on the host.
+const PI_HOME_KEEPS: [&str; 2] = ["auth.json", "models-store.json"];
+/// What a harness may keep under `.claude`: the login. Claude Code recreates
+/// its runtime state; settings, hooks, plugins, skills, agents, commands and
+/// `CLAUDE.md` stay on the host.
+const CLAUDE_HOME_KEEPS: [&str; 1] = [".credentials.json"];
+
 /// Refresh the host login in a scratch home before each invocation. Both CLIs
 /// store credentials under `$HOME`, and subscriptions can rotate their tokens.
+/// Everything else a harness would read from its home is cleared, so a run
+/// sees only what Hulahoop hands it, never the user's extensions or skills.
 fn seed_home(home: &Path) {
-    let real_home = match std::env::var_os("HOME") {
-        Some(home) => PathBuf::from(home),
-        None => return,
+    let real_home = std::env::var_os("HOME").map(PathBuf::from);
+    seed_home_from(home, real_home.as_deref());
+}
+
+/// [`seed_home`] with the host's home named, so a test can stand one in.
+fn seed_home_from(home: &Path, real_home: Option<&Path>) {
+    let pi_dst = home.join(".pi/agent");
+    let claude_dst = home.join(".claude");
+    keep_only(home, &pi_dst, &PI_HOME_KEEPS);
+    keep_only(home, &claude_dst, &CLAUDE_HOME_KEEPS);
+    // Claude Code keeps MCP servers and project trust in `~/.claude.json`.
+    for stray in [".claude.json", ".claude.json.backup"] {
+        if let Ok(path) = safe_home_path(home, stray) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    let Some(real_home) = real_home else {
+        return;
     };
     let pi_src = real_home.join(".pi/agent");
-    let pi_dst = home.join(".pi/agent");
     if pi_src.exists() {
-        let fresh = !pi_dst.exists();
         let _ = std::fs::create_dir_all(&pi_dst);
-        for name in ["auth.json", "models-store.json", "settings.json"] {
-            let from = pi_src.join(name);
-            if fresh || name == "auth.json" {
-                refresh_login(&from, &pi_dst.join(name), home);
-            }
+        for name in PI_HOME_KEEPS {
+            refresh_login(&pi_src.join(name), &pi_dst.join(name), home);
         }
     } else {
         let _ = std::fs::remove_file(pi_dst.join("auth.json"));
@@ -1772,18 +1797,55 @@ fn seed_home(home: &Path) {
             .output();
     }
     let claude_src = real_home.join(".claude");
-    let claude_dst = home.join(".claude");
     if claude_src.exists() {
-        let fresh = !claude_dst.exists();
         let _ = std::fs::create_dir_all(&claude_dst);
-        for name in [".credentials.json", "settings.json", ".claude.json"] {
-            let from = claude_src.join(name);
-            if fresh || name == ".credentials.json" {
-                refresh_login(&from, &claude_dst.join(name), home);
-            }
+        for name in CLAUDE_HOME_KEEPS {
+            refresh_login(&claude_src.join(name), &claude_dst.join(name), home);
         }
     } else {
         let _ = std::fs::remove_file(claude_dst.join(".credentials.json"));
+    }
+}
+
+/// Remove everything in `dir` but the named entries. A symlinked `dir` (an
+/// agent can plant one in its own home) is removed as a link, never followed.
+fn keep_only(home: &Path, dir: &Path, keep: &[&str]) {
+    let Ok(relative) = dir.strip_prefix(home) else {
+        return;
+    };
+    let Some(relative) = relative.to_str() else {
+        return;
+    };
+    // Walk down from the home: the first link found is removed as a link (its
+    // parents are real directories by then), and nothing below it is touched.
+    let mut walked = home.to_path_buf();
+    for part in Path::new(relative).components() {
+        walked.push(part);
+        match std::fs::symlink_metadata(&walked) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let _ = std::fs::remove_file(&walked);
+                return;
+            }
+            Ok(meta) if meta.is_dir() => {}
+            _ => return,
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&walked) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if keep.iter().any(|kept| name == std::ffi::OsStr::new(kept)) {
+            continue;
+        }
+        let path = entry.path();
+        let removed = match entry.file_type() {
+            Ok(kind) if kind.is_dir() => std::fs::remove_dir_all(&path),
+            _ => std::fs::remove_file(&path),
+        };
+        if let Err(error) = removed {
+            tracing::warn!(path = %path.display(), %error, "could not clear a harness home entry");
+        }
     }
 }
 
@@ -2815,7 +2877,7 @@ fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
 mod lumi_auth_tests {
     use super::{
         apply_credential, apply_credential_from, lumi_failure_category, read_home_file,
-        refresh_login, refreshed_login, remove_home_file, LoginFiles,
+        refresh_login, refreshed_login, remove_home_file, seed_home_from, LoginFiles,
     };
     use serde_json::json;
 
@@ -2893,6 +2955,69 @@ mod lumi_auth_tests {
             std::fs::read_to_string(home.join(".pi/agent/auth.json")).unwrap(),
             "refreshed-in-a-run"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A harness home holds the login and Pi's model catalogue, nothing of the
+    /// user's own setup — also when an earlier version copied it in, or an
+    /// agent planted a link to the host's directory.
+    #[test]
+    fn a_harness_home_keeps_only_the_login() {
+        let root = temp("clean-home");
+        let host = root.join("host");
+        let home = root.join("home");
+        for dir in [".pi/agent/npm", ".pi/agent/skills/x", ".claude/plugins"] {
+            std::fs::create_dir_all(host.join(dir)).unwrap();
+        }
+        for (file, text) in [
+            (".pi/agent/auth.json", "pi-login"),
+            (".pi/agent/models-store.json", "catalogue"),
+            (".pi/agent/settings.json", "{\"packages\":[\"npm:x\"]}"),
+            (".pi/agent/AGENTS.md", "personal"),
+            (".claude/.credentials.json", "claude-login"),
+            (".claude/settings.json", "{\"hooks\":{}}"),
+            (".claude/CLAUDE.md", "personal"),
+        ] {
+            std::fs::write(host.join(file), text).unwrap();
+        }
+        // What an earlier version (or the harness itself) left in the home.
+        std::fs::create_dir_all(home.join(".pi/agent/npm/node_modules")).unwrap();
+        std::fs::write(home.join(".pi/agent/settings.json"), "old").unwrap();
+        std::fs::create_dir_all(home.join(".claude/skills/y")).unwrap();
+        std::fs::write(home.join(".claude.json"), "{\"mcpServers\":{}}").unwrap();
+
+        seed_home_from(&home, Some(&host));
+        let names = |dir: &str| {
+            let mut names: Vec<String> = std::fs::read_dir(home.join(dir))
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(names(".pi/agent"), ["auth.json", "models-store.json"]);
+        assert_eq!(names(".claude"), [".credentials.json"]);
+        assert!(!home.join(".claude.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(home.join(".pi/agent/auth.json")).unwrap(),
+            "pi-login"
+        );
+
+        // A planted link to the host's `.pi` goes as a link; the host keeps
+        // everything it had.
+        #[cfg(unix)]
+        {
+            std::fs::remove_dir_all(home.join(".pi")).unwrap();
+            std::os::unix::fs::symlink(host.join(".pi"), home.join(".pi")).unwrap();
+            seed_home_from(&home, Some(&host));
+            assert!(host.join(".pi/agent/settings.json").exists());
+            assert!(host.join(".pi/agent/npm").exists());
+            assert!(!std::fs::symlink_metadata(home.join(".pi"))
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            assert_eq!(names(".pi/agent"), ["auth.json", "models-store.json"]);
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
