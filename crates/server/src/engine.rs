@@ -443,10 +443,15 @@ impl Engine {
         if issue_before.status_enum() == target {
             return Ok(issue_before);
         }
+        // A task that goes to Blocked remembers where it was, whoever moved it:
+        // answering the block is what sends it back there.
+        let status_before = (target == IssueStatus::Blocked)
+            .then(|| issue_before.status_enum().as_str().to_string());
         sqlx::query(
-            "update issues set status = ?, status_before_blocked = null, updated_at = ? where id = ?",
+            "update issues set status = ?, status_before_blocked = ?, updated_at = ? where id = ?",
         )
         .bind(target.as_str())
+        .bind(status_before)
         .bind(Utc::now().to_rfc3339())
         .bind(issue_id)
         .execute(&self.db.pool)
@@ -456,6 +461,21 @@ impl Engine {
         let issue = self.issue(issue_id).await?;
         self.retire_checkout_when_finished(&issue, issue_before.status_enum())
             .await;
+        // In review is where a person reads the work, and they read it on the
+        // pull request, whoever made the move: an agent's handover or a person.
+        if target == IssueStatus::InReview {
+            if let Err(error) = self.ensure_pull_request(&issue).await {
+                let _ = self
+                    .comment(
+                        issue_id,
+                        hulahoop_core::AuthorType::Server,
+                        None,
+                        &format!("the pull request could not be opened: {error}"),
+                        false,
+                    )
+                    .await;
+            }
+        }
         if let Err(error) = Box::pin(self.dispatch_if_agent_owns(&issue)).await {
             let _ = self
                 .comment(
@@ -1913,6 +1933,17 @@ impl Engine {
             }
             None => String::new(),
         };
+        // Where the answer sends the task is settled before anything is written:
+        // an answer that cannot move the task must not leave a comment behind.
+        let restored = hulahoop_core::resume_to(
+            issue
+                .status_before_blocked
+                .as_deref()
+                .and_then(IssueStatus::parse),
+        )
+        .ok_or_else(|| {
+            anyhow!("this task has no status to return to; move it where it should go instead")
+        })?;
         let body = if question.is_empty() {
             format!("Answer: {answer}")
         } else {
@@ -1929,13 +1960,6 @@ impl Engine {
         // The question stays pinned until a turn carries it: the pin is what puts
         // the pair in the next run's input, so it retires with the run that reads
         // it (`build_run_spec`), not with the answer that is only half of it.
-        let restored = hulahoop_core::resume_to(
-            issue
-                .status_before_blocked
-                .as_deref()
-                .and_then(IssueStatus::parse),
-        )
-        .ok_or_else(|| anyhow!("this issue has no status to return to"))?;
         sqlx::query("update issues set status = ?, status_before_blocked = null, updated_at = ? where id = ?")
             .bind(restored.as_str())
             .bind(crate::db::now_rfc3339())
@@ -2383,10 +2407,8 @@ impl Engine {
                 .execute(&self.db.pool)
                 .await?;
         }
-        let issue = self.move_to(issue_id, target).await?;
-        if issue.status_enum() == IssueStatus::InReview {
-            self.ensure_pull_request(&issue).await?;
-        }
+        // Moving into In review opens the pull request (`move_to`).
+        self.move_to(issue_id, target).await?;
         Ok(())
     }
 
@@ -4026,6 +4048,66 @@ mod checkout_lifecycle_tests {
         // While that push is pending, asking again queues nothing more.
         engine.ensure_pull_request(&task).await.unwrap();
         assert_eq!(jobs(&engine, "open_pr").await.len(), 2);
+    }
+
+    /// A person moving a task into In review gets the pull request an agent's
+    /// handover would have opened (HUL-5 sat in In review without one).
+    #[tokio::test]
+    async fn a_person_moving_a_task_into_review_opens_its_pull_request() {
+        let (engine, _project, _repo, issue) = task_in_review("pr-on-move").await;
+        sqlx::query("update runs set head_bookmark = 'issue/x/head/1' where issue_id = ?")
+            .bind(issue)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        engine
+            .move_to(issue, hulahoop_core::IssueStatus::Blocked)
+            .await
+            .unwrap();
+        assert!(jobs(&engine, "open_pr").await.is_empty());
+        engine
+            .move_to(issue, hulahoop_core::IssueStatus::InReview)
+            .await
+            .unwrap();
+        assert_eq!(jobs(&engine, "open_pr").await.len(), 1);
+    }
+
+    /// A block remembers where the task was, whoever moved it there, so an
+    /// answer sends it back. An answer that cannot move the task leaves no
+    /// comment behind.
+    #[tokio::test]
+    async fn an_answer_returns_a_blocked_task_to_where_it_was() {
+        let (engine, _project, _repo, issue) = task_in_review("answer-block").await;
+        let comments = |engine: &Engine| {
+            let pool = engine.db.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>("select count(*) from comments where issue_id = ?")
+                    .bind(issue)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let blocked = engine
+            .move_to(issue, hulahoop_core::IssueStatus::Blocked)
+            .await
+            .unwrap();
+        assert_eq!(blocked.status_before_blocked.as_deref(), Some("in_review"));
+        let answered = engine.resume_issue(issue, "looked at it").await.unwrap();
+        assert_eq!(answered.status, "in_review");
+
+        // A block from before the task remembered: refused, and nothing written.
+        sqlx::query(
+            "update issues set status = 'blocked', status_before_blocked = null where id = ?",
+        )
+        .bind(issue)
+        .execute(&engine.db.pool)
+        .await
+        .unwrap();
+        let before = comments(&engine).await;
+        assert!(engine.resume_issue(issue, "again").await.is_err());
+        assert_eq!(comments(&engine).await, before);
     }
 
     /// A merge without a pull request lands the head on the remote's base
