@@ -61,6 +61,17 @@ Your final message is the handover: the next agent, and the person reading the
 task, see it as the turn's summary. Say what you did and why, name the files, and
 quote the final result of `just test`.
 
+If you changed files, name the commit on its own line before the last one:
+
+```
+HULAHOOP_COMMIT: Refuse to unlink a repository that has run history
+```
+
+That line is the commit's title, so make it say what *this turn* changed: an
+imperative sentence of at most 72 characters, specific enough to tell this turn
+from the others on the task. Skip the task key, prefixes like `implement:` or
+`fix:`, and a trailing period. A turn that changed nothing leaves it out.
+
 Then print exactly one of these as the last line:
 
 ```
