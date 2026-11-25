@@ -59,7 +59,11 @@ check-ui:
       node scripts/check-ui-queries.mjs
 
 # What CI runs.
-ci: fmt-check lint test check-ui
+# Run the desktop app's component tests.
+test-ui:
+    pnpm --prefix apps/desktop test
+
+ci: fmt-check lint test test-ui check-ui
     pnpm --prefix apps/desktop build
 
 # Start the server and the runner against a scratch data directory.

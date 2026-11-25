@@ -4,6 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+#[derive(Clone)]
 pub struct Client {
     base: String,
     token: String,
@@ -59,6 +60,14 @@ impl Connection {
     }
 }
 
+/// What became of a live diff the server was sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveDiffSent {
+    Sent,
+    /// The server will not take a body this size; sending it again is no use.
+    TooLarge,
+}
+
 impl Client {
     pub fn new(connection: &Connection) -> Result<Self> {
         Ok(Client {
@@ -108,6 +117,24 @@ impl Client {
         )
         .await?;
         Ok(())
+    }
+
+    /// The working diff of a run in progress, sent whenever it changed.
+    pub async fn live_diff(&self, run_id: &str, patch: &str) -> Result<LiveDiffSent> {
+        let path = format!("/internal/runs/{run_id}/diff");
+        let response = self
+            .http
+            .post(format!("{}{}", self.base, path))
+            .bearer_auth(&self.token)
+            .json(&json!({ "patch": patch }))
+            .send()
+            .await
+            .with_context(|| format!("POST {path}"))?;
+        if response.status() == reqwest::StatusCode::PAYLOAD_TOO_LARGE {
+            return Ok(LiveDiffSent::TooLarge);
+        }
+        self.decode(&path, response).await?;
+        Ok(LiveDiffSent::Sent)
     }
 
     pub async fn event(&self, run_id: &str, kind: &str, payload: Value) -> Result<()> {

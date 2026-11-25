@@ -80,11 +80,30 @@ pub fn due_date(value: &str) -> Result<Option<String>> {
 
 pub struct Engine {
     pub db: Db,
+    /// The GitHub API base this server talks to. Read from the environment once,
+    /// and a field so a test can point one engine at its own fake GitHub without
+    /// racing other tests over a process-wide variable.
+    pub github_api: String,
+    /// The id of every run whose diff changed or that ended, for whoever is
+    /// watching a run live; they read the diff itself from disk.
+    pub(crate) diffs: tokio::sync::broadcast::Sender<Uuid>,
+    /// Wakes the pull request sync early, and names the repositories it should
+    /// look at when it does.
+    pub(crate) pull_sync: crate::pulls::SyncSignal,
+    /// Installation tokens and rate limits, kept between calls to GitHub.
+    pub(crate) github_cache: crate::pulls::GithubCache,
 }
 
 impl Engine {
     pub fn new(db: Db) -> Self {
-        Self { db }
+        let (diffs, _) = tokio::sync::broadcast::channel(256);
+        Self {
+            db,
+            github_api: hulahoop_core::github_api(),
+            diffs,
+            pull_sync: crate::pulls::SyncSignal::default(),
+            github_cache: crate::pulls::GithubCache::default(),
+        }
     }
 
     // ---------------------------------------------------------------- issues
@@ -567,6 +586,7 @@ impl Engine {
             .execute(&self.db.pool)
             .await?;
         persist_run_metrics(&self.db, &run, &usage, Some(&message)).await?;
+        self.publish_diff(run_id);
         self.comment(
             issue_id,
             hulahoop_core::AuthorType::Server,
@@ -725,13 +745,28 @@ impl Engine {
         Ok(id)
     }
 
+    /// A person sends the work back: what they asked for becomes a comment the
+    /// Developer reads, and the task returns to In progress so it is reworked.
+    /// The same path serves the task screen and a pull request review.
+    pub async fn request_changes(&self, issue_id: Uuid, body: &str) -> Result<Issue> {
+        self.comment(
+            issue_id,
+            hulahoop_core::AuthorType::Human,
+            None,
+            body,
+            false,
+        )
+        .await?;
+        self.transition(issue_id, IssueEvent::RequestChanges).await
+    }
+
     // ----------------------------------------------------------- connectors
 
     /// Every provider the screen offers, stored or not. "Available" and
     /// "connected" are two different answers, and only a complete list shows both.
     pub const ENTRIES: [crate::connectors::Entry; 4] = crate::connectors::ENTRIES;
 
-    fn vault(&self) -> Result<crate::vault::Vault> {
+    pub(crate) fn vault(&self) -> Result<crate::vault::Vault> {
         crate::vault::Vault::open(&self.db.data_dir)
     }
 
@@ -1133,7 +1168,7 @@ impl Engine {
 
     // ------------------------------------------------------------------ runs
 
-    async fn live_run_on_issue(&self, issue_id: Uuid) -> Result<Option<Run>> {
+    pub(crate) async fn live_run_on_issue(&self, issue_id: Uuid) -> Result<Option<Run>> {
         Ok(sqlx::query_as::<_, Run>(
             "select * from runs where issue_id = ? and status in ('queued','running') limit 1",
         )
@@ -1431,6 +1466,7 @@ impl Engine {
             .execute(&self.db.pool)
             .await?;
         persist_run_metrics(&self.db, &run, &usage, Some("cancelled by a human")).await?;
+        self.publish_diff(run_id);
         // Cancelling a run leaves the issue where it was: a misclick costs one
         // run, never the issue.
         self.transition(run.issue_id, IssueEvent::CancelRun)
@@ -1699,6 +1735,9 @@ impl Engine {
         .bind(run_id)
         .execute(&self.db.pool)
         .await?;
+        // Whoever watches the run live sees the diff it finished with, and
+        // learns from `live: false` that nothing more is coming.
+        self.publish_diff(run_id);
         let category_reason = if final_status == RunStatus::TimedOut {
             Some("timed out")
         } else {
@@ -2316,6 +2355,9 @@ impl Engine {
                     let issue = self.issue(issue_id).await?;
                     self.ensure_pull_request(&issue).await?;
                 }
+                // The pull request list should show the new or updated pull
+                // request without waiting for the next scheduled sync.
+                self.request_pull_sync(job.repo_id);
             }
             _ => {}
         }
@@ -2464,6 +2506,7 @@ impl Engine {
                 Some("the runner stopped heartbeating"),
             )
             .await?;
+            self.publish_diff(run.id);
         }
         Ok(dead)
     }

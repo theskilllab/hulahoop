@@ -4,6 +4,7 @@ import {
   loadArtifacts,
   loadDoneIssueCount,
   loadMilestones,
+  loadOpenPullRequestCount,
   loadRecentRuns,
   loadSkills,
   loadWorkflow,
@@ -38,7 +39,8 @@ import Lumi from "./screens/Lumi";
 import Settings from "./screens/Settings";
 import CreateWorkspace from "./screens/CreateWorkspace";
 import { Connectors } from "./screens/Connectors";
-import { Activity, Inbox, Projects, PullRequests } from "./screens/Misc";
+import { Activity, Inbox, Projects } from "./screens/Misc";
+import PullRequests from "./screens/PullRequests";
 import Cost from "./screens/Cost";
 
 type View =
@@ -95,6 +97,8 @@ export default function App() {
   /** Tasks shows only active work by default; done tasks stay on the server. */
   const [showDone, setShowDone] = useState(false);
   const [doneCount, setDoneCount] = useState(0);
+  /** Open pull requests in the server's GitHub cache: the sidebar's count. */
+  const [openPrs, setOpenPrs] = useState(0);
   const [creatingTask, setCreatingTask] = useState(false);
   /** The open task as its detail loaded it: found even when the list left it out. */
   const [openDetail, setOpenDetail] = useState<{ id: string; key: string; title: string } | null>(null);
@@ -118,6 +122,7 @@ export default function App() {
     setPalette(false);
     setSettingsTab(tab);
   }, []);
+  const openPersonalSettings = useCallback(() => openSettings("personal"), [openSettings]);
   const closeSettings = () => {
     setSettingsTab(null);
     requestAnimationFrame(() => {
@@ -149,7 +154,7 @@ export default function App() {
     const ticket = ++refreshTicket.current;
     refreshing.current = true;
     try {
-      const [nextIssues, nextDone, nextMilestones, nextArtifacts, nextWorkflow, nextSkills, nextRuns] =
+      const [nextIssues, nextDone, nextMilestones, nextArtifacts, nextWorkflow, nextSkills, nextRuns, nextPrs] =
         await Promise.all([
           loadWorkspaceIssues(workspace.id, includeDone),
           loadDoneIssueCount(workspace.id, projectFilter === "all" ? null : projectFilter),
@@ -158,6 +163,8 @@ export default function App() {
           loadWorkflow(workspace.id),
           loadSkills(workspace.id),
           loadRecentRuns(workspace.id, 150),
+          // Reads the server's cache, never GitHub; a count it cannot give keeps the last one.
+          loadOpenPullRequestCount().catch(() => null),
         ]);
       if (ticket !== refreshTicket.current) return;
       setIssues(nextIssues);
@@ -167,6 +174,7 @@ export default function App() {
       setWorkflow(nextWorkflow);
       setSkills(nextSkills);
       setRunners(nextRuns);
+      if (nextPrs !== null) setOpenPrs(nextPrs);
       setError(null);
     } catch (cause) {
       if (ticket === refreshTicket.current) setError(String(cause instanceof Error ? cause.message : cause));
@@ -174,6 +182,9 @@ export default function App() {
       if (ticket === refreshTicket.current) refreshing.current = false;
     }
   }, [workspace, includeDone, projectFilter]);
+  // Stable, so the pull request screen does not reload its list every time the app re-renders.
+  const refreshQuietly = useCallback(() => void refresh(), [refresh]);
+  const openConnectors = useCallback(() => setView({ name: "connectors" }), []);
 
   const load = useCallback(async (preferred?: string | null) => {
     const info = await connect();
@@ -340,7 +351,6 @@ export default function App() {
   const inboxCount = issues.filter((issue) => ["blocked", "in_review"].includes(issue.status)).length;
   const openTasks = issues.filter((issue) => !["done", "cancelled"].includes(issue.status)).length;
   const running = runners.filter((run) => run.status === "running").length;
-  const openPrs = issues.filter((issue) => issue.prUrl && issue.status !== "done").length;
 
   const items: { name: View["name"]; icon: string; label: string; count?: number; hot?: boolean }[] = [
     { name: "inbox", icon: "inbox", label: "Inbox", count: inboxCount, hot: true },
@@ -553,12 +563,17 @@ export default function App() {
           />
         )}
 
-        {view.name === "connectors" && <Connectors />}
+        {view.name === "connectors" && <Connectors onOpenSettings={openPersonalSettings} />}
 
         {view.name === "cost" && <Cost workspaceId={workspace.id} agents={agents} onOpen={(id) => setView({ name: "issue", id })} />}
 
         {view.name === "prs" && (
-          <PullRequests issues={issues} onOpen={(id) => setView({ name: "issue", id })} />
+          <PullRequests
+            onOpenTask={(id) => setView({ name: "issue", id })}
+            onOpenSettings={openPersonalSettings}
+            onOpenConnectors={openConnectors}
+            onChanged={refreshQuietly}
+          />
         )}
 
         {view.name === "activity" && (

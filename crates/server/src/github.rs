@@ -2,9 +2,11 @@
 //! question the connections list asks about a stored key — can it sign?
 //!
 //! A GitHub app authenticates as itself with a short-lived RS256 JWT signed by
-//! the app's private key; GitHub swaps that for an installation token. Nothing
-//! here talks to GitHub, so the loop mints and hands over the half it can prove
-//! it owns: the signature only verifies against this app's own public key.
+//! the app's private key; GitHub swaps that for an installation token.
+//!
+//! The pull request screen reads and writes as a person instead: [`Github`] is a
+//! small REST client bound to one token and one API base, so a test can point it
+//! at a fake GitHub on localhost.
 
 use anyhow::{anyhow, bail, Context, Result};
 use rsa::pkcs1::DecodeRsaPrivateKey;
@@ -15,6 +17,22 @@ use rsa::RsaPrivateKey;
 use sha2::Sha256;
 
 pub const PROVIDER: &str = "github";
+
+/// The GitHub API base URL this process talks to: `HULAHOOP_GITHUB_API` when
+/// set, GitHub itself otherwise.
+pub fn api_base() -> String {
+    hulahoop_core::github_api()
+}
+
+/// An HTTP client with deadlines. A GitHub call that hangs would otherwise hold a
+/// sync, a merge or a person's button press for as long as the socket stays open.
+pub fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default()
+}
 
 /// The stored app with its credentials decrypted for the moment they are used.
 /// It never leaves this module's callers: the screen sees `provider`, `app_id`,
@@ -88,7 +106,7 @@ pub fn mint_token(app_id: &str, private_key: &str) -> Result<String> {
 /// after collisions, and only the slug makes a commit show up as `<slug>[bot]`.
 pub async fn fetch_slug(http: &reqwest::Client, jwt: &str) -> Result<String> {
     let response = http
-        .get("https://api.github.com/app")
+        .get(format!("{}/app", api_base()))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
         .bearer_auth(jwt)
@@ -142,7 +160,7 @@ pub async fn list_repositories(http: &reqwest::Client, jwt: &str) -> Result<Vec<
         let token = installation_token_by_id(http, jwt, installation).await?;
         for page in 1..=20 {
             let response = http
-                .get("https://api.github.com/installation/repositories")
+                .get(format!("{}/installation/repositories", api_base()))
                 .query(&[("per_page", "100"), ("page", &page.to_string())])
                 .header("accept", "application/vnd.github+json")
                 .header("user-agent", "hulahoop")
@@ -196,7 +214,7 @@ pub async fn installation_ids(http: &reqwest::Client, jwt: &str) -> Result<Vec<i
     let mut ids = Vec::new();
     for page in 1..=10 {
         let response = http
-            .get("https://api.github.com/app/installations")
+            .get(format!("{}/app/installations", api_base()))
             .query(&[("per_page", "100"), ("page", &page.to_string())])
             .header("accept", "application/vnd.github+json")
             .header("user-agent", "hulahoop")
@@ -233,7 +251,8 @@ pub async fn installation_token_by_id(
 ) -> Result<String> {
     let response = http
         .post(format!(
-            "https://api.github.com/app/installations/{installation}/access_tokens"
+            "{}/app/installations/{installation}/access_tokens",
+            api_base()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -279,10 +298,21 @@ pub async fn installation_token(
     owner: &str,
     repo: &str,
 ) -> Result<String> {
+    installation_token_at(http, &api_base(), jwt, owner, repo).await
+}
+
+/// [`installation_token`] against an explicit API base, so a caller that was
+/// given its GitHub (the engine, a test) never falls back to the environment.
+pub async fn installation_token_at(
+    http: &reqwest::Client,
+    base: &str,
+    jwt: &str,
+    owner: &str,
+    repo: &str,
+) -> Result<String> {
+    let base = base.trim_end_matches('/');
     let response = http
-        .get(format!(
-            "https://api.github.com/repos/{owner}/{repo}/installation"
-        ))
+        .get(format!("{base}/repos/{owner}/{repo}/installation"))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
         .bearer_auth(jwt)
@@ -302,7 +332,7 @@ pub async fn installation_token(
         .context("the installation response carried no id")?;
     let response = http
         .post(format!(
-            "https://api.github.com/app/installations/{installation}/access_tokens"
+            "{base}/app/installations/{installation}/access_tokens"
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -415,7 +445,8 @@ pub async fn pull_request(
 ) -> Result<MergeState> {
     let response = http
         .get(format!(
-            "https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+            "{}/repos/{owner}/{repo}/pulls/{number}",
+            api_base()
         ))
         .header("accept", "application/vnd.github+json")
         .header("user-agent", "hulahoop")
@@ -440,4 +471,424 @@ pub async fn pull_request(
         merged_at: body["merged_at"].as_str().map(str::to_string),
         state: body["state"].as_str().unwrap_or("unknown").to_string(),
     })
+}
+
+/// A REST client bound to one token and one API base. Every call answers with
+/// GitHub's JSON, or with an error that carries GitHub's own reason, because the
+/// person pressing Merge needs to read why GitHub refused, not that it did.
+///
+/// The token never appears in an error: only the method, the path and GitHub's
+/// message do.
+#[derive(Clone)]
+pub struct Github {
+    http: reqwest::Client,
+    base: String,
+    token: String,
+}
+
+/// Why a call to GitHub failed, kept typed so callers can tell a pull request
+/// that is gone (404/410) from one GitHub would not show right now, and a rate
+/// limit from everything else. `Display` is the message a person reads.
+#[derive(Debug, Clone)]
+pub struct GithubError {
+    /// The HTTP status, or `None` when GitHub could not be reached at all.
+    pub status: Option<u16>,
+    pub message: String,
+    /// When GitHub said to stop asking: the moment the limit lifts.
+    pub rate_limited_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl std::fmt::Display for GithubError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for GithubError {}
+
+impl GithubError {
+    /// The typed error behind an `anyhow` chain, if GitHub produced it.
+    pub fn of(error: &anyhow::Error) -> Option<&GithubError> {
+        error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<GithubError>())
+    }
+
+    /// GitHub says the thing is not there (any more), as opposed to an outage,
+    /// a timeout or a rate limit.
+    pub fn is_gone(error: &anyhow::Error) -> bool {
+        matches!(Self::of(error).and_then(|e| e.status), Some(404 | 410))
+    }
+
+    /// GitHub would not show this to the caller: the token cannot see it.
+    pub fn is_denied(error: &anyhow::Error) -> bool {
+        matches!(
+            Self::of(error).and_then(|e| e.status),
+            Some(401 | 403 | 404)
+        ) && Self::rate_limit(error).is_none()
+    }
+
+    pub fn rate_limit(error: &anyhow::Error) -> Option<chrono::DateTime<chrono::Utc>> {
+        Self::of(error).and_then(|e| e.rate_limited_until)
+    }
+}
+
+/// When a refusal is a rate limit, the moment it lifts. GitHub signals a
+/// secondary limit with `retry-after` and a primary one with
+/// `x-ratelimit-remaining: 0` plus the reset time in epoch seconds.
+fn rate_limited_until(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if status != reqwest::StatusCode::FORBIDDEN && status != reqwest::StatusCode::TOO_MANY_REQUESTS
+    {
+        return None;
+    }
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    if let Some(seconds) = header("retry-after").and_then(|v| v.parse::<i64>().ok()) {
+        return Some(chrono::Utc::now() + chrono::Duration::seconds(seconds.max(1)));
+    }
+    if header("x-ratelimit-remaining") == Some("0") {
+        let reset = header("x-ratelimit-reset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0));
+        return Some(reset.unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::minutes(1)));
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Some(chrono::Utc::now() + chrono::Duration::minutes(1));
+    }
+    None
+}
+
+/// Pages of 100 are GitHub's ceiling; thirty of them is GitHub's own cap on the
+/// files of one pull request, so no listing here needs more.
+const PAGE_SIZE: usize = 100;
+const MAX_PAGES: usize = 30;
+
+impl Github {
+    pub fn new(base: &str, token: &str) -> Self {
+        Self {
+            http: http_client(),
+            base: base.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+        }
+    }
+
+    async fn send(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        query: &[(&str, String)],
+        body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        let mut request = self
+            .http
+            .request(method.clone(), format!("{}{path}", self.base))
+            .query(query)
+            .header("accept", "application/vnd.github+json")
+            .header("x-github-api-version", "2022-11-28")
+            .header("user-agent", "hulahoop")
+            .bearer_auth(&self.token);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let response = request.send().await.map_err(|error| {
+            anyhow!(GithubError {
+                status: None,
+                message: format!(
+                    "GitHub could not be reached ({method} {path}): {}",
+                    error.without_url()
+                ),
+                rate_limited_until: None,
+            })
+        })?;
+        let status = response.status();
+        let limited = rate_limited_until(status, response.headers());
+        let text = response.text().await.unwrap_or_default();
+        let value: serde_json::Value = if text.trim().is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null)
+        };
+        if !status.is_success() {
+            return Err(anyhow!(GithubError {
+                status: Some(status.as_u16()),
+                message: format!(
+                    "GitHub refused {method} {path} ({status}): {}",
+                    reason(&value)
+                ),
+                rate_limited_until: limited,
+            }));
+        }
+        Ok(value)
+    }
+
+    async fn get(&self, path: &str, query: &[(&str, String)]) -> Result<serde_json::Value> {
+        self.send(reqwest::Method::GET, path, query, None).await
+    }
+
+    /// Every page of a listing, up to GitHub's own cap. `key` names the array in
+    /// an envelope (`check_runs`); `None` means the response is the array.
+    async fn list(
+        &self,
+        path: &str,
+        query: &[(&str, String)],
+        key: Option<&str>,
+        max_pages: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut out = Vec::new();
+        for page in 1..=max_pages {
+            let mut paged = query.to_vec();
+            paged.push(("per_page", PAGE_SIZE.to_string()));
+            paged.push(("page", page.to_string()));
+            let body = self.get(path, &paged).await?;
+            let batch = match key {
+                Some(key) => body[key].as_array().cloned().unwrap_or_default(),
+                None => body.as_array().cloned().unwrap_or_default(),
+            };
+            let count = batch.len();
+            out.extend(batch);
+            if count < PAGE_SIZE {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Who the token belongs to.
+    pub async fn user(&self) -> Result<serde_json::Value> {
+        self.get("/user", &[]).await
+    }
+
+    /// The repository as this token sees it: `permissions` says what the person
+    /// may do, `allow_*_merge` which merge methods the repository accepts.
+    pub async fn repo(&self, owner: &str, repo: &str) -> Result<serde_json::Value> {
+        self.get(&format!("/repos/{owner}/{repo}"), &[]).await
+    }
+
+    /// One page of pull requests, newest update first.
+    pub async fn pulls_page(
+        &self,
+        owner: &str,
+        repo: &str,
+        state: &str,
+        page: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let body = self
+            .get(
+                &format!("/repos/{owner}/{repo}/pulls"),
+                &[
+                    ("state", state.to_string()),
+                    ("sort", "updated".to_string()),
+                    ("direction", "desc".to_string()),
+                    ("per_page", PAGE_SIZE.to_string()),
+                    ("page", page.to_string()),
+                ],
+            )
+            .await?;
+        Ok(body.as_array().cloned().unwrap_or_default())
+    }
+
+    /// Every open pull request, however many pages that takes (up to the cap).
+    pub async fn open_pulls(&self, owner: &str, repo: &str) -> Result<Vec<serde_json::Value>> {
+        self.list(
+            &format!("/repos/{owner}/{repo}/pulls"),
+            &[
+                ("state", "open".to_string()),
+                ("sort", "updated".to_string()),
+                ("direction", "desc".to_string()),
+            ],
+            None,
+            MAX_PAGES,
+        )
+        .await
+    }
+
+    /// Whether the token may list pull requests at all. A fine-grained token can
+    /// see a repository and still have no access to its pull requests, so this is
+    /// asked separately, with the smallest page GitHub serves.
+    pub async fn can_list_pulls(&self, owner: &str, repo: &str) -> Result<()> {
+        self.get(
+            &format!("/repos/{owner}/{repo}/pulls"),
+            &[("per_page", "1".to_string())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn pull(&self, owner: &str, repo: &str, number: i64) -> Result<serde_json::Value> {
+        self.get(&format!("/repos/{owner}/{repo}/pulls/{number}"), &[])
+            .await
+    }
+
+    /// The changed files with their unified hunks. GitHub leaves `patch` out for
+    /// binary files and very large ones.
+    pub async fn pull_files(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.list(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/files"),
+            &[],
+            None,
+            MAX_PAGES,
+        )
+        .await
+    }
+
+    /// Submitted reviews, oldest first.
+    pub async fn reviews(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.list(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/reviews"),
+            &[],
+            None,
+            10,
+        )
+        .await
+    }
+
+    /// Line comments on the diff, oldest first.
+    pub async fn review_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.list(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/comments"),
+            &[],
+            None,
+            10,
+        )
+        .await
+    }
+
+    /// The people still asked to review: `{ users: [...], teams: [...] }`.
+    pub async fn requested_reviewers(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<serde_json::Value> {
+        self.get(
+            &format!("/repos/{owner}/{repo}/pulls/{number}/requested_reviewers"),
+            &[],
+        )
+        .await
+    }
+
+    /// The check runs reported against a commit.
+    pub async fn check_runs(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        self.list(
+            &format!("/repos/{owner}/{repo}/commits/{sha}/check-runs"),
+            &[],
+            Some("check_runs"),
+            5,
+        )
+        .await
+    }
+
+    /// The older commit-status API, folded into one state by GitHub. A commit
+    /// nobody reported on answers `pending` with no statuses at all.
+    pub async fn combined_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<serde_json::Value> {
+        self.get(
+            &format!("/repos/{owner}/{repo}/commits/{sha}/status"),
+            &[("per_page", PAGE_SIZE.to_string())],
+        )
+        .await
+    }
+
+    /// Submits a review with its line comments in one call, so GitHub shows
+    /// them together and nothing is half-sent.
+    pub async fn create_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        event: &str,
+        body: Option<&str>,
+        comments: &[serde_json::Value],
+    ) -> Result<serde_json::Value> {
+        let mut payload = serde_json::json!({ "event": event, "comments": comments });
+        if let Some(body) = body.filter(|b| !b.trim().is_empty()) {
+            payload["body"] = serde_json::Value::String(body.to_string());
+        }
+        self.send(
+            reqwest::Method::POST,
+            &format!("/repos/{owner}/{repo}/pulls/{number}/reviews"),
+            &[],
+            Some(&payload),
+        )
+        .await
+    }
+
+    /// Merges on GitHub. `method` is `merge`, `squash` or `rebase`. `sha` pins
+    /// the merge to the head the person reviewed: GitHub answers 409 instead of
+    /// merging commits pushed after they looked.
+    pub async fn merge(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        method: &str,
+        sha: &str,
+    ) -> Result<serde_json::Value> {
+        self.send(
+            reqwest::Method::PUT,
+            &format!("/repos/{owner}/{repo}/pulls/{number}/merge"),
+            &[],
+            Some(&serde_json::json!({ "merge_method": method, "sha": sha })),
+        )
+        .await
+    }
+}
+
+/// GitHub's reason for a refusal: its `message`, plus the detail of each entry
+/// in `errors` when it gave any.
+fn reason(body: &serde_json::Value) -> String {
+    let message = body["message"]
+        .as_str()
+        .unwrap_or("no reason given")
+        .to_string();
+    let details: Vec<String> = body["errors"]
+        .as_array()
+        .map(|errors| {
+            errors
+                .iter()
+                .filter_map(|error| {
+                    error
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| error["message"].as_str().map(str::to_string))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if details.is_empty() {
+        message
+    } else {
+        format!("{message}: {}", details.join("; "))
+    }
 }

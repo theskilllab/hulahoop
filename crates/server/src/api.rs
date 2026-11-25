@@ -62,7 +62,7 @@ async fn clone_token(engine: &Engine, repo: &Repo) -> Option<String> {
         .ok()
         .flatten()?;
     let jwt = crate::github::mint_token(&app.app_id, &app.private_key).ok()?;
-    crate::github::installation_token(&reqwest::Client::new(), &jwt, &owner, &name)
+    crate::github::installation_token(&crate::github::http_client(), &jwt, &owner, &name)
         .await
         .ok()
 }
@@ -73,6 +73,14 @@ pub fn router(state: Arc<ApiState>) -> Router {
         .route("/internal/runs/{id}/spec", axum::routing::get(get_spec))
         .route("/internal/runs/{id}/heartbeat", post(heartbeat))
         .route("/internal/runs/{id}/events", post(append_event))
+        // A live diff is capped by the runner at a byte limit; the body limit is
+        // said here so the two cannot drift apart into a silent 413.
+        .route(
+            "/internal/runs/{id}/diff",
+            post(live_diff).layer(axum::extract::DefaultBodyLimit::max(
+                hulahoop_core::LIVE_DIFF_BODY_LIMIT,
+            )),
+        )
         .route("/internal/runs/{id}/complete", post(complete_run))
         .route("/internal/jobs/claim", post(claim_job))
         .route("/internal/jobs/{id}/complete", post(complete_job))
@@ -92,19 +100,26 @@ fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), StatusCode> {
         .unwrap_or_default();
     // Constant-time compare: the token is the only thing between a run and the
     // ability to claim arbitrary work.
-    let expected = state.token.as_bytes();
+    if same_token(&state.token, provided) {
+        Ok(())
+    } else {
+        Err(StatusCode::UNAUTHORIZED)
+    }
+}
+
+/// Compares a presented token with the server's in constant time, so how long
+/// a wrong guess takes says nothing about how close it was. Shared by the
+/// runner API and the GraphQL WebSocket's `connection_init`.
+pub(crate) fn same_token(expected: &str, provided: &str) -> bool {
+    let expected = expected.as_bytes();
     let provided = provided.as_bytes();
-    let mut diff = (expected.len() ^ provided.len()) as u8;
+    let mut diff = u8::from(expected.len() != provided.len());
     for index in 0..expected.len().max(provided.len()) {
         let a = *expected.get(index).unwrap_or(&0);
         let b = *provided.get(index).unwrap_or(&0);
         diff |= a ^ b;
     }
-    if diff == 0 {
-        Ok(())
-    } else {
-        Err(StatusCode::UNAUTHORIZED)
-    }
+    diff == 0
 }
 
 type ApiResult<T> = Result<Json<T>, (StatusCode, Json<Value>)>;
@@ -189,6 +204,28 @@ async fn heartbeat(
     state
         .engine
         .heartbeat(id, body.pid, body.pgid)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LiveDiffRequest {
+    patch: String,
+}
+
+/// The working diff of a run in progress, reported by the runner whenever it
+/// changed. Kept beside the run's artifacts and passed on to watchers.
+async fn live_diff(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<LiveDiffRequest>,
+) -> ApiResult<Value> {
+    authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
+    state
+        .engine
+        .record_live_diff(id, &body.patch)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(json!({ "ok": true })))

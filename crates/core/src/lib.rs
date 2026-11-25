@@ -31,6 +31,65 @@ pub const DIFF_LINE_LIMIT: i64 = 2000;
 pub const LOG_ROTATE_BYTES: u64 = 50 * 1024 * 1024;
 pub const GRAPHQL_TIMEOUT_SECS: i64 = 30;
 pub const SQLITE_BUSY_TIMEOUT_MS: i64 = 5000;
+/// How often a runner recomputes the working diff of a live run, so a person
+/// watching it sees the work move without the runner diffing on every line.
+pub const LIVE_DIFF_INTERVAL_SECS: u64 = 10;
+/// How long one live diff may take before that tick is given up.
+pub const LIVE_DIFF_TIMEOUT_SECS: u64 = 20;
+
+/// Where GitHub's REST API lives. Both the server and the runner talk to it, and
+/// a test points both at a local fake through `HULAHOOP_GITHUB_API` instead.
+pub const GITHUB_API_ENV: &str = "HULAHOOP_GITHUB_API";
+pub const DEFAULT_GITHUB_API: &str = "https://api.github.com";
+
+/// The GitHub API base URL, without a trailing slash: the environment's choice
+/// when it names one, otherwise GitHub itself.
+pub fn github_api() -> String {
+    std::env::var(GITHUB_API_ENV)
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| DEFAULT_GITHUB_API.to_string())
+}
+
+/// The largest live diff a runner sends. The final diff is the whole one; this
+/// only keeps a run that rewrote a lockfile from posting megabytes every tick.
+pub const LIVE_DIFF_BYTE_LIMIT: usize = 1024 * 1024;
+
+/// The largest request body the server takes for a live diff: the cap above,
+/// with room for the JSON escaping a patch picks up on the way.
+pub const LIVE_DIFF_BODY_LIMIT: usize = 4 * LIVE_DIFF_BYTE_LIMIT;
+
+/// A patch cut to at most `limit` bytes at a `diff --git` file boundary, so
+/// what is shown is whole files and never half a hunk. A first file larger
+/// than the limit on its own is cut at the last line that fits.
+pub fn cap_patch(patch: &str, limit: usize) -> String {
+    if patch.len() <= limit {
+        return patch.to_string();
+    }
+    const FILE: &str = "\ndiff --git ";
+    let window = &patch[..floor_char_boundary(patch, limit + FILE.len())];
+    let boundary = window
+        .match_indices(FILE)
+        .map(|(index, _)| index + 1)
+        .filter(|end| *end <= limit)
+        .last();
+    match boundary {
+        Some(end) => patch[..end].to_string(),
+        None => match patch[..floor_char_boundary(patch, limit)].rfind('\n') {
+            Some(index) => patch[..=index].to_string(),
+            None => String::new(),
+        },
+    }
+}
+
+fn floor_char_boundary(text: &str, mut index: usize) -> usize {
+    index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
+}
 
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $s:literal),+ $(,)? }) => {
@@ -304,6 +363,22 @@ mod tests {
     use super::*;
     use IssueEvent as E;
     use IssueStatus as S;
+
+    #[test]
+    fn a_patch_is_capped_at_a_file_boundary() {
+        let one = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n";
+        let two = "diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -1 +1 @@\n-c\n+d\n";
+        let patch = format!("{one}{two}");
+        assert_eq!(cap_patch(&patch, patch.len()), patch);
+        // Anything short of both files is the first file, whole.
+        assert_eq!(cap_patch(&patch, patch.len() - 1), one);
+        assert_eq!(cap_patch(&patch, one.len()), one);
+        // A first file too big on its own is cut at a line.
+        assert_eq!(cap_patch(one, 20), "diff --git a/a b/a\n");
+        assert_eq!(cap_patch(one, 3), "");
+        // Never inside a character.
+        assert_eq!(cap_patch("é\né\n", 4), "é\n");
+    }
 
     #[test]
     fn the_team_only_works_forward() {

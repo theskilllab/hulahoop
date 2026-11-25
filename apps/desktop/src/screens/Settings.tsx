@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  clearGithubToken,
+  loadGithubAccount,
   loadModels,
+  setGithubToken,
   setWorkspaceLumi,
   updateWorkspace,
+  type GithubAccount,
   type ModelOption,
   type Workspace,
 } from "../api";
+import { Avatar, fmtWhen } from "../components/TaskBits";
 import { applyTheme, resolvedTheme, savedPalette, THEME_GROUPS, THEMES } from "../theme";
 
 type Tab = "personal" | "workspace";
@@ -55,6 +60,133 @@ function Themes() {
         ))}
       </div>
       <p className="dim small">Saved on this Mac. Match system follows your appearance setting.</p>
+    </div>
+  );
+}
+
+/** Where the person's own GitHub token goes: reviews and merges are theirs, not the App's. */
+export function GithubAccountBlock() {
+  // undefined while loading; null when there is no token.
+  const [account, setAccount] = useState<GithubAccount | null | undefined>(undefined);
+  const [replacing, setReplacing] = useState(false);
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  // Could not ask the server: the account stays unknown, which is not the same as no token.
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [attempt, setAttempt] = useState(0);
+  const [confirming, setConfirming] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    setLoadError(null);
+    loadGithubAccount()
+      .then((found) => { if (live) setAccount(found); })
+      .catch((cause) => {
+        if (!live) return;
+        setLoadError(String(cause instanceof Error ? cause.message : cause));
+      });
+    return () => { live = false; };
+  }, [attempt]);
+
+  async function save() {
+    if (!token.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      setAccount(await setGithubToken(token.trim()));
+      setToken("");
+      setReplacing(false);
+    } catch (cause) {
+      setError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    setBusy(true);
+    setError(null);
+    try {
+      await clearGithubToken();
+      setAccount(null);
+      setReplacing(false);
+      setConfirming(false);
+    } catch (cause) {
+      setError(String(cause instanceof Error ? cause.message : cause));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const form = account === null || replacing;
+
+  return (
+    <div className="settings-block gh-account">
+      <span className="field-label">GitHub account</span>
+      {account === undefined ? (
+        loadError ? (
+          <div className="row">
+            <p className="error fill" role="alert">Could not check your GitHub account: {loadError}</p>
+            <button type="button" className="secondary" onClick={() => setAttempt((count) => count + 1)}>Retry</button>
+          </div>
+        ) : (
+          <p className="dim small">Checking…</p>
+        )
+      ) : account && !replacing ? (
+        <>
+          <div className="row gh-who">
+            {account.avatarUrl ? <img className="gh-avatar" src={account.avatarUrl} alt="" /> : <Avatar name={account.login} />}
+            <span className="stack fill">
+              <strong>{account.name ?? account.login}</strong>
+              <span className="dim small">
+                @{account.login} · <span className="mono">{account.tokenHint}</span> · checked {fmtWhen(account.validatedAt)}
+              </span>
+            </span>
+          </div>
+          {account.problems.length > 0 ? (
+            <ul className="gh-problems" aria-label="What the token cannot do">
+              {account.problems.map((problem) => <li key={problem}>{problem}</li>)}
+            </ul>
+          ) : null}
+          {confirming ? (
+            <div className="row" role="group" aria-label="Remove the token">
+              <span className="small fill">Remove the token? Reviews and merges stop going to GitHub as you.</span>
+              <button type="button" className="danger" disabled={busy} onClick={() => void remove()}>{busy ? "Removing…" : "Remove token"}</button>
+              <button type="button" className="ghost" disabled={busy} onClick={() => setConfirming(false)}>Keep</button>
+            </div>
+          ) : (
+            <div className="row">
+              <button type="button" className="secondary" disabled={busy} onClick={() => { setReplacing(true); setError(null); }}>Replace</button>
+              <button type="button" className="danger" disabled={busy} onClick={() => setConfirming(true)}>Remove</button>
+            </div>
+          )}
+        </>
+      ) : null}
+      {form ? (
+        <form className="row gh-token" onSubmit={(event) => { event.preventDefault(); void save(); }}>
+          <label className="field fill">
+            <span className="field-label">Personal access token</span>
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="github_pat_…"
+              value={token}
+              onChange={(event) => setToken(event.target.value)}
+            />
+          </label>
+          <button type="submit" className="secondary" disabled={busy || !token.trim()}>{busy ? "Checking…" : "Save"}</button>
+          {replacing ? <button type="button" className="ghost" disabled={busy} onClick={() => { setReplacing(false); setToken(""); setError(null); }}>Cancel</button> : null}
+        </form>
+      ) : null}
+      {error ? <p className="error" role="alert">{error}</p> : null}
+      <p className="dim small">
+        {account && !replacing
+          ? "Reviews, line comments and merges go to GitHub as you."
+          : "Used to review, comment on and merge pull requests as you. Without it, line comments stay in Hulahoop."}{" "}
+        A fine-grained token needs Pull requests (read and write), Contents (read and write, to merge), and Checks and Commit statuses (read) on your repositories; a classic token needs <span className="mono">repo</span>. It is stored sealed on the server.
+      </p>
     </div>
   );
 }
@@ -151,7 +283,12 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
         </div>
       </div>
       <div id="settings-panel" className="settings-content" role="tabpanel" aria-labelledby={tab === "personal" ? "settings-personal-tab" : "settings-workspace-tab"}>
-        {tab === "personal" ? <Themes /> : (
+        {tab === "personal" ? (
+          <>
+            <GithubAccountBlock />
+            <Themes />
+          </>
+        ) : (
           <>
             <div className="settings-block">
               <strong>Workspace</strong>

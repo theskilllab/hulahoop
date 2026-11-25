@@ -27,7 +27,7 @@ impl Engine {
                 )
             })?;
         let jwt = crate::github::mint_token(&app.app_id, &app.private_key)?;
-        crate::github::list_repositories(&reqwest::Client::new(), &jwt).await
+        crate::github::list_repositories(&crate::github::http_client(), &jwt).await
     }
 
     // ---- workspaces ----------------------------------------------------------
@@ -668,7 +668,7 @@ impl Engine {
                 anyhow::anyhow!("no usable GitHub app is stored, so the merge cannot be read back")
             })?;
         let jwt = crate::github::mint_token(&app.app_id, &app.private_key)?;
-        let http = reqwest::Client::new();
+        let http = crate::github::http_client();
         let token = crate::github::installation_token(&http, &jwt, &owner, &name).await?;
         let state = crate::github::pull_request(&http, &token, &owner, &name, number).await?;
 
@@ -681,24 +681,33 @@ impl Engine {
         let merge_revision = state.merge_commit_sha.ok_or_else(|| {
             anyhow::anyhow!("github reports #{number} merged but names no revision")
         })?;
+        self.record_github_merge(issue_id, repo_id, &merge_revision, state.merged_at)
+            .await
+    }
 
+    /// Records a merge GitHub made: the revision it produced becomes the task's
+    /// merge and the repository's base, the task says so, closes, and the mirror
+    /// fetches. Shared by the Merge button on a task, which reads a merge back
+    /// from GitHub, and the one on a pull request, which made it.
+    pub(crate) async fn record_github_merge(
+        &self,
+        issue_id: uuid::Uuid,
+        repo_id: uuid::Uuid,
+        merge_revision: &str,
+        merged_at: Option<String>,
+    ) -> anyhow::Result<crate::model::Issue> {
         sqlx::query(
             "update issues set merge_revision = ?, merged_at = ?, updated_at = ? where id = ?",
         )
-        .bind(&merge_revision)
-        .bind(
-            state
-                .merged_at
-                .clone()
-                .unwrap_or_else(crate::db::now_rfc3339),
-        )
+        .bind(merge_revision)
+        .bind(merged_at.unwrap_or_else(crate::db::now_rfc3339))
         .bind(crate::db::now_rfc3339())
         .bind(issue_id)
         .execute(&self.db.pool)
         .await?;
         sqlx::query("update repos set base_revision = ? where id = ?")
-            .bind(&merge_revision)
-            .bind(issue.repo_id)
+            .bind(merge_revision)
+            .bind(repo_id)
             .execute(&self.db.pool)
             .await?;
         self.comment(
