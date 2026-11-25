@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent } from "react";
 import {
   addPullRequestComment,
+  deletePullRequestBranch,
   deletePullRequestComment,
   loadConnections,
   loadGithubAccount,
@@ -401,7 +402,7 @@ function PullRequestPane({
   // The run being watched, kept after the list stops naming it so "Run finished" and the final diff still show.
   const [watchRun, setWatchRun] = useState<string | null>(null);
   const [feedback, setFeedback] = useState(false);
-  const [busy, setBusy] = useState<"approve" | "changes" | "merge" | null>(null);
+  const [busy, setBusy] = useState<"approve" | "changes" | "merge" | "branch" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [method, setMethod] = useState<MergeMethod | null>(null);
   // Only the newest load may land: an older one would bring back comments a review already sent.
@@ -490,6 +491,26 @@ function PullRequestPane({
     }
   }
 
+  async function deleteBranch() {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setBusy("branch");
+    setActionError(null);
+    try {
+      const next = await deletePullRequestBranch(pr.repoId, pr.number);
+      loadTicket.current += 1;
+      setDetail(next);
+      setLoadError(null);
+      showToast(`Deleted branch ${pr.headRef}`);
+      onChanged(next.pullRequest);
+    } catch (cause) {
+      setActionError(reason(cause));
+    } finally {
+      inFlight.current = false;
+      setBusy(null);
+    }
+  }
+
   const { repoId, number } = pr;
   const addComment = useCallback(
     async (anchor: CommentAnchor, body: string) => {
@@ -541,6 +562,17 @@ function PullRequestPane({
           <a className="btn" href={pr.url} target="_blank" rel="noreferrer">
             Open on GitHub
           </a>
+          {pr.merged && detail?.canDeleteBranch ? (
+            <button
+              type="button"
+              className="link pr-delete-branch"
+              disabled={busy !== null}
+              title={`Delete ${pr.headRef} on GitHub`}
+              onClick={() => void deleteBranch()}
+            >
+              {busy === "branch" ? "Deleting branch…" : "Delete branch"}
+            </button>
+          ) : null}
           {liveRunId || watchRun ? (
             <button
               type="button"

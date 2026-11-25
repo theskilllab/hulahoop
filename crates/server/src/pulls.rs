@@ -326,6 +326,9 @@ pub struct PullRequestDetail {
     pub review_blocked_reason: Option<String>,
     pub can_merge: bool,
     pub merge_blocked_reason: Option<String>,
+    /// The pull request is merged and its branch, in this same repository,
+    /// is still on GitHub: the person can delete it from here.
+    pub can_delete_branch: bool,
 }
 
 /// A run's working diff, as one message of the `runDiff` subscription.
@@ -502,6 +505,14 @@ pub fn gate(
         can_merge: merge_blocked.is_none(),
         merge_blocked_reason: merge_blocked.map(str::to_string),
     }
+}
+
+/// Whether a pull request's branch lives in the linked repository itself.
+/// A fork's branch, or one whose fork is gone (`head.repo` is null), does not.
+fn same_repository(repo: &LinkedRepo, pull: &Value) -> bool {
+    pull["head"]["repo"]["full_name"]
+        .as_str()
+        .is_some_and(|name| name.eq_ignore_ascii_case(&repo.full_name()))
 }
 
 /// The review state GitHub shows: each reviewer counts with their latest
@@ -1497,6 +1508,8 @@ impl Engine {
             });
         }
 
+        let can_delete_branch = self.branch_left(&repo, &pull).await;
+
         Ok(Some(PullRequestDetail {
             pull_request,
             body: non_empty(&pull["body"]),
@@ -1524,7 +1537,69 @@ impl Engine {
             review_blocked_reason: gate.review_blocked_reason,
             can_merge: gate.can_merge,
             merge_blocked_reason: gate.merge_blocked_reason,
+            can_delete_branch,
         }))
+    }
+
+    /// Whether a merged pull request left its branch behind for the person to
+    /// delete. Only a branch of this repository qualifies (a fork's is not
+    /// theirs to remove), and only with their token, which does the deleting.
+    /// A failed check hides the link rather than failing the whole page.
+    async fn branch_left(&self, repo: &LinkedRepo, pull: &Value) -> bool {
+        if !is_merged(pull) || !same_repository(repo, pull) {
+            return false;
+        }
+        let Some(branch) = pull["head"]["ref"].as_str().filter(|b| !b.is_empty()) else {
+            return false;
+        };
+        let Ok(Some((github, _))) = self.personal_github().await else {
+            return false;
+        };
+        match github.branch_exists(&repo.owner, &repo.name, branch).await {
+            Ok(left) => left,
+            Err(error) => {
+                tracing::debug!(repo = %repo.full_name(), branch, "could not tell whether the branch is left: {error:#}");
+                false
+            }
+        }
+    }
+
+    /// Deletes the branch of a merged pull request on GitHub, with the
+    /// person's token, and returns the pull request as it now reads.
+    pub async fn delete_pull_request_branch(
+        &self,
+        repo_id: Uuid,
+        number: i64,
+    ) -> Result<PullRequestDetail> {
+        let repo = self
+            .linked_repo(repo_id)
+            .await?
+            .ok_or_else(|| anyhow!("no linked GitHub repository has id {repo_id}"))?;
+        let Some((github, _)) = self.personal_github().await? else {
+            bail!("{NO_TOKEN_REASON}");
+        };
+        let pull = github.pull(&repo.owner, &repo.name, number).await?;
+        if !is_merged(&pull) {
+            bail!("#{number} is not merged; its branch stays until it is");
+        }
+        if !same_repository(&repo, &pull) {
+            bail!("#{number} comes from another repository, so its branch is not yours to delete");
+        }
+        let branch = pull["head"]["ref"].as_str().unwrap_or_default();
+        if branch.is_empty() {
+            bail!("GitHub names no branch for #{number}");
+        }
+        if github
+            .branch_exists(&repo.owner, &repo.name, branch)
+            .await?
+        {
+            github
+                .delete_branch(&repo.owner, &repo.name, branch)
+                .await?;
+        }
+        self.pull_request_detail(repo_id, number)
+            .await?
+            .ok_or_else(|| anyhow!("pull request #{number} vanished"))
     }
 
     /// The pull request as GitHub has it right now, with what the gate needs:
@@ -2109,6 +2184,8 @@ fn review_sent_detail(fresh: Fresh) -> PullRequestDetail {
         review_blocked_reason: gate.review_blocked_reason,
         can_merge: gate.can_merge,
         merge_blocked_reason: gate.merge_blocked_reason,
+        // A review is only sent on an open pull request.
+        can_delete_branch: false,
     }
 }
 
@@ -2147,7 +2224,7 @@ mod tests {
     use crate::db::Db;
     use axum::extract::{Path as UrlPath, Query, State};
     use axum::http::{HeaderMap, StatusCode};
-    use axum::routing::{get, put};
+    use axum::routing::{delete, get, put};
     use axum::Json;
     use futures::StreamExt;
     use serde_json::json;
@@ -2168,6 +2245,8 @@ mod tests {
         refuse_merges: bool,
         /// Pull requests GitHub answers with a server error for.
         broken: Vec<i64>,
+        /// Branches still on GitHub.
+        branches: Vec<String>,
     }
 
     type Shared = Arc<Mutex<Fake>>;
@@ -2371,6 +2450,38 @@ mod tests {
         )
     }
 
+    async fn branch(
+        State(fake): State<Shared>,
+        UrlPath((_, _, branch)): UrlPath<(String, String, String)>,
+    ) -> Reply {
+        if fake.lock().unwrap().branches.contains(&branch) {
+            (
+                StatusCode::OK,
+                Json(json!({ "ref": format!("refs/heads/{branch}") })),
+            )
+        } else {
+            refused(StatusCode::NOT_FOUND, "Not Found")
+        }
+    }
+
+    async fn delete_branch(
+        State(fake): State<Shared>,
+        headers: HeaderMap,
+        UrlPath((_, _, branch)): UrlPath<(String, String, String)>,
+    ) -> StatusCode {
+        if !authorized(&headers) {
+            return StatusCode::UNAUTHORIZED;
+        }
+        let mut fake = fake.lock().unwrap();
+        let before = fake.branches.len();
+        fake.branches.retain(|b| b != &branch);
+        if fake.branches.len() < before {
+            StatusCode::NO_CONTENT
+        } else {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+    }
+
     async fn check_runs(
         State(fake): State<Shared>,
         UrlPath((_, _, sha)): UrlPath<(String, String, String)>,
@@ -2412,6 +2523,11 @@ mod tests {
                 get(comments),
             )
             .route("/repos/{owner}/{repo}/pulls/{number}/merge", put(merge))
+            .route("/repos/{owner}/{repo}/git/ref/heads/{*branch}", get(branch))
+            .route(
+                "/repos/{owner}/{repo}/git/refs/heads/{*branch}",
+                delete(delete_branch),
+            )
             .route(
                 "/repos/{owner}/{repo}/commits/{sha}/check-runs",
                 get(check_runs),
@@ -2439,7 +2555,11 @@ mod tests {
             "mergeable": true,
             "body": "What it does",
             "user": { "login": author, "avatar_url": null },
-            "head": { "ref": format!("hul-{number}"), "sha": sha },
+            "head": {
+                "ref": format!("hul-{number}"),
+                "sha": sha,
+                "repo": { "full_name": "acme/widgets" },
+            },
             "base": { "ref": "main" },
             "additions": 3,
             "deletions": 1,
@@ -2931,6 +3051,85 @@ mod tests {
         world
             .engine
             .review_pull_request(world.repo, 1, ReviewEvent::Approve, None)
+            .await
+            .unwrap();
+    }
+
+    /// Once merged, a branch left on GitHub can be deleted from the screen,
+    /// and the link goes away with it. A fork's branch is never offered.
+    #[tokio::test]
+    async fn a_merged_pull_request_offers_to_delete_its_branch() {
+        let world = world().await;
+        let mut fork = pull_json(2, "stranger", "sha2");
+        fork["head"]["repo"] = json!({ "full_name": "stranger/widgets" });
+        {
+            let mut fake = world.fake.lock().unwrap();
+            fake.pulls = vec![pull_json(1, "hulahoop-dev[bot]", "sha1"), fork];
+            fake.branches = vec!["hul-1".into(), "hul-2".into()];
+        }
+        world.approve(1);
+        world.approve(2);
+        world.engine.set_github_token(GOOD).await.unwrap();
+
+        let open = world
+            .engine
+            .pull_request_detail(world.repo, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !open.can_delete_branch,
+            "an open pull request keeps its branch"
+        );
+        let refused = world
+            .engine
+            .delete_pull_request_branch(world.repo, 1)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("not merged"), "{refused}");
+
+        for number in [1, 2] {
+            world
+                .engine
+                .merge_pull_request(world.repo, number, MergeMethod::Squash, None)
+                .await
+                .unwrap();
+        }
+        let merged = world
+            .engine
+            .pull_request_detail(world.repo, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(merged.can_delete_branch);
+        let forked = world
+            .engine
+            .pull_request_detail(world.repo, 2)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!forked.can_delete_branch, "a fork's branch is not ours");
+        assert!(world
+            .engine
+            .delete_pull_request_branch(world.repo, 2)
+            .await
+            .is_err());
+
+        let after = world
+            .engine
+            .delete_pull_request_branch(world.repo, 1)
+            .await
+            .unwrap();
+        assert!(!after.can_delete_branch);
+        assert_eq!(
+            world.fake.lock().unwrap().branches,
+            vec!["hul-2".to_string()]
+        );
+        // Deleting again, after GitHub already did, is not an error.
+        world
+            .engine
+            .delete_pull_request_branch(world.repo, 1)
             .await
             .unwrap();
     }

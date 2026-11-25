@@ -1334,6 +1334,8 @@ export interface PullRequestDetail {
   reviewBlockedReason: string | null;
   canMerge: boolean;
   mergeBlockedReason: string | null;
+  /** Merged, and its branch in this repository is still on GitHub. */
+  canDeleteBranch: boolean;
 }
 
 export interface RunDiff {
@@ -1363,7 +1365,7 @@ export const PULL_REQUEST_DETAIL_FIELDS = `
   comments { ${PULL_REQUEST_COMMENT_FIELDS} }
   reviews { authorLogin state body submittedAt }
   checks { name status conclusion url }
-  mergeMethods lastMergeMethod canReview reviewBlockedReason canMerge mergeBlockedReason
+  mergeMethods lastMergeMethod canReview reviewBlockedReason canMerge mergeBlockedReason canDeleteBranch
 `;
 
 /** The person's GitHub account, or null before they add a token. */
@@ -1488,4 +1490,15 @@ export async function mergePullRequest(
     { repoId, number, method, headSha: headSha ?? null },
   );
   return data.mergePullRequest;
+}
+
+/** Deletes the branch a merged pull request left on GitHub. */
+export async function deletePullRequestBranch(repoId: string, number: number): Promise<PullRequestDetail> {
+  const data = await gql<{ deletePullRequestBranch: PullRequestDetail }>(
+    `mutation ($repoId: UUID!, $number: Int!) {
+      deletePullRequestBranch(repoId: $repoId, number: $number) { ${PULL_REQUEST_DETAIL_FIELDS} }
+    }`,
+    { repoId, number },
+  );
+  return data.deletePullRequestBranch;
 }
