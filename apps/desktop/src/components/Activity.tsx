@@ -189,6 +189,7 @@ export function RunCard({
     fmtDuration(run.startedAt, run.finishedAt),
     run.tokensIn + run.tokensOut ? `${fmtTokens(run.tokensIn + run.tokensOut)} tokens` : null,
     run.apiEquivalentUsd ? `${fmtUsd(run.apiEquivalentUsd)} at API rates` : null,
+    run.credentialSource ? `Credential: ${run.credentialSource}` : null,
   ].filter(Boolean);
   return (
     <li className={`act run-card${live ? " live" : ""}`} id={`run-${run.id}`}>

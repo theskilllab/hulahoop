@@ -4,6 +4,7 @@
 //! server calls [`next`] for every transition, so a client cannot skip the gate.
 
 pub mod contract;
+pub mod credential;
 pub mod diff;
 pub mod junit;
 pub mod runspec;

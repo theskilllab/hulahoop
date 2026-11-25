@@ -13,6 +13,7 @@ pub mod mentions;
 pub mod model;
 pub mod models;
 pub mod pulls;
+pub mod signin;
 pub mod skills;
 pub mod tasks;
 pub mod tenancy;
@@ -77,6 +78,8 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
     let database = db::Db::open(&data_dir).await?;
     let workspace_id = database.seed_local().await?;
     tracing::info!(%workspace_id, data_dir = %data_dir.display(), "server starting");
+    // A server stopped mid sign-in can leave a login on disk; none is live now.
+    signin::sweep(&data_dir);
 
     // The token lives with the data, so restarting the server — a rebuild, a crash, a
     // laptop that woke up — does not sign every client out of its own workspace.
