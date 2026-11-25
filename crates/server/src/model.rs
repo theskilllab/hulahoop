@@ -273,6 +273,16 @@ pub struct Run {
     /// writes into the transcript. A stream that reports none spends zero.
     pub tokens_in: i64,
     pub tokens_out: i64,
+    /// The highest memory the run's process group held at once, as the runner
+    /// sampled it. Null for runs from before it measured.
+    pub peak_memory_bytes: Option<i64>,
+    /// Cores the run kept busy on average: CPU seconds over wall seconds.
+    pub cpu_cores: Option<f64>,
+    /// How much the run's checkout grew, never below zero. A task's first run
+    /// counts the whole fresh checkout.
+    pub disk_growth_bytes: Option<i64>,
+    /// Why a queued run has not started yet; null once it is claimed.
+    pub wait_reason: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

@@ -4146,6 +4146,8 @@ button.link.danger-link { color: var(--bad); }
 .task-due { white-space: nowrap; }
 .task-due.overdue { color: var(--bad); }
 .running-dot { color: var(--accent); }
+/* Why a queued run has not started: the host has no room for it yet. */
+.task-wait { min-width: 0; color: var(--warn); font-size: var(--fs-xs); font-weight: 400; }
 
 /* --- list --- */
 .task-list {
@@ -4462,6 +4464,8 @@ input[type="date"].date-empty::-webkit-datetime-edit { color: var(--line); }
 }
 .act.cm-note .md { font-size: var(--fs-xs); color: var(--muted); }
 .run-why { margin: 0; font-size: var(--fs-sm); }
+.run-wait { margin: 0; color: var(--warn); font-size: var(--fs-sm); }
+.props-text .run-wait { margin-left: var(--s2); font-size: var(--fs-xs); }
 .run-meta { margin: 0; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }
 
 /* Read-only markdown: tighter than the editor surface. */

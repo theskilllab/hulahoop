@@ -459,6 +459,15 @@ impl Query {
         .await?)
     }
 
+    /// How many runs share the host and the room the runner last reported;
+    /// null when no runner has reported in the last thirty seconds.
+    async fn runner_capacity(
+        &self,
+        ctx: &Context<'_>,
+    ) -> async_graphql::Result<Option<crate::capacity::RunnerCapacity>> {
+        Ok(engine(ctx).runner_capacity().await?)
+    }
+
     /// Full workspace period aggregates and completed-task cohorts; never capped
     /// to the Activity feed's most recent 500 runs.
     async fn cost_report(

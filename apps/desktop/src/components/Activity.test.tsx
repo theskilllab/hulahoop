@@ -1,9 +1,19 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment, Run } from "../api";
 
-vi.mock("../api", () => ({ addComment: vi.fn(), gql: vi.fn() }));
+const room = vi.hoisted(() => ({
+  running: 1,
+  waiting: 1,
+  freeMemoryBytes: 1_100_000_000,
+  freeDiskBytes: 0,
+  freeCpuCores: 0,
+  maxRuns: 4,
+  reportedAt: "2026-01-01T00:00:00Z",
+}));
+vi.mock("../api", () => ({ addComment: vi.fn(), gql: vi.fn(), loadRunnerCapacity: vi.fn(async () => room) }));
 
+import { publishRunnerCapacity } from "../runnerCapacity";
 import { CommentItem, RunCard } from "./Activity";
 
 const run = (over: Partial<Run> = {}): Run => ({
@@ -47,6 +57,16 @@ describe("RunCard", () => {
   it("leaves the line out for runs recorded before it existed", () => {
     render(<RunCard run={run({ credentialSource: null })} agentName="Builder" onOpenTranscript={vi.fn()} />);
     expect(screen.queryByText(/Credential:/)).toBeNull();
+  });
+
+  it("says why a queued run has not started, and nothing once it runs", () => {
+    const reason = "Waiting for memory: needs ~2.4 GB, 1.1 GB free";
+    publishRunnerCapacity(room);
+    render(<RunCard run={run({ status: "queued", waitReason: reason })} agentName="Builder" onOpenTranscript={vi.fn()} />);
+    expect(screen.getByText(reason)).toBeTruthy();
+    cleanup();
+    render(<RunCard run={run({ status: "running", waitReason: reason })} agentName="Builder" onOpenTranscript={vi.fn()} />);
+    expect(screen.queryByText(reason)).toBeNull();
   });
 });
 

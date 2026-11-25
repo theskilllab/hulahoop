@@ -24,8 +24,10 @@ import {
   assigneeKey,
   isLiveRun,
   parseAssigneeKey,
+  waitingFor,
 } from "../components/TaskBits";
 import RichText from "../RichText";
+import { useRunnerOnline } from "../runnerCapacity";
 
 const POLL_MS = 2500;
 
@@ -377,6 +379,7 @@ function Properties({
   // The server only moves a task between projects while no run is live: a run
   // is working in the old checkout.
   const live = Boolean(issue.currentRun && isLiveRun(issue.currentRun.status));
+  const waiting = waitingFor(issue.currentRun, useRunnerOnline());
 
   return (
     <dl className="props">
@@ -494,6 +497,7 @@ function Properties({
           <dt>Run</dt>
           <dd className="props-text">
             <RunStatusChip status={issue.currentRun.status} />
+            {waiting ? <span className="run-wait">{waiting}</span> : null}
           </dd>
         </>
       ) : null}

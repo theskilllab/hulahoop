@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, type MouseEvent } from "react";
 import {
+  fmtGb,
   moveIssue,
   updateIssue,
   type Agent,
@@ -8,6 +9,7 @@ import {
   type Milestone,
   type Project,
   type Run,
+  type RunnerCapacity,
 } from "../api";
 import ContextMenu, { type MenuItem } from "../components/ContextMenu";
 import Seg from "../components/Seg";
@@ -18,10 +20,17 @@ import Transcript from "../components/Transcript";
 import { useToast } from "../components/Toast";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
+import { useRunnerCapacity } from "../runnerCapacity";
 import IssueDetail, { useIssueDetail, type DraftUpdate, type TaskDraft } from "./IssueDetail";
 
 type Layout = "board" | "list";
 const LAYOUT_KEY = "hulahoop.tasks.layout";
+/** `3 running · 1 waiting · 4.2 GB room`: the host at a glance. The room is
+ *  what one more run could have on the runner that reported last, after its
+ *  reserve and its live runs' needs; the counts cover every runner. */
+export function capacityLine(capacity: RunnerCapacity): string {
+  return `${capacity.running} running · ${capacity.waiting} waiting · ${fmtGb(capacity.freeMemoryBytes)} room`;
+}
 
 /** The header filter is "all", "none" (tasks without a project) or a project id. */
 function matchesProjectFilter(projectId: string | null, filter: string): boolean {
@@ -76,6 +85,7 @@ export default function Tasks({
   const [transcript, setTranscript] = useState<Run | null>(null);
   const [toast, showToast] = useToast();
   const detail = useIssueDetail(openId);
+  const capacity = useRunnerCapacity();
   // Unsent comments and description edits, per task. The panel remounts for
   // each task, so drafts kept inside it were gone after a click on another card.
   const [drafts, setDrafts] = useState<Record<string, TaskDraft>>({});
@@ -172,7 +182,7 @@ export default function Tasks({
     <section className="screen fill tasks-screen">
       <PageHeader
         title="Tasks"
-        subtitle={`${openCount} open`}
+        subtitle={capacity ? `${openCount} open · ${capacityLine(capacity)}` : `${openCount} open`}
         actions={
           <>
             <select className="select" aria-label="Project" value={projectFilter} onChange={(event) => onProjectFilter(event.target.value)}>

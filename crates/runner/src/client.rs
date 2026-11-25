@@ -103,19 +103,46 @@ impl Client {
         Ok(serde_json::from_str(&text)?)
     }
 
-    pub async fn claim_run(&self, runner_id: &str) -> Result<Option<Value>> {
+    /// Asks for a queued run that fits in `capacity`, the room this runner has
+    /// for one more; without it the server hands out the oldest queued run.
+    pub async fn claim_run(
+        &self,
+        runner_id: &str,
+        capacity: Option<Value>,
+    ) -> Result<Option<Value>> {
         let value = self
-            .post("/internal/runs/claim", json!({ "runner_id": runner_id }))
+            .post(
+                "/internal/runs/claim",
+                json!({ "runner_id": runner_id, "capacity": capacity }),
+            )
             .await?;
         Ok(if value.is_object() { Some(value) } else { None })
     }
 
-    pub async fn heartbeat(&self, run_id: &str, pid: Option<i64>, pgid: Option<i64>) -> Result<()> {
-        self.post(
-            &format!("/internal/runs/{run_id}/heartbeat"),
-            json!({ "pid": pid, "pgid": pgid }),
-        )
-        .await?;
+    /// Keeps the run alive, and answers with what the server thinks of it:
+    /// `running`, or `cancelled` or `failed` for a run it has stopped. None
+    /// from a server too old to say. A pid and pgid of zero say the agent has
+    /// exited.
+    pub async fn heartbeat(
+        &self,
+        run_id: &str,
+        pid: Option<i64>,
+        pgid: Option<i64>,
+    ) -> Result<Option<String>> {
+        let reply = self
+            .post(
+                &format!("/internal/runs/{run_id}/heartbeat"),
+                json!({ "pid": pid, "pgid": pgid }),
+            )
+            .await?;
+        Ok(reply["status"].as_str().map(str::to_string))
+    }
+
+    /// The room this runner has while every slot is taken: it claims
+    /// nothing, and still tells the server how the host is doing.
+    pub async fn report_capacity(&self, capacity: Value) -> Result<()> {
+        self.post("/internal/runner/capacity", json!({ "capacity": capacity }))
+            .await?;
         Ok(())
     }
 
