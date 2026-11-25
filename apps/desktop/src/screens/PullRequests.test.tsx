@@ -14,6 +14,7 @@ const api = vi.hoisted(() => ({
   deletePullRequestComment: vi.fn(),
   reviewPullRequest: vi.fn(),
   mergePullRequest: vi.fn(),
+  deletePullRequestBranch: vi.fn(),
 }));
 
 vi.mock("../api", () => api);
@@ -68,6 +69,7 @@ const detail = (over: Partial<PullRequestDetail> = {}): PullRequestDetail => ({
   reviewBlockedReason: null,
   canMerge: true,
   mergeBlockedReason: null,
+  canDeleteBranch: false,
   ...over,
 });
 
@@ -236,6 +238,28 @@ describe("Merge", () => {
     await openFirst();
     await userEvent.click(screen.getByRole("button", { name: "Squash and merge" }));
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Merged #12"));
+  });
+});
+
+describe("Delete branch", () => {
+  it("offers to delete the branch only once merged and while it is still there", async () => {
+    const merged = pr({ merged: true, state: "closed", reviewState: "MERGED" });
+    api.loadPullRequests.mockResolvedValue([merged]);
+    api.loadPullRequest.mockResolvedValue(detail({ pullRequest: merged, canDeleteBranch: true }));
+    api.deletePullRequestBranch.mockResolvedValue(detail({ pullRequest: merged, canDeleteBranch: false }));
+    render(<PullRequests {...props()} />);
+    await openFirst();
+    await userEvent.click(screen.getByRole("button", { name: "Delete branch" }));
+    expect(api.deletePullRequestBranch).toHaveBeenCalledWith("repo1", 12);
+    await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Deleted branch hul-7-retry"));
+    expect(screen.queryByRole("button", { name: "Delete branch" })).toBeNull();
+  });
+
+  it("does not offer it on an open pull request", async () => {
+    api.loadPullRequest.mockResolvedValue(detail({ canDeleteBranch: true }));
+    render(<PullRequests {...props()} />);
+    await openFirst();
+    expect(screen.queryByRole("button", { name: "Delete branch" })).toBeNull();
   });
 });
 

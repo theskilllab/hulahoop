@@ -863,6 +863,34 @@ impl Github {
         )
         .await
     }
+
+    /// Whether a branch is still on GitHub. The exact-match ref endpoint
+    /// answers 404 once it is gone.
+    pub async fn branch_exists(&self, owner: &str, repo: &str, branch: &str) -> Result<bool> {
+        match self
+            .get(
+                &format!("/repos/{owner}/{repo}/git/ref/heads/{branch}"),
+                &[],
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) if GithubError::of(&error).and_then(|e| e.status) == Some(404) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Deletes a branch, as GitHub's own button does after a merge.
+    pub async fn delete_branch(&self, owner: &str, repo: &str, branch: &str) -> Result<()> {
+        self.send(
+            reqwest::Method::DELETE,
+            &format!("/repos/{owner}/{repo}/git/refs/heads/{branch}"),
+            &[],
+            None,
+        )
+        .await?;
+        Ok(())
+    }
 }
 
 /// GitHub's reason for a refusal: its `message`, plus the detail of each entry

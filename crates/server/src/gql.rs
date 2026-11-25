@@ -648,6 +648,19 @@ impl Mutation {
             .await?)
     }
 
+    /// Deletes the branch a merged pull request left behind, on GitHub, with
+    /// the person's token.
+    async fn delete_pull_request_branch(
+        &self,
+        ctx: &Context<'_>,
+        repo_id: Uuid,
+        number: i64,
+    ) -> async_graphql::Result<PullRequestDetail> {
+        Ok(engine(ctx)
+            .delete_pull_request_branch(repo_id, number)
+            .await?)
+    }
+
     async fn save_cost_settings(
         &self,
         ctx: &Context<'_>,

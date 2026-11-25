@@ -4735,6 +4735,7 @@ button.link.new-task-choose { justify-self: start; margin-top: calc(-1 * var(--s
 .pr-branch { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); overflow-wrap: anywhere; }
 .pr-actions { gap: var(--s2); margin-top: var(--s1); }
 .prs a.btn { text-decoration: none; }
+.pr-actions button.pr-delete-branch { text-decoration: underline; }
 .prs .btn.ok { background: var(--ok); border-color: var(--ok); color: var(--bg); }
 .prs .btn.ok:hover:not(:disabled) { filter: brightness(1.06); }
 .prs .btn[aria-pressed="true"] { background: var(--bg-3); }
