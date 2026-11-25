@@ -154,7 +154,7 @@ export default function NewArtifactDialog({
               id={ids.content}
               rows={5}
               value={content}
-              placeholder="Write it here, or drop files anywhere on this dialog."
+              placeholder="Leave empty to start from a template. You can drag and drop files anywhere in this window to attach them."
               onChange={(event) => setContent(event.target.value)}
             />
           </div>

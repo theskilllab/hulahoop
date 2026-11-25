@@ -2010,12 +2010,12 @@ impl Issue {
     }
 
     async fn file_count(&self, ctx: &Context<'_>) -> async_graphql::Result<i64> {
-        Ok(
-            sqlx::query_scalar("select count(*) from artifacts where issue_id = ?")
-                .bind(self.id)
-                .fetch_one(&engine(ctx).db.pool)
-                .await?,
+        Ok(sqlx::query_scalar(
+            "select count(*) from artifacts where issue_id = ? and filename <> ''",
         )
+        .bind(self.id)
+        .fetch_one(&engine(ctx).db.pool)
+        .await?)
     }
 
     async fn runs(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<Run>> {

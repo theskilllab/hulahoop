@@ -86,7 +86,7 @@ export default function Artifacts({ workspaceId, projects, milestones, issues, a
   const alert = confirming && (
     <div className="review-bar" role="alert">
       <span className="od-fill">
-        <strong>Delete this artifact?</strong> It will be removed from {ownerName(confirming)} and from Artifacts, along with {confirming.files.length} {confirming.files.length === 1 ? "file" : "files"}.
+        <strong>Delete this artifact?</strong> It will be removed from {ownerName(confirming)} and from Artifacts{confirming.files.length > 0 && `, along with ${confirming.files.length} ${confirming.files.length === 1 ? "file" : "files"}`}.
       </span>
       <button type="button" className="ghost" onClick={() => setConfirming(null)}>
         Cancel

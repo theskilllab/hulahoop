@@ -4939,12 +4939,16 @@ button.link.new-milestone-choose { justify-self: start; font-size: var(--fs-xs);
 .alist { display: grid; }
 .arow {
   display: grid;
-  grid-template-columns: minmax(0, 2.2fr) minmax(0, 1.6fr) minmax(0, 1fr) 80px;
+  grid-template-columns: minmax(0, 1.3fr) minmax(0, 1.3fr) 130px 120px;
   gap: var(--s3);
   align-items: center;
   padding: var(--s2) var(--s4);
   border-bottom: 1px solid var(--line);
   cursor: pointer;
+}
+@media (max-width: 900px) {
+  .arow { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .arow > :nth-child(n + 3) { display: none; }
 }
 .arow:hover { background: var(--bg-2); }
 .arow.sel { background: var(--accent-soft); }
