@@ -230,7 +230,15 @@ export default function Tasks({
           <SidePanel
             key={openId}
             label={summary ? `Task ${summary.key}` : "Task"}
-            title={<span className="mono">{issue?.key ?? summary?.key ?? "Task"}</span>}
+            title={
+              transcript ? (
+                <button type="button" className="linkbtn tx-back" autoFocus onClick={() => setTranscript(null)}>
+                  ← Back to {issue?.key ?? summary?.key ?? "task"}
+                </button>
+              ) : (
+                <span className="mono">{issue?.key ?? summary?.key ?? "Task"}</span>
+              )
+            }
             onClose={() => onOpen(null)}
             onEscape={() => {
               if (!transcript) return false;
@@ -250,7 +258,6 @@ export default function Tasks({
                     credentialSource={
                       issue.runs.find((run) => run.id === transcript.id)?.credentialSource ?? transcript.credentialSource ?? null
                     }
-                    onBack={() => setTranscript(null)}
                   />
                 ) : null}
                 {/* Stays mounted under the transcript, so drafts survive a look at a run. */}

@@ -530,6 +530,7 @@ function DueInput({ value, onSave }: { value: string | null; onSave: (value: str
     <input
       type="date"
       aria-label="Due date"
+      className={draft ? undefined : "date-empty"}
       value={draft}
       onFocus={() => (focused.current = true)}
       onBlur={() => {

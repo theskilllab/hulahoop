@@ -85,7 +85,6 @@ export default function Transcript({
   agentName,
   issueKey,
   credentialSource = null,
-  onBack,
 }: {
   runId: string;
   runStatus: string;
@@ -93,7 +92,6 @@ export default function Transcript({
   issueKey: string;
   /** What the run signed in with, such as `Claude subscription` or `host login`. */
   credentialSource?: string | null;
-  onBack: () => void;
 }) {
   const [entries, setEntries] = useState<Keyed[]>([]);
   const arrived = useRef(0);
@@ -104,11 +102,6 @@ export default function Transcript({
   const cursor = useRef(0);
   const root = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
-  const back = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    back.current?.focus({ preventScroll: true });
-  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -169,9 +162,6 @@ export default function Transcript({
   return (
     <div className="transcript" ref={root}>
       <div className="tx-head">
-        <button ref={back} type="button" className="linkbtn tx-back" onClick={onBack}>
-          ← Back to {issueKey}
-        </button>
         <h2>
           Transcript <span className="dim">· {agentName}</span>
         </h2>
