@@ -1,4 +1,5 @@
 import type { IssueSummary, Milestone, Project } from "./api";
+import { isLiveRun } from "./components/TaskBits";
 
 /** The eight colours a project can wear, in the order a new project picks them. */
 export const PROJECT_COLORS = [
@@ -30,7 +31,7 @@ export function projectStats(projectId: string | null, issues: IssueSummary[]): 
   return {
     open: open.length,
     openPrs: open.filter((issue) => issue.prNumber !== null).length,
-    running: own.filter((issue) => issue.currentRun?.status === "running").length,
+    running: own.filter((issue) => isLiveRun(issue.currentRun?.status)).length,
     progress: own.length ? Math.round((done / own.length) * 100) : 0,
   };
 }

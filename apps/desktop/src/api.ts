@@ -1140,7 +1140,7 @@ export async function setProjectPrefix(projectId: string, prefix: string): Promi
   );
 }
 
-/// Take a repository off its project. The server refuses while open tasks use it.
+/// Take a repository off its project. The server refuses while open tasks use it or it has run history.
 export async function unlinkRepo(id: string): Promise<void> {
   await gql(`mutation ($id: UUID!) { unlinkRepo(id: $id) { id } }`, { id });
 }

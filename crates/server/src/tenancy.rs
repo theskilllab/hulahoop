@@ -228,9 +228,10 @@ impl Engine {
         )
     }
 
-    /// Unlink a repository from its project. Open tasks still work in it, so
-    /// they block the unlink; finished tasks keep their history and lose only
-    /// the link.
+    /// Unlink a repository from its project. Open tasks still work in it, and
+    /// a repository with runs carries their history (deleting it would cascade
+    /// to those runs), so either blocks the unlink. Finished tasks without
+    /// runs just lose the link.
     pub async fn unlink_repo(&self, repo_id: Uuid) -> Result<Project> {
         let project_id: Uuid = sqlx::query_scalar("select project_id from repos where id = ?")
             .bind(repo_id)
@@ -244,8 +245,19 @@ impl Engine {
         .fetch_one(&self.db.pool)
         .await?;
         if open > 0 {
-            let s = if open == 1 { "" } else { "s" };
-            bail!("{open} open task{s} still use this repository. Finish or move them first.");
+            let (noun, verb) = if open == 1 {
+                ("task", "uses")
+            } else {
+                ("tasks", "use")
+            };
+            bail!("{open} open {noun} still {verb} this repository. Finish or move them first.");
+        }
+        let runs: i64 = sqlx::query_scalar("select count(*) from runs where repo_id = ?")
+            .bind(repo_id)
+            .fetch_one(&self.db.pool)
+            .await?;
+        if runs > 0 {
+            bail!("This repository has run history, which unlinking would delete.");
         }
         let mut tx = self.db.pool.begin().await?;
         sqlx::query("update issues set repo_id = null where repo_id = ?")

@@ -1,5 +1,5 @@
 //! Backend acceptance tests for the Projects page revamp: a colour stored per
-//! project, and a way to unlink a repository without losing task history.
+//! project, and a way to unlink a repository that never destroys run history.
 
 use hulahoop_server::db::Db;
 use hulahoop_server::engine::Engine;
@@ -247,11 +247,40 @@ async fn unlinking_is_refused_while_open_tasks_use_the_repo() {
     )
     .await
     .unwrap_err();
-    assert!(err.contains("1 open task"), "{err}");
+    assert!(err.contains("1 open task still uses"), "{err}");
     let (left,): (i64,) = sqlx::query_as("select count(*) from repos where id = ?")
         .bind(repo)
         .fetch_one(&f.engine.db.pool)
         .await
         .unwrap();
     assert_eq!(left, 1);
+}
+
+// Deleting a repository cascades to its runs, so a repository with runs stays linked.
+#[tokio::test]
+async fn unlinking_is_refused_for_a_repo_with_run_history() {
+    let f = fixture("pj-unlink-runs").await;
+    let (project, repo) = one_repo(&f).await;
+    let done = task_on(&f, project, repo, "done", 1).await;
+    let agent = Uuid::now_v7();
+    sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,'builder','pi','m',?,?)")
+        .bind(agent).bind(f.workspace).bind(chrono::Utc::now()).bind(chrono::Utc::now())
+        .execute(&f.engine.db.pool).await.unwrap();
+    let run_id = Uuid::now_v7();
+    sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,?,?,1,'main','prompt','/tmp','succeeded','m',?)")
+        .bind(run_id).bind(done).bind(repo).bind(agent).bind(chrono::Utc::now())
+        .execute(&f.engine.db.pool).await.unwrap();
+    let err = run(
+        &f,
+        format!(r#"mutation {{ unlinkRepo(id: "{repo}") {{ id }} }}"#),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("run history"), "{err}");
+    let (kept,): (i64,) = sqlx::query_as("select count(*) from runs where id = ?")
+        .bind(run_id)
+        .fetch_one(&f.engine.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
 }
