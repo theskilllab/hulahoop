@@ -315,8 +315,8 @@ export default function Activity({
     return list.sort((a, b) => b.at.localeCompare(a.at));
   }, [issue.comments, issue.runs, filter]);
   // Runs whose summary the agent also posted as a comment: the comment carries
-  // the text the run card only the run. A
-  // pinned question or a server note from the run is not its summary.
+  // the text — the run card only the run. A pinned question or a server note
+  // from the run is not its summary.
   const commented = useMemo(
     () =>
       new Set(

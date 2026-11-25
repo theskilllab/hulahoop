@@ -4299,6 +4299,7 @@ button.link.danger-link { color: var(--bad); }
 .props dt { color: var(--muted); }
 .props dd { margin: 0; min-width: 0; }
 /* The prototype's `.select`: a filled control with its own chevron. */
+.select,
 .props select {
   -webkit-appearance: none;
   appearance: none;
@@ -4306,7 +4307,7 @@ button.link.danger-link { color: var(--bad); }
   background: var(--bg-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 10 10' fill='none' stroke='%23888' stroke-width='1.5' stroke-linecap='round'%3E%3Cpath d='M2 3.5l3 3 3-3'/%3E%3C/svg%3E") no-repeat right 8px center;
   text-overflow: ellipsis;
 }
-.props select:hover, .props input:hover { border-color: var(--muted); }
+.select:hover, .props select:hover, .props input:hover { border-color: var(--muted); }
 /* An empty date shows only its mm/dd/yyyy mask; draw it in the border colour. */
 input[type="date"].date-empty::-webkit-datetime-edit { color: var(--line); }
 .props select,

@@ -93,6 +93,12 @@ describe("agent runs fold long summaries", () => {
     expect(screen.getByRole("button", { name: "Show less" })).toBeTruthy();
   });
 
+  it("leaves a short run summary unfolded", () => {
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(10);
+    render(<RunCard run={run({ summary: "Short." })} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+
   it("keeps the run's own Open transcript button", () => {
     render(<RunCard run={run()} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
     expect(screen.getByRole("button", { name: "Open transcript" })).toBeTruthy();

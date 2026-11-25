@@ -23,6 +23,12 @@ import IssueDetail, { useIssueDetail, type DraftUpdate, type TaskDraft } from ".
 type Layout = "board" | "list";
 const LAYOUT_KEY = "hulahoop.tasks.layout";
 
+/** The header filter is "all", "none" (tasks without a project) or a project id. */
+function matchesProjectFilter(projectId: string | null, filter: string): boolean {
+  if (filter === "all") return true;
+  return filter === "none" ? projectId === null : projectId === filter;
+}
+
 type Props = {
   workspaceId: string;
   issues: IssueSummary[];
@@ -30,8 +36,8 @@ type Props = {
   agents: Agent[];
   milestones: Milestone[];
   columns?: Column[];
-  projectFilter: string | "all";
-  onProjectFilter: (id: string | "all") => void;
+  projectFilter: string;
+  onProjectFilter: (id: string) => void;
   /** Whether done tasks are loaded (All) or left on the server (Active). */
   showDone: boolean;
   onShowDone: (show: boolean) => void;
@@ -93,7 +99,7 @@ export default function Tasks({
   const columns = declared?.length ? declared : FALLBACK_COLUMNS;
   const title = (status: string) => columns.find((column) => column.status === status)?.title ?? status.replace(/_/g, " ");
   const shown = useMemo(
-    () => (projectFilter === "all" ? issues : issues.filter((issue) => issue.projectId === projectFilter)),
+    () => issues.filter((issue) => matchesProjectFilter(issue.projectId, projectFilter)),
     [issues, projectFilter],
   );
   const hiddenDone = showDone ? 0 : doneCount;
@@ -169,8 +175,9 @@ export default function Tasks({
         subtitle={`${openCount} open`}
         actions={
           <>
-            <select aria-label="Project" value={projectFilter} onChange={(event) => onProjectFilter(event.target.value)}>
+            <select className="select" aria-label="Project" value={projectFilter} onChange={(event) => onProjectFilter(event.target.value)}>
               <option value="all">All projects</option>
+              <option value="none">No project</option>
               {projects.map((entry) => (
                 <option key={entry.id} value={entry.id}>
                   {entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name}
@@ -233,7 +240,7 @@ export default function Tasks({
             title={
               transcript ? (
                 <button type="button" className="linkbtn tx-back" autoFocus onClick={() => setTranscript(null)}>
-                  ← Back to {issue?.key ?? summary?.key ?? "task"}
+                  ← Back to {issue?.key ?? summary?.key ?? "Task"}
                 </button>
               ) : (
                 <span className="mono">{issue?.key ?? summary?.key ?? "Task"}</span>

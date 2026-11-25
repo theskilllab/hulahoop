@@ -536,11 +536,15 @@ export async function loadBoard(workspaceId: string, includeDone = false): Promi
   return data.issues;
 }
 
-/** How many done tasks the Active view leaves out. */
-export async function loadDoneIssueCount(workspaceId: string, projectId: string | null): Promise<number> {
+/** How many done tasks the Active view leaves out. `projectFilter` is "all", "none" (no project) or a project id. */
+export async function loadDoneIssueCount(workspaceId: string, projectFilter: string): Promise<number> {
   const data = await gql<{ doneIssueCount: number }>(
-    `query ($workspaceId: UUID!, $projectIds: [UUID!]) { doneIssueCount(workspaceId: $workspaceId, projectIds: $projectIds) }`,
-    { workspaceId, projectIds: projectId ? [projectId] : [] },
+    `query ($workspaceId: UUID!, $projectIds: [UUID!], $noProject: Boolean!) { doneIssueCount(workspaceId: $workspaceId, projectIds: $projectIds, noProject: $noProject) }`,
+    {
+      workspaceId,
+      projectIds: projectFilter === "all" || projectFilter === "none" ? [] : [projectFilter],
+      noProject: projectFilter === "none",
+    },
   );
   return data.doneIssueCount;
 }

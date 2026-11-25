@@ -157,7 +157,7 @@ export default function App() {
       const [nextIssues, nextDone, nextMilestones, nextArtifacts, nextWorkflow, nextSkills, nextRuns, nextPrs] =
         await Promise.all([
           loadWorkspaceIssues(workspace.id, includeDone),
-          loadDoneIssueCount(workspace.id, projectFilter === "all" ? null : projectFilter),
+          loadDoneIssueCount(workspace.id, projectFilter),
           loadMilestones(workspace.id),
           loadArtifacts(workspace.id),
           loadWorkflow(workspace.id),
@@ -674,7 +674,7 @@ export default function App() {
           projects={projects}
           agents={agents}
           milestones={milestones}
-          defaultProjectId={projectFilter === "all" ? null : projectFilter}
+          defaultProjectId={projectFilter === "all" || projectFilter === "none" ? null : projectFilter}
           onCreated={async (issue) => {
             await refresh();
             setView({ name: "issue", id: issue.id });
