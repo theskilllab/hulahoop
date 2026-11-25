@@ -438,11 +438,12 @@ function PullRequestPane({
     }
   }, [pr.repoId, pr.number]);
 
-  // Again whenever the list sees the pull request move. A conflict shows up without `updatedAt` moving, so a change
-  // in the list's conflict check reloads it too.
+  // Again whenever the list sees the pull request move. CI finishing, a review landing and a conflict appearing do
+  // not always move `updatedAt`, so a change in any of the list's checks reloads it too; otherwise the merge button
+  // kept saying "CI is still running" until the app was reopened.
   useEffect(() => {
     void load();
-  }, [load, pr.updatedAt, pr.headSha, pr.merged, pr.mergeable]);
+  }, [load, pr.updatedAt, pr.headSha, pr.merged, pr.mergeable, pr.ciState, pr.reviewState]);
 
   const files = useMemo(() => (detail ? filesFromGithub(detail.files) : []), [detail]);
   const sum = useMemo(() => totals(files), [files]);

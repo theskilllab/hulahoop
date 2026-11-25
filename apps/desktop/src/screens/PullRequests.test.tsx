@@ -240,6 +240,25 @@ describe("Merge", () => {
     await userEvent.click(screen.getByRole("button", { name: "Squash and merge" }));
     await waitFor(() => expect(screen.getByRole("status").textContent).toBe("Merged #12"));
   });
+
+  it("turns the merge on when the list sees CI pass, though the pull request did not move", async () => {
+    const running = pr({ ciState: "RUNNING" });
+    api.loadPullRequests.mockResolvedValue([running]);
+    api.loadPullRequest.mockResolvedValue(
+      detail({ pullRequest: running, canMerge: false, mergeBlockedReason: "CI is still running" }),
+    );
+    render(<PullRequests {...props()} />);
+    await openFirst();
+    expect((screen.getByRole("button", { name: "Squash and merge" }) as HTMLButtonElement).disabled).toBe(true);
+
+    // Same updatedAt and head: only CI changed.
+    api.loadPullRequest.mockResolvedValue(detail());
+    api.loadPullRequests.mockResolvedValue([pr({ ciState: "PASSING" })]);
+    await userEvent.click(screen.getByRole("button", { name: /Sync/ }));
+    await waitFor(() =>
+      expect((screen.getByRole("button", { name: "Squash and merge" }) as HTMLButtonElement).disabled).toBe(false),
+    );
+  });
 });
 
 describe("Delete branch", () => {
