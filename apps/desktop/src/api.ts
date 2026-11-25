@@ -329,6 +329,22 @@ export interface Artifact {
   size: number;
   sha256: string;
   createdAt: string;
+  /** Plan, spec, report, notes or a plain file. */
+  type: "plan" | "spec" | "report" | "notes" | "file";
+  /** Markdown body; empty for a plain file. */
+  content: string;
+  files: ArtifactFile[];
+  /** Person or agent who wrote it. */
+  author: string;
+  authorIsAgent: boolean;
+  updatedAt: string;
+}
+
+export interface ArtifactFile {
+  id: string;
+  filename: string;
+  mime: string;
+  size: number;
 }
 
 let connection: Connection | null = null;
@@ -921,7 +937,7 @@ export async function loadMilestones(workspaceId: string): Promise<Milestone[]> 
   return data.milestones;
 }
 
-export const ARTIFACT_FIELDS = `id projectId milestoneId issueId title kind filename mime size sha256 createdAt`;
+export const ARTIFACT_FIELDS = `id projectId milestoneId issueId title kind type content author authorIsAgent filename mime size sha256 createdAt updatedAt files { id filename mime size }`;
 
 export async function loadArtifacts(workspaceId: string): Promise<Artifact[]> {
   const data = await gql<{ artifacts: Artifact[] }>(
@@ -964,6 +980,80 @@ export async function uploadArtifact(input: {
   return data.createArtifact;
 }
 
+async function toBase64(file: File): Promise<string> {
+  const buffer = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let index = 0; index < buffer.length; index += 0x8000) {
+    binary += String.fromCharCode(...buffer.subarray(index, index + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** Attach files to an artifact; returns the artifact as the server now holds it. */
+export async function addArtifactFiles(artifactId: string, files: File[]): Promise<void> {
+  for (const file of files) {
+    await gql(
+      `mutation ($artifactId: UUID!, $filename: String!, $mime: String, $contentBase64: String!) {
+        addArtifactFile(artifactId: $artifactId, filename: $filename, mime: $mime, contentBase64: $contentBase64) { id }
+      }`,
+      { artifactId, filename: file.name, mime: file.type || null, contentBase64: await toBase64(file) },
+    );
+  }
+}
+
+/** The artifact was created but a file upload failed; it exists and can be opened to add the rest. */
+export class PartialArtifactError extends Error {
+  constructor(
+    readonly artifact: Artifact,
+    cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+  }
+}
+
+/** A document artifact owned by a task or a milestone, with any files dropped on it. */
+export async function createArtifact(input: {
+  workspaceId: string;
+  title: string;
+  type: Artifact["type"];
+  content: string;
+  issueId: string | null;
+  milestoneId: string | null;
+  files: File[];
+}): Promise<Artifact> {
+  const { files, ...fields } = input;
+  const data = await gql<{ createArtifactDocument: Artifact }>(
+    `mutation ($workspaceId: UUID!, $title: String!, $type: String!, $content: String, $issueId: UUID, $milestoneId: UUID) {
+      createArtifactDocument(workspaceId: $workspaceId, title: $title, type: $type, content: $content, issueId: $issueId, milestoneId: $milestoneId) { ${ARTIFACT_FIELDS} }
+    }`,
+    fields,
+  );
+  try {
+    await addArtifactFiles(data.createArtifactDocument.id, files);
+  } catch (cause) {
+    throw new PartialArtifactError(data.createArtifactDocument, cause);
+  }
+  return data.createArtifactDocument;
+}
+
+export async function updateArtifact(id: string, fields: { title?: string; type?: Artifact["type"]; content?: string }): Promise<void> {
+  await gql(
+    `mutation ($id: UUID!, $title: String, $type: String, $content: String) { updateArtifact(id: $id, title: $title, type: $type, content: $content) { id } }`,
+    { id, ...fields },
+  );
+}
+
+export async function moveArtifact(id: string, owner: { issueId: string | null; milestoneId: string | null }): Promise<void> {
+  await gql(
+    `mutation ($id: UUID!, $issueId: UUID, $milestoneId: UUID) { moveArtifact(id: $id, issueId: $issueId, milestoneId: $milestoneId) { id } }`,
+    { id, ...owner },
+  );
+}
+
+export async function removeArtifactFile(id: string): Promise<void> {
+  await gql(`mutation ($id: UUID!) { removeArtifactFile(id: $id) }`, { id });
+}
+
 /** The file's bytes, fetched with the bearer token; previews read these too. */
 export async function fetchArtifactBlob(artifact: Pick<Artifact, "id" | "filename">): Promise<Blob> {
   const current = await connect();
@@ -975,7 +1065,7 @@ export async function fetchArtifactBlob(artifact: Pick<Artifact, "id" | "filenam
 }
 
 /** Fetch the bytes with the bearer token, then hand them to the browser to save. */
-export async function downloadArtifact(artifact: Artifact): Promise<void> {
+export async function downloadArtifact(artifact: Pick<Artifact, "id" | "filename">): Promise<void> {
   const blob = await fetchArtifactBlob(artifact);
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");

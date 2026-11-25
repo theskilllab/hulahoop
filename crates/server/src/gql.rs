@@ -1080,6 +1080,91 @@ impl Mutation {
             .await?)
     }
 
+    /// A document artifact: type, Markdown content, author, owned by a task or a
+    /// milestone. Add its files with `addArtifactFile`.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_artifact_document(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        title: String,
+        #[graphql(name = "type")] artifact_type: String,
+        content: Option<String>,
+        issue_id: Option<Uuid>,
+        milestone_id: Option<Uuid>,
+        author: Option<String>,
+        author_is_agent: Option<bool>,
+    ) -> async_graphql::Result<Artifact> {
+        Ok(engine(ctx)
+            .create_artifact_document(
+                workspace_id,
+                title,
+                artifact_type,
+                content.unwrap_or_default(),
+                issue_id,
+                milestone_id,
+                author.unwrap_or_else(|| "You".into()),
+                author_is_agent.unwrap_or(false),
+            )
+            .await?)
+    }
+
+    async fn update_artifact(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        title: Option<String>,
+        #[graphql(name = "type")] artifact_type: Option<String>,
+        content: Option<String>,
+    ) -> async_graphql::Result<Artifact> {
+        Ok(engine(ctx)
+            .update_artifact(id, title, artifact_type, content)
+            .await?)
+    }
+
+    /// Change what the artifact belongs to: exactly one of a task or a milestone.
+    async fn move_artifact(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        issue_id: Option<Uuid>,
+        milestone_id: Option<Uuid>,
+    ) -> async_graphql::Result<Artifact> {
+        Ok(engine(ctx)
+            .move_artifact(id, issue_id, milestone_id)
+            .await?)
+    }
+
+    async fn add_artifact_file(
+        &self,
+        ctx: &Context<'_>,
+        artifact_id: Uuid,
+        filename: String,
+        mime: Option<String>,
+        content_base64: String,
+    ) -> async_graphql::Result<ArtifactFile> {
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(content_base64.trim())
+            .map_err(|e| async_graphql::Error::new(format!("the file is not valid base64: {e}")))?;
+        if bytes.len() as u64 > hulahoop_core::ARTIFACT_LIMIT_BYTES {
+            return Err(async_graphql::Error::new(
+                "that file is larger than the artifact limit (500 MB)",
+            ));
+        }
+        Ok(engine(ctx)
+            .add_artifact_file(artifact_id, filename, mime, &bytes)
+            .await?)
+    }
+
+    async fn remove_artifact_file(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+    ) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).remove_artifact_file(id).await?)
+    }
+
     async fn delete_artifact(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
         Ok(engine(ctx).delete_artifact(id).await?)
     }
@@ -1770,6 +1855,13 @@ struct NewRepoInput {
 
 /// Nested reads stay on one screen's worth of data: the board asks for issues,
 /// the detail screen asks for the rest.
+#[ComplexObject]
+impl Artifact {
+    async fn files(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ArtifactFile>> {
+        Ok(engine(ctx).artifact_files(self.id).await?)
+    }
+}
+
 #[ComplexObject]
 impl Project {
     /// The repositories of this project. A project holds one in v0, but the

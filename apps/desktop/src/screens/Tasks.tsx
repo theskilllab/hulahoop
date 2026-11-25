@@ -4,6 +4,7 @@ import {
   moveIssue,
   updateIssue,
   type Agent,
+  type Artifact,
   type IssueStatus,
   type IssueSummary,
   type Milestone,
@@ -56,6 +57,9 @@ type Props = {
   openId: string | null;
   onOpen: (id: string | null) => void;
   onNew: () => void;
+  artifacts: Artifact[];
+  onNewArtifact: (issueId: string) => void;
+  onOpenArtifact: (id: string) => void;
   onChanged: () => void | Promise<void>;
   /** The open task's key and title once its detail has loaded, for Lumi's context. */
   onDetail?: (detail: { id: string; key: string; title: string } | null) => void;
@@ -77,6 +81,9 @@ export default function Tasks({
   openId,
   onOpen,
   onNew,
+  artifacts,
+  onNewArtifact,
+  onOpenArtifact,
   onChanged,
   onDetail,
 }: Props) {
@@ -288,6 +295,9 @@ export default function Tasks({
                     projects={projects}
                     milestones={milestones}
                     columns={columns}
+                    artifacts={artifacts.filter((artifact) => artifact.issueId === issue.id)}
+                    onNewArtifact={() => onNewArtifact(issue.id)}
+                    onOpenArtifact={onOpenArtifact}
                     onChanged={refreshAll}
                     onOpenTranscript={setTranscript}
                     onSaved={(message) => showToast(message)}

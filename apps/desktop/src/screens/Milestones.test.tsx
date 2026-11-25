@@ -35,6 +35,7 @@ const milestone = (over: Partial<Milestone>): Milestone => ({
 function setup(milestones: Milestone[]) {
   return render(
     <Milestones
+      onNewArtifact={() => {}}
       workspaceId="w1"
       projects={[]}
       milestones={milestones}

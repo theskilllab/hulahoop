@@ -23,6 +23,7 @@ const VIEWS: { id: string; label: string; hint: string }[] = [
   { id: "cost", label: "Cost control", hint: "what the agents spend" },
   { id: "prs", label: "Pull requests", hint: "what is open for review" },
   { id: "activity", label: "Activity", hint: "recent runs" },
+  { id: "new-artifact", label: "Create new artifact", hint: "a plan, spec, report, notes or file" },
   { id: "settings", label: "Settings", hint: "theme, workspace, Lumi" },
 ];
 

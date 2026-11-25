@@ -15,6 +15,7 @@ export default function PageHeader({
   size,
   subtitle,
   actions,
+  ownSearch,
 }: {
   title: string;
   back?: { label: string; onClick: () => void };
@@ -23,29 +24,38 @@ export default function PageHeader({
   /// The fact beside the title: a count, a state, a source. Keep it short.
   subtitle?: string;
   actions?: React.ReactNode;
+  /// The page brings its own search field, so the ⌘K door is left out.
+  ownSearch?: boolean;
 }) {
   return (
-    <header className={size === "big" ? "page-head big" : "page-head"} data-drag>
+    <header
+      className={size === "big" ? "page-head big" : "page-head"}
+      data-drag
+    >
       {back ? (
         <button className="ghost small page-back" onClick={back.onClick}>
           {back.label}
         </button>
       ) : null}
-      <h1 data-drag>
+      <h1 data-drag aria-label={title}>
         {title}
         {subtitle ? <small data-drag>{subtitle}</small> : null}
       </h1>
       <div className="page-tools">
         {actions}
-        <button
-          className="page-search"
-          onClick={() => window.dispatchEvent(new CustomEvent("hulahoop:search"))}
-          title="Search (⌘K)"
-        >
-          <Icon name="search" size={13} />
-          <span>Search</span>
-          <kbd>⌘K</kbd>
-        </button>
+        {ownSearch ? null : (
+          <button
+            className="page-search"
+            onClick={() =>
+              window.dispatchEvent(new CustomEvent("hulahoop:search"))
+            }
+            title="Search (⌘K)"
+          >
+            <Icon name="search" size={13} />
+            <span>Search</span>
+            <kbd>⌘K</kbd>
+          </button>
+        )}
       </div>
     </header>
   );
