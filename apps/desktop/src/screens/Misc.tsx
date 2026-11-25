@@ -122,7 +122,11 @@ export function Projects({
         ))}
         {unassignedTasks || openMilestones > 0 ? (
           <div className="pcard-wrap">
-            <button className="pcard" onClick={() => onOpenTasks(NO_PROJECT)}>
+            <button
+              className="pcard"
+              aria-label="Open tasks with no project"
+              onClick={() => onOpenTasks(NO_PROJECT)}
+            >
               <span className="pc">
                 <span className="pdot muted" aria-hidden="true" />
                 <h3>No project</h3>
@@ -184,7 +188,7 @@ function ProjectCard({
   const more = project.repos.length - shown.length;
   return (
     <div className="pcard-wrap">
-      <button className="pcard" onClick={onOpen}>
+      <button className="pcard" aria-label={`Open ${project.name} tasks`} onClick={onOpen}>
         <span className="pc">
           <span className="pdot" style={{ background: project.color }} aria-hidden="true" />
           <h3 className="truncate">{project.name}</h3>
