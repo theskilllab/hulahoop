@@ -106,7 +106,7 @@ export default function App() {
   const [paletteIssues, setPaletteIssues] = useState<IssueSummary[] | null>(null);
   const [collapsed, setCollapsed] = useState(localStorage.getItem(RAIL_KEY) === "collapsed");
 
-  /// On macOS the traffic lights sit inside the folded rail's 48px, so they go
+  /// On macOS the traffic lights sit inside the folded rail's 56px, so they go
   /// with the labels. Everywhere else this is a no-op.
   useEffect(() => {
     invoke("set_traffic_lights", { visible: !collapsed }).catch(() => undefined);
