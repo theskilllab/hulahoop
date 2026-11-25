@@ -4,6 +4,7 @@ import { gql, type Artifact, type IssueSummary as Issue, type Milestone, type Pr
 import PageHeader from "../PageHeader";
 import { FALLBACK_COLUMNS, isDoneStatus, type Column } from "../components/TaskBoard";
 import LinkTasksDialog from "../components/LinkTasksDialog";
+import NewMilestoneDialog from "../components/NewMilestoneDialog";
 import { StatusIcon, plural } from "../components/TaskBits";
 
 interface Props {
@@ -28,7 +29,7 @@ function parseDate(iso: string | null): Date | null {
 
 function formatDate(iso: string | null): string {
   const date = parseDate(iso);
-  return date ? date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "No date";
+  return date ? date.toLocaleDateString("en-US", { month: "short", day: "numeric", year: "numeric" }) : "—";
 }
 
 /** The workflow's column order, as the prototype orders a milestone's tasks; cancelled goes last. */
@@ -82,49 +83,11 @@ function progressOf(members: Issue[]) {
  */
 export default function Milestones({ workspaceId, projects, milestones, issues, artifacts, columns = FALLBACK_COLUMNS, onChanged, onOpenIssue, onOpenArtifacts }: Props) {
   const order = statusOrder(columns);
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
-  const [target, setTarget] = useState("");
-  const [projectId, setProjectId] = useState<string>("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
   const [linking, setLinking] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
-
-  async function create() {
-    if (title.trim().length < 3) {
-      setError("a milestone needs a title, so it can be referred to later");
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      const data = await gql<{ createMilestone: { id: string } }>(
-        `mutation ($workspaceId: UUID!, $projectId: UUID, $title: String!, $body: String, $targetDate: String) {
-          createMilestone(workspaceId: $workspaceId, projectId: $projectId, title: $title, body: $body, targetDate: $targetDate) { id }
-        }`,
-        {
-          workspaceId,
-          projectId: projectId || null,
-          title: title.trim(),
-          body,
-          targetDate: target || null,
-        },
-      );
-      setTitle("");
-      setBody("");
-      setTarget("");
-      setSelected(data.createMilestone.id);
-      setCreating(false);
-      await onChanged();
-    } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   /** Run a mutation from the detail pane; a failure is shown there instead of vanishing. */
   async function act(change: () => Promise<unknown>, refreshOnError = false) {
@@ -202,51 +165,23 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
         title="Milestones"
         subtitle={`${milestones.filter((entry) => entry.status === "open").length} open`}
         actions={
-          <button type="button" className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
-            <Icon name={creating ? "close" : "plus"} size={12} />
-            {creating ? "Cancel" : "New milestone"}
+          <button type="button" className="primary" onClick={() => setCreating(true)}>
+            <Icon name="plus" size={12} />
+            New milestone
           </button>
         }
       />
 
       {creating ? (
-        <div className="panel ms-new">
-          <h2>New milestone</h2>
-          <div className="grid-2">
-            <label>
-              <span>title</span>
-              <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="GitHub identity" />
-            </label>
-            <label>
-              <span>project (optional)</span>
-              <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-                <option value="">workspace</option>
-                {projects.map((project) => (
-                  <option key={project.id} value={project.id}>
-                    {project.prefix ? `${project.prefix} · ${project.name}` : project.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              <span>target date (optional)</span>
-              <input type="date" value={target} onChange={(event) => setTarget(event.target.value)} />
-            </label>
-            <label className="wide">
-              <span>what it is for</span>
-              <textarea value={body} onChange={(event) => setBody(event.target.value)} rows={3} />
-            </label>
-          </div>
-          {error && <p className="error">{error}</p>}
-          <div className="row">
-            <button type="button" className="primary" onClick={() => void create()} disabled={busy}>
-              {busy ? "creating…" : "create milestone"}
-            </button>
-            <button type="button" className="ghost" onClick={() => setCreating(false)}>
-              Cancel
-            </button>
-          </div>
-        </div>
+        <NewMilestoneDialog
+          workspaceId={workspaceId}
+          projects={projects}
+          onCreated={async (created) => {
+            setSelected(created.id);
+            await onChanged();
+          }}
+          onClose={() => setCreating(false)}
+        />
       ) : null}
 
       <div className="msplit">
@@ -279,8 +214,8 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
                   </span>
                 </span>
                 <span className="od-row ms-meta">
-                  <span className="ms-nowrap">{formatDate(entry.targetDate)}</span>
-                  <span className="od-fill ms-name">· {state.left}</span>
+                  {entry.targetDate && <span className="ms-nowrap">{formatDate(entry.targetDate)}</span>}
+                  <span className="od-fill ms-name">{entry.targetDate ? `· ${state.left}` : state.left}</span>
                   <span className="ms-nowrap">
                     {done}/{members.length} done
                   </span>

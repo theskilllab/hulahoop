@@ -16,6 +16,10 @@ fn page() -> String {
     desktop("screens/Milestones.tsx")
 }
 
+fn dialog() -> String {
+    desktop("components/NewMilestoneDialog.tsx")
+}
+
 fn css() -> String {
     desktop("styles.css")
 }
@@ -99,10 +103,11 @@ fn page_renders_title_status_and_target_date_from_data() {
     );
 }
 
-// Criterion 3: existing navigation and actions are kept.
+// Criterion 3: existing navigation and actions are kept. Creating a milestone
+// moved from the page into `NewMilestoneDialog`, so the two files are read together.
 #[test]
 fn existing_milestone_actions_survive() {
-    let tsx = page();
+    let tsx = format!("{}\n{}", page(), dialog());
     for needle in [
         "createMilestone",
         "updateMilestone",
@@ -111,8 +116,122 @@ fn existing_milestone_actions_survive() {
         "Reopen milestone",
         "New milestone",
     ] {
-        assert!(tsx.contains(needle), "Milestones.tsx lost `{needle}`");
+        assert!(tsx.contains(needle), "Milestones page lost `{needle}`");
     }
+}
+
+// Bug-fix ticket: New milestone is a sheet like New task, not an inline panel.
+#[test]
+fn new_milestone_opens_a_dialog_like_new_task() {
+    let tsx = page();
+    assert!(
+        tsx.contains("NewMilestoneDialog"),
+        "Milestones.tsx must open NewMilestoneDialog"
+    );
+    assert!(
+        !tsx.contains("ms-new"),
+        "the inline `.ms-new` panel must be gone"
+    );
+    let dialog = dialog();
+    for needle in [
+        "<dialog",
+        "settings-dialog",
+        "new-milestone-dialog",
+        "showModal()",
+        "createMilestone",
+        "uploadArtifact",
+    ] {
+        assert!(
+            dialog.contains(needle),
+            "NewMilestoneDialog lacks `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn new_milestone_copy_follows_the_prototype() {
+    let dialog = dialog();
+    for copy in [
+        "Due date",
+        "Description",
+        "(optional)",
+        "No project",
+        "or choose files to attach",
+        "Name the milestone so people know what it is working toward.",
+        "You can drag and drop files here to attach them.",
+    ] {
+        assert!(
+            dialog.contains(copy),
+            "NewMilestoneDialog lacks the copy `{copy}`"
+        );
+    }
+    for old in [
+        "target date",
+        "what it is for",
+        "creating…\"",
+        "create milestone",
+    ] {
+        assert!(
+            !dialog.contains(old) && !page().contains(old),
+            "the old copy `{old}` is still there"
+        );
+    }
+}
+
+#[test]
+fn description_is_a_drop_area_for_artifacts() {
+    let dialog = dialog();
+    for needle in [
+        "new-milestone-text",
+        "onDragOver",
+        "onDrop",
+        "type=\"file\"",
+        "milestoneId: created.id",
+    ] {
+        assert!(
+            dialog.contains(needle),
+            "NewMilestoneDialog lacks `{needle}`"
+        );
+    }
+}
+
+#[test]
+fn dialog_fields_use_the_prototype_field_styles() {
+    let dialog = dialog();
+    assert!(
+        dialog.contains("field-label"),
+        "labels use the prototype's .field-label"
+    );
+    let css = css();
+    assert!(
+        css.contains(".new-milestone-dialog"),
+        "dialog styles are scoped under .new-milestone-dialog"
+    );
+    assert!(
+        css.contains(".new-milestone-text.over") || css.contains(".new-milestone-text.over,"),
+        "the drop area highlights while a file is dragged over it"
+    );
+}
+
+// Bug-fix ticket: the detail progress is as wide as the lists below it.
+#[test]
+fn detail_progress_is_as_wide_as_the_rest_of_the_pane() {
+    let css = css();
+    let progress = rule(&css, ".ms-progress").expect(".ms-progress rule");
+    assert!(
+        !progress.contains("max-width"),
+        "`.ms-progress` must fill `.msd`, not stop at 640px: {progress}"
+    );
+}
+
+// Bug-fix ticket: a milestone with no due date says so once.
+#[test]
+fn list_row_does_not_print_no_date_beside_no_due_date() {
+    let tsx = page();
+    assert!(
+        !tsx.contains("\"No date\""),
+        "the list row must not print a placeholder date before `No due date`"
+    );
 }
 
 // Criterion 4: mobile width and keyboard focus.
