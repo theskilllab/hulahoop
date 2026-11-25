@@ -125,13 +125,14 @@ fn window(period: &str) -> async_graphql::Result<(DateTime<Utc>, DateTime<Utc>)>
         .single()
         .expect("valid UTC day");
     let start = match period {
+        "today" => midnight,
         "7d" => midnight - Duration::days(6),
         "30d" => midnight - Duration::days(29),
         "mtd" => Utc
             .with_ymd_and_hms(end.year(), end.month(), 1, 0, 0, 0)
             .single()
             .expect("valid UTC month"),
-        _ => return Err("period must be 7d, 30d or mtd".into()),
+        _ => return Err("period must be today, 7d, 30d or mtd".into()),
     };
     Ok((start, end))
 }
@@ -142,6 +143,8 @@ fn prior_window(
     end: DateTime<Utc>,
 ) -> (DateTime<Utc>, DateTime<Utc>) {
     match period {
+        // Yesterday up to the same time of day, so a morning compares with a morning.
+        "today" => (start - Duration::days(1), end - Duration::days(1)),
         "7d" => (start - Duration::days(7), end - Duration::days(7)),
         "30d" => (start - Duration::days(30), end - Duration::days(30)),
         _ => {
@@ -503,6 +506,13 @@ mod tests {
         assert_eq!(prior_end.date_naive().to_string(), "2026-03-01");
         let (prior, prior_end) = prior_window("7d", end - Duration::days(6), end);
         assert_eq!(prior_end - prior, end - (end - Duration::days(6)));
+        let midnight = Utc.with_ymd_and_hms(2026, 3, 31, 0, 0, 0).single().unwrap();
+        let (prior, prior_end) = prior_window("today", midnight, end);
+        assert_eq!(prior.to_rfc3339(), "2026-03-30T00:00:00+00:00");
+        assert_eq!(prior_end.to_rfc3339(), "2026-03-30T12:00:00+00:00");
+        let (start, now) = window("today").unwrap();
+        assert_eq!(start.date_naive(), now.date_naive());
+        assert_eq!(start.time(), chrono::NaiveTime::MIN);
     }
 
     #[tokio::test]

@@ -11,7 +11,7 @@ const money = (value: number | null) => value === null ? "—" : `$${value.toLoc
 const average = (sum: number, count: number) => count ? sum / count : null;
 const time = (minutes: number | null) => minutes === null ? "—" : minutes >= 60 ? `${number(minutes / 60)}h` : `${number(minutes)}m`;
 const percent = (numerator: number, denominator: number) => denominator ? `${number(100 * numerator / denominator)}%` : "—";
-const periodName = { "7d": "Last 7 days", "30d": "Last 30 days", mtd: "Month to date" };
+const periodName = { today: "Today", "7d": "Last 7 days", "30d": "Last 30 days", mtd: "Month to date" };
 const modelColors = ["var(--accent)", "var(--brand)", "var(--ok)", "var(--warn)", "var(--text-2)", "var(--muted)"];
 
 type Period = CostReport["period"];
