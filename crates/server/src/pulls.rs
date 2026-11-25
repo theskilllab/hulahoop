@@ -94,6 +94,16 @@ pub enum CiState {
     None,
 }
 
+/// Whether an open pull request merges cleanly into its base branch, as
+/// GitHub's conflict check last said. `Unknown` until GitHub has been asked,
+/// and while it is still computing the answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum MergeableState {
+    Clean,
+    Conflicting,
+    Unknown,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
 pub enum MergeMethod {
     Merge,
@@ -153,6 +163,34 @@ impl CiState {
             "FAILING" => Self::Failing,
             "RUNNING" => Self::Running,
             _ => Self::None,
+        }
+    }
+}
+
+impl MergeableState {
+    /// GitHub's `mergeable`: a boolean, or null while it computes.
+    fn from_github(mergeable: &Value) -> Self {
+        match mergeable.as_bool() {
+            Some(true) => Self::Clean,
+            Some(false) => Self::Conflicting,
+            None => Self::Unknown,
+        }
+    }
+
+    /// The stored word; unknown is stored as null.
+    fn as_db(self) -> Option<&'static str> {
+        match self {
+            Self::Clean => Some("clean"),
+            Self::Conflicting => Some("conflicting"),
+            Self::Unknown => None,
+        }
+    }
+
+    fn parse(text: Option<&str>) -> Self {
+        match text {
+            Some("clean") => Self::Clean,
+            Some("conflicting") => Self::Conflicting,
+            _ => Self::Unknown,
         }
     }
 }
@@ -232,6 +270,9 @@ pub struct PullRequest {
     pub review_state: ReviewState,
     pub review_requested_from_me: bool,
     pub ci_state: CiState,
+    /// Whether it merges cleanly into `base_ref`; only open pull requests are
+    /// asked, so a closed or merged one is `UNKNOWN`.
+    pub mergeable: MergeableState,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub merged_at: Option<DateTime<Utc>>,
@@ -444,14 +485,17 @@ pub struct Gate {
 }
 
 /// Which buttons a person gets on a pull request. Pure, so the rules read as a
-/// list: no token, then the pull request's own state, then reviews, then CI.
+/// list: no token, then the pull request's own state, then conflicts, then
+/// reviews, then CI.
 ///
-/// `mergeable` is GitHub's own conflict check, `None` while it is computing.
+/// A conflict with the base branch comes before reviews and CI: no approval or
+/// green build lets it merge, and it is the one thing the person has to go and
+/// fix themselves. `pull.mergeable` is GitHub's own conflict check; unknown
+/// (still computing) does not block, and GitHub refuses the merge if it must.
 /// `task` is why the linked task is not ready to merge, if it is not.
 pub fn gate(
     login: Option<&str>,
     pull: &PullRequest,
-    mergeable: Option<bool>,
     methods: &[MergeMethod],
     task: Option<&str>,
 ) -> Gate {
@@ -476,25 +520,28 @@ pub fn gate(
     let own = login.is_some_and(|me| me.eq_ignore_ascii_case(&pull.author_login));
 
     let merge_blocked = if login.is_none() {
-        Some(NO_TOKEN_REASON)
-    } else if closed_reason.is_some() {
-        closed_reason
-    } else if task.is_some() {
-        task
+        Some(NO_TOKEN_REASON.to_string())
+    } else if let Some(reason) = closed_reason {
+        Some(reason.to_string())
+    } else if let Some(reason) = task {
+        Some(reason.to_string())
     } else if pull.draft {
-        Some("This pull request is still a draft")
+        Some("This pull request is still a draft".to_string())
+    } else if pull.mergeable == MergeableState::Conflicting {
+        Some(format!(
+            "This branch has conflicts with {}; resolve them before merging",
+            pull.base_ref
+        ))
     } else if pull.review_state == ReviewState::ChangesRequested {
-        Some("Changes were requested; it needs an approving review first")
+        Some("Changes were requested; it needs an approving review first".to_string())
     } else if pull.review_state != ReviewState::Approved && !own {
-        Some("Waiting for an approving review")
+        Some("Waiting for an approving review".to_string())
     } else if pull.ci_state == CiState::Failing {
-        Some("CI is failing")
+        Some("CI is failing".to_string())
     } else if pull.ci_state == CiState::Running {
-        Some("CI is still running")
-    } else if mergeable == Some(false) {
-        Some("GitHub reports a conflict with the base branch")
+        Some("CI is still running".to_string())
     } else if methods.is_empty() {
-        Some("The repository allows no merge method")
+        Some("The repository allows no merge method".to_string())
     } else {
         None
     };
@@ -503,7 +550,7 @@ pub fn gate(
         can_review: review_blocked.is_none(),
         review_blocked_reason: review_blocked.map(str::to_string),
         can_merge: merge_blocked.is_none(),
-        merge_blocked_reason: merge_blocked.map(str::to_string),
+        merge_blocked_reason: merge_blocked,
     }
 }
 
@@ -651,6 +698,8 @@ struct PullRow {
     requested_reviewers: String,
     ci_state: String,
     ci_checked_at: Option<DateTime<Utc>>,
+    mergeable: Option<String>,
+    mergeable_checked_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     merged_at: Option<DateTime<Utc>>,
@@ -688,6 +737,7 @@ impl PullRow {
             review_state: ReviewState::parse(&self.review_state),
             review_requested_from_me,
             ci_state: CiState::parse(&self.ci_state),
+            mergeable: MergeableState::parse(self.mergeable.as_deref()),
             created_at: self.created_at,
             updated_at: self.updated_at,
             merged_at: self.merged_at,
@@ -1211,6 +1261,15 @@ impl Engine {
                 .map(|row| (row.number, row))
                 .collect();
 
+        // When a pull request last merged in this repository. A merge moves a
+        // base branch, which can put any other open pull request in conflict
+        // without GitHub touching that one's `updated_at`; its conflict check
+        // is asked again when it is older than this.
+        let last_merge = seen
+            .values()
+            .filter_map(|pull| parse_time(&pull["merged_at"]))
+            .max();
+
         let cutoff = Utc::now() - chrono::Duration::days(KEEP_CLOSED_DAYS);
         for (number, listed) in &seen {
             let open = listed["state"].as_str() == Some("open");
@@ -1219,7 +1278,10 @@ impl Engine {
                 continue;
             }
             let before = cached.get(number);
-            if let Err(error) = self.refresh_pull(&github, repo, listed, before).await {
+            if let Err(error) = self
+                .refresh_pull(&github, repo, listed, before, last_merge)
+                .await
+            {
                 if crate::github::GithubError::rate_limit(&error).is_some() {
                     return Err(error);
                 }
@@ -1235,7 +1297,10 @@ impl Engine {
             }
             match github.pull(&repo.owner, &repo.name, *number).await {
                 Ok(pull) => {
-                    if let Err(error) = self.refresh_pull(&github, repo, &pull, Some(row)).await {
+                    if let Err(error) = self
+                        .refresh_pull(&github, repo, &pull, Some(row), last_merge)
+                        .await
+                    {
                         tracing::warn!(repo = %full, number, "pull request sync: {error:#}");
                     }
                 }
@@ -1269,33 +1334,58 @@ impl Engine {
     }
 
     /// Updates one cached pull request from its listing, asking GitHub for
-    /// more only where the listing says something changed.
+    /// more only where the listing says something changed. `last_merge` is when
+    /// a pull request last merged in the repository, which may have moved this
+    /// one's base branch.
     async fn refresh_pull(
         &self,
         github: &Github,
         repo: &LinkedRepo,
         listed: &Value,
         before: Option<&PullRow>,
+        last_merge: Option<DateTime<Utc>>,
     ) -> Result<()> {
         let number = listed["number"].as_i64().unwrap_or_default();
         let open = listed["state"].as_str() == Some("open");
         let updated = parse_time(&listed["updated_at"]);
         let changed = before.is_none_or(|row| Some(row.updated_at) != updated);
+        let recheck =
+            |at: DateTime<Utc>| Utc::now() - at > chrono::Duration::minutes(CI_RECHECK_MINUTES);
 
-        // The listing has no line counts; the pull request itself does.
-        let pull = if changed && listed["additions"].is_null() {
+        // The listing carries no conflict check, so an open pull request is
+        // read on its own when that check is due: when the listing changed,
+        // when the answer is unknown (GitHub computes it in the background and
+        // says null until it is done), when it is old, or when another pull
+        // request merged since. GitHub's merge times are whole seconds, so a
+        // merge in the same second as the check counts as after it.
+        let conflicts_due = open
+            && !is_merged(listed)
+            && (changed
+                || before.is_none_or(|row| {
+                    row.mergeable.is_none()
+                        || row.mergeable_checked_at.is_none_or(|at| {
+                            recheck(at)
+                                || last_merge.is_some_and(|merged| {
+                                    merged + chrono::Duration::seconds(1) > at
+                                })
+                        })
+                }));
+
+        // The listing has no line counts nor the conflict check; the pull
+        // request itself has both. One read serves both, and a payload that
+        // is already the pull request itself is not read again.
+        let whole = listed.get("mergeable").is_some();
+        let pull = if !whole && ((changed && listed["additions"].is_null()) || conflicts_due) {
             github.pull(&repo.owner, &repo.name, number).await?
         } else {
             listed.clone()
         };
+        let mergeable = pull.get("mergeable").map(MergeableState::from_github);
 
         let head = pull["head"]["sha"].as_str().unwrap_or_default();
         // Reviews do not always move `updated_at`, so they are read again on
         // the same clock as CI, not only when the listing says it changed.
-        let stale = before.is_none_or(|row| {
-            row.ci_checked_at
-                .is_none_or(|at| Utc::now() - at > chrono::Duration::minutes(CI_RECHECK_MINUTES))
-        });
+        let stale = before.is_none_or(|row| row.ci_checked_at.is_none_or(recheck));
         let review = if !open || is_merged(&pull) || pull["draft"].as_bool() == Some(true) {
             review_state(&pull, &[])
         } else if changed || stale {
@@ -1320,17 +1410,21 @@ impl Engine {
         } else {
             None
         };
-        self.store_pull(repo, &pull, review, ci, before).await
+        self.store_pull(repo, &pull, review, ci, mergeable, before)
+            .await
     }
 
-    /// Writes one pull request into the cache. `ci` is `None` when CI was not
-    /// asked this time, which keeps what was cached.
+    /// Writes one pull request into the cache. `ci` and `mergeable` are `None`
+    /// when they were not asked this time, which keeps what was cached. Only an
+    /// open pull request keeps a conflict check: a closed or merged one has no
+    /// base to conflict with any more.
     async fn store_pull(
         &self,
         repo: &LinkedRepo,
         pull: &Value,
         review: ReviewState,
         ci: Option<CiState>,
+        mergeable: Option<MergeableState>,
         before: Option<&PullRow>,
     ) -> Result<()> {
         let number = pull["number"]
@@ -1355,13 +1449,24 @@ impl Engine {
         } else {
             before.and_then(|row| row.ci_checked_at.map(|at| at.to_rfc3339()))
         };
+        let (mergeable, mergeable_checked_at) =
+            if pull["state"].as_str() != Some("open") || is_merged(pull) {
+                (None, None)
+            } else if let Some(state) = mergeable {
+                (state.as_db().map(str::to_string), Some(now.clone()))
+            } else {
+                (
+                    before.and_then(|row| row.mergeable.clone()),
+                    before.and_then(|row| row.mergeable_checked_at.map(|at| at.to_rfc3339())),
+                )
+            };
         sqlx::query(
             "insert into pull_requests
                (repo_id, number, repo_name, title, url, state, draft, merged, author_login,
                 author_avatar_url, head_ref, head_sha, base_ref, additions, deletions, changed_files,
-                review_state, requested_reviewers, ci_state, ci_checked_at, created_at, updated_at,
-                merged_at, closed_at, synced_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                review_state, requested_reviewers, ci_state, ci_checked_at, mergeable,
+                mergeable_checked_at, created_at, updated_at, merged_at, closed_at, synced_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              on conflict (repo_id, number) do update set
                repo_name = excluded.repo_name, title = excluded.title, url = excluded.url,
                state = excluded.state, draft = excluded.draft, merged = excluded.merged,
@@ -1370,7 +1475,9 @@ impl Engine {
                additions = excluded.additions, deletions = excluded.deletions,
                changed_files = excluded.changed_files, review_state = excluded.review_state,
                requested_reviewers = excluded.requested_reviewers, ci_state = excluded.ci_state,
-               ci_checked_at = excluded.ci_checked_at, created_at = excluded.created_at,
+               ci_checked_at = excluded.ci_checked_at, mergeable = excluded.mergeable,
+               mergeable_checked_at = excluded.mergeable_checked_at,
+               created_at = excluded.created_at,
                updated_at = excluded.updated_at, merged_at = excluded.merged_at,
                closed_at = excluded.closed_at, synced_at = excluded.synced_at
              -- A sync that read GitHub before a merge must not write the
@@ -1399,6 +1506,8 @@ impl Engine {
         .bind(serde_json::to_string(&requested)?)
         .bind(ci_state.as_str())
         .bind(ci_checked_at)
+        .bind(mergeable)
+        .bind(mergeable_checked_at)
         .bind(timestamp(&pull["created_at"]).unwrap_or_else(|| now.clone()))
         .bind(timestamp(&pull["updated_at"]).unwrap_or_else(|| now.clone()))
         .bind(timestamp(&pull["merged_at"]))
@@ -1624,8 +1733,18 @@ impl Engine {
         let review = review_state(&pull, &reviews);
         let ci = ci_state(&runs, &combined);
         let before = self.cached_row(repo.id, number).await?;
-        self.store_pull(repo, &pull, review, Some(ci), before.as_ref())
-            .await?;
+        // The conflict check is stored too, so the list shows what the person
+        // just saw; the gate reads it back from the row.
+        let mergeable = MergeableState::from_github(&pull["mergeable"]);
+        self.store_pull(
+            repo,
+            &pull,
+            review,
+            Some(ci),
+            Some(mergeable),
+            before.as_ref(),
+        )
+        .await?;
         let pull_request = self
             .load_pull(repo.id, number)
             .await?
@@ -1644,13 +1763,7 @@ impl Engine {
             }
         }
         let task = self.task_merge_block(repo.id, number).await?;
-        let gate = gate(
-            login,
-            &pull_request,
-            pull["mergeable"].as_bool(),
-            &merge_methods,
-            task.as_deref(),
-        );
+        let gate = gate(login, &pull_request, &merge_methods, task.as_deref());
         Ok(Fresh {
             pull,
             reviews,
@@ -1965,6 +2078,7 @@ impl Engine {
                 pull.merged = true;
                 pull.state = "closed".to_string();
                 pull.review_state = ReviewState::Merged;
+                pull.mergeable = MergeableState::Unknown;
                 pull.merged_at = Some(Utc::now());
                 Ok(pull)
             }
@@ -1993,9 +2107,29 @@ impl Engine {
         let pull = github.pull(&repo.owner, &repo.name, number).await.ok();
         if let Some(pull) = &pull {
             let before = self.cached_row(repo.id, number).await?;
-            self.store_pull(repo, pull, review_state(pull, &[]), None, before.as_ref())
-                .await?;
+            self.store_pull(
+                repo,
+                pull,
+                review_state(pull, &[]),
+                None,
+                None,
+                before.as_ref(),
+            )
+            .await?;
         }
+
+        // The merge moved a base branch, which can put any other open pull
+        // request in conflict without GitHub changing its `updated_at`. Their
+        // checks are dropped as stale so the next sync asks again; the answers
+        // they had stay on screen until then.
+        sqlx::query(
+            "update pull_requests set mergeable_checked_at = null
+              where repo_id = ? and number != ? and state = 'open'",
+        )
+        .bind(repo.id)
+        .bind(number)
+        .execute(&self.db.pool)
+        .await?;
 
         if let Some(issue) = self.linked_issue(repo.id, number).await? {
             if issue.status_enum() == IssueStatus::InReview {
@@ -2247,6 +2381,8 @@ mod tests {
         broken: Vec<i64>,
         /// Branches still on GitHub.
         branches: Vec<String>,
+        /// How often each pull request was read on its own.
+        pull_reads: HashMap<i64, usize>,
     }
 
     type Shared = Arc<Mutex<Fake>>;
@@ -2313,12 +2449,14 @@ mod tests {
             .iter()
             .filter(|p| state == "all" || p["state"] == state)
             .map(|p| {
-                // The listing leaves the line counts out, as GitHub's does.
+                // The listing leaves the line counts and the conflict check
+                // out, as GitHub's does.
                 let mut p = p.clone();
                 if let Some(object) = p.as_object_mut() {
                     object.remove("additions");
                     object.remove("deletions");
                     object.remove("changed_files");
+                    object.remove("mergeable");
                 }
                 p
             })
@@ -2334,7 +2472,8 @@ mod tests {
         if !authorized(&headers) {
             return refused(StatusCode::NOT_FOUND, "Not Found");
         }
-        let fake = fake.lock().unwrap();
+        let mut fake = fake.lock().unwrap();
+        *fake.pull_reads.entry(number).or_default() += 1;
         if fake.broken.contains(&number) {
             return refused(StatusCode::INTERNAL_SERVER_ERROR, "Server Error");
         }
@@ -2822,6 +2961,141 @@ mod tests {
         assert_eq!(data["openPullRequestCount"], 3);
     }
 
+    /// The cached conflict check of each pull request, by number.
+    async fn conflicts(world: &World) -> HashMap<i64, MergeableState> {
+        world
+            .engine
+            .pull_requests(PullRequestFilter::Open)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|pull| (pull.number, pull.mergeable))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_sync_records_conflicts_with_the_base_branch() {
+        let world = world().await;
+        {
+            let mut fake = world.fake.lock().unwrap();
+            fake.pulls = vec![
+                pull_json(1, "octo", "sha1"),
+                pull_json(2, "octo", "sha2"),
+                pull_json(3, "octo", "sha3"),
+            ];
+            fake.pulls[1]["mergeable"] = json!(false);
+            fake.pulls[2]["mergeable"] = Value::Null;
+        }
+        world.engine.set_github_token(GOOD).await.unwrap();
+        world.engine.sync_pull_requests(None).await.unwrap();
+        assert_eq!(
+            conflicts(&world).await,
+            HashMap::from([
+                (1, MergeableState::Clean),
+                (2, MergeableState::Conflicting),
+                (3, MergeableState::Unknown),
+            ])
+        );
+
+        let schema = crate::gql::build_schema(world.engine.clone());
+        let response = schema
+            .execute("{ pullRequests(filter: OPEN) { number mergeable } }")
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        let data = response.data.into_json().unwrap();
+        let conflicting = data["pullRequests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|pull| pull["number"] == 2)
+            .unwrap();
+        assert_eq!(conflicting["mergeable"], "CONFLICTING");
+
+        // Nothing changed: a known answer is not asked again, an unknown one
+        // (GitHub was still computing it) is.
+        {
+            let mut fake = world.fake.lock().unwrap();
+            fake.pull_reads.clear();
+            fake.pulls[2]["mergeable"] = json!(true);
+            // The base moves under #1, and GitHub leaves its `updated_at` alone.
+            fake.pulls[0]["mergeable"] = json!(false);
+        }
+        world.engine.sync_pull_requests(None).await.unwrap();
+        {
+            let fake = world.fake.lock().unwrap();
+            assert_eq!(fake.pull_reads.get(&1), None);
+            assert_eq!(fake.pull_reads.get(&2), None);
+            assert_eq!(fake.pull_reads.get(&3), Some(&1));
+        }
+        let after = conflicts(&world).await;
+        assert_eq!(after[&1], MergeableState::Clean, "not asked again yet");
+        assert_eq!(after[&3], MergeableState::Clean);
+
+        // Another pull request merged since #1 was checked: its base moved, so
+        // it is asked again although its own listing did not change.
+        {
+            let mut fake = world.fake.lock().unwrap();
+            let mut merged = pull_json(4, "octo", "sha4");
+            merged["state"] = json!("closed");
+            merged["merged"] = json!(true);
+            merged["merged_at"] = json!(Utc::now().to_rfc3339());
+            merged["closed_at"] = json!(Utc::now().to_rfc3339());
+            fake.pulls.push(merged);
+        }
+        world.engine.sync_pull_requests(None).await.unwrap();
+        assert_eq!(conflicts(&world).await[&1], MergeableState::Conflicting);
+        let merged = world
+            .engine
+            .pull_requests(PullRequestFilter::Merged)
+            .await
+            .unwrap();
+        assert_eq!(merged[0].mergeable, MergeableState::Unknown);
+    }
+
+    #[tokio::test]
+    async fn a_merge_from_hulahoop_has_the_other_pull_requests_checked_again() {
+        let world = world().await;
+        world.fake.lock().unwrap().pulls =
+            vec![pull_json(1, "octo", "sha1"), pull_json(2, "octo", "sha2")];
+        world.approve(2);
+        world.engine.set_github_token(GOOD).await.unwrap();
+        world.engine.sync_pull_requests(None).await.unwrap();
+        assert_eq!(conflicts(&world).await[&1], MergeableState::Clean);
+
+        // #2 merges from here. GitHub's merge time is older than #1's check,
+        // so only the merge itself can tell the sync that #1's base moved.
+        world.fake.lock().unwrap().pulls[0]["mergeable"] = json!(false);
+        world
+            .engine
+            .merge_pull_request(world.repo, 2, MergeMethod::Squash, None)
+            .await
+            .unwrap();
+        world.engine.sync_pull_requests(None).await.unwrap();
+        assert_eq!(conflicts(&world).await[&1], MergeableState::Conflicting);
+
+        // The detail reads the check live and says it before review and CI.
+        let detail = world
+            .engine
+            .pull_request_detail(world.repo, 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.pull_request.mergeable, MergeableState::Conflicting);
+        assert_eq!(
+            detail.merge_blocked_reason.as_deref(),
+            Some("This branch has conflicts with main; resolve them before merging")
+        );
+
+        // Resolved on GitHub: the live read clears it from the list too.
+        world.fake.lock().unwrap().pulls[0]["mergeable"] = json!(true);
+        world
+            .engine
+            .pull_request_detail(world.repo, 1)
+            .await
+            .unwrap();
+        assert_eq!(conflicts(&world).await[&1], MergeableState::Clean);
+    }
+
     #[tokio::test]
     async fn merge_and_review_buttons_say_why_they_are_off() {
         let world = world().await;
@@ -2886,37 +3160,64 @@ mod tests {
 
         // The pure gate, rule by rule.
         let mut pull = detail.pull_request.clone();
+        assert_eq!(pull.mergeable, MergeableState::Clean);
         pull.ci_state = CiState::None;
         let methods = [MergeMethod::Squash];
-        let open = gate(Some(ME), &pull, Some(true), &methods, None);
+        let open = gate(Some(ME), &pull, &methods, None);
         assert!(open.can_merge, "no checks at all counts as passing");
-        let none = gate(None, &pull, Some(true), &methods, None);
+        let none = gate(None, &pull, &methods, None);
         assert_eq!(none.review_blocked_reason.as_deref(), Some(NO_TOKEN_REASON));
         assert_eq!(none.merge_blocked_reason.as_deref(), Some(NO_TOKEN_REASON));
         pull.draft = true;
         assert_eq!(
-            gate(Some(ME), &pull, Some(true), &methods, None)
+            gate(Some(ME), &pull, &methods, None)
                 .merge_blocked_reason
                 .as_deref(),
             Some("This pull request is still a draft")
         );
         pull.draft = false;
         pull.review_state = ReviewState::ChangesRequested;
-        assert!(!gate(Some(ME), &pull, Some(true), &methods, None).can_merge);
+        assert!(!gate(Some(ME), &pull, &methods, None).can_merge);
         pull.review_state = ReviewState::Approved;
         pull.ci_state = CiState::Running;
         assert_eq!(
-            gate(Some(ME), &pull, Some(true), &methods, None)
+            gate(Some(ME), &pull, &methods, None)
                 .merge_blocked_reason
                 .as_deref(),
             Some("CI is still running")
         );
         pull.ci_state = CiState::Passing;
-        assert!(!gate(Some(ME), &pull, Some(false), &methods, None).can_merge);
-        assert!(!gate(Some(ME), &pull, Some(true), &[], None).can_merge);
+        pull.mergeable = MergeableState::Unknown;
+        assert!(
+            gate(Some(ME), &pull, &methods, None).can_merge,
+            "a check GitHub is still computing does not hold the merge back"
+        );
+        assert!(!gate(Some(ME), &pull, &[], None).can_merge);
+
+        // A conflict is said before waiting on a review or on CI: no approval
+        // and no green build make it mergeable.
+        pull.mergeable = MergeableState::Conflicting;
+        pull.review_state = ReviewState::ReviewRequested;
+        pull.ci_state = CiState::Failing;
+        let conflicting = gate(Some(ME), &pull, &methods, None);
+        assert!(!conflicting.can_merge);
+        assert_eq!(
+            conflicting.merge_blocked_reason.as_deref(),
+            Some("This branch has conflicts with main; resolve them before merging")
+        );
+        assert!(conflicting.can_review, "a conflict does not stop a review");
+        pull.draft = true;
+        assert_eq!(
+            gate(Some(ME), &pull, &methods, None)
+                .merge_blocked_reason
+                .as_deref(),
+            Some("This pull request is still a draft")
+        );
+        pull.draft = false;
+
         pull.merged = true;
         assert_eq!(
-            gate(Some(ME), &pull, Some(true), &methods, None)
+            gate(Some(ME), &pull, &methods, None)
                 .review_blocked_reason
                 .as_deref(),
             Some("This pull request is already merged")
@@ -3364,7 +3665,7 @@ mod tests {
         let repo = world.engine.linked_repo(world.repo).await.unwrap().unwrap();
         world
             .engine
-            .store_pull(&repo, &read_before, ReviewState::Approved, None, None)
+            .store_pull(&repo, &read_before, ReviewState::Approved, None, None, None)
             .await
             .unwrap();
         let cached = world
@@ -3384,7 +3685,7 @@ mod tests {
         same_second["updated_at"] = json!(cached.updated_at.to_rfc3339());
         world
             .engine
-            .store_pull(&repo, &same_second, ReviewState::Approved, None, None)
+            .store_pull(&repo, &same_second, ReviewState::Approved, None, None, None)
             .await
             .unwrap();
         assert!(

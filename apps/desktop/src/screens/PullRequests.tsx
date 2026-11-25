@@ -116,6 +116,21 @@ export function CiChip({ state }: { state: CiState }) {
   }
 }
 
+/** Whether an open pull request has conflicts with its base branch, as GitHub's check last said. */
+export function conflicting(pr: PullRequest): boolean {
+  return !pr.merged && pr.state === "open" && pr.mergeable === "CONFLICTING";
+}
+
+export function ConflictChip({ pr }: { pr: PullRequest }) {
+  if (!conflicting(pr)) return null;
+  return (
+    <span className="chip bad" title={`Conflicts with ${pr.baseRef}`}>
+      <Icon name="alert" size={12} />
+      Conflicts
+    </span>
+  );
+}
+
 function Stat({ additions, deletions }: { additions: number; deletions: number }) {
   return (
     <span className="mono diff-stat" aria-label={`${additions} added, ${deletions} removed`}>
@@ -346,6 +361,7 @@ export default function PullRequests({
                     </span>
                     <span className="pr-chips">
                       <ReviewChip pr={pr} />
+                      <ConflictChip pr={pr} />
                       {pr.merged ? null : <CiChip state={pr.ciState} />}
                     </span>
                   </button>
@@ -422,10 +438,11 @@ function PullRequestPane({
     }
   }, [pr.repoId, pr.number]);
 
-  // Again whenever the list sees the pull request move.
+  // Again whenever the list sees the pull request move. A conflict shows up without `updatedAt` moving, so a change
+  // in the list's conflict check reloads it too.
   useEffect(() => {
     void load();
-  }, [load, pr.updatedAt, pr.headSha, pr.merged]);
+  }, [load, pr.updatedAt, pr.headSha, pr.merged, pr.mergeable]);
 
   const files = useMemo(() => (detail ? filesFromGithub(detail.files) : []), [detail]);
   const sum = useMemo(() => totals(files), [files]);
@@ -441,7 +458,11 @@ function PullRequestPane({
   const canMerge = Boolean(detail?.canMerge) && chosen !== null;
   const reviewWhy = detail && !detail.canReview ? detail.reviewBlockedReason ?? "" : "";
   const mergeWhy = detail && !detail.canMerge ? detail.mergeBlockedReason ?? "" : "";
-  const reasons = [...new Set([reviewWhy, mergeWhy].filter(Boolean))];
+  // The live check when the detail has loaded, the list's until then.
+  const conflict = conflicting(detail ? { ...pr, mergeable: detail.pullRequest.mergeable } : pr);
+  // The conflict has its own line below the branch, so the merge reason does not say it twice.
+  const conflictWhy = conflict && mergeWhy.startsWith("This branch has conflicts");
+  const reasons = [...new Set([reviewWhy, conflictWhy ? "" : mergeWhy].filter(Boolean))];
   const task = pr.issue;
 
   async function review(event: ReviewEvent, note: string | null) {
@@ -558,6 +579,12 @@ function PullRequestPane({
           <Icon name="branch" size={12} />
           {pr.headRef} → {pr.baseRef}
         </div>
+        {conflict ? (
+          <p className="pr-conflict" role="status">
+            <Icon name="alert" size={14} />
+            This branch has conflicts with {pr.baseRef} that must be resolved.
+          </p>
+        ) : null}
         <div className="pr-cluster pr-actions">
           <a className="btn" href={pr.url} target="_blank" rel="noreferrer">
             Open on GitHub

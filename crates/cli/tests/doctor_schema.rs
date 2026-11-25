@@ -98,8 +98,17 @@ async fn doctor_fails_when_the_data_dir_has_a_migration_the_binary_lacks() {
     let dir = data_dir("unknown");
     let db = migrated(&dir).await;
     let newest = newest_known();
-    let (first, second) = (newest + 24, newest + 25);
-    for version in [first, second] {
+    // Two unknown migrations, or three when two would make the applied count
+    // equal the newest known number: the numbering has gaps, so the count
+    // can land on it.
+    let unknown = if applied(&db).await + 2 == newest {
+        3
+    } else {
+        2
+    };
+    let versions: Vec<i64> = (1..=unknown).map(|n| newest + 23 + n).collect();
+    let second = versions[versions.len() - 1];
+    for &version in &versions {
         sqlx::query(
             "insert into _sqlx_migrations \
              (version, description, success, checksum, execution_time) \

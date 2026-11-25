@@ -1279,6 +1279,8 @@ export interface GithubAccount {
 export type PullRequestFilter = "OPEN" | "NEEDS_MY_REVIEW" | "MINE" | "BY_AGENTS" | "FAILING_CI" | "MERGED";
 export type ReviewState = "DRAFT" | "REVIEW_REQUESTED" | "APPROVED" | "CHANGES_REQUESTED" | "MERGED" | "CLOSED";
 export type CiState = "PASSING" | "FAILING" | "RUNNING" | "NONE";
+/** GitHub's conflict check against the base branch; `UNKNOWN` until asked, or while GitHub computes it. */
+export type MergeableState = "CLEAN" | "CONFLICTING" | "UNKNOWN";
 export type MergeMethod = "MERGE" | "SQUASH" | "REBASE";
 export type ReviewEvent = "APPROVE" | "REQUEST_CHANGES";
 export type DiffSide = "LEFT" | "RIGHT";
@@ -1308,6 +1310,8 @@ export interface PullRequest {
   reviewState: ReviewState;
   reviewRequestedFromMe: boolean;
   ciState: CiState;
+  /** Whether it merges cleanly into `baseRef`; closed and merged ones are `UNKNOWN`. */
+  mergeable: MergeableState;
   createdAt: string;
   updatedAt: string;
   mergedAt: string | null;
@@ -1386,7 +1390,7 @@ export const GITHUB_ACCOUNT_FIELDS = `login name avatarUrl tokenHint validatedAt
 export const PULL_REQUEST_FIELDS = `
   id repoId repoName number title url state draft merged authorLogin authorAvatarUrl byAgent
   headRef headSha baseRef additions deletions changedFiles reviewState reviewRequestedFromMe ciState
-  createdAt updatedAt mergedAt
+  mergeable createdAt updatedAt mergedAt
   issue { id key title status }
   liveRun { id agentId status }
 `;
