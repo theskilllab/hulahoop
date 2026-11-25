@@ -298,9 +298,13 @@ impl Query {
         &self,
         ctx: &Context<'_>,
         workspace_id: Uuid,
-        #[graphql(default)] project_ids: Vec<Uuid>,
+        #[graphql(default)] mut project_ids: Vec<Uuid>,
         #[graphql(default = false)] no_project: bool,
+        // The single-project form apps up to 0.0.44 send. Without it their
+        // refresh fails as a whole and Tasks, Milestones and Artifacts stay empty.
+        #[graphql(deprecation = "use projectIds")] project_id: Option<Uuid>,
     ) -> async_graphql::Result<i64> {
+        project_ids.extend(project_id);
         Ok(engine(ctx)
             .done_issue_count(workspace_id, &project_ids, no_project)
             .await?)
