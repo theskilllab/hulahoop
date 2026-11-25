@@ -390,7 +390,7 @@ impl Engine {
             .ok_or_else(|| anyhow!("there is no finished run on this issue to review yet"))
     }
 
-    async fn next_turn_agent(&self, issue: &Issue) -> Result<Option<String>> {
+    pub(crate) async fn next_turn_agent(&self, issue: &Issue) -> Result<Option<String>> {
         let queue: Vec<String> = serde_json::from_str(&issue.turn_queue).unwrap_or_default();
         let served: Vec<String> = serde_json::from_str(&issue.turn_served).unwrap_or_default();
         if queue.is_empty() {

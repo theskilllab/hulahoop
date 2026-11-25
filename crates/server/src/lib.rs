@@ -14,6 +14,7 @@ pub mod mentions;
 pub mod model;
 pub mod models;
 pub mod pulls;
+pub mod resume;
 pub mod signin;
 pub mod skills;
 pub mod tasks;
@@ -168,6 +169,10 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
 
     // Pull requests are read from a cache this keeps in step with GitHub.
     tokio::spawn(engine.clone().pull_sync_loop());
+
+    // Turns a task is owed but never got, such as one a restart cut off, start
+    // here instead of waiting for somebody to touch the task.
+    tokio::spawn(engine.clone().resume_loop());
 
     let connection_path_clone = connection_path.clone();
     let shutdown = async move {
