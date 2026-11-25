@@ -46,6 +46,7 @@ const pr = (over: Partial<PullRequest> = {}): PullRequest => ({
   reviewState: "REVIEW_REQUESTED",
   reviewRequestedFromMe: true,
   ciState: "PASSING",
+  mergeable: "CLEAN",
   createdAt: new Date(Date.now() - 12 * 60_000).toISOString(),
   updatedAt: new Date(Date.now() - 12 * 60_000).toISOString(),
   mergedAt: null,
@@ -539,5 +540,46 @@ describe("CI line", () => {
     render(<PullRequests {...props()} />);
     await openFirst();
     expect(screen.getAllByText(/CI is failing/)).toHaveLength(1);
+  });
+});
+
+describe("Conflicts", () => {
+  const why = "This branch has conflicts with main; resolve them before merging";
+
+  it("shows a chip in the list and a line in the detail, and the merge reason once", async () => {
+    api.loadPullRequests.mockResolvedValue([pr({ mergeable: "CONFLICTING" })]);
+    api.loadPullRequest.mockResolvedValue(
+      detail({ pullRequest: pr({ mergeable: "CONFLICTING" }), canMerge: false, mergeBlockedReason: why }),
+    );
+    render(<PullRequests {...props()} />);
+    const row = await screen.findByRole("button", { name: /Add retry with backoff/ });
+    expect(within(row).getByText("Conflicts")).toBeTruthy();
+    await openFirst();
+    const line = screen.getByText("This branch has conflicts with main that must be resolved.");
+    expect(line.getAttribute("role")).toBe("status");
+    expect(screen.getByRole("link", { name: "Open on GitHub" })).toBeTruthy();
+    const merge = screen.getByRole("button", { name: "Squash and merge" }) as HTMLButtonElement;
+    expect(merge.disabled).toBe(true);
+    expect(merge.title).toBe(why);
+    expect(screen.queryByText(why)).toBeNull();
+  });
+
+  it("follows the live check once the detail has loaded", async () => {
+    api.loadPullRequests.mockResolvedValue([pr({ mergeable: "CONFLICTING" })]);
+    api.loadPullRequest.mockResolvedValue(detail({ pullRequest: pr({ mergeable: "CLEAN" }) }));
+    render(<PullRequests {...props()} />);
+    await openFirst();
+    expect(screen.queryByText(/must be resolved/)).toBeNull();
+  });
+
+  it("says nothing for a merged pull request", async () => {
+    const merged = pr({ merged: true, state: "closed", reviewState: "MERGED", mergeable: "CONFLICTING" });
+    api.loadPullRequests.mockResolvedValue([merged]);
+    api.loadPullRequest.mockResolvedValue(detail({ pullRequest: merged }));
+    render(<PullRequests {...props()} />);
+    const row = await screen.findByRole("button", { name: /Add retry with backoff/ });
+    expect(within(row).queryByText("Conflicts")).toBeNull();
+    await openFirst();
+    expect(screen.queryByText(/must be resolved/)).toBeNull();
   });
 });

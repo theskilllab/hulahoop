@@ -4751,6 +4751,8 @@ button.link.new-milestone-choose { justify-self: start; font-size: var(--fs-xs);
 .pr-cluster > button.chip { cursor: pointer; border: 0; }
 .pr-by { font-size: var(--fs-xs); }
 .pr-branch { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); overflow-wrap: anywhere; }
+/* A conflict with the base branch: the failing CI chip's colours, as a line of its own under the branch. */
+.pr-conflict { display: flex; align-items: center; gap: var(--s2); margin: 0; padding: var(--s2) var(--s3); border-radius: var(--r-sm); background: var(--bad-soft); color: var(--bad); font-size: var(--fs-sm); font-weight: 550; }
 .pr-actions { gap: var(--s2); margin-top: var(--s1); }
 .prs a.btn { text-decoration: none; }
 .pr-actions button.pr-delete-branch { text-decoration: underline; }
