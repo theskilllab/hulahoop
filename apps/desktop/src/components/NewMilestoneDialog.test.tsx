@@ -20,8 +20,8 @@ beforeAll(() => {
 });
 
 const projects: Project[] = [
-  { id: "p1", name: "Balance", prefix: "BAL", repos: [] },
-  { id: "p2", name: "Loose", prefix: null, repos: [] },
+  { id: "p1", name: "Balance", prefix: "BAL", color: "#2f7ad8", repos: [] },
+  { id: "p2", name: "Loose", prefix: null, color: "#2f7ad8", repos: [] },
 ];
 
 function setup() {

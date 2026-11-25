@@ -45,6 +45,8 @@ pub struct Project {
     pub name: String,
     /// `BAL` in `BAL-15`. Unique per workspace, uppercase.
     pub prefix: Option<String>,
+    /// One of the eight palette colours, as `#rrggbb`.
+    pub color: String,
     pub created_at: DateTime<Utc>,
 }
 

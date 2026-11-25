@@ -807,6 +807,8 @@ impl Mutation {
         workspace_id: Uuid,
         name: String,
         prefix: Option<String>,
+        color: Option<String>,
+        repos: Option<Vec<NewRepoInput>>,
     ) -> async_graphql::Result<Project> {
         let engine = engine(ctx);
         let id = Uuid::now_v7();
@@ -817,6 +819,24 @@ impl Mutation {
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?,
             None => Engine::derive_prefix(&name),
         };
+        let color = match color {
+            Some(color) => {
+                Engine::check_project_color(&color)?;
+                color
+            }
+            None => engine.next_project_color(workspace_id).await?.to_string(),
+        };
+        let repos = repos
+            .unwrap_or_default()
+            .into_iter()
+            .map(|repo| {
+                Ok((
+                    repo.name,
+                    remote_url_to_clone(&repo.remote_url)?,
+                    repo.base_bookmark,
+                ))
+            })
+            .collect::<async_graphql::Result<Vec<_>>>()?;
         let taken: Option<(String,)> =
             sqlx::query_as("select id from projects where workspace_id = ? and prefix = ?")
                 .bind(workspace_id)
@@ -828,20 +848,68 @@ impl Mutation {
                 "the prefix {prefix} is already used by another project in this workspace"
             )));
         }
+        // The project and its repositories save together or not at all.
+        let mut tx = engine.db.pool.begin().await?;
         sqlx::query(
-            "insert into projects (id, workspace_id, name, prefix, created_at) values (?, ?, ?, ?, ?)",
+            "insert into projects (id, workspace_id, name, prefix, color, created_at) values (?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
         .bind(&name)
         .bind(&prefix)
+        .bind(&color)
         .bind(crate::db::now_rfc3339())
-        .execute(&engine.db.pool)
+        .execute(&mut *tx)
         .await?;
+        let mut repo_ids = Vec::new();
+        for (repo_name, remote_url, base_bookmark) in &repos {
+            let repo_id = Uuid::now_v7();
+            sqlx::query(
+                "insert into repos (id, project_id, name, remote_url, vcs, base_bookmark, contract, contract_version, created_at)
+                 values (?, ?, ?, ?, 'jj', ?, 'nix+just', ?, ?)",
+            )
+            .bind(repo_id)
+            .bind(id)
+            .bind(repo_name)
+            .bind(remote_url)
+            .bind(base_bookmark.as_deref().unwrap_or("main"))
+            .bind(hulahoop_core::CONTRACT_VERSION)
+            .bind(crate::db::now_rfc3339())
+            .execute(&mut *tx)
+            .await?;
+            repo_ids.push(repo_id);
+        }
+        tx.commit().await?;
+        for repo_id in repo_ids {
+            engine
+                .queue_job(repo_id, None, "fetch", serde_json::json!({}))
+                .await?;
+        }
         Ok(sqlx::query_as("select * from projects where id = ?")
             .bind(id)
             .fetch_one(&engine.db.pool)
             .await?)
+    }
+
+    async fn update_project(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        name: Option<String>,
+        color: Option<String>,
+    ) -> async_graphql::Result<Project> {
+        engine(ctx)
+            .update_project(id, name.as_deref(), color.as_deref())
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// Take a repository off its project. Refused while open tasks use it.
+    async fn unlink_repo(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<Project> {
+        engine(ctx)
+            .unlink_repo(id)
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
     }
 
     async fn set_project_prefix(
@@ -1690,6 +1758,14 @@ impl Mutation {
     ) -> async_graphql::Result<Issue> {
         Ok(engine(ctx).clear_run_cap(issue_id).await?)
     }
+}
+
+/// A repository to link in the same save as `createProject`.
+#[derive(async_graphql::InputObject)]
+struct NewRepoInput {
+    name: String,
+    remote_url: String,
+    base_bookmark: Option<String>,
 }
 
 /// Nested reads stay on one screen's worth of data: the board asks for issues,

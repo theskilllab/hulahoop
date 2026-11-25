@@ -223,6 +223,8 @@ export interface Project {
   name: string;
   /** `BAL` in `BAL-15`. Null until somebody decides one. */
   prefix: string | null;
+  /** One of the eight palette colours, as `#rrggbb`. */
+  color: string;
   repos: Repo[];
 }
 
@@ -1002,7 +1004,7 @@ export async function loadWorkspace(workspaceId?: string | null): Promise<Worksp
     data.workspaces.find((entry) => entry.id === workspaceId) ?? data.workspaces[0];
   if (!workspace) throw new Error("the server has no workspace yet");
   const projects = await gql<{ projects: Project[] }>(
-    `query ($id: UUID!) { projects(workspaceId: $id) { id name prefix repos { id name remoteUrl vcs baseBookmark contractVersion fetchedAt } } }`,
+    `query ($id: UUID!) { projects(workspaceId: $id) { id name prefix color repos { id name remoteUrl vcs baseBookmark contractVersion fetchedAt } } }`,
     { id: workspace.id },
   );
   const agents = await gql<{ agents: Agent[] }>(
@@ -1104,12 +1106,43 @@ export async function setWorkspaceLumi(
   return data.setWorkspaceLumi;
 }
 
-export async function renameProject(id: string, name: string): Promise<Project> {
-  const data = await gql<{ renameProject: Project }>(
-    `mutation ($id: UUID!, $name: String!) { renameProject(id: $id, name: $name) { id name prefix } }`,
-    { id, name },
+export interface NewRepo {
+  name: string;
+  remoteUrl: string;
+  baseBookmark: string;
+}
+
+/** The project, and the repositories it links, save together or not at all. */
+export async function createProject(
+  workspaceId: string,
+  input: { name: string; prefix: string; color: string; repos: NewRepo[] },
+): Promise<string> {
+  const data = await gql<{ createProject: { id: string } }>(
+    `mutation ($workspaceId: UUID!, $name: String!, $prefix: String!, $color: String!, $repos: [NewRepoInput!]) {
+       createProject(workspaceId: $workspaceId, name: $name, prefix: $prefix, color: $color, repos: $repos) { id }
+     }`,
+    { workspaceId, ...input },
   );
-  return data.renameProject;
+  return data.createProject.id;
+}
+
+export async function updateProject(id: string, name: string, color: string): Promise<void> {
+  await gql(
+    `mutation ($id: UUID!, $name: String!, $color: String!) { updateProject(id: $id, name: $name, color: $color) { id } }`,
+    { id, name, color },
+  );
+}
+
+export async function setProjectPrefix(projectId: string, prefix: string): Promise<void> {
+  await gql(
+    `mutation ($projectId: UUID!, $prefix: String!) { setProjectPrefix(projectId: $projectId, prefix: $prefix) { id } }`,
+    { projectId, prefix },
+  );
+}
+
+/// Take a repository off its project. The server refuses while open tasks use it.
+export async function unlinkRepo(id: string): Promise<void> {
+  await gql(`mutation ($id: UUID!) { unlinkRepo(id: $id) { id } }`, { id });
 }
 
 export interface GithubRepo {
@@ -1131,16 +1164,27 @@ export async function loadGithubRepos(): Promise<GithubRepo[]> {
   return data.githubRepos;
 }
 
-/// Attach a repository the app can reach. It has no checkout on this machine, so
-/// the runner clones into a mirror it owns on the first run.
-export async function attachGithubRepo(projectId: string, repo: GithubRepo): Promise<string> {
+/// Link a repository by its url. It has no checkout on this machine, so the
+/// runner clones into a mirror it owns on the first run.
+export async function addRepo(projectId: string, repo: NewRepo): Promise<void> {
   const data = await gql<{ addRepo: { id: string } }>(
     `mutation ($projectId: UUID!, $name: String!, $remoteUrl: String!) {
        addRepo(projectId: $projectId, name: $name, remoteUrl: $remoteUrl) { id }
      }`,
-    { projectId, name: repo.name, remoteUrl: repo.cloneUrl },
+    { projectId, name: repo.name, remoteUrl: repo.remoteUrl },
   );
-  return data.addRepo.id;
+  if (repo.baseBookmark !== "main") await setBaseBookmark(data.addRepo.id, repo.baseBookmark);
+}
+
+export async function setBaseBookmark(id: string, bookmark: string): Promise<void> {
+  await gql(`mutation ($id: UUID!, $bookmark: String!) { updateRepo(id: $id, baseBookmark: $bookmark) { id } }`, {
+    id,
+    bookmark,
+  });
+}
+
+export async function fetchRepo(id: string): Promise<void> {
+  await gql(`mutation ($id: UUID!) { fetchRepo(id: $id) { id } }`, { id });
 }
 
 export async function loadWorkspaceMembers(workspaceId: string): Promise<WorkspaceMember[]> {
