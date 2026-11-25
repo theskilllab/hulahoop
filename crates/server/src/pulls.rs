@@ -466,6 +466,11 @@ pub fn gate(
         Some(me) if me.eq_ignore_ascii_case(&pull.author_login) => Some(OWN_PULL_REASON),
         Some(_) => None,
     };
+    // GitHub never lets an author approve their own pull request, so waiting
+    // for that approval would lock them out of merging it for good. Their own
+    // pull request merges on CI alone; a branch rule that wants a reviewer is
+    // still enforced by GitHub when the merge is sent.
+    let own = login.is_some_and(|me| me.eq_ignore_ascii_case(&pull.author_login));
 
     let merge_blocked = if login.is_none() {
         Some(NO_TOKEN_REASON)
@@ -477,7 +482,7 @@ pub fn gate(
         Some("This pull request is still a draft")
     } else if pull.review_state == ReviewState::ChangesRequested {
         Some("Changes were requested; it needs an approving review first")
-    } else if pull.review_state != ReviewState::Approved {
+    } else if pull.review_state != ReviewState::Approved && !own {
         Some("Waiting for an approving review")
     } else if pull.ci_state == CiState::Failing {
         Some("CI is failing")
@@ -2753,9 +2758,10 @@ mod tests {
             .unwrap();
         assert!(!own.can_review);
         assert_eq!(own.review_blocked_reason.as_deref(), Some(OWN_PULL_REASON));
-        assert_eq!(
-            own.merge_blocked_reason.as_deref(),
-            Some("Waiting for an approving review")
+        assert!(
+            own.can_merge,
+            "your own pull request needs no approval: {:?}",
+            own.merge_blocked_reason
         );
 
         // The pure gate, rule by rule.
