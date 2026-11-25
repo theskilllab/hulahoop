@@ -78,25 +78,42 @@ impl Engine {
         Ok(rows)
     }
 
-    /// How many finished tasks the Active view is hiding.
+    /// How many finished tasks the Active view is hiding. No projects and
+    /// `no_project` off means no filter; otherwise a task counts when it is in
+    /// one of `project_ids` or, with `no_project`, in none.
     pub async fn done_issue_count(
         &self,
         workspace_id: Uuid,
-        project_id: Option<Uuid>,
+        project_ids: &[Uuid],
+        no_project: bool,
     ) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "select count(*) from issues
-              where workspace_id = ?
-                and (? is null or project_id = ?)
-                and status in (?, ?)",
-        )
-        .bind(workspace_id)
-        .bind(project_id)
-        .bind(project_id)
-        .bind(FINISHED[0].as_str())
-        .bind(FINISHED[1].as_str())
-        .fetch_one(&self.db.pool)
-        .await?)
+        let mut query =
+            sqlx::QueryBuilder::new("select count(*) from issues where workspace_id = ");
+        query.push_bind(workspace_id);
+        query.push(" and status in (");
+        query.push_bind(FINISHED[0].as_str());
+        query.push(", ");
+        query.push_bind(FINISHED[1].as_str());
+        query.push(")");
+        if !project_ids.is_empty() || no_project {
+            query.push(" and (");
+            if no_project {
+                query.push("project_id is null");
+            }
+            if !project_ids.is_empty() {
+                if no_project {
+                    query.push(" or ");
+                }
+                query.push("project_id in (");
+                let mut ids = query.separated(", ");
+                for id in project_ids {
+                    ids.push_bind(*id);
+                }
+                query.push(")");
+            }
+            query.push(")");
+        }
+        Ok(query.build_query_scalar().fetch_one(&self.db.pool).await?)
     }
 
     /// One aggregate over the task's runs. A run that never reported a metric
@@ -461,10 +478,67 @@ mod tests {
         assert_eq!(done.len(), 1);
         assert_eq!(
             engine
-                .done_issue_count(fixture.workspace, Some(fixture.project))
+                .done_issue_count(fixture.workspace, &[fixture.project], false)
                 .await
                 .unwrap(),
             2
+        );
+        fixture.done();
+    }
+
+    /// The "+N" toggle follows the project filter: several projects at once,
+    /// and "No project" as a choice of its own.
+    #[tokio::test]
+    async fn done_count_follows_a_multi_project_filter() {
+        let fixture = Fixture::new().await;
+        let other = Uuid::now_v7();
+        sqlx::query("insert into projects (id, workspace_id, name, created_at) values (?,?, 'Other','2026-01-01')")
+            .bind(other)
+            .bind(fixture.workspace)
+            .execute(&fixture.engine.db.pool)
+            .await
+            .unwrap();
+        // One finished task each in the first project, the other, and none;
+        // the first project also has a second one, and an open task is ignored.
+        let in_first = fixture.issue(1, "done", &[]).await;
+        let in_first_too = fixture.issue(2, "cancelled", &[]).await;
+        let in_other = fixture.issue(3, "done", &[]).await;
+        let loose = fixture.issue(4, "done", &[]).await;
+        fixture.issue(5, "todo", &[]).await;
+        let _ = (in_first, in_first_too);
+        sqlx::query("update issues set project_id = ? where id = ?")
+            .bind(other)
+            .bind(in_other)
+            .execute(&fixture.engine.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("update issues set project_id = null where id = ?")
+            .bind(loose)
+            .execute(&fixture.engine.db.pool)
+            .await
+            .unwrap();
+        let count = |projects: Vec<Uuid>, none: bool| {
+            let engine = &fixture.engine;
+            let workspace = fixture.workspace;
+            async move {
+                engine
+                    .done_issue_count(workspace, &projects, none)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count(vec![], false).await, 4, "no filter counts everything");
+        assert_eq!(count(vec![fixture.project], false).await, 2);
+        assert_eq!(count(vec![], true).await, 1, "no project only");
+        assert_eq!(
+            count(vec![fixture.project, other], false).await,
+            3,
+            "two projects"
+        );
+        assert_eq!(
+            count(vec![other], true).await,
+            2,
+            "one project plus no project"
         );
         fixture.done();
     }

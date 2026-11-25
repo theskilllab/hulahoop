@@ -1,10 +1,10 @@
-import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import type { Run } from "../api";
+import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { Comment, Run } from "../api";
 
 vi.mock("../api", () => ({ addComment: vi.fn(), gql: vi.fn() }));
 
-import { RunCard } from "./Activity";
+import { CommentItem, RunCard } from "./Activity";
 
 const run = (over: Partial<Run> = {}): Run => ({
   id: "r1",
@@ -47,5 +47,60 @@ describe("RunCard", () => {
   it("leaves the line out for runs recorded before it existed", () => {
     render(<RunCard run={run({ credentialSource: null })} agentName="Builder" onOpenTranscript={vi.fn()} />);
     expect(screen.queryByText(/Credential:/)).toBeNull();
+  });
+});
+
+// jsdom has no layout: pretend every text box is far taller than the clamp.
+beforeEach(() => {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1000);
+  const computed = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((el) => {
+    const style = computed(el);
+    return new Proxy(style, { get: (target, key) => (key === "fontSize" ? "16px" : Reflect.get(target, key)) });
+  });
+});
+
+const comment = (over: Partial<Comment> = {}): Comment => ({
+  id: "c1",
+  author: "Developer",
+  authorType: "agent",
+  body: "Done.",
+  pinned: false,
+  createdAt: "2026-01-01T00:00:00Z",
+  ...over,
+});
+
+describe("comments never carry an Open transcript link", () => {
+  it("even an agent comment that came from a run", () => {
+    render(<CommentItem comment={comment({ runId: "r1" })} mentions={[]} />);
+    expect(screen.queryByText("Open transcript")).toBeNull();
+  });
+});
+
+describe("agent runs fold long summaries", () => {
+  it("shows Show more on a long run summary and expands it", () => {
+    render(<RunCard run={run({ summary: "line\n\n".repeat(40) })} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
+    const more = screen.getByRole("button", { name: "Show more" });
+    fireEvent.click(more);
+    expect(screen.getByRole("button", { name: "Show less" })).toBeTruthy();
+  });
+
+  it("leaves a short run summary unfolded", () => {
+    vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(10);
+    render(<RunCard run={run({ summary: "Short." })} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
+  });
+
+  it("keeps the run's own Open transcript button", () => {
+    render(<RunCard run={run()} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Open transcript" })).toBeTruthy();
   });
 });

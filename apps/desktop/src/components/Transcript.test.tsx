@@ -13,14 +13,14 @@ beforeEach(() => {
 describe("Transcript header", () => {
   it("says which credential the run started with", async () => {
     render(
-      <Transcript runId="r1" runStatus="succeeded" agentName="Builder" issueKey="HUL-12" credentialSource="Codex subscription" onBack={vi.fn()} />,
+      <Transcript runId="r1" runStatus="succeeded" agentName="Builder" issueKey="HUL-12" credentialSource="Codex subscription" />,
     );
     await screen.findByText("This run left no transcript.");
     expect((document.querySelector(".tx-bar") as HTMLElement).textContent).toContain("Credential: Codex subscription");
   });
 
   it("leaves it out when the run did not record one", async () => {
-    render(<Transcript runId="r1" runStatus="succeeded" agentName="Builder" issueKey="HUL-12" onBack={vi.fn()} />);
+    render(<Transcript runId="r1" runStatus="succeeded" agentName="Builder" issueKey="HUL-12" />);
     await screen.findByText("This run left no transcript.");
     expect(screen.queryByText(/Credential:/)).toBeNull();
   });
