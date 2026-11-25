@@ -10,6 +10,11 @@ use crate::model::*;
 use anyhow::{anyhow, bail, Context, Result};
 use uuid::Uuid;
 
+/// The colours a project can wear, in the order a new project picks them.
+pub const PROJECT_COLORS: [&str; 8] = [
+    "#2f7ad8", "#1f9d7a", "#c2692b", "#6a5acd", "#d4558a", "#b88100", "#d03b3b", "#64748b",
+];
+
 impl Engine {
     // ---- github -------------------------------------------------------------
 
@@ -171,6 +176,105 @@ impl Engine {
         .bind(workspace_id)
         .fetch_all(&self.db.pool)
         .await?)
+    }
+
+    pub fn check_project_color(color: &str) -> Result<()> {
+        if !PROJECT_COLORS.contains(&color) {
+            bail!("a project colour is one of the eight project colours");
+        }
+        Ok(())
+    }
+
+    /// The first palette colour no project in the workspace wears, or the
+    /// palette's next turn once every colour is taken.
+    pub async fn next_project_color(&self, workspace_id: Uuid) -> Result<&'static str> {
+        let used: Vec<String> =
+            sqlx::query_scalar("select color from projects where workspace_id = ?")
+                .bind(workspace_id)
+                .fetch_all(&self.db.pool)
+                .await?;
+        Ok(PROJECT_COLORS
+            .iter()
+            .find(|color| !used.iter().any(|u| u == *color))
+            .copied()
+            .unwrap_or(PROJECT_COLORS[used.len() % PROJECT_COLORS.len()]))
+    }
+
+    /// Change a project's name and/or colour. The prefix has its own mutation.
+    pub async fn update_project(
+        &self,
+        id: Uuid,
+        name: Option<&str>,
+        color: Option<&str>,
+    ) -> Result<Project> {
+        if let Some(color) = color {
+            Self::check_project_color(color)?;
+        }
+        if let Some(name) = name {
+            self.rename_project(id, name).await?;
+        }
+        if let Some(color) = color {
+            sqlx::query("update projects set color = ? where id = ?")
+                .bind(color)
+                .bind(id)
+                .execute(&self.db.pool)
+                .await?;
+        }
+        Ok(
+            sqlx::query_as::<_, Project>("select * from projects where id = ?")
+                .bind(id)
+                .fetch_one(&self.db.pool)
+                .await?,
+        )
+    }
+
+    /// Unlink a repository from its project. Open tasks still work in it, and
+    /// a repository with runs carries their history (deleting it would cascade
+    /// to those runs), so either blocks the unlink. Finished tasks without
+    /// runs just lose the link.
+    pub async fn unlink_repo(&self, repo_id: Uuid) -> Result<Project> {
+        let project_id: Uuid = sqlx::query_scalar("select project_id from repos where id = ?")
+            .bind(repo_id)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .ok_or_else(|| anyhow!("repository {repo_id} not found"))?;
+        let open: i64 = sqlx::query_scalar(
+            "select count(*) from issues where repo_id = ? and status not in ('done', 'cancelled')",
+        )
+        .bind(repo_id)
+        .fetch_one(&self.db.pool)
+        .await?;
+        if open > 0 {
+            let (noun, verb) = if open == 1 {
+                ("task", "uses")
+            } else {
+                ("tasks", "use")
+            };
+            bail!("{open} open {noun} still {verb} this repository. Finish or move them first.");
+        }
+        let runs: i64 = sqlx::query_scalar("select count(*) from runs where repo_id = ?")
+            .bind(repo_id)
+            .fetch_one(&self.db.pool)
+            .await?;
+        if runs > 0 {
+            bail!("This repository has run history, which unlinking would delete.");
+        }
+        let mut tx = self.db.pool.begin().await?;
+        sqlx::query("update issues set repo_id = null where repo_id = ?")
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("delete from repos where id = ?")
+            .bind(repo_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(
+            sqlx::query_as::<_, Project>("select * from projects where id = ?")
+                .bind(project_id)
+                .fetch_one(&self.db.pool)
+                .await?,
+        )
     }
 
     pub async fn rename_project(&self, id: Uuid, name: &str) -> Result<Project> {

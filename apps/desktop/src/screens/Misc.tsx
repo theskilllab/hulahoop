@@ -11,7 +11,9 @@ import {
 } from "../api";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
-import ProjectManager from "./ProjectManager";
+import ProjectDialog from "../components/ProjectDialog";
+import { useToast } from "../components/Toast";
+import { openMilestoneCount, projectStats } from "../projectStats";
 import type { Workspace } from "../api";
 
 function when(iso: string | null): string {
@@ -74,94 +76,158 @@ export function Inbox({ issues, onOpen }: { issues: Issue[]; onOpen: (id: string
 
 /* ------------------------------------------------------------- Projects --- */
 
+const NO_PROJECT = "none";
+
 export function Projects({
   projects,
   issues,
+  milestones,
   workspace,
   onChanged,
-  onOpen,
+  onOpenTasks,
 }: {
   projects: Project[];
   issues: Issue[];
+  milestones: Milestone[];
   workspace: Workspace;
   onChanged: () => Promise<void>;
-  onOpen: (id: string) => void;
+  /** Open Tasks filtered to a project id, or to "none" for tasks without one. */
+  onOpenTasks: (filter: string) => void;
 }) {
   const [managing, setManaging] = useState<string | null>(null);
+  const [toast, notify] = useToast();
+  const unassigned = projectStats(null, issues);
+  const unassignedTasks = issues.some((issue) => issue.projectId === null);
+  const openMilestones = openMilestoneCount(milestones);
   return (
     <section className="screen projects">
       <PageHeader
         title="Projects"
-        subtitle={`${projects.length} projects`}
         actions={
-          <button className="ghost" onClick={() => setManaging("new")}>
-            New project
+          <button className="primary" onClick={() => setManaging("new")}>
+            <Icon name="plus" size={13} /> New project
           </button>
         }
       />
 
-      <div className="project-grid">
-        {projects.map((project) => {
-          const own = issues.filter((issue) => issue.projectId === project.id);
-          const open = own.filter((issue) => !["done", "cancelled"].includes(issue.status)).length;
-          return (
-            <article key={project.id} className="project-card">
-              <header>
-                <span className="prefix">{project.prefix ?? "—"}</span>
-                <strong>{project.name}</strong>
-              </header>
-              <dl>
-                <div>
-                  <dt>open</dt>
-                  <dd>{open}</dd>
-                </div>
-                <div>
-                  <dt>done</dt>
-                  <dd>{own.length - open}</dd>
-                </div>
-                <div>
-                  <dt>repositories</dt>
-                  <dd>{project.repos.length}</dd>
-                </div>
-              </dl>
-              <ul className="repo-list">
-                {project.repos.map((repo) => (
-                  <li key={repo.id}>
-                    <Icon name="branch" size={13} />
-                    <span className="mono">{repo.name}</span>
-                    <span className="dim">{repo.remoteUrl ?? "no url"}</span>
-                  </li>
-                ))}
-                {project.repos.length === 0 ? <li className="dim">No repository attached yet.</li> : null}
-              </ul>
-              <footer>
-                <button
-                  className="link"
-                  onClick={() => {
-                    const first = own[0];
-                    if (first) onOpen(first.id);
-                    else setManaging(project.id);
-                  }}
-                >
-                  {own[0] ? `Open ${own[0].key}` : "Attach a repository"}
-                </button>
-                <button className="link" onClick={() => setManaging(project.id)}>Project settings</button>
-              </footer>
-            </article>
-          );
-        })}
-        {projects.length === 0 ? <p className="dim">No projects yet. Create one here.</p> : null}
+      <div className="pgrid">
+        {projects.map((project) => (
+          <ProjectCard
+            key={project.id}
+            project={project}
+            issues={issues}
+            onOpen={() => onOpenTasks(project.id)}
+            onSettings={() => setManaging(project.id)}
+          />
+        ))}
+        {unassignedTasks || openMilestones > 0 ? (
+          <div className="pcard-wrap">
+            <button
+              className="pcard"
+              aria-label="Open tasks with no project"
+              onClick={() => onOpenTasks(NO_PROJECT)}
+            >
+              <span className="pc">
+                <span className="pdot muted" aria-hidden="true" />
+                <h3>No project</h3>
+              </span>
+              <span className="dim small">Tasks and milestones that don't belong to a project.</span>
+              <span className="pstats two">
+                <Stat value={unassigned.open} label="Open tasks" />
+                <Stat value={openMilestones} label="Open milestones" />
+              </span>
+            </button>
+          </div>
+        ) : null}
       </div>
+      {projects.length === 0 && !unassignedTasks && openMilestones === 0 ? (
+        <div className="empty">
+          <strong>No projects yet</strong>
+          <span>A project groups tasks, repositories and milestones. Create one to get started.</span>
+        </div>
+      ) : null}
+      {toast}
       {managing && (
-        <ProjectManager
+        <ProjectDialog
           key={managing}
           workspace={workspace}
           project={projects.find((entry) => entry.id === managing) ?? null}
-          onChanged={onChanged}
+          projects={projects}
+          issues={issues}
+          reload={onChanged}
+          notify={notify}
           onClose={() => setManaging(null)}
         />
       )}
     </section>
+  );
+}
+
+function Stat({ value, label }: { value: number; label: string }) {
+  return (
+    <span className="pstat">
+      <b>{value}</b>
+      <small>{label}</small>
+    </span>
+  );
+}
+
+function ProjectCard({
+  project,
+  issues,
+  onOpen,
+  onSettings,
+}: {
+  project: Project;
+  issues: Issue[];
+  onOpen: () => void;
+  onSettings: () => void;
+}) {
+  const stats = projectStats(project.id, issues);
+  const shown = project.repos.slice(0, 2);
+  const more = project.repos.length - shown.length;
+  return (
+    <div className="pcard-wrap">
+      <button className="pcard" aria-label={`Open ${project.name} tasks`} onClick={onOpen}>
+        <span className="pc">
+          <span className="pdot" style={{ background: project.color }} aria-hidden="true" />
+          <h3 className="truncate">{project.name}</h3>
+          <span className="chip mono">{project.prefix ?? "—"}</span>
+        </span>
+        <span className="prepos">
+          {shown.map((repo) => (
+            <span key={repo.id} className="chip repo-chip">
+              <Icon name="branch" size={11} />
+              <span className="mono truncate">{repo.name}</span>
+            </span>
+          ))}
+          {more > 0 ? <span className="chip mono">+{more}</span> : null}
+          {project.repos.length === 0 ? <span className="dim small">No repositories yet</span> : null}
+        </span>
+        <span className="pstats">
+          <Stat value={stats.open} label="Open tasks" />
+          <Stat value={stats.openPrs} label="Open PRs" />
+          <Stat value={stats.running} label="Agents running" />
+        </span>
+        <span className="prog-row">
+          <span>Progress</span>
+          <span>{stats.progress}%</span>
+        </span>
+        <span
+          className="prog"
+          role="progressbar"
+          aria-label={`${project.name} progress`}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={stats.progress}
+        >
+          <i style={{ width: `${stats.progress}%` }} />
+        </span>
+      </button>
+      <button className="icon-btn pgear" aria-label={`Settings for ${project.name}`} onClick={onSettings}>
+        <Icon name="gear" size={14} />
+      </button>
+    </div>
   );
 }
 

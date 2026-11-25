@@ -557,9 +557,13 @@ export default function App() {
           <Projects
             projects={projects}
             issues={issues}
+            milestones={milestones}
             workspace={workspace}
             onChanged={reload}
-            onOpen={(id) => setView({ name: "issue", id })}
+            onOpenTasks={(filter) => {
+              setProjectFilter(filter);
+              setView({ name: "tasks" });
+            }}
           />
         )}
 
