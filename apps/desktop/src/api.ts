@@ -847,7 +847,7 @@ export interface CostCohort {
 }
 
 export interface CostReport {
-  period: "7d" | "30d" | "mtd";
+  period: "today" | "7d" | "30d" | "mtd";
   start: string;
   end: string;
   priorStart: string;
