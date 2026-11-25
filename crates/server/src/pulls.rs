@@ -1711,8 +1711,10 @@ impl Engine {
         .fetch_all(&self.db.pool)
         .await?;
         let note = body.map(str::trim).filter(|note| !note.is_empty());
-        if note.is_none() && pending.is_empty() {
-            bail!("a review needs a note or at least one line comment");
+        // An approval may stand alone, as on GitHub; a change request has to
+        // say what should change.
+        if event == ReviewEvent::RequestChanges && note.is_none() && pending.is_empty() {
+            bail!("a change request needs a note or at least one line comment");
         }
         let comments: Vec<Value> = pending
             .iter()
@@ -2909,10 +2911,10 @@ mod tests {
             "{note}"
         );
 
-        // An empty review is refused.
+        // An empty change request is refused; an approval needs no note.
         let empty = world
             .engine
-            .review_pull_request(world.repo, 1, ReviewEvent::Approve, None)
+            .review_pull_request(world.repo, 1, ReviewEvent::RequestChanges, None)
             .await
             .unwrap_err()
             .to_string();
@@ -2920,6 +2922,11 @@ mod tests {
             empty.contains("a note or at least one line comment"),
             "{empty}"
         );
+        world
+            .engine
+            .review_pull_request(world.repo, 1, ReviewEvent::Approve, None)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
