@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Comment, Run } from "../api";
 
@@ -61,6 +61,11 @@ beforeEach(() => {
     },
   );
   vi.spyOn(HTMLElement.prototype, "scrollHeight", "get").mockReturnValue(1000);
+  const computed = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((el) => {
+    const style = computed(el);
+    return new Proxy(style, { get: (target, key) => (key === "fontSize" ? "16px" : Reflect.get(target, key)) });
+  });
 });
 
 const comment = (over: Partial<Comment> = {}): Comment => ({
@@ -75,7 +80,7 @@ const comment = (over: Partial<Comment> = {}): Comment => ({
 
 describe("comments never carry an Open transcript link", () => {
   it("even an agent comment that came from a run", () => {
-    render(<CommentItem comment={comment({ runId: "r1" })} mentions={[]} onOpenRun={vi.fn()} />);
+    render(<CommentItem comment={comment({ runId: "r1" })} mentions={[]} />);
     expect(screen.queryByText("Open transcript")).toBeNull();
   });
 });
@@ -84,7 +89,7 @@ describe("agent runs fold long summaries", () => {
   it("shows Show more on a long run summary and expands it", () => {
     render(<RunCard run={run({ summary: "line\n\n".repeat(40) })} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
     const more = screen.getByRole("button", { name: "Show more" });
-    more.click();
+    fireEvent.click(more);
     expect(screen.getByRole("button", { name: "Show less" })).toBeTruthy();
   });
 

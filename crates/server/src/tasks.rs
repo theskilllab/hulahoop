@@ -78,25 +78,42 @@ impl Engine {
         Ok(rows)
     }
 
-    /// How many finished tasks the Active view is hiding.
+    /// How many finished tasks the Active view is hiding. No projects and
+    /// `no_project` off means no filter; otherwise a task counts when it is in
+    /// one of `project_ids` or, with `no_project`, in none.
     pub async fn done_issue_count(
         &self,
         workspace_id: Uuid,
-        project_id: Option<Uuid>,
+        project_ids: &[Uuid],
+        no_project: bool,
     ) -> Result<i64> {
-        Ok(sqlx::query_scalar(
-            "select count(*) from issues
-              where workspace_id = ?
-                and (? is null or project_id = ?)
-                and status in (?, ?)",
-        )
-        .bind(workspace_id)
-        .bind(project_id)
-        .bind(project_id)
-        .bind(FINISHED[0].as_str())
-        .bind(FINISHED[1].as_str())
-        .fetch_one(&self.db.pool)
-        .await?)
+        let mut query =
+            sqlx::QueryBuilder::new("select count(*) from issues where workspace_id = ");
+        query.push_bind(workspace_id);
+        query.push(" and status in (");
+        query.push_bind(FINISHED[0].as_str());
+        query.push(", ");
+        query.push_bind(FINISHED[1].as_str());
+        query.push(")");
+        if !project_ids.is_empty() || no_project {
+            query.push(" and (");
+            if no_project {
+                query.push("project_id is null");
+            }
+            if !project_ids.is_empty() {
+                if no_project {
+                    query.push(" or ");
+                }
+                query.push("project_id in (");
+                let mut ids = query.separated(", ");
+                for id in project_ids {
+                    ids.push_bind(*id);
+                }
+                query.push(")");
+            }
+            query.push(")");
+        }
+        Ok(query.build_query_scalar().fetch_one(&self.db.pool).await?)
     }
 
     /// One aggregate over the task's runs. A run that never reported a metric

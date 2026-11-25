@@ -129,15 +129,7 @@ function ClampedMarkdown({ value, mentions, clamp = true }: { value: string; men
   );
 }
 
-export function CommentItem({
-  comment,
-  mentions,
-  onOpenRun,
-}: {
-  comment: Comment;
-  mentions: string[];
-  onOpenRun?: (runId: string) => void;
-}) {
+export function CommentItem({ comment, mentions }: { comment: Comment; mentions: string[] }) {
   const kind = commentKind(comment);
   const name = kind === "human" ? (comment.author === "you" ? "You" : comment.author) : comment.author;
   if (kind === "server") {
@@ -157,11 +149,6 @@ export function CommentItem({
           {CHIP[kind] ? <span className="chip">{CHIP[kind]}</span> : null}
           {comment.pinned ? <span className="chip warn">question</span> : null}
           <time className="dim">{fmtWhen(comment.createdAt)}</time>
-          {comment.runId && onOpenRun ? (
-            <button type="button" className="linkbtn" onClick={() => onOpenRun(comment.runId as string)}>
-              Open transcript
-            </button>
-          ) : null}
         </div>
         <ClampedMarkdown value={comment.body} mentions={mentions} clamp={!comment.pinned} />
       </div>
@@ -200,7 +187,7 @@ export function RunCard({
           <span className="dim">· run {run.attempt} · {fmtWhen(run.startedAt ?? run.createdAt)}</span>
           <RunStatusChip status={run.status} />
         </div>
-        {showSummary && run.summary ? <MarkdownView className="run-sum" value={run.summary} /> : null}
+        {showSummary && run.summary ? <ClampedMarkdown value={run.summary} mentions={[]} /> : null}
         {run.error && (run.status === "failed" || run.status === "timed_out") ? (
           <p className="run-why">
             {run.failureCategory ? <strong>{run.failureCategory.replace(/_/g, " ")}: </strong> : null}
@@ -328,7 +315,7 @@ export default function Activity({
     return list.sort((a, b) => b.at.localeCompare(a.at));
   }, [issue.comments, issue.runs, filter]);
   // Runs whose summary the agent also posted as a comment: the comment carries
-  // the text (and its Open transcript link), the run card only the run. A
+  // the text the run card only the run. A
   // pinned question or a server note from the run is not its summary.
   const commented = useMemo(
     () =>
@@ -356,11 +343,6 @@ export default function Activity({
       setSending(false);
     }
   }
-
-  const openRun = (runId: string) => {
-    const run = issue.runs.find((entry) => entry.id === runId);
-    if (run) onOpenTranscript(run);
-  };
 
   return (
     <section className="tsec activity" aria-labelledby="activity-head">
@@ -398,7 +380,7 @@ export default function Activity({
         <ol className="act-list">
           {entries.map((entry) =>
             entry.comment ? (
-              <CommentItem key={`c-${entry.comment.id}`} comment={entry.comment} mentions={mentionNames} onOpenRun={openRun} />
+              <CommentItem key={`c-${entry.comment.id}`} comment={entry.comment} mentions={mentionNames} />
             ) : entry.run ? (
               <RunCard
                 key={`r-${entry.run.id}`}

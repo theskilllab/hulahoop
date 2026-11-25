@@ -298,10 +298,11 @@ impl Query {
         &self,
         ctx: &Context<'_>,
         workspace_id: Uuid,
-        project_id: Option<Uuid>,
+        #[graphql(default)] project_ids: Vec<Uuid>,
+        #[graphql(default = false)] no_project: bool,
     ) -> async_graphql::Result<i64> {
         Ok(engine(ctx)
-            .done_issue_count(workspace_id, project_id)
+            .done_issue_count(workspace_id, &project_ids, no_project)
             .await?)
     }
 
