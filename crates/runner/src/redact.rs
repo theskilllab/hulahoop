@@ -135,7 +135,7 @@ mod tests {
             "REFRESHTOKENVALUE",
             "person@example.com",
         ] {
-            assert!(!clean.contains(secret), "{secret} leaked: {clean}");
+            assert!(!clean.contains(secret), "a credential value leaked");
         }
         assert!(clean.contains("oauth"), "labels stay readable");
         assert!(clean.contains("1700000000000"), "numbers stay");

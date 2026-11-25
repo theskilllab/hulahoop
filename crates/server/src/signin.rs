@@ -862,7 +862,16 @@ read code
             started.url.as_deref(),
             Some("https://claude.ai/oauth/authorize?code=true&state=abc")
         );
-        assert!(started.needs_code);
+        // `start` answers once the link shows; the prompt can reach the pty a
+        // moment later (macOS), so wait for it the way the screen polls.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !status(&engine, &started.id).unwrap().unwrap().needs_code {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the prompt never came"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
 
         let answered = submit_code(&engine, &started.id, "the-code#abc")
             .await
