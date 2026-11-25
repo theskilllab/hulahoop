@@ -772,8 +772,8 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
         "skills": skill_files,
-        // The runner names the commit after the task; without the title every head
-        // read "implement: the issue".
+        // A commit is named by the subject its turn gave (`HULAHOOP_COMMIT:`);
+        // the task's title is the fallback for a turn that gave none.
         "issue": { "key": issue.issue_key, "title": commit_title(&issue.title) },
         // The connector, opened server-side, travels only on this authenticated
         // channel: the runner needs it to act, the desktop never sees it.

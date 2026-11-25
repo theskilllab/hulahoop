@@ -201,6 +201,43 @@ impl RunStatus {
     }
 }
 
+/// The longest commit subject a turn may give: what fits a `git log --oneline`
+/// line and GitHub's commit list without being cut.
+pub const COMMIT_SUBJECT_MAX: usize = 72;
+
+/// The commit subject an agent gave its turn with `HULAHOOP_COMMIT: <subject>`.
+///
+/// The last such line wins, as with the verdict. Anything past
+/// [`COMMIT_SUBJECT_MAX`] characters is cut at the last whole word, so a long
+/// subject stays readable instead of ending mid-word.
+pub fn commit_subject(text: &str) -> Option<String> {
+    const MARKER: &str = "hulahoop_commit:";
+    let index = text.to_lowercase().rfind(MARKER)?;
+    let line = text[index + MARKER.len()..].lines().next()?;
+    // Agents write markdown; a subject wrapped in backticks or quotes is still
+    // the subject.
+    let subject = line
+        .trim()
+        .trim_matches(|c| matches!(c, '`' | '"' | '\'' | '*'))
+        .trim();
+    if subject.is_empty() {
+        return None;
+    }
+    if subject.chars().count() <= COMMIT_SUBJECT_MAX {
+        return Some(subject.to_string());
+    }
+    let cut: String = subject.chars().take(COMMIT_SUBJECT_MAX).collect();
+    let words = match cut.rfind(' ') {
+        Some(space) if space > COMMIT_SUBJECT_MAX / 2 => &cut[..space],
+        _ => &cut[..],
+    };
+    Some(
+        words
+            .trim_end_matches([',', ';', ':', '-', ' '])
+            .to_string(),
+    )
+}
+
 /// The author name a run's commits carry: the app's slug and the agent's own
 /// name, so `jj log` answers "who wrote this" without a role anywhere. The team
 /// a task passes through is named in the workflow, and those names are the ones
@@ -364,6 +401,34 @@ mod tests {
     use super::*;
     use IssueEvent as E;
     use IssueStatus as S;
+
+    #[test]
+    fn a_turn_names_its_commit() {
+        let text = "Done.\n\nHULAHOOP_COMMIT: `Add project colours and the settings dialog`\nHULAHOOP_VERDICT: done";
+        assert_eq!(
+            commit_subject(text).as_deref(),
+            Some("Add project colours and the settings dialog")
+        );
+        assert_eq!(commit_subject("HULAHOOP_VERDICT: done"), None);
+        assert_eq!(
+            commit_subject("hulahoop_commit:   \nHULAHOOP_VERDICT: done"),
+            None
+        );
+        // The last one wins.
+        assert_eq!(
+            commit_subject("HULAHOOP_COMMIT: first\nHULAHOOP_COMMIT: second").as_deref(),
+            Some("second")
+        );
+        // Too long: cut at a whole word, within the limit.
+        let long = format!(
+            "HULAHOOP_COMMIT: {}",
+            "Refuse to unlink a repository that has run history ".repeat(3)
+        );
+        let subject = commit_subject(&long).unwrap();
+        assert!(subject.chars().count() <= COMMIT_SUBJECT_MAX);
+        let rest = long.split_once(subject.as_str()).unwrap().1;
+        assert!(rest.starts_with(' '), "cut mid-word: {subject}");
+    }
 
     #[test]
     fn a_patch_is_capped_at_a_file_boundary() {

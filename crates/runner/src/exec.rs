@@ -697,16 +697,19 @@ impl Executor {
         }
         let changed = touched && unresolved.is_empty();
         // A commit with no message cannot be pushed and reads as noise in `jj log`.
-        // The author says who, the issue says what.
+        // The author says who; the subject the agent gave the turn says what it
+        // changed, so every turn on a task reads differently in the log. A turn
+        // that gave none falls back to the task's title.
         if changed {
-            let title = spec["issue"]["title"].as_str().unwrap_or("the issue");
-            vcs.describe_as(
-                &checkout,
-                &format!("implement: {title}"),
-                &author_name,
-                &author_email,
-            )
-            .with_context(|| "describing the commit")?;
+            let subject = hulahoop_core::commit_subject(&outcome.final_text).unwrap_or_else(|| {
+                spec["issue"]["title"]
+                    .as_str()
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or("Work on the task")
+                    .to_string()
+            });
+            vcs.describe_as(&checkout, &subject, &author_name, &author_email)
+                .with_context(|| "describing the commit")?;
         }
         drop(turn);
         // A head that fails `fmt-check` in CI is a head nobody can merge, so the
