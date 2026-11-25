@@ -470,7 +470,7 @@ pub async fn save_plan(
 ) -> async_graphql::Result<bool> {
     if !matches!(
         connector,
-        "claude-sub" | "pi" | "opencode-go" | "claude-api"
+        "claude-sub" | "codex-sub" | "pi" | "opencode-go" | "claude-api"
     ) || label.trim().is_empty()
         || label.len() > 80
         || !fee.is_finite()

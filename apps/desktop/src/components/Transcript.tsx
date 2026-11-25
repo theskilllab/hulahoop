@@ -84,12 +84,15 @@ export default function Transcript({
   runStatus,
   agentName,
   issueKey,
+  credentialSource = null,
   onBack,
 }: {
   runId: string;
   runStatus: string;
   agentName: string;
   issueKey: string;
+  /** What the run signed in with, such as `Claude subscription` or `host login`. */
+  credentialSource?: string | null;
   onBack: () => void;
 }) {
   const [entries, setEntries] = useState<Keyed[]>([]);
@@ -177,6 +180,7 @@ export default function Transcript({
         <RunStatusChip status={live ? (runStatus === "queued" ? "queued" : "running") : runStatus === "running" ? "succeeded" : runStatus} />
         <span className="dim small">
           {plural(turns, "turn")} · {plural(toolCalls, "tool call")}
+          {credentialSource ? ` · Credential: ${credentialSource}` : null}
         </span>
         <span className="spacer" />
         <label className="check small">

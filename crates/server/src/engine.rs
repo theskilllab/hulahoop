@@ -1,7 +1,7 @@
 //! Business rules: every mutation and every runner callback lands here, so the
 //! state machine and the gate live in one place.
 
-use crate::connectors::Credential;
+use crate::connectors::{Credential, Secrets};
 use crate::db::{kill_process_group, sha256_hex, Db};
 use crate::github::StoredApp;
 use crate::model::ConnectorRow;
@@ -11,6 +11,8 @@ use chrono::Utc;
 use hulahoop_core::contract;
 use hulahoop_core::diff;
 use hulahoop_core::{IssueEvent, IssueStatus, RunFlag, RunStatus};
+use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// The provider's own refusal, when the adapter recorded one. pi reports a rejected
@@ -92,6 +94,34 @@ pub struct Engine {
     pub(crate) pull_sync: crate::pulls::SyncSignal,
     /// Installation tokens and rate limits, kept between calls to GitHub.
     pub(crate) github_cache: crate::pulls::GithubCache,
+    /// The Pi binary a sign-in and the model list run: `HULAHOOP_PI_BIN`, else
+    /// `pi` on `PATH`. A field so a test can hand one engine a fake Pi.
+    pub pi_bin: std::path::PathBuf,
+    /// OAuth sign-ins in progress, by id.
+    pub signins: crate::signin::Registry,
+    /// One lock per stored connector row, held while a login about to expire
+    /// is refreshed, so two claims never spend the same refresh token.
+    refresh_locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+/// A stored OAuth login closer than this to expiring is refreshed before a run
+/// is handed it, so the harness never refreshes a token another run shares.
+const REFRESH_AHEAD_MS: i64 = 30 * 60 * 1000;
+/// How long a central refresh may take before the run goes ahead without it.
+const REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Now, in milliseconds since the epoch: the unit OAuth logins expire in.
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// The Pi binary to run: `HULAHOOP_PI_BIN` when set, so a developer or a test
+/// can stand one in, else `pi` from `PATH`.
+pub fn pi_bin() -> std::path::PathBuf {
+    std::env::var_os("HULAHOOP_PI_BIN")
+        .filter(|bin| !bin.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("pi"))
 }
 
 impl Engine {
@@ -103,6 +133,9 @@ impl Engine {
             diffs,
             pull_sync: crate::pulls::SyncSignal::default(),
             github_cache: crate::pulls::GithubCache::default(),
+            pi_bin: pi_bin(),
+            signins: crate::signin::Registry::default(),
+            refresh_locks: std::sync::Mutex::default(),
         }
     }
 
@@ -764,7 +797,7 @@ impl Engine {
 
     /// Every provider the screen offers, stored or not. "Available" and
     /// "connected" are two different answers, and only a complete list shows both.
-    pub const ENTRIES: [crate::connectors::Entry; 4] = crate::connectors::ENTRIES;
+    pub const ENTRIES: [crate::connectors::Entry; 6] = crate::connectors::ENTRIES;
 
     pub(crate) fn vault(&self) -> Result<crate::vault::Vault> {
         crate::vault::Vault::open(&self.db.data_dir)
@@ -839,45 +872,66 @@ impl Engine {
         }))
     }
 
+    /// Every secret field of one entry's row, opened. `None` when the entry has
+    /// no row.
+    pub(crate) async fn secrets(
+        &self,
+        entry: &crate::connectors::Entry,
+    ) -> Result<Option<Secrets>> {
+        let Some(row) = self.connector_row(entry.provider, entry.kind).await? else {
+            return Ok(None);
+        };
+        let vault = self.vault()?;
+        let open = |field| Self::open_field(&vault, &row.secret_ciphertext, field);
+        Ok(Some(Secrets {
+            row: row.id,
+            secret: open("secret"),
+            token: open("token"),
+            contents: open("contents"),
+            oauth: open("oauth"),
+        }))
+    }
+
     /// What a run of this adapter authenticates with: a key in the environment, or
-    /// the file a login wrote. `connector` is the entry the agent chose, which
-    /// matters where a harness offers two ways to pay; an empty one takes whatever
-    /// is connected, subscription first.
+    /// a login file. `connector` is the entry the agent chose, which matters where
+    /// a harness offers more than one; an empty one takes whatever is connected,
+    /// subscription first. A Pi run also needs its `model`, because the model's
+    /// provider decides which entry can serve it.
     pub async fn agent_credential(
         &self,
         adapter: hulahoop_core::Adapter,
         connector: Option<&str>,
+        model: Option<&str>,
     ) -> Result<Credential> {
-        let entries = crate::connectors::for_adapter(adapter);
-        let chosen = match connector {
-            Some(id) if !id.is_empty() => entries.iter().find(|entry| entry.id == id).copied(),
-            _ => None,
-        };
-        let candidates: Vec<&crate::connectors::Entry> = match chosen {
+        let chosen = connector
+            .filter(|id| !id.is_empty())
+            .and_then(crate::connectors::entry)
+            .filter(|entry| {
+                crate::connectors::for_adapter(adapter)
+                    .iter()
+                    .any(|offered| offered.id == entry.id)
+            });
+        match adapter {
+            hulahoop_core::Adapter::Pi => self.pi_credential(chosen, model).await,
+            _ => self.claude_code_credential(adapter, chosen).await,
+        }
+    }
+
+    /// Claude Code takes the chosen entry or, with none, the first connected one.
+    async fn claude_code_credential(
+        &self,
+        adapter: hulahoop_core::Adapter,
+        chosen: Option<&'static crate::connectors::Entry>,
+    ) -> Result<Credential> {
+        let candidates = match chosen {
             Some(entry) => vec![entry],
-            None => entries,
+            None => crate::connectors::for_adapter(adapter),
         };
         for entry in candidates {
-            let Some(row) = self.connector_row(entry.provider, entry.kind).await? else {
+            let Some(secrets) = self.fresh_secrets(entry).await? else {
                 continue;
             };
-            let vault = self.vault()?;
-            let mut credential = Credential::default();
-            if let Some(secret) = Self::open_field(&vault, &row.secret_ciphertext, "secret") {
-                if let Some(name) = crate::connectors::api_key_env(entry.provider) {
-                    credential.env.push((name.to_string(), secret));
-                }
-            }
-            if let Some(token) = Self::open_field(&vault, &row.secret_ciphertext, "token") {
-                credential
-                    .env
-                    .push(("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token));
-            }
-            if let Some(contents) = Self::open_field(&vault, &row.secret_ciphertext, "contents") {
-                if let Some(path) = crate::connectors::credentials_file(entry.provider) {
-                    credential.files.push((path.to_string(), contents));
-                }
-            }
+            let credential = crate::connectors::claude_code_credential(entry, &secrets);
             if !credential.is_empty() {
                 return Ok(credential);
             }
@@ -885,66 +939,227 @@ impl Engine {
         Ok(Credential::default())
     }
 
+    /// Pi's precedence while both paths exist: the agent's choice when it serves
+    /// the model's provider, then that provider's own entries, then the stored Pi
+    /// login, then nothing — which leaves the run on the host login. A choice
+    /// that cannot serve the model (a Claude key for an OpenCode model) is
+    /// ignored rather than failing the run, and so is a chosen entry that is not
+    /// connected: the provider's other entries are the next best answer.
+    async fn pi_credential(
+        &self,
+        chosen: Option<&'static crate::connectors::Entry>,
+        model: Option<&str>,
+    ) -> Result<Credential> {
+        let pi_login = crate::connectors::entry(crate::connectors::PI);
+        if let Some(entry) = chosen.filter(|entry| entry.provider == crate::connectors::PI) {
+            return self.pi_login_credential(entry).await;
+        }
+        let provider = model.and_then(crate::connectors::pi_provider_of);
+        let mut candidates: Vec<&'static crate::connectors::Entry> = chosen
+            .filter(|entry| entry.pi_provider.is_some() && entry.pi_provider == provider)
+            .into_iter()
+            .collect();
+        if let Some(provider) = provider {
+            candidates.extend(crate::connectors::for_pi_provider(provider));
+        }
+        for entry in candidates {
+            let Some(secrets) = self.fresh_secrets(entry).await? else {
+                continue;
+            };
+            let credential = crate::connectors::pi_credential(entry, &secrets);
+            if !credential.is_empty() {
+                return Ok(credential);
+            }
+        }
+        match pi_login {
+            Some(entry) => self.pi_login_credential(entry).await,
+            None => Ok(Credential::default()),
+        }
+    }
+
+    /// A row's secrets, with its OAuth login refreshed first when it is about
+    /// to expire. Pi and Claude Code refresh an expired token themselves, and
+    /// providers rotate the refresh token on every use, so two runs (or the Lumi
+    /// lane beside a run) refreshing the same login would spend one refresh
+    /// token twice and lose the login. Refreshing here, one claim at a time per
+    /// row, hands every run a token with at least half an hour left. A refresh
+    /// that fails leaves the run on the stored login, as before.
+    async fn fresh_secrets(
+        &self,
+        entry: &'static crate::connectors::Entry,
+    ) -> Result<Option<Secrets>> {
+        let Some(secrets) = self.secrets(entry).await? else {
+            return Ok(None);
+        };
+        let Some(key) = entry.pi_provider else {
+            return Ok(Some(secrets));
+        };
+        if secrets.refreshing_entry().is_none() {
+            return Ok(Some(secrets));
+        }
+        let lock = {
+            let mut locks = self
+                .refresh_locks
+                .lock()
+                .map_err(|_| anyhow!("refresh locks poisoned"))?;
+            locks.entry(secrets.row).or_default().clone()
+        };
+        let _turn = lock.lock().await;
+        // Another claim may have refreshed this login while this one waited.
+        let Some(secrets) = self.secrets(entry).await? else {
+            return Ok(None);
+        };
+        let Some(login) = secrets.refreshing_entry() else {
+            return Ok(Some(secrets));
+        };
+        let expires = hulahoop_core::credential::oauth_expires(&login);
+        if expires.is_some_and(|expires| expires > now_ms() + REFRESH_AHEAD_MS) {
+            return Ok(Some(secrets));
+        }
+        match self.refresh_centrally(entry, key, &secrets, &login).await {
+            Ok(true) => self.secrets(entry).await,
+            Ok(false) => Ok(Some(secrets)),
+            Err(error) => {
+                // The error names a step, never the login: nothing from Pi's
+                // output or the file is put in it.
+                tracing::warn!(connector = entry.id, %error, "could not refresh a login before a run; the run gets the stored one");
+                Ok(Some(secrets))
+            }
+        }
+    }
+
+    /// Refresh one login with `pi auth print-bearer-token`, in a private home
+    /// holding only that login, and store what Pi wrote back. The token Pi
+    /// prints is discarded unread. Whether a newer login was stored.
+    async fn refresh_centrally(
+        &self,
+        entry: &'static crate::connectors::Entry,
+        key: &str,
+        secrets: &Secrets,
+        login: &serde_json::Value,
+    ) -> Result<bool> {
+        let home = crate::signin::private_home(&self.db.data_dir, "refresh")?;
+        let refreshed = self.run_refresh(&home, key, login).await;
+        let _ = std::fs::remove_dir_all(&home);
+        let refreshed = refreshed?;
+        if refreshed == *login {
+            return Ok(false);
+        }
+        self.store_refreshed_oauth(entry.id, secrets.row, &refreshed)
+            .await
+    }
+
+    async fn run_refresh(
+        &self,
+        home: &std::path::Path,
+        key: &str,
+        login: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+        let auth = home.join(hulahoop_core::credential::PI_AUTH_FILE);
+        let directory = auth.parent().ok_or_else(|| anyhow!("no login directory"))?;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(directory)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&auth)?
+            .write_all(serde_json::json!({ key: login }).to_string().as_bytes())?;
+        let mut command = tokio::process::Command::new(&self.pi_bin);
+        command
+            .args([
+                "auth",
+                "print-bearer-token",
+                "--provider",
+                key,
+                "--min-expiry",
+                "30m",
+            ])
+            .env_clear()
+            .env("HOME", home)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("NO_COLOR", "1")
+            .envs(crate::signin::pass_through_env())
+            .current_dir(home)
+            .stdin(std::process::Stdio::null())
+            // The bearer token itself: never read, never logged.
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let status = tokio::time::timeout(REFRESH_TIMEOUT, command.status())
+            .await
+            .map_err(|_| anyhow!("pi did not refresh within {REFRESH_TIMEOUT:?}"))?
+            .map_err(|error| anyhow!("could not start pi: {}", error.kind()))?;
+        if !status.success() {
+            bail!("pi exited with {status}");
+        }
+        let written = std::fs::read(&auth)?;
+        if written.len() > 64 * 1024 {
+            bail!("pi wrote an oversized login file");
+        }
+        let written: serde_json::Value = serde_json::from_slice(&written)
+            .map_err(|_| anyhow!("pi wrote an unreadable login file"))?;
+        written
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow!("pi's login file lost the provider"))
+    }
+
+    async fn pi_login_credential(
+        &self,
+        entry: &'static crate::connectors::Entry,
+    ) -> Result<Credential> {
+        let Some(secrets) = self.secrets(entry).await? else {
+            return Ok(Credential::default());
+        };
+        let credential = crate::connectors::pi_login_credential(entry, &secrets);
+        Ok(if credential.is_empty() {
+            Credential::default()
+        } else {
+            credential
+        })
+    }
+
     /// Whether a stored secret can still act is the only honest definition of
     /// "connected": an app whose key cannot sign is not the app it claims to be,
     /// and a key the CLI would reject is not a login.
     pub async fn connections(&self) -> Result<Vec<Connection>> {
         let mut connections = Vec::with_capacity(Self::ENTRIES.len());
-        for entry in Self::ENTRIES {
+        let vault = self.vault()?;
+        for entry in &crate::connectors::ENTRIES {
             let row = self.connector_row(entry.provider, entry.kind).await?;
-            let connected_at = row.as_ref().map(|row| row.updated_at);
-            let vault = self.vault()?;
-            let (connected, app_id, label) = match &row {
-                None => (false, None, None),
-                Some(row) => {
-                    let app_id = Self::open_field(&vault, &row.secret_ciphertext, "app_id");
-                    let private_key =
-                        Self::open_field(&vault, &row.secret_ciphertext, "private_key");
-                    // Sealed and openable is what every entry can prove locally;
-                    // a github app has one more answer, whether the key parses.
-                    let openable = app_id.is_some()
-                        || private_key.is_some()
-                        || Self::open_field(&vault, &row.secret_ciphertext, "secret").is_some()
-                        || Self::open_field(&vault, &row.secret_ciphertext, "token").is_some()
-                        || Self::open_field(&vault, &row.secret_ciphertext, "contents").is_some();
-                    let signs = private_key.as_deref().is_none_or(crate::github::can_sign);
-                    (
-                        openable && signs,
-                        if openable { app_id } else { None },
-                        row.label.clone(),
-                    )
-                }
-            };
-            connections.push(Connection {
-                id: entry.id.to_string(),
-                provider: entry.provider.to_string(),
-                kind: entry.kind.to_string(),
-                group: entry.group.to_string(),
-                name: entry.name.to_string(),
-                icon: entry.icon.to_string(),
-                desc: entry.desc.to_string(),
-                enables: entry.enables.to_string(),
-                connected,
-                app_id,
-                label: label.clone(),
-                connected_at,
-            });
+            connections.push(Self::connection_of(entry, row.as_ref(), &vault));
         }
         Ok(connections)
     }
 
-    /// Forget a stored credential. The loop stops acting as that provider, so the
-    /// next attempt goes back to what the machine has until one is stored again.
-    pub async fn clear_connection(&self, id: &str) -> Result<Connection> {
-        let entry = crate::connectors::entry(id)
-            .ok_or_else(|| anyhow!("unknown connector `{id}`"))?
-            .to_owned();
-        sqlx::query("delete from connectors where provider = ? and kind = ?")
-            .bind(entry.provider)
-            .bind(entry.kind)
-            .execute(&self.db.pool)
-            .await?;
-        Ok(Connection {
+    fn connection_of(
+        entry: &crate::connectors::Entry,
+        row: Option<&ConnectorRow>,
+        vault: &crate::vault::Vault,
+    ) -> Connection {
+        let (connected, app_id) = match row {
+            None => (false, None),
+            Some(row) => {
+                let open = |field| Self::open_field(vault, &row.secret_ciphertext, field);
+                let app_id = open("app_id");
+                let private_key = open("private_key");
+                // Sealed and openable is what every entry can prove locally;
+                // a github app has one more answer, whether the key parses.
+                let openable = app_id.is_some()
+                    || private_key.is_some()
+                    || ["secret", "token", "contents", "oauth"]
+                        .into_iter()
+                        .any(|field| open(field).is_some());
+                let signs = private_key.as_deref().is_none_or(crate::github::can_sign);
+                (openable && signs, if openable { app_id } else { None })
+            }
+        };
+        Connection {
             id: entry.id.to_string(),
             provider: entry.provider.to_string(),
             kind: entry.kind.to_string(),
@@ -953,13 +1168,73 @@ impl Engine {
             icon: entry.icon.to_string(),
             desc: entry.desc.to_string(),
             enables: entry.enables.to_string(),
-            connected: false,
-            app_id: None,
-            label: None,
-            connected_at: None,
-        })
+            connected,
+            app_id,
+            label: row.and_then(|row| row.label.clone()),
+            connected_at: row.map(|row| row.updated_at),
+            plans: crate::connectors::plans(entry.id)
+                .iter()
+                .map(|plan| ConnectorPlan {
+                    id: plan.id.to_string(),
+                    name: plan.name.to_string(),
+                })
+                .collect(),
+            plan: row.and_then(|row| row.plan.clone()),
+            harnesses: crate::connectors::harnesses(entry.id)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        }
     }
 
+    /// The Pi providers a connected entry serves, for the model list. A row
+    /// holding a secret field counts; nothing is opened, so the model list
+    /// costs one query rather than a decryption per field.
+    pub async fn connected_pi_providers(&self) -> Result<Vec<&'static str>> {
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("select provider, kind, secret_ciphertext from connectors")
+                .fetch_all(&self.db.pool)
+                .await?;
+        let mut providers = Vec::new();
+        for (provider, kind, payload) in rows {
+            let Some(pi_provider) =
+                crate::connectors::find(&provider, &kind).and_then(|entry| entry.pi_provider)
+            else {
+                continue;
+            };
+            let holds_secret = ["secret", "token", "contents", "oauth"]
+                .into_iter()
+                .any(|field| Self::payload_field(&payload, field).is_some());
+            if holds_secret && !providers.contains(&pi_provider) {
+                providers.push(pi_provider);
+            }
+        }
+        // The entries' order, so the list does not depend on row order.
+        providers.sort_by_key(|provider| {
+            crate::connectors::ENTRIES
+                .iter()
+                .position(|entry| entry.pi_provider == Some(*provider))
+        });
+        Ok(providers)
+    }
+
+    /// Forget a stored credential. The loop stops acting as that provider, so the
+    /// next attempt goes back to what the machine has until one is stored again.
+    /// The plan goes with the row.
+    pub async fn clear_connection(&self, id: &str) -> Result<Connection> {
+        let entry =
+            crate::connectors::entry(id).ok_or_else(|| anyhow!("unknown connector `{id}`"))?;
+        sqlx::query("delete from connectors where provider = ? and kind = ?")
+            .bind(entry.provider)
+            .bind(entry.kind)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(Self::connection_of(entry, None, &self.vault()?))
+    }
+
+    /// Store a row's secret, replacing whatever it held. A replaced secret gets a
+    /// new row id, so a run still holding the old login cannot hand a refreshed
+    /// copy of it back over the new one.
     async fn write_connector(
         &self,
         provider: &str,
@@ -972,6 +1247,7 @@ impl Engine {
             "insert into connectors (id, provider, kind, secret_ciphertext, label, created_at, updated_at)
              values (?, ?, ?, ?, ?, ?, ?)
              on conflict(provider, kind) do update set
+                 id = excluded.id,
                  secret_ciphertext = excluded.secret_ciphertext,
                  label = excluded.label,
                  updated_at = excluded.updated_at",
@@ -1074,13 +1350,153 @@ impl Engine {
         if token.len() < 20 {
             bail!("that does not look like a token; `claude setup-token` prints one line");
         }
-        if entry.kind != crate::connectors::KIND_SUBSCRIPTION {
-            bail!("`{}` takes an API key, not a token", entry.name);
+        if entry.id != "claude-sub" {
+            bail!("`{}` does not take a token", entry.name);
         }
         let vault = self.vault()?;
         let payload = Self::sealed_payload(&[("token", vault.seal_string(token)?)]);
         self.write_connector(entry.provider, entry.kind, &payload, Some("oauth token"))
             .await?;
+        self.connection(entry.id).await
+    }
+
+    /// Seal the OAuth entry a sign-in produced. A new sign-in replaces the row's
+    /// whole secret, a setup token or a pasted file included, so the newest login
+    /// is the one runs use.
+    pub(crate) async fn set_agent_oauth(
+        &self,
+        id: &str,
+        oauth: &serde_json::Value,
+        label: &str,
+    ) -> Result<Connection> {
+        let entry =
+            crate::connectors::entry(id).ok_or_else(|| anyhow!("unknown connector `{id}`"))?;
+        if !hulahoop_core::credential::is_oauth(oauth) {
+            bail!("the sign-in did not produce an OAuth login");
+        }
+        let vault = self.vault()?;
+        let payload = Self::sealed_payload(&[("oauth", vault.seal_string(&oauth.to_string())?)]);
+        self.write_connector(entry.provider, entry.kind, &payload, Some(label))
+            .await?;
+        self.connection(entry.id).await
+    }
+
+    /// Keep the token a harness refreshed during a run (or a central refresh
+    /// produced). Only the row the run was given, only a login shaped like one
+    /// (`{type: "oauth", access, refresh, expires, accountId?, email?,
+    /// scopes?}`, other fields dropped) that expires in the future but within
+    /// 30 days, and only one that expires later than the stored login: two runs
+    /// that refreshed the same subscription race, and the newest token wins. The
+    /// refreshed fields are laid over the stored entry, so an account id or an
+    /// email the refresh did not repeat survives. `updated_at` stays: it is when
+    /// the person connected, not when a token rotated. Returns whether the entry
+    /// was stored.
+    pub async fn store_refreshed_oauth(
+        &self,
+        connector: &str,
+        row_id: Uuid,
+        oauth: &serde_json::Value,
+    ) -> Result<bool> {
+        let entry = crate::connectors::entry(connector)
+            .ok_or_else(|| anyhow!("unknown connector `{connector}`"))?;
+        let Some(refreshed) = crate::connectors::checked_oauth(oauth, now_ms()) else {
+            return Ok(false);
+        };
+        let Some(row) = self.connector_row(entry.provider, entry.kind).await? else {
+            return Ok(false);
+        };
+        if row.id != row_id {
+            return Ok(false);
+        }
+        let vault = self.vault()?;
+        let stored = Self::open_field(&vault, &row.secret_ciphertext, "oauth")
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+        let newer = match (
+            stored
+                .as_ref()
+                .and_then(hulahoop_core::credential::oauth_expires),
+            refreshed
+                .get("expires")
+                .and_then(|expires| expires.as_f64()),
+        ) {
+            (Some(stored), Some(new)) => new > stored as f64,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !newer {
+            return Ok(false);
+        }
+        let merged = crate::connectors::merge_oauth(stored.as_ref(), refreshed);
+        let mut payload: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&row.secret_ciphertext).unwrap_or_default();
+        payload.insert(
+            "oauth".into(),
+            serde_json::Value::String(vault.seal_string(&merged.to_string())?),
+        );
+        // Compare-and-swap on the old payload, so a sign-in or another hand-back
+        // that landed in between is never overwritten by this one.
+        let stored = sqlx::query(
+            "update connectors set secret_ciphertext = ?
+              where id = ? and secret_ciphertext = ?",
+        )
+        .bind(serde_json::Value::Object(payload).to_string())
+        .bind(row.id)
+        .bind(&row.secret_ciphertext)
+        .execute(&self.db.pool)
+        .await?
+        .rows_affected();
+        Ok(stored == 1)
+    }
+
+    /// Say which plan a connected entry is on. A plan with a published fee fills
+    /// in Cost control's plan for every workspace, keeping any allowance already
+    /// set there; a plan without one, or clearing the plan, leaves Cost control
+    /// alone.
+    pub async fn set_connector_plan(&self, id: &str, plan: Option<&str>) -> Result<Connection> {
+        let entry =
+            crate::connectors::entry(id).ok_or_else(|| anyhow!("unknown connector `{id}`"))?;
+        let plan = match plan.map(str::trim).filter(|plan| !plan.is_empty()) {
+            Some(plan) => Some(
+                crate::connectors::plans(entry.id)
+                    .iter()
+                    .find(|known| known.id == plan)
+                    .ok_or_else(|| anyhow!("`{}` has no plan `{plan}`", entry.name))?,
+            ),
+            None => None,
+        };
+        // The plan and Cost control's copy of it change together or not at all.
+        let mut transaction = self.db.pool.begin().await?;
+        let updated = sqlx::query("update connectors set plan = ? where provider = ? and kind = ?")
+            .bind(plan.map(|plan| plan.id))
+            .bind(entry.provider)
+            .bind(entry.kind)
+            .execute(&mut *transaction)
+            .await?
+            .rows_affected();
+        if updated == 0 {
+            bail!("connect {} before choosing its plan", entry.name);
+        }
+        if let Some((plan, fee)) = plan.and_then(|plan| plan.fee.map(|fee| (plan, fee))) {
+            let label = format!("{} · {}", entry.name, plan.name);
+            let workspaces: Vec<(Uuid,)> = sqlx::query_as("select id from workspaces")
+                .fetch_all(&mut *transaction)
+                .await?;
+            for (workspace,) in workspaces {
+                sqlx::query(
+                    "insert into cost_plans (workspace_id, connector_id, label, monthly_fee_usd, allowance_tokens)
+                     values (?, ?, ?, ?, null)
+                     on conflict(workspace_id, connector_id) do update set
+                         label = excluded.label, monthly_fee_usd = excluded.monthly_fee_usd",
+                )
+                .bind(workspace)
+                .bind(entry.id)
+                .bind(&label)
+                .bind(fee)
+                .execute(&mut *transaction)
+                .await?;
+            }
+        }
+        transaction.commit().await?;
         self.connection(entry.id).await
     }
 
@@ -1379,9 +1795,9 @@ impl Engine {
         let price = crate::models::price_per_token(&run_agent.model);
         sqlx::query(
             "insert into runs (id, issue_id, repo_id, agent_id, model, adapter_snapshot, connector_id,
-                price_in_per_million, price_out_per_million, attempt, base_bookmark, base_revision,
-                prompt_revision, artifact_dir, parent_run_id, status, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                chosen_connector, price_in_per_million, price_out_per_million, attempt, base_bookmark,
+                base_revision, prompt_revision, artifact_dir, parent_run_id, status, created_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
         )
         .bind(run_id)
         .bind(issue_id)
@@ -1389,6 +1805,7 @@ impl Engine {
         .bind(agent_id)
         .bind(&run_agent.model)
         .bind(&run_agent.adapter)
+        .bind(&run_agent.connector)
         .bind(&run_agent.connector)
         .bind(price.map(|(input, _)| input * 1_000_000.0))
         .bind(price.map(|(_, output)| output * 1_000_000.0))
@@ -3749,5 +4166,562 @@ mod checkout_lifecycle_tests {
         // Moving a finished task again queues nothing more.
         assert!(engine.transition(issue, IssueEvent::Abandon).await.is_err());
         assert_eq!(jobs(&engine, "cleanup").await.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod credential_tests {
+    //! Which stored login a run gets, and what the runner writes from it.
+
+    use super::Engine;
+    use crate::db::Db;
+    use hulahoop_core::Adapter;
+    use serde_json::{json, Value};
+
+    async fn engine() -> (Engine, std::path::PathBuf) {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-credential-{}", uuid::Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        db.seed_local().await.unwrap();
+        let mut engine = Engine::new(db);
+        // No Pi: a login about to expire is not refreshed against a real
+        // provider, and the run goes ahead with the stored one.
+        engine.pi_bin = directory.join("no-pi");
+        (engine, directory)
+    }
+
+    fn oauth(access: &str, expires: i64) -> Value {
+        json!({"type": "oauth", "access": access, "refresh": format!("{access}-refresh"), "expires": expires})
+    }
+
+    /// Milliseconds from now, as an OAuth login's `expires`.
+    fn in_ms(offset: i64) -> i64 {
+        super::now_ms() + offset
+    }
+
+    const HOUR: i64 = 60 * 60 * 1000;
+
+    /// A fake Pi that refreshes a Codex login: it checks it was asked the
+    /// right thing with only that login in its home, counts its calls, prints
+    /// a bearer token and writes a login expiring in five hours.
+    fn fake_refreshing_pi(directory: &std::path::Path, exit: i32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(directory).unwrap();
+        let pi = directory.join("refreshing-pi");
+        let count = directory.join("refresh-count");
+        std::fs::write(
+            &pi,
+            format!(
+                r#"#!/bin/sh
+echo x >> '{count}'
+[ "$*" = "auth print-bearer-token --provider openai-codex --min-expiry 30m" ] || exit 9
+grep -q '"access":"stale"' "$HOME/.pi/agent/auth.json" || exit 8
+grep -q anthropic "$HOME/.pi/agent/auth.json" && exit 7
+sleep 0.2
+expires=$(( $(date +%s) * 1000 + 5 * 3600 * 1000 ))
+printf '{{"openai-codex":{{"type":"oauth","access":"refreshed","refresh":"refreshed-refresh","expires":%s,"accountId":"acc"}}}}' "$expires" > "$HOME/.pi/agent/auth.json"
+echo bearer-token-that-must-not-be-kept
+exit {exit}
+"#,
+                count = count.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pi, std::fs::Permissions::from_mode(0o755)).unwrap();
+        pi
+    }
+
+    fn refresh_calls(directory: &std::path::Path) -> usize {
+        std::fs::read_to_string(directory.join("refresh-count"))
+            .map(|calls| calls.lines().count())
+            .unwrap_or(0)
+    }
+
+    /// The one `auth.json` a Pi credential carries, parsed.
+    fn auth_file(credential: &crate::connectors::Credential) -> Value {
+        assert_eq!(
+            credential.files.len(),
+            1,
+            "{:?}",
+            credential.files.iter().map(|f| &f.0).collect::<Vec<_>>()
+        );
+        assert_eq!(credential.files[0].0, ".pi/agent/auth.json");
+        serde_json::from_str(&credential.files[0].1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn nothing_stored_leaves_a_pi_run_on_the_host_login() {
+        let (engine, directory) = engine().await;
+        let credential = engine
+            .agent_credential(Adapter::Pi, None, Some("anthropic/claude-sonnet-4-5"))
+            .await
+            .unwrap();
+        assert!(credential.is_empty());
+        assert_eq!(credential.source(), "host login");
+        assert_eq!(credential.billing(), "unknown");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn an_anthropic_model_takes_the_subscription_before_the_key_unless_the_agent_chose() {
+        let (engine, directory) = engine().await;
+        engine
+            .set_agent_key("claude-api", "sk-ant-api-key")
+            .await
+            .unwrap();
+        engine
+            .set_agent_oauth("claude-sub", &oauth("sub-access", 10), "signed in")
+            .await
+            .unwrap();
+        let model = Some("anthropic/claude-sonnet-4-5");
+
+        let automatic = engine
+            .agent_credential(Adapter::Pi, None, model)
+            .await
+            .unwrap();
+        assert_eq!(automatic.source(), "Claude subscription");
+        assert_eq!(
+            auth_file(&automatic),
+            json!({"anthropic": oauth("sub-access", 10)})
+        );
+        assert_eq!(automatic.billing(), "subscription");
+        let refresh = automatic.refresh.expect("an OAuth login is handed back");
+        assert_eq!(
+            (refresh.connector.as_str(), refresh.key.as_deref()),
+            ("claude-sub", Some("anthropic"))
+        );
+
+        let chosen = engine
+            .agent_credential(Adapter::Pi, Some("claude-api"), model)
+            .await
+            .unwrap();
+        assert_eq!(chosen.source(), "Claude API key");
+        assert_eq!(
+            auth_file(&chosen),
+            json!({"anthropic": {"type": "api_key", "key": "sk-ant-api-key"}})
+        );
+        assert_eq!(chosen.billing(), "api");
+        assert!(chosen.refresh.is_none());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A choice that cannot serve the model is ignored; the model's provider
+    /// decides, and the file holds that provider's entry and nothing else.
+    #[tokio::test]
+    async fn a_choice_for_another_provider_is_ignored_and_the_file_holds_one_entry() {
+        let (engine, directory) = engine().await;
+        engine
+            .set_agent_key("claude-api", "sk-ant-api-key")
+            .await
+            .unwrap();
+        engine
+            .set_agent_key("opencode-go", "ocg-key")
+            .await
+            .unwrap();
+        engine
+            .set_agent_oauth("codex-sub", &oauth("codex-access", 10), "signed in")
+            .await
+            .unwrap();
+        engine
+            .set_agent_subscription(
+                "pi",
+                r#"{"opencode-go":{"type":"api_key","key":"pi-login"}}"#,
+            )
+            .await
+            .unwrap();
+
+        let credential = engine
+            .agent_credential(Adapter::Pi, Some("claude-api"), Some("opencode-go/glm-5"))
+            .await
+            .unwrap();
+        assert_eq!(credential.source(), "OpenCode Go key");
+        assert_eq!(credential.entry.map(|entry| entry.id), Some("opencode-go"));
+        assert_eq!(
+            auth_file(&credential),
+            json!({"opencode-go": {"type": "api_key", "key": "ocg-key"}})
+        );
+        assert_eq!(credential.billing(), "subscription");
+
+        let codex = engine
+            .agent_credential(Adapter::Pi, None, Some("openai-codex/gpt-5.1-codex"))
+            .await
+            .unwrap();
+        assert_eq!(
+            auth_file(&codex),
+            json!({"openai-codex": oauth("codex-access", 10)})
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// With no entry for the model's provider, the stored Pi login is next, and
+    /// choosing the Pi login always gets it.
+    #[tokio::test]
+    async fn a_provider_without_an_entry_falls_back_to_the_pi_login() {
+        let (engine, directory) = engine().await;
+        let login = r#"{"kimi-coding":{"type":"api_key","key":"k"}}"#;
+        engine.set_agent_subscription("pi", login).await.unwrap();
+        engine
+            .set_agent_key("claude-api", "sk-ant-api-key")
+            .await
+            .unwrap();
+
+        for (connector, model) in [
+            (None, "kimi-coding/k2"),
+            (Some("claude-api"), "opencode-go/glm-5"),
+            (Some("pi"), "anthropic/claude-sonnet-4-5"),
+            (None, "no-provider"),
+        ] {
+            let credential = engine
+                .agent_credential(Adapter::Pi, connector, Some(model))
+                .await
+                .unwrap();
+            assert_eq!(credential.source(), "Pi login", "{connector:?} {model}");
+            assert_eq!(
+                credential.files,
+                vec![(".pi/agent/auth.json".to_string(), login.to_string())]
+            );
+            assert_eq!(credential.billing(), "unknown");
+        }
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A `claude setup-token` token reaches Pi in the environment, with no file.
+    #[tokio::test]
+    async fn a_setup_token_reaches_pi_in_the_environment() {
+        let (engine, directory) = engine().await;
+        let token = "sk-ant-oat01-a-long-lived-setup-token";
+        engine.set_agent_token("claude-sub", token).await.unwrap();
+        let credential = engine
+            .agent_credential(Adapter::Pi, None, Some("anthropic/claude-opus-4-5"))
+            .await
+            .unwrap();
+        assert_eq!(
+            credential.env,
+            vec![("ANTHROPIC_OAUTH_TOKEN".to_string(), token.to_string())]
+        );
+        assert!(credential.files.is_empty());
+        assert!(credential.refresh.is_none());
+        assert_eq!(credential.source(), "Claude subscription");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Claude Code runs get exactly what they got before: the key or the setup
+    /// token in the environment, and no file.
+    #[tokio::test]
+    async fn a_claude_code_run_keeps_its_environment() {
+        let (engine, directory) = engine().await;
+        engine
+            .set_agent_key("claude-api", "sk-ant-api-key")
+            .await
+            .unwrap();
+        let token = "sk-ant-oat01-a-long-lived-setup-token";
+        engine.set_agent_token("claude-sub", token).await.unwrap();
+
+        let automatic = engine
+            .agent_credential(Adapter::ClaudeCode, None, Some("sonnet"))
+            .await
+            .unwrap();
+        assert_eq!(
+            automatic.env,
+            vec![("CLAUDE_CODE_OAUTH_TOKEN".to_string(), token.to_string())]
+        );
+        assert!(automatic.files.is_empty());
+        assert!(automatic.refresh.is_none());
+        assert_eq!(automatic.billing(), "subscription");
+
+        let keyed = engine
+            .agent_credential(Adapter::ClaudeCode, Some("claude-api"), Some("sonnet"))
+            .await
+            .unwrap();
+        assert_eq!(
+            keyed.env,
+            vec![(
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-ant-api-key".to_string()
+            )]
+        );
+        assert!(keyed.files.is_empty());
+        assert_eq!(keyed.billing(), "api");
+
+        // A Pi entry chosen for a Claude Code agent is not Claude Code's to use.
+        let other = engine
+            .agent_credential(Adapter::ClaudeCode, Some("opencode-go"), Some("sonnet"))
+            .await
+            .unwrap();
+        assert_eq!(other.source(), "Claude subscription");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A signed-in Claude subscription reaches Claude Code as the session file
+    /// Claude Code reads, and is handed back in that format.
+    #[tokio::test]
+    async fn a_claude_sign_in_becomes_a_claude_code_session_file() {
+        let (engine, directory) = engine().await;
+        engine
+            .set_agent_oauth("claude-sub", &oauth("sub-access", 42), "signed in")
+            .await
+            .unwrap();
+        let credential = engine
+            .agent_credential(Adapter::ClaudeCode, None, Some("opus"))
+            .await
+            .unwrap();
+        assert!(credential.env.is_empty());
+        assert_eq!(credential.files.len(), 1);
+        assert_eq!(credential.files[0].0, ".claude/.credentials.json");
+        let file: Value = serde_json::from_str(&credential.files[0].1).unwrap();
+        assert_eq!(
+            file,
+            json!({"claudeAiOauth": {
+                "accessToken": "sub-access",
+                "refreshToken": "sub-access-refresh",
+                "expiresAt": 42,
+                "scopes": ["user:inference", "user:profile", "user:sessions:claude_code"],
+                "subscriptionType": null,
+            }})
+        );
+        let refresh = credential.refresh.unwrap();
+        assert_eq!((refresh.format.as_str(), refresh.key), ("claude", None));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    async fn stored_access(engine: &Engine) -> Value {
+        let entry = crate::connectors::entry("codex-sub").unwrap();
+        let secrets = engine.secrets(entry).await.unwrap().unwrap();
+        serde_json::from_str::<Value>(&secrets.oauth.unwrap()).unwrap()["access"].clone()
+    }
+
+    /// A refreshed login is kept only when it is newer and for the row the run
+    /// was given; a row replaced since (a new sign-in) ignores it.
+    #[tokio::test]
+    async fn a_refreshed_login_is_kept_only_when_newer_and_for_the_same_row() {
+        let (engine, directory) = engine().await;
+        let mut first = oauth("first", in_ms(HOUR));
+        first["email"] = json!("me@example.com");
+        first["accountId"] = json!("acc-1");
+        engine
+            .set_agent_oauth("codex-sub", &first, "signed in")
+            .await
+            .unwrap();
+        let entry = crate::connectors::entry("codex-sub").unwrap();
+        let row = engine.secrets(entry).await.unwrap().unwrap().row;
+        let connected_at = engine.connection("codex-sub").await.unwrap().connected_at;
+        let mut newer = oauth("newer", in_ms(2 * HOUR));
+        newer["planted"] = json!("not a login field");
+        assert!(engine
+            .store_refreshed_oauth("codex-sub", row, &newer)
+            .await
+            .unwrap());
+        assert_eq!(stored_access(&engine).await, "newer");
+        let stored: Value =
+            serde_json::from_str(&engine.secrets(entry).await.unwrap().unwrap().oauth.unwrap())
+                .unwrap();
+        assert_eq!(
+            stored["email"], "me@example.com",
+            "merged over the stored entry"
+        );
+        assert_eq!(stored["accountId"], "acc-1");
+        assert!(stored.get("planted").is_none());
+        assert_eq!(
+            engine.connection("codex-sub").await.unwrap().connected_at,
+            connected_at,
+            "a refresh is not a new connection"
+        );
+        assert!(!engine
+            .store_refreshed_oauth("codex-sub", row, &oauth("older", in_ms(HOUR + HOUR / 2)))
+            .await
+            .unwrap());
+        assert_eq!(stored_access(&engine).await, "newer");
+
+        // Not a login a refresh produces: already expired, or good for years.
+        for planted in [
+            oauth("expired", in_ms(-HOUR)),
+            oauth("forever", in_ms(31 * 24 * HOUR)),
+            json!({"type": "oauth", "access": "no-refresh", "expires": in_ms(3 * HOUR)}),
+        ] {
+            assert!(!engine
+                .store_refreshed_oauth("codex-sub", row, &planted)
+                .await
+                .unwrap());
+        }
+        assert_eq!(stored_access(&engine).await, "newer");
+
+        engine
+            .set_agent_oauth(
+                "codex-sub",
+                &oauth("signed-in-again", in_ms(HOUR / 2)),
+                "signed in",
+            )
+            .await
+            .unwrap();
+        assert!(!engine
+            .store_refreshed_oauth("codex-sub", row, &oauth("stale-run", in_ms(9 * HOUR)))
+            .await
+            .unwrap());
+        assert_eq!(stored_access(&engine).await, "signed-in-again");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A login about to expire is refreshed once, centrally, before runs get
+    /// it: two claims at once start Pi once and both carry the new login. A
+    /// login with time left is not refreshed, and a refresh that fails leaves
+    /// the run on the stored login.
+    #[tokio::test]
+    async fn a_login_about_to_expire_is_refreshed_once_before_the_run() {
+        let (mut engine, directory) = engine().await;
+        engine.pi_bin = fake_refreshing_pi(&directory, 0);
+        engine
+            .set_agent_oauth("claude-sub", &oauth("claude", in_ms(HOUR / 4)), "signed in")
+            .await
+            .unwrap();
+        engine
+            .set_agent_oauth("codex-sub", &oauth("stale", in_ms(HOUR / 4)), "signed in")
+            .await
+            .unwrap();
+        let model = Some("openai-codex/gpt-5.1-codex");
+        let (first, second) = tokio::join!(
+            engine.agent_credential(Adapter::Pi, None, model),
+            engine.agent_credential(Adapter::Pi, None, model),
+        );
+        for credential in [first.unwrap(), second.unwrap()] {
+            let login = &auth_file(&credential)["openai-codex"];
+            assert_eq!(login["access"], "refreshed");
+            assert_eq!(login["accountId"], "acc");
+        }
+        assert_eq!(refresh_calls(&directory), 1, "one refresh for both claims");
+        assert_eq!(stored_access(&engine).await, "refreshed");
+
+        // Five hours left: nothing to do.
+        engine
+            .agent_credential(Adapter::Pi, None, model)
+            .await
+            .unwrap();
+        assert_eq!(refresh_calls(&directory), 1);
+        // Nothing is left behind in the private homes.
+        assert_eq!(
+            std::fs::read_dir(directory.join("signin"))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0
+        );
+
+        let (mut failing, failing_directory) = self::engine().await;
+        failing.pi_bin = fake_refreshing_pi(&failing_directory, 1);
+        failing
+            .set_agent_oauth("codex-sub", &oauth("stale", in_ms(HOUR / 4)), "signed in")
+            .await
+            .unwrap();
+        let credential = failing
+            .agent_credential(Adapter::Pi, None, model)
+            .await
+            .unwrap();
+        assert_eq!(auth_file(&credential)["openai-codex"]["access"], "stale");
+        assert_eq!(refresh_calls(&failing_directory), 1);
+        let _ = std::fs::remove_dir_all(failing_directory);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A chosen entry that serves the model but is not connected is skipped
+    /// like an unserved one: the provider's other entries come next.
+    #[tokio::test]
+    async fn a_chosen_entry_that_is_not_connected_falls_back_to_the_providers_others() {
+        let (engine, directory) = engine().await;
+        engine
+            .set_agent_key("claude-api", "sk-ant-api-key")
+            .await
+            .unwrap();
+        let credential = engine
+            .agent_credential(
+                Adapter::Pi,
+                Some("claude-sub"),
+                Some("anthropic/claude-sonnet-4-5"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(credential.source(), "Claude API key");
+        assert_eq!(
+            auth_file(&credential),
+            json!({"anthropic": {"type": "api_key", "key": "sk-ant-api-key"}})
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[tokio::test]
+    async fn a_plan_is_checked_and_fills_in_cost_control() {
+        let (engine, directory) = engine().await;
+        let workspace: (uuid::Uuid,) = sqlx::query_as("select id from workspaces limit 1")
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        let error = engine
+            .set_connector_plan("opencode-go", Some("go"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("connect OpenCode Go key"),
+            "{error}"
+        );
+
+        engine
+            .set_agent_key("opencode-go", "ocg-key")
+            .await
+            .unwrap();
+        assert!(engine
+            .set_connector_plan("opencode-go", Some("max"))
+            .await
+            .is_err());
+        assert!(engine
+            .set_connector_plan("claude-api", Some("pro"))
+            .await
+            .is_err());
+        crate::cost::save_plan(
+            &engine.db,
+            workspace.0,
+            "opencode-go",
+            "Mine",
+            1.0,
+            Some(5_000),
+        )
+        .await
+        .unwrap();
+
+        let connection = engine
+            .set_connector_plan("opencode-go", Some("go-plus"))
+            .await
+            .unwrap();
+        assert_eq!(connection.plan.as_deref(), Some("go-plus"));
+        assert_eq!(connection.plans.len(), 3);
+        let plans: Vec<(String, f64, Option<i64>)> = sqlx::query_as(
+            "select label, monthly_fee_usd, allowance_tokens from cost_plans where connector_id = 'opencode-go'",
+        )
+        .fetch_all(&engine.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            plans,
+            vec![("OpenCode Go key · Go Plus".to_string(), 40.0, Some(5_000))]
+        );
+
+        // A plan without a published fee, or none, leaves Cost control alone.
+        engine
+            .set_agent_token("claude-sub", "sk-ant-oat01-a-long-lived-setup-token")
+            .await
+            .unwrap();
+        engine
+            .set_connector_plan("claude-sub", Some("team"))
+            .await
+            .unwrap();
+        let cleared = engine
+            .set_connector_plan("opencode-go", None)
+            .await
+            .unwrap();
+        assert!(cleared.plan.is_none());
+        let count: (i64,) = sqlx::query_as("select count(*) from cost_plans")
+            .fetch_one(&engine.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(count.0, 1);
+        let gone = engine.clear_connection("opencode-go").await.unwrap();
+        assert!(gone.plan.is_none() && !gone.connected);
+        let _ = std::fs::remove_dir_all(directory);
     }
 }

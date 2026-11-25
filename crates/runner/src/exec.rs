@@ -2,8 +2,10 @@
 
 use crate::adapter;
 use crate::client::Client;
+use crate::redact::Redactor;
 use crate::vcs::{Kind, Vcs};
 use anyhow::{anyhow, bail, Context, Result};
+use hulahoop_core::credential::{Refresh, CLAUDE_CREDENTIALS_FILE, PI_AUTH_FILE};
 use hulahoop_core::{contract, github_api, slugify, Adapter};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
@@ -112,7 +114,13 @@ impl Executor {
             .await
             .ok();
 
-        let env = agent_env(spec, &scratch, &self.data_dir)?;
+        // The run's login files go however this function ends, after the
+        // hand-back has read them: the next run of this shared home must not
+        // start on this run's connector.
+        let home = agent_home(spec, &self.data_dir)?;
+        let login = LoginFiles::new(spec, &home);
+        let env = agent_env(spec, &scratch, &self.data_dir, &home)?;
+        let redactor = Redactor::new(spec, &env);
         self.write_skills(spec, &scratch)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
         let message = adapter::scratch_message_for(agent_name, &input_path, &scratch);
@@ -129,8 +137,12 @@ impl Executor {
                 &env,
                 wall_clock,
                 None,
+                &redactor,
             )
-            .await?;
+            .await;
+        self.hand_back(&format!("runs/{run_id}"), spec, &home).await;
+        drop(login);
+        let outcome = outcome?;
 
         let artifact_limit_hit = dir_size(&artifact_dir) > hulahoop_core::ARTIFACT_LIMIT_BYTES;
         self.client
@@ -263,7 +275,13 @@ impl Executor {
             return Ok(());
         }
 
-        let env = agent_env(spec, &checkout, &self.data_dir)?;
+        // The run's login files go however this function ends, after the
+        // hand-back has read them: the next run of this shared home must not
+        // start on this run's connector.
+        let home = agent_home(spec, &self.data_dir)?;
+        let login = LoginFiles::new(spec, &home);
+        let env = agent_env(spec, &checkout, &self.data_dir, &home)?;
+        let redactor = Redactor::new(spec, &env);
         self.write_skills(spec, &checkout)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
         let mut message = adapter::message_for(agent_name, &input_path, &checkout);
@@ -294,7 +312,7 @@ impl Executor {
         if live_diff.is_none() {
             tracing::info!(run_id, checkout = %checkout.display(), "git cannot read this checkout; no live diff for this run");
         }
-        let mut outcome = self
+        let outcome = self
             .spawn_and_stream(
                 run_id,
                 &checkout,
@@ -305,8 +323,12 @@ impl Executor {
                 &env,
                 wall_clock,
                 live_diff,
+                &redactor,
             )
-            .await?;
+            .await;
+        self.hand_back(&format!("runs/{run_id}"), spec, &home).await;
+        drop(login);
+        let mut outcome = outcome?;
 
         // The team is named in the workflow, so the commit carries the agent's
         // own name: `Test Author` becomes `hulahoop-dev-test-author`.
@@ -641,7 +663,9 @@ impl Executor {
             ),
         ];
 
+        let login = LoginFiles::new(spec, &home);
         apply_credential(&mut env, spec, &home)?;
+        let redactor = Redactor::new(spec, &env);
         let prompt_file = adapter::write_system_prompt(&home, system_prompt)?;
         let invocation = adapter::invocation(adapter, model, &prompt_file, &message)?;
         let mut child = adapter::spawn(&invocation, &workdir, &env)?;
@@ -697,7 +721,7 @@ impl Executor {
             tokio::select! {
                 line = line_rx.recv() => {
                     match line {
-                        Some(line) => transcript.feed(&line),
+                        Some(line) => transcript.feed(&redactor.redact(&line)),
                         None => break,
                     }
                 }
@@ -709,11 +733,15 @@ impl Executor {
             }
         }
         let status = loop {
-            match child.try_wait()? {
-                Some(status) => break status,
-                None => tokio::time::sleep(Duration::from_millis(100)).await,
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(error) => break Err(error),
             }
         };
+        self.hand_back(&format!("jobs/{job_id}"), spec, &home).await;
+        drop(login);
+        let status = status?;
         if timed_out {
             bail!(
                 "the harness did not answer within {} minutes",
@@ -898,6 +926,22 @@ impl Executor {
         );
     }
 
+    /// Hand back a login the harness refreshed, before the next run of this
+    /// home overwrites it. Best effort: a failed hand-back costs a sign-in later,
+    /// never this run. The login itself is never logged.
+    async fn hand_back(&self, owner: &str, spec: &Value, home: &Path) {
+        let Some((refresh, entry)) = refreshed_login(spec, home) else {
+            return;
+        };
+        let body = json!({ "connector": refresh.connector, "row": refresh.row, "entry": entry });
+        match self.client.hand_back_credential(owner, body).await {
+            Ok(()) => {
+                tracing::info!(owner, connector = %refresh.connector, "handed back a refreshed login")
+            }
+            Err(error) => tracing::warn!(owner, %error, "could not hand back a refreshed login"),
+        }
+    }
+
     /// The recipes a repository declares beyond the suite, run at the same revision
     /// the suite ran at. The pull request's checks run `just ci`, so a head that
     /// passes the suite and fails `fmt-check` is a head that was never finished.
@@ -913,6 +957,7 @@ impl Executor {
         env: &[(String, String)],
         wall_clock_minutes: i64,
         live_diff: Option<crate::live::LiveDiffSource>,
+        redactor: &Redactor,
     ) -> Result<Outcome> {
         let pid_slot = Arc::new(AtomicI64::new(0));
         let pgid_slot = Arc::new(AtomicI64::new(0));
@@ -988,6 +1033,9 @@ impl Executor {
                     match message {
                         Some((stream, line)) => {
                             log_bytes += line.len();
+                            // Nothing the agent printed leaves the runner with
+                            // the run's own keys or tokens in it.
+                            let line = redactor.redact(&line);
                             if stream == "stdout" {
                                 if let Some(log) = &agent_log {
                                     use std::io::Write;
@@ -1095,16 +1143,13 @@ fn ensure_envrc(checkout: &Path) -> Result<()> {
 
 /// The agent's environment is the v0 boundary: an allowlist, a scratch home, and
 /// a checkout. Nothing from the user's shell comes through.
-fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(String, String)>> {
-    let adapter =
-        Adapter::parse(spec["adapter"].as_str().unwrap_or_default()).unwrap_or(Adapter::Pi);
-    let home = contract::scratch_home(data_dir, adapter);
-    std::fs::create_dir_all(&home)?;
-    seed_home(&home);
-    // Everything the agent is handed has to be absolute: its working directory is
-    // the checkout, so a relative home resolves to nothing and pi reports a missing
-    // API key instead of a missing directory.
-    let home = std::fs::canonicalize(&home).unwrap_or(home);
+fn agent_env(
+    spec: &Value,
+    checkout: &Path,
+    data_dir: &Path,
+    home: &Path,
+) -> Result<Vec<(String, String)>> {
+    seed_home(home);
     let checkout = std::fs::canonicalize(checkout).unwrap_or_else(|_| checkout.to_path_buf());
     let checkout = checkout.as_path();
 
@@ -1154,7 +1199,7 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     if let Ok(script) = std::env::var("HULAHOOP_FAKE_SCRIPT") {
         env.push(("HULAHOOP_FAKE_SCRIPT".into(), script));
     }
-    apply_credential(&mut env, spec, &home)?;
+    apply_credential(&mut env, spec, home)?;
     // The commit says who wrote it. jj reads its identity from the environment,
     // so the agent commits under its own name even where the runner's identity is
     // the machine's. The team is named in the workflow, so the commit carries the
@@ -1183,9 +1228,106 @@ fn agent_env(spec: &Value, checkout: &Path, data_dir: &Path) -> Result<Vec<(Stri
     Ok(env)
 }
 
+/// The scratch home an agent run of this spec's adapter uses, created and then
+/// made absolute, so every run of it (and the hand-back after each) names the
+/// same directory even when the data directory sits behind a symlink.
+/// Everything the agent is handed has to be absolute: its working directory is
+/// the checkout, so a relative home resolves to nothing and pi reports a missing
+/// API key instead of a missing directory.
+fn agent_home(spec: &Value, data_dir: &Path) -> Result<PathBuf> {
+    let adapter =
+        Adapter::parse(spec["adapter"].as_str().unwrap_or_default()).unwrap_or(Adapter::Pi);
+    let home = contract::scratch_home(data_dir, adapter);
+    std::fs::create_dir_all(&home)?;
+    Ok(std::fs::canonicalize(&home)?)
+}
+
+/// The login files a run's credential writes into its home, removed when this
+/// goes out of scope — after the hand-back, and on every error path too. Agent
+/// homes are shared per adapter, so a file left behind would sign the next run
+/// in as this run's connector.
+struct LoginFiles {
+    home: PathBuf,
+    files: Vec<String>,
+}
+
+impl LoginFiles {
+    fn new(spec: &Value, home: &Path) -> Self {
+        let files = spec["credential"]["files"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|file| file.get(0).and_then(Value::as_str))
+            .filter(|relative| LOGIN_FILES.contains(relative))
+            .map(str::to_string)
+            .collect();
+        LoginFiles {
+            home: home.to_path_buf(),
+            files,
+        }
+    }
+}
+
+impl Drop for LoginFiles {
+    fn drop(&mut self) {
+        let mut removed = true;
+        for relative in &self.files {
+            if let Err(error) = remove_home_file(&self.home, relative) {
+                removed = false;
+                tracing::warn!(file = %relative, %error, "could not remove a run's login file");
+            }
+        }
+        // The marker outlives a failed removal, so the next host-login run
+        // still knows to replace what is left.
+        if removed && !self.files.is_empty() {
+            let _ = std::fs::remove_file(self.home.join(CONNECTOR_MARKER));
+        }
+    }
+}
+
+/// Left in a home while it holds a connector's login. A host-login run that
+/// finds it replaces the login files with the host's; without it the home's
+/// files came from the host, and a newer one is a refresh worth keeping.
+const CONNECTOR_MARKER: &str = ".hulahoop-connector-login";
+
+/// The only files a credential may write, relative to `HOME`.
+const LOGIN_FILES: [&str; 2] = [PI_AUTH_FILE, CLAUDE_CREDENTIALS_FILE];
+/// A login file is a few hundred bytes; anything this big is not one.
+const LOGIN_FILE_CAP: u64 = 64 * 1024;
+
+/// The OAuth login a harness rewrote during the run, when it differs from the
+/// one the run was given. The file is read only when it is a plain file inside
+/// the home: a symlink could point at a login that is not this connector's.
+fn refreshed_login(spec: &Value, home: &Path) -> Option<(Refresh, Value)> {
+    let credential = spec.get("credential")?;
+    let refresh: Refresh = serde_json::from_value(credential.get("refresh")?.clone()).ok()?;
+    if !LOGIN_FILES.contains(&refresh.file.as_str()) {
+        return None;
+    }
+    let written = credential["files"]
+        .as_array()?
+        .iter()
+        .find(|file| file.get(0).and_then(Value::as_str) == Some(refresh.file.as_str()))
+        .and_then(|file| file.get(1)?.as_str())
+        .and_then(|contents| refresh.entry_in(contents));
+    let current = refresh.entry_in(&read_home_file(home, &refresh.file).ok()?)?;
+    (written.as_ref() != Some(&current)).then_some((refresh, current))
+}
+
 /// Agent runs and Lumi use the same credential boundary. A stored connector
 /// wins over inherited host keys, particularly when it represents a subscription.
 fn apply_credential(env: &mut Vec<(String, String)>, spec: &Value, home: &Path) -> Result<()> {
+    let host_home = std::env::var_os("HOME").map(PathBuf::from);
+    apply_credential_from(env, spec, home, host_home.as_deref())
+}
+
+/// [`apply_credential`] with the host's home named, so a test can stand one in.
+fn apply_credential_from(
+    env: &mut Vec<(String, String)>,
+    spec: &Value,
+    home: &Path,
+    host_home: Option<&Path>,
+) -> Result<()> {
     let supplied = spec.get("credential").is_some_and(|credential| {
         credential["env"]
             .as_array()
@@ -1197,13 +1339,31 @@ fn apply_credential(env: &mut Vec<(String, String)>, spec: &Value, home: &Path) 
     if supplied {
         // A chosen connector must not silently fall back to a different host
         // subscription when the CLI sees an old login in this reused home.
-        for relative in [".pi/agent/auth.json", ".claude/.credentials.json"] {
-            let path = home.join(relative);
-            if path.exists() {
-                std::fs::remove_file(&path)?;
-            }
+        for relative in LOGIN_FILES {
+            remove_home_file(home, relative)?;
         }
     } else {
+        // A connector's login a killed runner never removed: start from the
+        // host's own files, however new the leftovers look. Without the
+        // marker `seed_home` already kept the newer of host and home, which
+        // keeps a refresh an earlier host-login run made.
+        let leftover = home.join(CONNECTOR_MARKER).exists();
+        for relative in LOGIN_FILES.iter().filter(|_| leftover) {
+            remove_home_file(home, relative)?;
+            let Some(source) = host_home.map(|host| host.join(relative)) else {
+                continue;
+            };
+            if !source.is_file() {
+                continue;
+            }
+            let contents = std::fs::read_to_string(&source)
+                .with_context(|| format!("reading the host's {relative}"))?;
+            write_private_file(&safe_home_path(home, relative)?, &contents)
+                .with_context(|| format!("copying the host's {relative} into the run's home"))?;
+        }
+        if leftover {
+            let _ = std::fs::remove_file(home.join(CONNECTOR_MARKER));
+        }
         for key in contract::CREDENTIAL_ENV {
             if let Ok(value) = std::env::var(key) {
                 env.push((key.into(), value));
@@ -1224,12 +1384,17 @@ fn apply_credential(env: &mut Vec<(String, String)>, spec: &Value, home: &Path) 
                 entry.get(0).and_then(Value::as_str),
                 entry.get(1).and_then(Value::as_str),
             ) {
-                if ![".pi/agent/auth.json", ".claude/.credentials.json"].contains(&relative) {
+                if !LOGIN_FILES.contains(&relative) {
                     bail!("invalid credential destination");
                 }
                 let path = safe_home_path(home, relative)?;
                 write_private_file(&path, contents)
                     .with_context(|| format!("writing {relative} into the run's home"))?;
+                let marker = home.join(CONNECTOR_MARKER);
+                if !marker.exists() {
+                    write_private_file(&marker, "")
+                        .context("marking the run's home as holding a connector's login")?;
+                }
             }
         }
     }
@@ -1239,24 +1404,88 @@ fn apply_credential(env: &mut Vec<(String, String)>, spec: &Value, home: &Path) 
 /// A CLI-writable home can contain symlinks left by an earlier run. Keep host
 /// credentials under the canonical scratch root and reject symlinked parents.
 fn safe_home_path(home: &Path, relative: &str) -> Result<PathBuf> {
-    let root = home.canonicalize()?;
-    let path = home.join(relative);
-    let mut component = home.to_path_buf();
-    for part in Path::new(relative).components() {
-        if !matches!(part, std::path::Component::Normal(_)) {
-            bail!("invalid home path");
-        }
-        component.push(part);
-        if std::fs::symlink_metadata(&component).is_ok_and(|meta| meta.file_type().is_symlink()) {
-            bail!("symlink in credential path");
-        }
-    }
-    let parent = path.parent().context("credential path has no parent")?;
-    std::fs::create_dir_all(parent)?;
-    if !parent.canonicalize()?.starts_with(&root) {
-        bail!("credential path left scratch home");
+    let path = checked_home_path(home, relative, true)?.context("credential path has no parent")?;
+    if std::fs::symlink_metadata(&path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        bail!("symlink in credential path");
     }
     Ok(path)
+}
+
+/// `relative` under `home` when every directory on the way is a real directory
+/// (no symlink) inside the canonical home. A missing directory is created when
+/// `create` is set, and otherwise means there is nothing there: `None`. The
+/// last component is not checked; each caller decides what a symlink there
+/// means.
+fn checked_home_path(home: &Path, relative: &str, create: bool) -> Result<Option<PathBuf>> {
+    let root = home.canonicalize()?;
+    let parts: Vec<_> = Path::new(relative).components().collect();
+    if parts.is_empty()
+        || parts
+            .iter()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        bail!("invalid home path");
+    }
+    let mut directory = home.to_path_buf();
+    for part in &parts[..parts.len() - 1] {
+        directory.push(part);
+        match std::fs::symlink_metadata(&directory) {
+            Ok(meta) if meta.file_type().is_symlink() => bail!("symlink in credential path"),
+            Ok(meta) if !meta.is_dir() => bail!("credential path is not a directory"),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if !create {
+                    return Ok(None);
+                }
+                std::fs::create_dir(&directory)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if !directory.canonicalize()?.starts_with(&root) {
+        bail!("credential path left scratch home");
+    }
+    Ok(Some(home.join(relative)))
+}
+
+/// Remove a login file from a home without following a symlink on the way:
+/// a symlinked `.pi` must not lead the removal to the host's own login. A
+/// symlink in the file's own place is removed as the link it is.
+fn remove_home_file(home: &Path, relative: &str) -> Result<()> {
+    let Some(path) = checked_home_path(home, relative, false)? else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// A login file the harness may have rewritten, read only when it is a plain
+/// file inside the home reached through no symlink, and at most
+/// [`LOGIN_FILE_CAP`] bytes: the agent controls this directory.
+fn read_home_file(home: &Path, relative: &str) -> Result<String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = checked_home_path(home, relative, false)?.context("no such login file")?;
+    let file = std::fs::OpenOptions::new()
+        // Non-blocking too, so a FIFO planted in the file's place cannot
+        // stall the runner; a regular file reads the same either way.
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(&path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.len() > LOGIN_FILE_CAP {
+        bail!("not a login file");
+    }
+    let mut contents = String::new();
+    file.take(LOGIN_FILE_CAP + 1)
+        .read_to_string(&mut contents)?;
+    if contents.len() as u64 > LOGIN_FILE_CAP {
+        bail!("login file too large");
+    }
+    Ok(contents)
 }
 
 /// A credentials file the CLI will read. Owner-only and created exclusively,
@@ -2584,8 +2813,208 @@ fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod lumi_auth_tests {
-    use super::{apply_credential, lumi_failure_category, refresh_login};
+    use super::{
+        apply_credential, apply_credential_from, lumi_failure_category, read_home_file,
+        refresh_login, refreshed_login, remove_home_file, LoginFiles,
+    };
     use serde_json::json;
+
+    fn temp(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hulahoop-{name}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    /// A connector's login is gone once its run is over, and a host-login run
+    /// after it starts on the host's own file — even when a killed runner left
+    /// the connector's file behind, newer than the host's.
+    #[test]
+    fn a_connector_login_never_outlives_its_run() {
+        let root = temp("leftover");
+        let host = root.join("host");
+        let home = root.join("home");
+        std::fs::create_dir_all(host.join(".pi/agent")).unwrap();
+        std::fs::create_dir_all(host.join(".claude")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(host.join(".pi/agent/auth.json"), "host-pi-login").unwrap();
+        std::fs::write(host.join(".claude/.credentials.json"), "host-claude-login").unwrap();
+
+        let connector = json!({ "credential": { "env": [], "files": [
+            [".pi/agent/auth.json", "{\"opencode-go\":{\"type\":\"api_key\",\"key\":\"k\"}}"],
+            [".claude/.credentials.json", "{\"claudeAiOauth\":{}}"],
+        ]}});
+        let login = LoginFiles::new(&connector, &home);
+        apply_credential_from(&mut Vec::new(), &connector, &home, Some(&host)).unwrap();
+        assert!(std::fs::read_to_string(home.join(".pi/agent/auth.json"))
+            .unwrap()
+            .contains("opencode-go"));
+        drop(login);
+        assert!(!home.join(".pi/agent/auth.json").exists());
+        assert!(!home.join(".claude/.credentials.json").exists());
+
+        // A killed runner never dropped its guard: the connector's files are
+        // still here and newer than the host's.
+        apply_credential_from(&mut Vec::new(), &connector, &home, Some(&host)).unwrap();
+        let empty = json!({ "credential": { "env": [], "files": [] }});
+        apply_credential_from(&mut Vec::new(), &empty, &home, Some(&host)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".pi/agent/auth.json")).unwrap(),
+            "host-pi-login"
+        );
+        assert_eq!(
+            std::fs::read_to_string(home.join(".claude/.credentials.json")).unwrap(),
+            "host-claude-login"
+        );
+
+        // With no host login at all, the run has none either.
+        std::fs::remove_file(host.join(".pi/agent/auth.json")).unwrap();
+        apply_credential_from(&mut Vec::new(), &connector, &home, Some(&host)).unwrap();
+        apply_credential_from(&mut Vec::new(), &empty, &home, Some(&host)).unwrap();
+        assert!(!home.join(".pi/agent/auth.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A host-login run whose CLI refreshed the token leaves the newer login in
+    /// the home. The next host-login run keeps it: the host's copy holds a
+    /// refresh token the provider may already have rotated away.
+    #[test]
+    fn a_host_login_refresh_survives_the_next_host_login_run() {
+        let root = temp("host-refresh");
+        let host = root.join("host");
+        let home = root.join("home");
+        std::fs::create_dir_all(host.join(".pi/agent")).unwrap();
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(host.join(".pi/agent/auth.json"), "host-pi-login").unwrap();
+        std::fs::write(home.join(".pi/agent/auth.json"), "refreshed-in-a-run").unwrap();
+
+        let empty = json!({ "credential": { "env": [], "files": [] }});
+        apply_credential_from(&mut Vec::new(), &empty, &home, Some(&host)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(home.join(".pi/agent/auth.json")).unwrap(),
+            "refreshed-in-a-run"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The agent owns its home. A symlinked `.pi` pointing at the host's login
+    /// is neither handed back as the connector's login nor deleted through.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_login_directory_is_neither_read_nor_removed_through() {
+        let root = temp("symlinked");
+        let host = root.join("host");
+        let home = root.join("home");
+        std::fs::create_dir_all(host.join(".pi/agent")).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        let host_login = json!({"openai-codex": {"type": "oauth", "access": "host", "refresh": "host", "expires": 9}});
+        std::fs::write(host.join(".pi/agent/auth.json"), host_login.to_string()).unwrap();
+        std::os::unix::fs::symlink(host.join(".pi"), home.join(".pi")).unwrap();
+
+        let spec = json!({ "credential": {
+            "env": [],
+            "files": [[".pi/agent/auth.json", "{}"]],
+            "refresh": {"connector": "codex-sub", "row": uuid::Uuid::now_v7(), "file": ".pi/agent/auth.json",
+                        "key": "openai-codex", "format": "pi"},
+        }});
+        assert!(refreshed_login(&spec, &home).is_none());
+        assert!(remove_home_file(&home, ".pi/agent/auth.json").is_err());
+        assert!(apply_credential_from(&mut Vec::new(), &spec, &home, None).is_err());
+        drop(LoginFiles::new(&spec, &home));
+        assert!(
+            host.join(".pi/agent/auth.json").exists(),
+            "the host login stays"
+        );
+
+        // A symlink in the file's own place is removed as a link.
+        std::fs::remove_file(home.join(".pi")).unwrap();
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::os::unix::fs::symlink(
+            host.join(".pi/agent/auth.json"),
+            home.join(".pi/agent/auth.json"),
+        )
+        .unwrap();
+        assert!(read_home_file(&home, ".pi/agent/auth.json").is_err());
+        remove_home_file(&home, ".pi/agent/auth.json").unwrap();
+        assert!(host.join(".pi/agent/auth.json").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_oversized_login_file_is_not_read() {
+        let home = temp("oversized");
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(home.join(".pi/agent/auth.json"), vec![b' '; 65 * 1024]).unwrap();
+        assert!(read_home_file(&home, ".pi/agent/auth.json").is_err());
+        std::fs::write(home.join(".pi/agent/auth.json"), "{}").unwrap();
+        assert_eq!(read_home_file(&home, ".pi/agent/auth.json").unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A Claude setup token reaches Pi in the environment with no file, and the
+    /// host's stale `auth.json` must still go, or Pi would sign in as the host.
+    #[test]
+    fn a_token_only_credential_still_removes_the_host_login() {
+        let home = std::env::temp_dir().join(format!("hulahoop-token-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+        std::fs::write(home.join(".pi/agent/auth.json"), "{\"anthropic\":{}}").unwrap();
+        let mut env = Vec::new();
+        apply_credential(
+            &mut env,
+            &json!({ "credential": { "env": [["ANTHROPIC_OAUTH_TOKEN", "sk-ant-oat"]], "files": [] }}),
+            &home,
+        )
+        .unwrap();
+        assert!(!home.join(".pi/agent/auth.json").exists());
+        assert!(env.contains(&("ANTHROPIC_OAUTH_TOKEN".into(), "sk-ant-oat".into())));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// Only a login the harness changed is handed back, and a Claude Code file
+    /// is handed back in Pi's entry format.
+    #[test]
+    fn a_refreshed_login_is_found_only_when_it_changed() {
+        let home = std::env::temp_dir().join(format!("hulahoop-refresh-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&home).unwrap();
+        let row = uuid::Uuid::now_v7();
+        let written = json!({"openai-codex": {"type": "oauth", "access": "a1", "refresh": "r1", "expires": 1}});
+        let spec = json!({ "credential": {
+            "env": [],
+            "files": [[".pi/agent/auth.json", written.to_string()]],
+            "refresh": {"connector": "codex-sub", "row": row, "file": ".pi/agent/auth.json",
+                        "key": "openai-codex", "format": "pi"},
+        }});
+        apply_credential(&mut Vec::new(), &spec, &home).unwrap();
+        assert!(
+            refreshed_login(&spec, &home).is_none(),
+            "nothing changed yet"
+        );
+
+        let refreshed = json!({"openai-codex": {"type": "oauth", "access": "a2", "refresh": "r2", "expires": 2, "accountId": "acc"}});
+        std::fs::write(home.join(".pi/agent/auth.json"), refreshed.to_string()).unwrap();
+        let (refresh, entry) = refreshed_login(&spec, &home).expect("a changed login");
+        assert_eq!(refresh.connector, "codex-sub");
+        assert_eq!(refresh.row, row);
+        assert_eq!(entry, refreshed["openai-codex"]);
+
+        let claude = json!({ "credential": {
+            "env": [],
+            "files": [[".claude/.credentials.json", "{\"claudeAiOauth\":{\"accessToken\":\"a\",\"refreshToken\":\"r\",\"expiresAt\":1}}"]],
+            "refresh": {"connector": "claude-sub", "row": row, "file": ".claude/.credentials.json",
+                        "key": null, "format": "claude"},
+        }});
+        apply_credential(&mut Vec::new(), &claude, &home).unwrap();
+        std::fs::write(
+            home.join(".claude/.credentials.json"),
+            "{\"claudeAiOauth\":{\"accessToken\":\"b\",\"refreshToken\":\"s\",\"expiresAt\":9}}",
+        )
+        .unwrap();
+        let (_, entry) = refreshed_login(&claude, &home).expect("a changed Claude login");
+        assert_eq!(
+            entry,
+            json!({"type": "oauth", "access": "b", "refresh": "s", "expires": 9})
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
 
     #[test]
     fn stored_connector_replaces_host_login_and_passes_its_secret() {
@@ -2665,6 +3094,138 @@ mod lumi_auth_tests {
         assert!(error.contains("authentication"));
         assert!(!error.contains("secret-value"));
         assert!(lumi_failure_category("rate limit 429", "").contains("rate limit"));
+    }
+}
+
+#[cfg(test)]
+mod hand_back_tests {
+    use super::Executor;
+    use crate::client::{Client, Connection};
+    use serde_json::{json, Value};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A server that answers every POST with `{}` and keeps what it was sent.
+    async fn fake_server() -> (String, Arc<Mutex<Vec<(String, Value)>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let kept = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let kept = kept.clone();
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, body) = loop {
+                        let size = socket.read(&mut chunk).await.unwrap_or(0);
+                        if size == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..size]);
+                        let text = String::from_utf8_lossy(&buffer).to_string();
+                        let Some(end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= end + 4 + length {
+                            break (
+                                text[..end].to_string(),
+                                String::from_utf8_lossy(&buffer[end + 4..end + 4 + length])
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    kept.lock()
+                        .unwrap()
+                        .push((path, serde_json::from_str(&body).unwrap_or(Value::Null)));
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                        .await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// A Lumi answer whose harness refreshed its login hands the new entry
+    /// back before the login file goes — on success and on failure alike — and
+    /// its reply never carries the token it was given.
+    #[tokio::test]
+    async fn a_refreshed_lumi_login_is_handed_back_before_it_is_removed() {
+        let root = std::env::temp_dir().join(format!("hulahoop-handback-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = root.canonicalize().unwrap();
+        let script = root.join("fake-harness.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+given=$(cat "$HOME/.pi/agent/auth.json")
+printf '%s' '{"openai-codex":{"type":"oauth","access":"fresh-access","refresh":"fresh-refresh","expires":2}}' > "$HOME/.pi/agent/auth.json"
+echo "reply: $given"
+[ "$2" = fail ] && exit 3
+exit 0
+"#,
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("HULAHOOP_FAKE_SCRIPT", &script);
+        let (base, seen) = fake_server().await;
+        let client = Client::new(&Connection::remote(&base, "token", root.clone())).unwrap();
+        let executor = Executor::new(client, root.clone());
+
+        let row = uuid::Uuid::now_v7();
+        let given = json!({"openai-codex": {"type": "oauth", "access": "given-access-token-0123456789",
+                                             "refresh": "given-refresh-token-0123456789", "expires": 1}});
+        for model in ["ok", "fail"] {
+            let job = uuid::Uuid::now_v7().to_string();
+            let spec = json!({
+                "artifact_dir": root.join(format!("work-{model}")),
+                "payload": {"adapter": "fake", "model": model, "message": "hi", "system_prompt": ""},
+                "credential": {
+                    "env": [],
+                    "files": [[".pi/agent/auth.json", given.to_string()]],
+                    "refresh": {"connector": "codex-sub", "row": row, "file": ".pi/agent/auth.json",
+                                "key": "openai-codex", "format": "pi"},
+                },
+            });
+            let result = executor.job_lumi(&root, &spec, &job).await;
+            let home = root.join("home/lumi").join(&job);
+            assert!(
+                !home.join(".pi/agent/auth.json").exists(),
+                "the login file is gone after the answer"
+            );
+            let posted = seen.lock().unwrap().clone();
+            let (path, body) = posted.last().expect("a hand-back").clone();
+            assert_eq!(path, format!("/internal/jobs/{job}/credential"));
+            assert_eq!(body["connector"], "codex-sub");
+            assert_eq!(body["row"], json!(row));
+            assert_eq!(body["entry"]["access"], "fresh-access");
+            match model {
+                "ok" => {
+                    let reply = result.expect("an answer");
+                    let text = reply.to_string();
+                    assert!(!text.contains("given-access-token"), "{text}");
+                }
+                _ => assert!(result.is_err()),
+            }
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 }
 

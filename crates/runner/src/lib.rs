@@ -5,6 +5,7 @@ mod adapter;
 mod client;
 mod exec;
 mod live;
+mod redact;
 mod vcs;
 
 use anyhow::Context;

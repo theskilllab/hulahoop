@@ -82,6 +82,14 @@ pub fn router(state: Arc<ApiState>) -> Router {
             )),
         )
         .route("/internal/runs/{id}/complete", post(complete_run))
+        .route(
+            "/internal/runs/{id}/credential",
+            post(refreshed_run_credential),
+        )
+        .route(
+            "/internal/jobs/{id}/credential",
+            post(refreshed_job_credential),
+        )
         .route("/internal/jobs/claim", post(claim_job))
         .route("/internal/jobs/{id}/complete", post(complete_job))
         .route("/internal/repos/{id}/lock", post(lock_repo))
@@ -279,6 +287,88 @@ async fn complete_run(
     ))
 }
 
+/// An OAuth login the harness refreshed during a run, handed back by the
+/// runner. The entry is a secret: it is sealed and never logged.
+#[derive(Deserialize)]
+struct RefreshedCredential {
+    connector: String,
+    row: Uuid,
+    entry: Value,
+}
+
+/// A run hands back only while it runs, and only the login it was issued at
+/// claim (`runs.credential_refresh`): the connector and the row both match.
+async fn refreshed_run_credential(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RefreshedCredential>,
+) -> ApiResult<Value> {
+    authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
+    let issued: Option<(String, Option<String>)> =
+        sqlx::query_as("select status, credential_refresh from runs where id = ?")
+            .bind(id)
+            .fetch_optional(&state.engine.db.pool)
+            .await
+            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let Some((status, issued)) = issued else {
+        return Err(fail(StatusCode::NOT_FOUND, "no run with that id"));
+    };
+    store_refreshed(&state.engine, &body, status == "running", issued).await
+}
+
+/// A Lumi job hands back on the same terms as a run.
+async fn refreshed_job_credential(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(body): Json<RefreshedCredential>,
+) -> ApiResult<Value> {
+    authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
+    let issued: Option<(String, String, Option<String>)> =
+        sqlx::query_as("select kind, status, credential_refresh from runner_jobs where id = ?")
+            .bind(id)
+            .fetch_optional(&state.engine.db.pool)
+            .await
+            .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    let Some((_, status, issued)) = issued.filter(|(kind, _, _)| kind == "lumi") else {
+        return Err(fail(StatusCode::NOT_FOUND, "no Lumi job with that id"));
+    };
+    store_refreshed(&state.engine, &body, status == "running", issued).await
+}
+
+/// Store a handed-back login when its owner is still running and it is the
+/// login the owner was issued; otherwise answer `{stored: false}`.
+async fn store_refreshed(
+    engine: &Engine,
+    body: &RefreshedCredential,
+    running: bool,
+    issued: Option<String>,
+) -> ApiResult<Value> {
+    let issued = issued.and_then(|issued| serde_json::from_str::<Value>(&issued).ok());
+    let matches = issued.is_some_and(|issued| {
+        issued["connector"].as_str() == Some(body.connector.as_str())
+            && issued["row"].as_str() == Some(body.row.to_string().as_str())
+    });
+    if !running || !matches {
+        return Ok(Json(json!({ "stored": false })));
+    }
+    let stored = engine
+        .store_refreshed_oauth(&body.connector, body.row, &body.entry)
+        .await
+        .map_err(|e| fail(StatusCode::BAD_REQUEST, e))?;
+    Ok(Json(json!({ "stored": stored })))
+}
+
+/// What a hand-back must match: the connector and row of the login a run or a
+/// Lumi job was given, or null when it was given nothing to refresh.
+fn issued_refresh(credential: &crate::connectors::Credential) -> Option<String> {
+    credential
+        .refresh
+        .as_ref()
+        .map(|refresh| json!({ "connector": refresh.connector, "row": refresh.row }).to_string())
+}
+
 #[derive(Deserialize)]
 struct ClaimJobRequest {
     #[serde(default)]
@@ -432,7 +522,10 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     // Agent edits after dispatch affect only future runs.
     agent.adapter = run.adapter_snapshot.clone().unwrap_or(agent.adapter);
     agent.model = run.model.clone();
-    agent.connector = run.connector_id.clone();
+    // The choice made when the run was queued; `connector_id` becomes the
+    // connector actually used once the run is claimed. Runs queued before the
+    // choice had its own column still read it from `connector_id`.
+    agent.connector = run.chosen_connector.clone().or(run.connector_id.clone());
     let (checkout_project, checkout_path) = match &repo {
         Some(repo) => {
             // A task attached to a repository before projects were required may
@@ -549,46 +642,10 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         let adapter =
             hulahoop_core::Adapter::parse(&agent.adapter).unwrap_or(hulahoop_core::Adapter::Pi);
         let credential = engine
-            .agent_credential(adapter, agent.connector.as_deref())
+            .agent_credential(adapter, agent.connector.as_deref(), Some(&agent.model))
             .await?;
-        let has_api_key = credential
-            .env
-            .iter()
-            .any(|(key, _)| key == "ANTHROPIC_API_KEY" || key == "PI_API_KEY");
-        let source = if has_api_key {
-            "api"
-        } else if !credential.is_empty() && adapter == hulahoop_core::Adapter::ClaudeCode {
-            "subscription"
-        } else {
-            // Pi login may bill a provider directly; inherited runner credentials
-            // can also supersede a supplied login. Preserve this uncertainty.
-            "unknown"
-        };
-        let selected = match (adapter, source) {
-            (hulahoop_core::Adapter::ClaudeCode, "api") => Some("claude-api"),
-            (hulahoop_core::Adapter::ClaudeCode, "subscription") => Some("claude-sub"),
-            (hulahoop_core::Adapter::Pi, "api") => Some("pi"),
-            _ => None,
-        };
-        if run
-            .billing_source
-            .as_deref()
-            .is_some_and(|previous| previous != source)
-        {
-            anyhow::bail!("run credential billing source changed after claim");
-        }
-        if run.billing_source.is_none() {
-            sqlx::query("update runs set billing_source = ?, connector_id = coalesce(connector_id, ?) where id = ? and status = 'running' and billing_source is null")
-                .bind(source)
-                .bind(selected)
-                .bind(run.id)
-                .execute(&engine.db.pool)
-                .await?;
-        }
-        serde_json::json!({
-            "env": credential.env,
-            "files": credential.files,
-        })
+        record_credential(engine, run, &credential).await?;
+        credential.to_spec()
     };
     // Committing is the app's act, so every turn gets the app's token: a turn that
     // changed nothing pushes nothing, and nothing else may decide that in advance.
@@ -699,6 +756,51 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
         "prompt_revision": engine.prompt_revision(&prompt),
     }))
+}
+
+/// Write down what a run was given, once, at its first claim: the billing a
+/// cost report reads, the connector its plan usage counts against (none when
+/// the run fell back to the host login), and the credential the run page
+/// shows. A re-read spec must resolve to the same
+/// billing, or the run would be billed as one thing and paid as another.
+async fn record_credential(
+    engine: &Engine,
+    run: &Run,
+    credential: &crate::connectors::Credential,
+) -> anyhow::Result<()> {
+    let billing = credential.billing();
+    if run
+        .billing_source
+        .as_deref()
+        .is_some_and(|previous| previous != billing)
+    {
+        anyhow::bail!("run credential billing source changed after claim");
+    }
+    // Every claim issues the login it builds, so only that one can be handed
+    // back: a re-claim after the row was replaced issues the new row.
+    sqlx::query("update runs set credential_refresh = ? where id = ?")
+        .bind(issued_refresh(credential))
+        .bind(run.id)
+        .execute(&engine.db.pool)
+        .await?;
+    if run.billing_source.is_some() {
+        return Ok(());
+    }
+    let used = credential
+        .entry
+        .filter(|_| !credential.is_empty())
+        .map(|entry| entry.id);
+    sqlx::query(
+        "update runs set billing_source = ?, connector_id = ?, credential_source = ?
+          where id = ? and status = 'running' and billing_source is null",
+    )
+    .bind(billing)
+    .bind(used)
+    .bind(credential.source())
+    .bind(run.id)
+    .execute(&engine.db.pool)
+    .await?;
+    Ok(())
 }
 
 /// The task's files, as paths into the artifact store the runner can read.
@@ -854,8 +956,15 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
         let adapter =
             hulahoop_core::Adapter::parse(payload["adapter"].as_str().unwrap_or_default())
                 .ok_or_else(|| anyhow::anyhow!("unknown Lumi adapter"))?;
-        let credential = engine.agent_credential(adapter, None).await?;
-        Some(json!({ "env": credential.env, "files": credential.files }))
+        let credential = engine
+            .agent_credential(adapter, None, payload["model"].as_str())
+            .await?;
+        sqlx::query("update runner_jobs set credential_refresh = ? where id = ?")
+            .bind(issued_refresh(&credential))
+            .bind(job.id)
+            .execute(&engine.db.pool)
+            .await?;
+        Some(credential.to_spec())
     } else {
         None
     };
@@ -1198,6 +1307,75 @@ mod claim_spec_tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    /// A claim records which credential the run used and how it bills, once:
+    /// a later claim of the same run keeps what the first one wrote.
+    #[tokio::test]
+    async fn a_claim_records_the_credential_the_run_used() {
+        let directory =
+            std::env::temp_dir().join(format!("hulahoop-claim-credential-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let now = Utc::now() - Duration::seconds(3);
+        let mut runs = Vec::new();
+        for (number, model) in [
+            (1, "anthropic/claude-sonnet-4-5"),
+            (2, "openai-codex/gpt-5.1"),
+        ] {
+            let (agent, issue, run) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+            sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null,?,?,'Task','in_progress',?,?)")
+                .bind(issue).bind(workspace).bind(format!("TSK-{number}")).bind(number).bind(now).bind(now)
+                .execute(&db.pool).await.unwrap();
+            sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi',?,?,?)")
+                .bind(agent).bind(workspace).bind(model).bind(model).bind(now).bind(now)
+                .execute(&db.pool).await.unwrap();
+            let artifacts = directory.join(run.to_string());
+            std::fs::create_dir_all(&artifacts).unwrap();
+            sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, created_at) values (?,?,null,?,1,'','prompt',?,'running',?,?)")
+                .bind(run).bind(issue).bind(agent)
+                .bind(artifacts.to_string_lossy().to_string()).bind(model).bind(now)
+                .execute(&db.pool).await.unwrap();
+            runs.push(run);
+        }
+        let engine = Engine::new(db);
+        engine
+            .set_agent_key("claude-api", "sk-ant-api03-a-test-key")
+            .await
+            .unwrap();
+
+        let claim = |run_id: Uuid| {
+            let engine = &engine;
+            async move {
+                let run: Run = sqlx::query_as("select * from runs where id = ?")
+                    .bind(run_id)
+                    .fetch_one(&engine.db.pool)
+                    .await
+                    .unwrap();
+                let spec = build_run_spec(engine, &run).await.unwrap();
+                let run: Run = sqlx::query_as("select * from runs where id = ?")
+                    .bind(run_id)
+                    .fetch_one(&engine.db.pool)
+                    .await
+                    .unwrap();
+                (spec, run)
+            }
+        };
+        let (spec, run) = claim(runs[0]).await;
+        assert_eq!(run.credential_source.as_deref(), Some("Claude API key"));
+        assert_eq!(run.connector_id.as_deref(), Some("claude-api"));
+        assert_eq!(run.billing_source.as_deref(), Some("api"));
+        assert!(spec["credential"]["files"]
+            .as_array()
+            .is_some_and(|files| !files.is_empty()));
+        let (_, again) = claim(runs[0]).await;
+        assert_eq!(again.credential_source, run.credential_source);
+
+        let (_, run) = claim(runs[1]).await;
+        assert_eq!(run.credential_source.as_deref(), Some("host login"));
+        assert_eq!(run.billing_source.as_deref(), Some("unknown"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     /// A rework's parent is the reviewer's run, which wrote the review but
     /// published nothing: the spec carries that review as the handover.
     #[tokio::test]
@@ -1249,5 +1427,364 @@ mod claim_spec_tests {
         assert_eq!(input["parent"]["body"], "Fix the target date field.");
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+#[cfg(test)]
+mod hand_back_tests {
+    //! The routes a runner hands a refreshed login back through, and what a
+    //! claim records for them to check against.
+
+    use super::{
+        build_job_spec, build_run_spec, refreshed_job_credential, refreshed_run_credential,
+        ApiState, RefreshedCredential,
+    };
+    use crate::db::Db;
+    use crate::engine::Engine;
+    use crate::model::{Run, RunnerJob};
+    use axum::extract::{Path, State};
+    use axum::http::HeaderMap;
+    use axum::Json;
+    use chrono::{Duration, Utc};
+    use serde_json::{json, Value};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    const HOUR_MS: i64 = 60 * 60 * 1000;
+
+    fn login(access: &str, hours: i64) -> Value {
+        json!({"type": "oauth", "access": access, "refresh": format!("{access}-r"),
+               "expires": Utc::now().timestamp_millis() + hours * HOUR_MS})
+    }
+
+    struct Fixture {
+        state: Arc<ApiState>,
+        directory: std::path::PathBuf,
+        workspace: Uuid,
+        repo: Uuid,
+    }
+
+    async fn fixture() -> Fixture {
+        let directory = std::env::temp_dir().join(format!("hulahoop-handback-{}", Uuid::now_v7()));
+        let db = Db::open(&directory).await.unwrap();
+        let workspace = db.seed_local().await.unwrap();
+        let (project, repo) = (Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now() - Duration::seconds(3);
+        sqlx::query(
+            "insert into projects (id, workspace_id, name, created_at) values (?,?, 'Back',?)",
+        )
+        .bind(project)
+        .bind(workspace)
+        .bind(now)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+        sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'repo','/tmp/repo','1',?)")
+            .bind(repo).bind(project).bind(now).execute(&db.pool).await.unwrap();
+        let mut engine = Engine::new(db);
+        engine.pi_bin = directory.join("no-pi");
+        let state = Arc::new(ApiState {
+            engine: Arc::new(engine),
+            token: "runner-token".into(),
+            runner_id_default: "runner".into(),
+        });
+        Fixture {
+            state,
+            directory,
+            workspace,
+            repo,
+        }
+    }
+
+    fn headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer runner-token".parse().unwrap());
+        headers
+    }
+
+    /// A running run of a Pi agent on `model`, queued with `chosen` as the
+    /// agent's connector.
+    async fn running_run(fixture: &Fixture, model: &str, chosen: Option<&str>) -> Uuid {
+        let pool = &fixture.state.engine.db.pool;
+        let (agent, issue, run) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+        let now = Utc::now() - Duration::seconds(3);
+        let number: i64 = sqlx::query_scalar("select count(*) + 1 from issues")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, created_at, updated_at) values (?,?,null,null,?,?,'Task','in_progress',?,?)")
+            .bind(issue).bind(fixture.workspace).bind(format!("HB-{number}")).bind(number).bind(now).bind(now)
+            .execute(pool).await.unwrap();
+        sqlx::query("insert into agents (id, workspace_id, name, adapter, model, connector, created_at, updated_at) values (?,?,?,'pi',?,?,?,?)")
+            .bind(agent).bind(fixture.workspace).bind(format!("agent-{number}")).bind(model).bind(chosen).bind(now).bind(now)
+            .execute(pool).await.unwrap();
+        let artifacts = fixture.directory.join(run.to_string());
+        std::fs::create_dir_all(&artifacts).unwrap();
+        sqlx::query("insert into runs (id, issue_id, repo_id, agent_id, attempt, base_bookmark, prompt_revision, artifact_dir, status, model, connector_id, chosen_connector, created_at) values (?,?,null,?,1,'','prompt',?,'running',?,?,?,?)")
+            .bind(run).bind(issue).bind(agent)
+            .bind(artifacts.to_string_lossy().to_string()).bind(model).bind(chosen).bind(chosen).bind(now)
+            .execute(pool).await.unwrap();
+        run
+    }
+
+    async fn claim(fixture: &Fixture, run_id: Uuid) -> (Value, Run) {
+        let pool = &fixture.state.engine.db.pool;
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let spec = build_run_spec(&fixture.state.engine, &run).await.unwrap();
+        let run: Run = sqlx::query_as("select * from runs where id = ?")
+            .bind(run_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        (spec, run)
+    }
+
+    async fn hand_back_run(fixture: &Fixture, run: Uuid, body: Value) -> bool {
+        let body: RefreshedCredential = serde_json::from_value(body).unwrap();
+        let Json(answer) = refreshed_run_credential(
+            State(fixture.state.clone()),
+            headers(),
+            Path(run),
+            Json(body),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("the route refused the request"));
+        answer["stored"].as_bool().unwrap()
+    }
+
+    async fn stored_access(fixture: &Fixture) -> Value {
+        let entry = crate::connectors::entry("codex-sub").unwrap();
+        let secrets = fixture.state.engine.secrets(entry).await.unwrap().unwrap();
+        serde_json::from_str::<Value>(&secrets.oauth.unwrap()).unwrap()["access"].clone()
+    }
+
+    /// A running run hands back only the login it was issued: the same
+    /// connector and the same row, and only while it runs.
+    #[tokio::test]
+    async fn a_run_hands_back_only_the_login_it_was_issued() {
+        let fixture = fixture().await;
+        let engine = &fixture.state.engine;
+        engine
+            .set_agent_oauth("codex-sub", &login("given", 5), "signed in")
+            .await
+            .unwrap();
+        engine
+            .set_agent_key("opencode-go", "ocg-key")
+            .await
+            .unwrap();
+        let run = running_run(&fixture, "openai-codex/gpt-5.1-codex", None).await;
+        let (spec, recorded) = claim(&fixture, run).await;
+        let refresh = &spec["credential"]["refresh"];
+        assert_eq!(refresh["connector"], "codex-sub");
+        assert_eq!(recorded.connector_id.as_deref(), Some("codex-sub"));
+        let row = refresh["row"].clone();
+
+        // Another connector, or another row of this one, is not what it was given.
+        let other_row = json!(Uuid::now_v7());
+        assert!(
+            !hand_back_run(
+                &fixture,
+                run,
+                json!({"connector": "opencode-go", "row": row, "entry": login("x", 6)})
+            )
+            .await
+        );
+        assert!(
+            !hand_back_run(
+                &fixture,
+                run,
+                json!({"connector": "codex-sub", "row": other_row, "entry": login("x", 6)})
+            )
+            .await
+        );
+        assert_eq!(stored_access(&fixture).await, "given");
+
+        assert!(
+            hand_back_run(
+                &fixture,
+                run,
+                json!({"connector": "codex-sub", "row": row, "entry": login("refreshed", 6)})
+            )
+            .await
+        );
+        assert_eq!(stored_access(&fixture).await, "refreshed");
+
+        // Finished runs hand back nothing.
+        sqlx::query("update runs set status = 'succeeded' where id = ?")
+            .bind(run)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        assert!(
+            !hand_back_run(
+                &fixture,
+                run,
+                json!({"connector": "codex-sub", "row": row, "entry": login("late", 7)})
+            )
+            .await
+        );
+        assert_eq!(stored_access(&fixture).await, "refreshed");
+
+        // A wrong token is refused outright.
+        let body: RefreshedCredential = serde_json::from_value(
+            json!({"connector": "codex-sub", "row": row, "entry": login("x", 6)}),
+        )
+        .unwrap();
+        assert!(refreshed_run_credential(
+            State(fixture.state.clone()),
+            HeaderMap::new(),
+            Path(run),
+            Json(body)
+        )
+        .await
+        .is_err());
+        let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    /// A run that fell back to the host login counts against no connector, and
+    /// a re-claim still resolves the agent's own choice.
+    #[tokio::test]
+    async fn a_host_login_run_records_no_connector_and_keeps_the_choice() {
+        let fixture = fixture().await;
+        let engine = &fixture.state.engine;
+        engine
+            .set_agent_key("opencode-go", "ocg-key")
+            .await
+            .unwrap();
+        let run = running_run(&fixture, "anthropic/claude-sonnet-4-5", Some("opencode-go")).await;
+        let (spec, recorded) = claim(&fixture, run).await;
+        assert_eq!(recorded.credential_source.as_deref(), Some("host login"));
+        assert_eq!(recorded.connector_id, None);
+        assert_eq!(recorded.chosen_connector.as_deref(), Some("opencode-go"));
+        assert!(spec["credential"]["refresh"].is_null());
+        let (_, again) = claim(&fixture, run).await;
+        assert_eq!(again.connector_id, None);
+        assert_eq!(again.billing_source.as_deref(), Some("unknown"));
+
+        // The agent's choice serves this one and is what it records.
+        let run = running_run(&fixture, "opencode-go/glm-5", Some("opencode-go")).await;
+        let (_, recorded) = claim(&fixture, run).await;
+        assert_eq!(recorded.connector_id.as_deref(), Some("opencode-go"));
+        let _ = std::fs::remove_dir_all(&fixture.directory);
+    }
+
+    async fn job(fixture: &Fixture, kind: &str, payload: Value) -> RunnerJob {
+        let pool = &fixture.state.engine.db.pool;
+        let id = Uuid::now_v7();
+        sqlx::query("insert into runner_jobs (id, repo_id, kind, payload, status, created_at) values (?,?,?,?,'running',?)")
+            .bind(id).bind(fixture.repo).bind(kind).bind(payload.to_string()).bind(Utc::now())
+            .execute(pool).await.unwrap();
+        sqlx::query_as("select * from runner_jobs where id = ?")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn hand_back_job(fixture: &Fixture, job: Uuid, body: Value) -> Result<bool, ()> {
+        let body: RefreshedCredential = serde_json::from_value(body).unwrap();
+        refreshed_job_credential(
+            State(fixture.state.clone()),
+            headers(),
+            Path(job),
+            Json(body),
+        )
+        .await
+        .map(|Json(answer)| answer["stored"].as_bool().unwrap())
+        .map_err(|_| ())
+    }
+
+    /// Lumi resolves its credential from the model it asks with, and hands
+    /// back on a run's terms; no other kind of job hands back at all.
+    #[tokio::test]
+    async fn a_lumi_job_gets_its_models_login_and_hands_back_only_that() {
+        let fixture = fixture().await;
+        let engine = &fixture.state.engine;
+        engine
+            .set_agent_oauth("codex-sub", &login("given", 5), "signed in")
+            .await
+            .unwrap();
+        engine
+            .set_agent_key("opencode-go", "ocg-key")
+            .await
+            .unwrap();
+
+        let codex = job(
+            &fixture,
+            "lumi",
+            json!({"adapter": "pi", "model": "openai-codex/gpt-5.1-codex", "message": "hi"}),
+        )
+        .await;
+        let spec = build_job_spec(engine, &codex).await.unwrap();
+        let files = spec["credential"]["files"].as_array().unwrap();
+        let auth: Value = serde_json::from_str(files[0][1].as_str().unwrap()).unwrap();
+        assert_eq!(
+            auth["openai-codex"]["access"], "given",
+            "the model's provider decides"
+        );
+        let row = spec["credential"]["refresh"]["row"].clone();
+
+        let opencode = job(
+            &fixture,
+            "lumi",
+            json!({"adapter": "pi", "model": "opencode-go/glm-5", "message": "hi"}),
+        )
+        .await;
+        let spec = build_job_spec(engine, &opencode).await.unwrap();
+        let auth: Value =
+            serde_json::from_str(spec["credential"]["files"][0][1].as_str().unwrap()).unwrap();
+        assert_eq!(
+            auth,
+            json!({"opencode-go": {"type": "api_key", "key": "ocg-key"}})
+        );
+        // Given nothing to refresh, it hands back nothing.
+        assert_eq!(
+            hand_back_job(
+                &fixture,
+                opencode.id,
+                json!({"connector": "codex-sub", "row": row, "entry": login("x", 6)})
+            )
+            .await,
+            Ok(false)
+        );
+
+        assert_eq!(
+            hand_back_job(
+                &fixture,
+                codex.id,
+                json!({"connector": "codex-sub", "row": row, "entry": login("refreshed", 6)})
+            )
+            .await,
+            Ok(true)
+        );
+        assert_eq!(stored_access(&fixture).await, "refreshed");
+        sqlx::query("update runner_jobs set status = 'succeeded' where id = ?")
+            .bind(codex.id)
+            .execute(&engine.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            hand_back_job(
+                &fixture,
+                codex.id,
+                json!({"connector": "codex-sub", "row": row, "entry": login("late", 7)})
+            )
+            .await,
+            Ok(false)
+        );
+
+        let fetch = job(&fixture, "fetch", json!({})).await;
+        assert!(hand_back_job(
+            &fixture,
+            fetch.id,
+            json!({"connector": "codex-sub", "row": row, "entry": login("x", 6)})
+        )
+        .await
+        .is_err());
+        let _ = std::fs::remove_dir_all(&fixture.directory);
     }
 }

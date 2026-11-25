@@ -60,6 +60,9 @@ export interface Run {
   cacheReadTokens?: number | null;
   failureCategory?: string | null;
   createdAt?: string;
+  /** What the run signed in with: a connector name such as `Claude subscription`,
+   *  or `host login`. Null for runs from before it was recorded. */
+  credentialSource?: string | null;
 }
 
 /** One normalized line of a run's transcript. */
@@ -496,7 +499,7 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
   }
 }
 
-const RUN_FIELDS = `id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt`;
+const RUN_FIELDS = `id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt credentialSource`;
 
 /** The light shape every list of tasks asks for, every few seconds: no body,
  *  no turn queue, no nested runs or comments. */
@@ -1141,10 +1144,21 @@ export type ConnectorRow = {
   label: string | null;
   appId: string | null;
   connectedAt: string | null;
+  /** The harness adapters this entry can sign in (`claude_code`, `pi`); empty outside Agent access. */
+  harnesses: string[];
+  /** The plans a person can say they are on. Names only: the fee lives in Cost control. */
+  plans: ConnectorPlan[];
+  /** The chosen plan's id, if any. */
+  plan: string | null;
 };
 
+export interface ConnectorPlan {
+  id: string;
+  name: string;
+}
+
 export const CONNECTION_FIELDS = `
-  id provider kind group name icon desc enables connected label appId connectedAt
+  id provider kind group name icon desc enables connected label appId connectedAt harnesses plan plans { id name }
 `;
 
 export async function loadConnections(): Promise<ConnectorRow[]> {
@@ -1152,6 +1166,65 @@ export async function loadConnections(): Promise<ConnectorRow[]> {
     `query { connections { ${CONNECTION_FIELDS} } }`,
   );
   return data.connections;
+}
+
+/** Says which plan a connected entry is on, or clears it with null. */
+export async function setConnectorPlan(id: string, plan: string | null): Promise<ConnectorRow> {
+  const data = await gql<{ setConnectorPlan: ConnectorRow }>(
+    `mutation ($id: String!, $plan: String) { setConnectorPlan(id: $id, plan: $plan) { ${CONNECTION_FIELDS} } }`,
+    { id, plan },
+  );
+  return data.setConnectorPlan;
+}
+
+export type SignInState = "starting" | "waiting" | "done" | "failed" | "cancelled";
+
+/** One OAuth sign-in the server drives through the harness's own login. */
+export interface SignIn {
+  id: string;
+  connectorId: string;
+  state: SignInState;
+  /** The page to sign in on, once the login has printed it. */
+  url: string | null;
+  /** A device code to type on that page, when the provider uses one. */
+  userCode: string | null;
+  /** The provider shows a code after sign-in that has to be pasted back. */
+  needsCode: boolean;
+  error: string | null;
+}
+
+export const SIGN_IN_FIELDS = `id connectorId state url userCode needsCode error`;
+
+export async function startSignIn(id: string): Promise<SignIn> {
+  const data = await gql<{ startSignIn: SignIn }>(
+    `mutation ($id: String!) { startSignIn(id: $id) { ${SIGN_IN_FIELDS} } }`,
+    { id },
+  );
+  return data.startSignIn;
+}
+
+export async function loadSignIn(signInId: string): Promise<SignIn | null> {
+  const data = await gql<{ signIn: SignIn | null }>(
+    `query ($id: ID!) { signIn(signInId: $id) { ${SIGN_IN_FIELDS} } }`,
+    { id: signInId },
+  );
+  return data.signIn;
+}
+
+export async function submitSignInCode(signInId: string, code: string): Promise<SignIn> {
+  const data = await gql<{ submitSignInCode: SignIn }>(
+    `mutation ($id: ID!, $code: String!) { submitSignInCode(signInId: $id, code: $code) { ${SIGN_IN_FIELDS} } }`,
+    { id: signInId, code },
+  );
+  return data.submitSignInCode;
+}
+
+export async function cancelSignIn(signInId: string): Promise<boolean> {
+  const data = await gql<{ cancelSignIn: boolean }>(
+    `mutation ($id: ID!) { cancelSignIn(signInId: $id) }`,
+    { id: signInId },
+  );
+  return data.cancelSignIn;
 }
 
 /* ------------------------------------------------------------ Pull requests --- */

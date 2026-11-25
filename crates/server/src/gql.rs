@@ -2,7 +2,7 @@
 //! so a mutation and a runner callback cannot disagree about the gate.
 
 use async_graphql::{
-    ComplexObject, Context, MaybeUndefined, Object, Schema, SimpleObject, Subscription,
+    ComplexObject, Context, MaybeUndefined, Object, Schema, SimpleObject, Subscription, ID,
 };
 use uuid::Uuid;
 
@@ -216,6 +216,16 @@ impl Query {
         Ok(engine(ctx).connections().await?)
     }
 
+    /// One OAuth sign-in as it stands; the Connectors screen polls this while
+    /// the person signs in. `null` once it is forgotten.
+    async fn sign_in(
+        &self,
+        ctx: &Context<'_>,
+        sign_in_id: ID,
+    ) -> async_graphql::Result<Option<crate::signin::SignIn>> {
+        Ok(crate::signin::status(engine(ctx), &sign_in_id)?)
+    }
+
     async fn projects(
         &self,
         ctx: &Context<'_>,
@@ -253,8 +263,18 @@ impl Query {
 
     /// What a harness can run, read from the harness's own catalogue: pi reports the
     /// providers this machine is signed in to, Claude Code reports its aliases.
-    async fn models(&self, harness: String) -> Vec<crate::models::ModelOption> {
-        crate::models::catalogue(&harness)
+    /// Pi also lists the models of every connected connector.
+    async fn models(
+        &self,
+        ctx: &Context<'_>,
+        harness: String,
+    ) -> async_graphql::Result<Vec<crate::models::ModelOption>> {
+        if harness != "pi" {
+            return Ok(crate::models::catalogue(&harness));
+        }
+        let engine = engine(ctx);
+        let connected = engine.connected_pi_providers().await?;
+        Ok(crate::models::pi_catalogue(&engine.pi_bin, &connected).await)
     }
 
     async fn issues(
@@ -1023,6 +1043,47 @@ impl Mutation {
         Ok(engine(ctx).set_agent_token(&id, &token).await?)
     }
 
+    /// Start an OAuth sign-in for a subscription entry (`claude-sub`,
+    /// `codex-sub`). Answers once there is a link or a code to show.
+    async fn start_sign_in(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+    ) -> async_graphql::Result<crate::signin::SignIn> {
+        let engine = ctx.data_unchecked::<std::sync::Arc<Engine>>();
+        Ok(crate::signin::start(engine, &id).await?)
+    }
+
+    /// Pass the code the provider showed after the person signed in.
+    async fn submit_sign_in_code(
+        &self,
+        ctx: &Context<'_>,
+        sign_in_id: ID,
+        code: String,
+    ) -> async_graphql::Result<crate::signin::SignIn> {
+        Ok(crate::signin::submit_code(engine(ctx), &sign_in_id, &code).await?)
+    }
+
+    /// Stop a sign-in; `false` when it had already ended.
+    async fn cancel_sign_in(
+        &self,
+        ctx: &Context<'_>,
+        sign_in_id: ID,
+    ) -> async_graphql::Result<bool> {
+        Ok(crate::signin::cancel(engine(ctx), &sign_in_id)?)
+    }
+
+    /// Say which plan a connected subscription is on; `null` clears it. A plan
+    /// with a published fee fills in Cost control's plan for every workspace.
+    async fn set_connector_plan(
+        &self,
+        ctx: &Context<'_>,
+        id: String,
+        plan: Option<String>,
+    ) -> async_graphql::Result<Connection> {
+        Ok(engine(ctx).set_connector_plan(&id, plan.as_deref()).await?)
+    }
+
     /// Forget a credential. Commits go back to the human's identity and a run falls
     /// back to whatever the machine has, which is the only honest thing to do when
     /// a secret is compromised.
@@ -1151,18 +1212,22 @@ impl Mutation {
         name: String,
         adapter: String,
         model: String,
+        // Which connector the agent signs in with; none means automatic.
+        connector: Option<String>,
     ) -> async_graphql::Result<Agent> {
         let id = Uuid::now_v7();
         let now = crate::db::now_rfc3339();
+        let connector = connector.filter(|id| !id.is_empty());
         sqlx::query(
-            "insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at)
-             values (?, ?, ?, ?, ?, ?, ?)",
+            "insert into agents (id, workspace_id, name, adapter, model, connector, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
         .bind(&name)
         .bind(&adapter)
         .bind(&model)
+        .bind(&connector)
         .bind(&now)
         .bind(&now)
         .execute(&engine(ctx).db.pool)

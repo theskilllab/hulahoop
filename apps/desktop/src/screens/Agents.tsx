@@ -17,6 +17,7 @@ import {
 } from "../api";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
+import { servesPiModel } from "../piProviders";
 
 /** Harnesses we can run. `harness` is the provider key a connection is stored under. */
 const HARNESSES: { adapter: string; harness: string; name: string }[] = [
@@ -26,11 +27,14 @@ const HARNESSES: { adapter: string; harness: string; name: string }[] = [
 ];
 
 interface Connection {
+  id: string;
   provider: string;
   kind: string;
   connected: boolean;
   label: string | null;
   connectedAt: string | null;
+  /** The harness adapters this entry can sign in. */
+  harnesses: string[];
 }
 
 interface Preflight {
@@ -81,7 +85,7 @@ export default function Agents({
 
   async function loadConnections() {
     const data = await gql<{ connections: Connection[] }>(
-      `query { connections { provider kind connected label connectedAt } }`,
+      `query { connections { id provider kind connected label connectedAt harnesses } }`,
     );
     setConnections(data.connections);
   }
@@ -113,8 +117,9 @@ export default function Agents({
   }, [agents, selected]);
 
   const agent = agents.find((entry) => entry.id === selected) ?? null;
+  // A harness is usable when any entry that can sign it in is connected.
   const connected = (harness: string) =>
-    harness === "" || connections.some((entry) => entry.provider === harness && entry.connected);
+    harness === "" || connections.some((entry) => entry.connected && entry.harnesses.includes(harness));
 
   /** The newest run this agent started. Every run records whose time it was. */
   const current = useMemo(() => {
@@ -356,13 +361,21 @@ function AgentDialog({
   const [model, setModel] = useState(agent?.model ?? "");
   // A harness with two ways to pay needs to know which one this agent uses.
   const [connector, setConnector] = useState(agent?.connector ?? "");
-  const [connectors, setConnectors] = useState<ConnectorRow[]>([]);
+  // `null` until the list arrives, so a stored choice is not flagged before it can be checked.
+  const [connectors, setConnectors] = useState<ConnectorRow[] | null>(null);
   const [md, setMd] = useState(agent?.agentsMd ?? "");
   const [picked, setPicked] = useState<string[]>(agent?.skills.map((skill) => skill.id) ?? []);
   const [busy, setBusy] = useState<string | null>(null);
 
   const harness = harnessOf(adapter) ?? HARNESSES[0];
   const [models, setModels] = useState<ModelOption[]>([]);
+
+  // A Pi model from another provider makes a per-provider choice moot: the server
+  // would ignore it, so the form lets it go instead of saving it.
+  const chooseModel = (next: string) => {
+    setModel(next);
+    if (adapter === "pi") setConnector((current) => (current && !servesPiModel(current, next) ? "" : current));
+  };
 
   // The list comes from the harness, not from us: pi reports the providers it is
   // signed in to, Claude Code reports its aliases.
@@ -372,7 +385,7 @@ function AgentDialog({
       .then((next) => {
         if (!live) return;
         setModels(next);
-        if (next.length && !next.some((entry) => entry.id === model)) setModel(next[0].id);
+        if (next.length && !next.some((entry) => entry.id === model)) chooseModel(next[0].id);
       })
       .catch(() => live && setModels([]));
     return () => {
@@ -394,9 +407,17 @@ function AgentDialog({
       .catch(() => setConnectors([]));
   }, []);
 
-  const offered = connectors.filter(
-    (row) => row.connected && (adapter === "claude_code" ? row.provider === "claude_code" : row.provider === adapter),
+  // The connected entries the server would use for this harness and, on Pi, for
+  // this model's provider (the Pi login serves any model).
+  const offered = (connectors ?? []).filter(
+    (row) =>
+      row.connected && row.harnesses.includes(adapter) && (adapter !== "pi" || servesPiModel(row.id, model)),
   );
+  // A stored choice that is not on offer stays visible, disabled, instead of reading as Automatic.
+  const stored = connectors?.find((row) => row.id === connector);
+  const stale = connectors !== null && connector !== "" && !offered.some((row) => row.id === connector);
+  const staleReason =
+    stored?.connected && stored.harnesses.includes(adapter) ? "does not serve this model" : "not connected";
 
   async function save() {
     setBusy("save");
@@ -412,10 +433,10 @@ function AgentDialog({
         );
       } else {
         const data = await gql<{ createAgent: { id: string } }>(
-          `mutation ($w: UUID!, $n: String!, $a: String!, $m: String) {
-             createAgent(workspaceId: $w, name: $n, adapter: $a, model: $m) { id }
+          `mutation ($w: UUID!, $n: String!, $a: String!, $m: String, $c: String) {
+             createAgent(workspaceId: $w, name: $n, adapter: $a, model: $m, connector: $c) { id }
            }`,
-          { w: workspaceId, n: name, a: adapter, m: model },
+          { w: workspaceId, n: name, a: adapter, m: model, c: connector || null },
         );
         id = data.createAgent.id;
       }
@@ -456,8 +477,11 @@ function AgentDialog({
           <select
             value={adapter}
             onChange={(event) => {
-              setAdapter(event.target.value);
+              const next = event.target.value;
+              setAdapter(next);
               setModel("");
+              const row = connectors?.find((entry) => entry.id === connector);
+              if (!row?.harnesses.includes(next)) setConnector("");
             }}
           >
             {HARNESSES.map((entry) => {
@@ -482,7 +506,7 @@ function AgentDialog({
           {models.length > 0 ? (
             <select
               value={model}
-              onChange={(event) => setModel(event.target.value)}
+              onChange={(event) => chooseModel(event.target.value)}
               disabled={!connected(harness.harness)}
             >
               {providers.map(([provider, entries]) => (
@@ -500,7 +524,7 @@ function AgentDialog({
             <input
               value={model}
               placeholder="provider/model"
-              onChange={(event) => setModel(event.target.value)}
+              onChange={(event) => chooseModel(event.target.value)}
             />
           )}
         </label>
@@ -510,27 +534,32 @@ function AgentDialog({
             : `${harness.name} did not report a catalogue, so type the model it takes.`}
         </p>
 
-        {offered.length > 1 ? (
-          <div className="field">
-            <span className="field-label">Signs in with</span>
-            <div className="seg" role="group" aria-label="Connector">
-              {offered.map((entry) => (
-                <button
-                  key={entry.id}
-                  type="button"
-                  aria-pressed={connector === entry.id}
-                  onClick={() => setConnector(entry.id)}
-                >
-                  {entry.name}
-                </button>
-              ))}
-            </div>
-            <span className="dim small">
-              {harness.name} can act on a plan login or a billed key. This chooses which.
-            </span>
-          </div>
+        {offered.length > 1 || (adapter === "pi" && offered.length > 0) || stale ? (
+          <>
+            <label>
+              Signs in with
+              <select value={connector} onChange={(event) => setConnector(event.target.value)}>
+                <option value="">Automatic</option>
+                {offered.map((entry) => (
+                  <option key={entry.id} value={entry.id}>
+                    {entry.name}
+                  </option>
+                ))}
+                {stale ? (
+                  <option value={connector} disabled>
+                    {stored?.name ?? connector} ({staleReason})
+                  </option>
+                ) : null}
+              </select>
+            </label>
+            <p className="dim small">
+              {adapter === "pi"
+                ? "Lists the connectors for this model's provider and your Pi login. Automatic uses the provider's connector, then your Pi login."
+                : `${harness.name} can act on a plan login or a billed key. This chooses which.`}
+            </p>
+          </>
         ) : null}
-        {offered.length === 1 && connector !== offered[0].id ? (
+        {adapter !== "pi" && !stale && offered.length === 1 && connector !== offered[0].id ? (
           <p className="dim small">{harness.name} will sign in with {offered[0].name}.</p>
         ) : null}
 

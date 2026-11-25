@@ -31,3 +31,4 @@ futures = "0.3"
 ring = "0.17"
 rsa = "0.9"
 tokio-stream = "0.1"
+pty-process = { version = "0.5", features = ["async"] }

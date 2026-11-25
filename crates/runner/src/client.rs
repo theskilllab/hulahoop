@@ -152,6 +152,14 @@ impl Client {
         Ok(())
     }
 
+    /// Hand back an OAuth login the harness refreshed, so the server can seal it
+    /// over the stored one. `owner` is `runs/<id>` or `jobs/<id>`.
+    pub async fn hand_back_credential(&self, owner: &str, refreshed: Value) -> Result<()> {
+        self.post(&format!("/internal/{owner}/credential"), refreshed)
+            .await?;
+        Ok(())
+    }
+
     pub async fn claim_job(&self, lumi: bool) -> Result<Option<Value>> {
         let value = self
             .post("/internal/jobs/claim", json!({ "lumi": lumi }))

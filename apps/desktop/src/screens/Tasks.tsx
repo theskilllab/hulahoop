@@ -247,6 +247,9 @@ export default function Tasks({
                     runStatus={issue.runs.find((run) => run.id === transcript.id)?.status ?? transcript.status}
                     agentName={agentName(transcript.agentId)}
                     issueKey={issue.key}
+                    credentialSource={
+                      issue.runs.find((run) => run.id === transcript.id)?.credentialSource ?? transcript.credentialSource ?? null
+                    }
                     onBack={() => setTranscript(null)}
                   />
                 ) : null}

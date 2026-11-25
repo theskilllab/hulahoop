@@ -235,8 +235,18 @@ pub struct Run {
     pub model: String,
     /// Frozen execution context and measured effort; legacy rows remain unknown.
     pub adapter_snapshot: Option<String>,
+    /// The connector a run used once claimed (none for the host login); the
+    /// agent's choice until then.
     pub connector_id: Option<String>,
+    /// The connector the agent chose when the run was queued, which a re-claim
+    /// resolves again.
+    #[graphql(skip)]
+    pub chosen_connector: Option<String>,
     pub billing_source: Option<String>,
+    /// What the run started with: a connector's name, `Pi login` or `host
+    /// login`. Recorded at claim, so a run that quietly fell back to the host
+    /// login says so.
+    pub credential_source: Option<String>,
     pub actual_model: Option<String>,
     pub cache_read_tokens: Option<i64>,
     pub cache_write_tokens: Option<i64>,
@@ -344,7 +354,7 @@ pub struct RunnerJob {
 /// this is, whether the stored credential still works, and which app it names.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject)]
 pub struct Connection {
-    /// The screen's id for this entry: `github`, `claude-sub`, `claude-api`, `pi`.
+    /// The screen's id for this entry: `github`, `claude-sub`, `codex-sub`, `pi`, …
     pub id: String,
     pub provider: String,
     pub kind: String,
@@ -359,6 +369,21 @@ pub struct Connection {
     pub app_id: Option<String>,
     pub label: Option<String>,
     pub connected_at: Option<DateTime<Utc>>,
+    /// The plans a person can say they are on; empty for entries without plans.
+    /// Names only: a price belongs to Cost control, not to this screen.
+    pub plans: Vec<ConnectorPlan>,
+    /// The plan chosen, by id.
+    pub plan: Option<String>,
+    /// The harnesses this entry can power (`claude_code`, `pi`), from the
+    /// server's own table, so a screen never keeps a copy that drifts.
+    pub harnesses: Vec<String>,
+}
+
+/// One plan a subscription entry offers.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject)]
+pub struct ConnectorPlan {
+    pub id: String,
+    pub name: String,
 }
 
 /// The stored row: the credentials as vault ciphertext, never as plaintext.
@@ -371,6 +396,8 @@ pub struct ConnectorRow {
     /// never requires opening all of it: the app id is public, the key is not.
     pub secret_ciphertext: String,
     pub label: Option<String>,
+    /// The plan the person said they are on, from the entry's catalogue.
+    pub plan: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
