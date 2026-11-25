@@ -3,7 +3,67 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long a fetch, clone or push may take. One that hangs holds the
+/// mirror's lock while it does, and every run and job of the repository waits
+/// behind it, all of them heartbeating as if nothing were wrong.
+pub const NETWORK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// What `command` printed, once it has exited; an error once it has run for
+/// `limit`, after it and everything it started (its own process group) are
+/// killed.
+pub fn output_within(command: &mut Command, limit: Duration) -> Result<Output> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    command
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let drain = |stream: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            use nix::sys::signal::{killpg, Signal};
+            use nix::unistd::Pid;
+            let _ = killpg(Pid::from_raw(child.id() as i32), Signal::SIGKILL);
+            let _ = child.wait();
+            bail!("gave up after {} seconds", limit.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
 
 pub struct Vcs {
     pub root: PathBuf,
@@ -514,15 +574,27 @@ impl Vcs {
     }
 
     pub fn fetch(&self) -> Result<()> {
+        let fetch = |program: &str, args: &[&str]| -> Result<()> {
+            let output = output_within(
+                Command::new(program).args(args).current_dir(&self.root),
+                NETWORK_TIMEOUT,
+            )
+            .with_context(|| format!("running {program} {args:?} in {}", self.root.display()))?;
+            if !output.status.success() {
+                bail!(
+                    "{program} {args:?} failed in {}: {}",
+                    self.root.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(())
+        };
         match self.kind() {
             Kind::Jj => {
-                let _ = self.run(&self.root, "jj", &["git", "fetch"]);
+                let _ = fetch("jj", &["git", "fetch"]);
                 Ok(())
             }
-            Kind::Git => {
-                self.run(&self.root, "git", &["fetch", "--all", "--prune"])?;
-                Ok(())
-            }
+            Kind::Git => fetch("git", &["fetch", "--all", "--prune"]),
         }
     }
 
@@ -606,6 +678,28 @@ fn workspace_name(checkout: &Path) -> String {
 #[cfg(test)]
 mod carry_tests {
     use super::*;
+
+    /// A command that outlives its limit is killed with everything it
+    /// started, and says so; one that finishes in time gives its output.
+    #[test]
+    fn a_command_that_hangs_is_given_up_on() {
+        let started = std::time::Instant::now();
+        let error = super::output_within(
+            Command::new("sh").args(["-c", "sleep 30 & sleep 30"]),
+            std::time::Duration::from_millis(300),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("gave up"), "{error}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        let output = super::output_within(
+            Command::new("sh").args(["-c", "echo out; echo err >&2"]),
+            std::time::Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "out\n");
+        assert_eq!(String::from_utf8_lossy(&output.stderr), "err\n");
+    }
 
     fn jj(dir: &Path, args: &[&str]) -> String {
         let out = Command::new("jj")

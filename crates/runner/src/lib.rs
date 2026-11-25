@@ -6,10 +6,14 @@ mod client;
 mod exec;
 mod live;
 mod redact;
+mod resources;
 mod vcs;
 
 use anyhow::Context;
 use std::time::Duration;
+
+/// How many runs share the host at most, unless `HULAHOOP_MAX_RUNS` says.
+const DEFAULT_MAX_RUNS: usize = 4;
 
 /// Where the work comes from: `--server`/`--token` (or `HULAHOOP_SERVER`,
 /// `HULAHOOP_TOKEN`) point the runner at a host that already runs the server;
@@ -130,16 +134,30 @@ pub async fn run(args: Vec<String>) -> anyhow::Result<()> {
     if pruned > 0 {
         tracing::info!(pruned, "removed checkouts a killed runner left behind");
     }
+    let pruned = exec::prune_run_homes(&data_dir);
+    if pruned > 0 {
+        tracing::info!(pruned, "removed run homes a killed runner left behind");
+    }
+
+    // Runs share the host while it has room for them, and never more than
+    // this many at once whatever the room.
+    let max_runs = std::env::var("HULAHOOP_MAX_RUNS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&runs| runs > 0)
+        .unwrap_or(DEFAULT_MAX_RUNS);
 
     tracing::info!(
         runner_id,
         server = %connection.base,
         data_dir = %data_dir.display(),
+        max_runs,
         "runner watching for work"
     );
+    let mut live = Vec::new();
     let mut idle = Duration::from_millis(250);
     loop {
-        match executor.tick(&runner_id).await {
+        match executor.tick(&runner_id, &mut live, max_runs).await {
             Ok(did_work) => {
                 idle = if did_work {
                     Duration::from_millis(50)

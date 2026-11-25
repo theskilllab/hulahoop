@@ -104,6 +104,16 @@ export function isLiveRun(status: string | null | undefined): boolean {
   return status === "running" || status === "queued";
 }
 
+/** Why a queued run has not started yet, when the server said; nothing for a
+ *  run that is going or over, nor while no runner reports (`runnerOnline`
+ *  false), since only a polling runner keeps the reason fresh. */
+export function waitingFor(
+  run: { status: string; waitReason?: string | null } | null | undefined,
+  runnerOnline: boolean,
+): string | null {
+  return runnerOnline && run?.status === "queued" && run.waitReason ? run.waitReason : null;
+}
+
 export function fmtTokens(value: number): string {
   if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
   if (value >= 1_000) return `${Math.round(value / 1_000)}k`;

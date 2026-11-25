@@ -102,6 +102,8 @@ pub struct Engine {
     /// One lock per stored connector row, held while a login about to expire
     /// is refreshed, so two claims never spend the same refresh token.
     refresh_locks: std::sync::Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
+    /// The capacity a runner sent with its last claim, for the Tasks page.
+    pub(crate) runner_capacity: std::sync::Mutex<Option<crate::capacity::Report>>,
 }
 
 /// A stored OAuth login closer than this to expiring is refreshed before a run
@@ -136,6 +138,7 @@ impl Engine {
             pi_bin: pi_bin(),
             signins: crate::signin::Registry::default(),
             refresh_locks: std::sync::Mutex::default(),
+            runner_capacity: std::sync::Mutex::default(),
         }
     }
 
@@ -550,14 +553,14 @@ impl Engine {
             return Ok(());
         }
 
-        sqlx::query("update issues set turns_used = turns_used + 1 where id = ?")
-            .bind(issue.id)
-            .execute(&self.db.pool)
-            .await?;
         // The parent is the turn before this one, whoever took it: that is
         // where the message the next agent has to read lives.
         let parent = self.last_finished_run(issue.id).await?;
-        self.start_run(issue.id, agent, parent).await?;
+        // The turn is spent with the run that takes it, in one write: a start
+        // the server refused (no preflight yet, the run cap) costs the task
+        // nothing, and a run that fails at once refunds a turn already spent.
+        self.start_run_spending(issue.id, agent, parent, true)
+            .await?;
         Ok(())
     }
 
@@ -638,19 +641,19 @@ impl Engine {
     /// finishing that run — a rule that does not hold for this workflow, a column
     /// that is null where a value was assumed — the agent never got to act, so
     /// the turn it spent has to return, or a cap of six becomes a cap of five.
+    ///
+    /// Only the count returns: `turn_served` is a non-null JSON list, and
+    /// setting it to null (as this once did) failed the whole update, so no
+    /// turn ever came back.
     pub async fn refund_turn(&self, issue_id: Uuid, agent_id: Uuid) {
-        let _ = sqlx::query(
-            "update issues set turns_used = max(0, turns_used - 1), turn_served = null where id = ?",
-        )
-        .bind(issue_id)
-        .execute(&self.db.pool)
-        .await;
-        let _ = sqlx::query("update issues set turn_served = ? where id = ? and turn_served = ?")
-            .bind(Option::<String>::None)
-            .bind(issue_id)
-            .bind(agent_id.to_string())
-            .execute(&self.db.pool)
-            .await;
+        if let Err(error) =
+            sqlx::query("update issues set turns_used = max(0, turns_used - 1) where id = ?")
+                .bind(issue_id)
+                .execute(&self.db.pool)
+                .await
+        {
+            tracing::warn!(%issue_id, %agent_id, %error, "could not give a turn back");
+        }
     }
 
     /// Queue a probe for this agent against every repository in its workspace.
@@ -1593,15 +1596,6 @@ impl Engine {
         .await?)
     }
 
-    async fn live_run_on_repo(&self, repo_id: Uuid) -> Result<Option<Run>> {
-        Ok(sqlx::query_as::<_, Run>(
-            "select * from runs where repo_id = ? and status in ('queued','running') limit 1",
-        )
-        .bind(repo_id)
-        .fetch_optional(&self.db.pool)
-        .await?)
-    }
-
     /// Any agent in this workspace: the one whose last run is oldest, so a status
     /// that says `any` gets a rotation through the roster instead of one
     /// favourite. The workflow names people by name; this is what `any` means
@@ -1626,6 +1620,19 @@ impl Engine {
         issue_id: Uuid,
         agent_id: Option<Uuid>,
         parent_run_id: Option<Uuid>,
+    ) -> Result<Run> {
+        self.start_run_spending(issue_id, agent_id, parent_run_id, false)
+            .await
+    }
+
+    /// [`Engine::start_run`], spending one of the task's turns with the run
+    /// when `spend_turn` is set.
+    async fn start_run_spending(
+        &self,
+        issue_id: Uuid,
+        agent_id: Option<Uuid>,
+        parent_run_id: Option<Uuid>,
+        spend_turn: bool,
     ) -> Result<Run> {
         let issue = self.issue(issue_id).await?;
         // A task with no repository still runs: the agent works in an empty
@@ -1723,18 +1730,9 @@ impl Engine {
         if let Some(live) = self.live_run_on_issue(issue_id).await? {
             bail!("a run is already active on this issue ({})", live.id);
         }
-        // Repo-less runs share nothing, so only runs on a repository queue up
-        // behind each other.
-        let live_on_repo = match issue.repo_id {
-            Some(repo_id) => self.live_run_on_repo(repo_id).await?,
-            None => None,
-        };
-        if let Some(live) = live_on_repo {
-            bail!(
-                "another run is active on this repo ({}). One agent per repo keeps the jj op log and the build cache uncontended; start this run when that one finishes.",
-                live.id
-            );
-        }
+        // Runs on one repository no longer wait for each other here: each task
+        // has its own checkout, the runner takes turns on the shared mirror, and
+        // the run is queued until the host has room for it (`claim_run`).
 
         // The cap counts runs since the last human override, so clearing it is a
         // deliberate act rather than a side effect of a new attempt.
@@ -1793,6 +1791,7 @@ impl Engine {
         );
 
         let price = crate::models::price_per_token(&run_agent.model);
+        let mut write = self.db.pool.begin().await?;
         sqlx::query(
             "insert into runs (id, issue_id, repo_id, agent_id, model, adapter_snapshot, connector_id,
                 chosen_connector, price_in_per_million, price_out_per_million, attempt, base_bookmark,
@@ -1823,21 +1822,25 @@ impl Engine {
         // findings, a handover); dropping it left reworks without the review.
         .bind(parent_run_id)
         .bind(crate::db::now_rfc3339())
-        .execute(&self.db.pool)
+        .execute(&mut *write)
         .await?;
 
         // The agent that picks a task up assigns itself, so the board shows who
         // has it. This is a label for people: dispatch reads WORKFLOWS.md, never
-        // the assignee, and a person may reassign at any time.
+        // the assignee, and a person may reassign at any time. The turn the run
+        // takes is spent in the same write as the run itself, so a refund for
+        // a run that fails at once always finds it spent.
         sqlx::query(
-            "update issues set run_count = run_count + 1, attempt = ?, assignee_type = 'agent', assignee_id = ?, updated_at = ? where id = ?",
+            "update issues set run_count = run_count + 1, attempt = ?, assignee_type = 'agent', assignee_id = ?, updated_at = ?, turns_used = turns_used + ? where id = ?",
         )
         .bind(issue.attempt + 1)
         .bind(agent_id.to_string())
         .bind(crate::db::now_rfc3339())
+        .bind(i64::from(spend_turn))
         .bind(issue_id)
-        .execute(&self.db.pool)
+        .execute(&mut *write)
         .await?;
+        write.commit().await?;
 
         // Starting a run never moves the task. An agent works *in* the status it
         // was dispatched for — `To do` stays `To do` while the Architect plans —
@@ -1983,41 +1986,36 @@ impl Engine {
         Ok(id)
     }
 
-    pub async fn claim_run(&self, runner_id: &str) -> Result<Option<Run>> {
-        let candidate: Option<Run> = sqlx::query_as(
-            "select * from runs where status = 'queued' order by created_at limit 1",
+    /// Keeps a run alive and answers with its status, so a runner still
+    /// working on a run the server has cancelled or declared dead stops it. A
+    /// pid or pgid of zero says the agent has exited: a cancel must not
+    /// signal a group whose number the system may since have handed out
+    /// again.
+    pub async fn heartbeat(
+        &self,
+        run_id: Uuid,
+        pid: Option<i64>,
+        pgid: Option<i64>,
+    ) -> Result<Option<String>> {
+        sqlx::query(
+            "update runs set last_heartbeat_at = ?,
+                pid = case when ? = 0 then null else coalesce(?, pid) end,
+                pgid = case when ? = 0 then null else coalesce(?, pgid) end
+              where id = ?",
         )
-        .fetch_optional(&self.db.pool)
-        .await?;
-        let Some(run) = candidate else {
-            return Ok(None);
-        };
-        let now = Utc::now().to_rfc3339();
-        let updated = sqlx::query(
-            "update runs set status = 'running', runner_id = ?, claimed_at = ?, started_at = ?, last_heartbeat_at = ? where id = ? and status = 'queued'",
-        )
-        .bind(runner_id)
-        .bind(&now)
-        .bind(&now)
-        .bind(&now)
-        .bind(run.id)
+        .bind(crate::db::now_rfc3339())
+        .bind(pid)
+        .bind(pid)
+        .bind(pgid)
+        .bind(pgid)
+        .bind(run_id)
         .execute(&self.db.pool)
         .await?;
-        if updated.rows_affected() == 0 {
-            return Ok(None);
-        }
-        self.run(run.id).await.map(Some)
-    }
-
-    pub async fn heartbeat(&self, run_id: Uuid, pid: Option<i64>, pgid: Option<i64>) -> Result<()> {
-        sqlx::query("update runs set last_heartbeat_at = ?, pid = coalesce(?, pid), pgid = coalesce(?, pgid) where id = ?")
-            .bind(crate::db::now_rfc3339())
-            .bind(pid)
-            .bind(pgid)
+        let status: Option<(String,)> = sqlx::query_as("select status from runs where id = ?")
             .bind(run_id)
-            .execute(&self.db.pool)
+            .fetch_optional(&self.db.pool)
             .await?;
-        Ok(())
+        Ok(status.map(|(status,)| status))
     }
 
     pub async fn append_event(
@@ -2046,6 +2044,15 @@ impl Engine {
     /// Records what a run reported and moves its task on from there.
     pub async fn complete_run(&self, run_id: Uuid, payload: RunCompletion) -> Result<Run> {
         let run = self.run(run_id).await?;
+        // What the run used is kept whatever happens below: a completion the
+        // server then fails to process still measured the host.
+        self.record_resources(
+            run_id,
+            payload.peak_memory_bytes,
+            payload.cpu_cores,
+            payload.disk_growth_bytes,
+        )
+        .await?;
         let issue = self.issue(run.issue_id).await?;
         let status = RunStatus::parse(&payload.status)
             .ok_or_else(|| anyhow!("unknown run status {}", payload.status))?;
@@ -3130,6 +3137,14 @@ pub struct RunCompletion {
     pub commit_name: Option<String>,
     #[serde(default)]
     pub commit_email: Option<String>,
+    /// What the runner measured of the run's process group and checkout;
+    /// absent when it could not tell.
+    #[serde(default, rename = "peakMemoryBytes")]
+    pub peak_memory_bytes: Option<i64>,
+    #[serde(default, rename = "cpuCores")]
+    pub cpu_cores: Option<f64>,
+    #[serde(default, rename = "diskGrowthBytes")]
+    pub disk_growth_bytes: Option<i64>,
 }
 
 /// Twelve characters of a revision, which is what a human reads in a comment.
@@ -3199,6 +3214,9 @@ mod adapter_failure_tests {
             transcript: Some(transcript.to_string()),
             commit_name: None,
             commit_email: None,
+            peak_memory_bytes: None,
+            cpu_cores: None,
+            disk_growth_bytes: None,
         }
     }
 
@@ -3257,6 +3275,10 @@ mod rework_tests {
         for (id, name) in [(developer, "Developer"), (reviewer, "Reviewer")] {
             sqlx::query("insert into agents (id, workspace_id, name, adapter, model, created_at, updated_at) values (?,?,?,'pi','model-x',?,?)")
                 .bind(id).bind(workspace).bind(name).bind(now).bind(now).execute(&db.pool).await.unwrap();
+            // A turn counts once its run starts, and a run starts only for an
+            // agent that passed its probe on the repository.
+            sqlx::query("insert into agent_preflight (agent_id, repo_id, ok, detail, checked_at) values (?,?,1,'ok',?)")
+                .bind(id).bind(repo).bind(now).execute(&db.pool).await.unwrap();
         }
         let served = serde_json::json!([developer.to_string()]).to_string();
         sqlx::query("insert into issues (id, workspace_id, project_id, repo_id, issue_key, number, title, status, turn_queue, turn_served, turns_used, created_at, updated_at) values (?,?,?,?, 'RWK-1',1,'Task','in_progress','[\"Developer\",\"Reviewer\"]',?,2,?,?)")

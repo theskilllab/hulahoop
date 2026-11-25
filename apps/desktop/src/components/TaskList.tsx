@@ -1,7 +1,8 @@
 import type { MouseEvent } from "react";
 import type { IssueSummary } from "../api";
+import { useRunnerOnline } from "../runnerCapacity";
 import type { Column } from "./TaskBoard";
-import { Avatar, PriorityIcon, StatusIcon, fmtDue, isLiveRun, isOverdue, priorityLabel } from "./TaskBits";
+import { Avatar, PriorityIcon, StatusIcon, fmtDue, isLiveRun, isOverdue, priorityLabel, waitingFor } from "./TaskBits";
 
 /**
  * Every task in one table, sorted by the workflow's column order. Each row is a
@@ -23,6 +24,7 @@ export default function TaskList({
 }) {
   const order = new Map(columns.map((column, index) => [column.status as string, index]));
   const title = new Map(columns.map((column) => [column.status as string, column.title]));
+  const runnerOnline = useRunnerOnline();
   const rows = [...issues].sort(
     (a, b) => (order.get(a.status) ?? 99) - (order.get(b.status) ?? 99) || b.number - a.number,
   );
@@ -64,7 +66,16 @@ export default function TaskList({
               <span className="task-key">{issue.key}</span>
               <span className="task-row-title">
                 <span className="truncate">{issue.title}</span>
-                {isLiveRun(issue.currentRun?.status) ? <span className="pulse running-dot" aria-label="Agent working" /> : null}
+                {isLiveRun(issue.currentRun?.status) ? (
+                  <span
+                    className="pulse running-dot"
+                    title={waitingFor(issue.currentRun, runnerOnline) ?? undefined}
+                    aria-label={waitingFor(issue.currentRun, runnerOnline) ? "Agent waiting for room" : "Agent working"}
+                  />
+                ) : null}
+                {waitingFor(issue.currentRun, runnerOnline) ? (
+                  <span className="task-wait truncate">{waitingFor(issue.currentRun, runnerOnline)}</span>
+                ) : null}
               </span>
               <span className="task-row-status">
                 <StatusIcon status={issue.status} />

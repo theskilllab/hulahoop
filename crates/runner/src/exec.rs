@@ -3,7 +3,8 @@
 use crate::adapter;
 use crate::client::Client;
 use crate::redact::Redactor;
-use crate::vcs::{Kind, Vcs};
+use crate::resources::{dir_size, LiveUse, Meter, Need};
+use crate::vcs::{output_within, Kind, Vcs, NETWORK_TIMEOUT};
 use anyhow::{anyhow, bail, Context, Result};
 use hulahoop_core::credential::{Refresh, CLAUDE_CREDENTIALS_FILE, PI_AUTH_FILE};
 use hulahoop_core::{contract, github_api, slugify, Adapter};
@@ -11,15 +12,107 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+/// Cheap to clone: a run executes on its own task with its own copy, beside
+/// the loop that keeps claiming work.
+#[derive(Clone)]
 pub struct Executor {
     client: Client,
     data_dir: PathBuf,
 }
+
+/// A run executing beside the loop: its task, and what the loop reads to tell
+/// how much room the run still needs.
+pub struct LiveRun {
+    run_id: String,
+    task: tokio::task::JoinHandle<()>,
+    watch: Arc<RunWatch>,
+}
+
+impl LiveRun {
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
+}
+
+/// One live run as its work, its keepalive and the loop share it: what it
+/// uses, the process group working for it now (the agent, `just setup`,
+/// `just fmt`), and whether the server has stopped it.
+pub struct RunWatch {
+    meter: Arc<Meter>,
+    group: AtomicI64,
+    stopped: AtomicBool,
+}
+
+impl RunWatch {
+    fn new(meter: Arc<Meter>) -> Arc<RunWatch> {
+        Arc::new(RunWatch {
+            meter,
+            group: AtomicI64::new(0),
+            stopped: AtomicBool::new(false),
+        })
+    }
+
+    /// `pgid` now works for the run. A run already stopped stops it too.
+    fn enter(&self, pgid: i64) {
+        self.group.store(pgid, Ordering::SeqCst);
+        if self.is_stopped() {
+            kill_group_apart(pgid);
+        }
+    }
+
+    fn leave(&self) {
+        self.group.store(0, Ordering::SeqCst);
+    }
+
+    /// The server cancelled the run or declared it dead: whatever works for
+    /// it is killed, and the run goes no further. Never reported: the server
+    /// has already recorded how it ended.
+    fn stop(&self) {
+        if self.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let group = self.group.load(Ordering::SeqCst);
+        if group > 0 {
+            kill_group_apart(group);
+        }
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
+    }
+
+    /// An error that ends the run's work once the server has stopped it.
+    fn go_on(&self) -> Result<()> {
+        if self.is_stopped() {
+            bail!("the server stopped the run");
+        }
+        Ok(())
+    }
+}
+
+/// Whether a run in this state is over for the server, so its runner stops.
+fn run_is_over(status: &str) -> bool {
+    !matches!(status, "running" | "queued")
+}
+
+/// Aborts the task when dropped, so a run that panics does not leave its
+/// keepalive heartbeating for it forever.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// How many heartbeats go by between two walks of a live run's checkout: the
+/// walk is slow on a big checkout, and what it tells changes slowly.
+const DISK_SAMPLE_EVERY: u64 = 12;
 
 #[derive(Default)]
 struct Outcome {
@@ -37,40 +130,148 @@ impl Executor {
         Executor { client, data_dir }
     }
 
-    /// Claim at most one piece of work per tick, so a slow run cannot starve the
-    /// heartbeats of another.
-    pub async fn tick(&self, runner_id: &str) -> Result<bool> {
+    /// Claim at most one piece of work per tick. A job runs here, one at a
+    /// time as always; a run starts on its own task and the loop goes on, so
+    /// several runs share the host while it has room for them.
+    ///
+    /// Each claim carries the room left for one more run, so the server hands
+    /// out only a run that fits. A host that cannot say how much room it has
+    /// claims as before. Either way the runner never has more than
+    /// `max_runs` live: with every slot taken it claims nothing, and only
+    /// tells the server how the host is doing.
+    pub async fn tick(
+        &self,
+        runner_id: &str,
+        live: &mut Vec<LiveRun>,
+        max_runs: usize,
+    ) -> Result<bool> {
         if let Some(job) = self.client.claim_job(false).await? {
-            self.run_job(job).await?;
+            self.run_job_apart(job).await?;
             return Ok(true);
         }
-        if let Some(run) = self.client.claim_run(runner_id).await? {
-            self.run_run(run).await?;
-            return Ok(true);
+        self.reap(live).await;
+        let used: Vec<LiveUse> = live.iter().map(|run| run.watch.meter.live_use()).collect();
+        let capacity = crate::resources::probe_host(&self.data_dir)
+            .map(|host| crate::resources::capacity(&host, &used, max_runs));
+        if live.len() >= max_runs {
+            if let Some(capacity) = capacity {
+                if let Err(error) = self.client.report_capacity(capacity).await {
+                    tracing::debug!(%error, "could not report the runner's capacity");
+                }
+            }
+            return Ok(false);
         }
-        Ok(false)
+        let Some(envelope) = self.client.claim_run(runner_id, capacity).await? else {
+            return Ok(false);
+        };
+        let run_id = envelope["run"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let watch = RunWatch::new(Meter::new(Need::from_envelope(&envelope["need"])));
+        let executor = self.clone();
+        let task_watch = watch.clone();
+        // A run spends long stretches in blocking calls (jj, `just setup`, the
+        // checkout walk), so it gets a thread of its own instead of a runtime
+        // worker: several runs at once must not starve the loop or each
+        // other's heartbeats.
+        let task = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                if let Err(error) = executor.run_run(envelope, task_watch).await {
+                    tracing::warn!(%error, "run ended with an error");
+                }
+            })
+        });
+        live.push(LiveRun {
+            run_id,
+            task,
+            watch,
+        });
+        Ok(true)
+    }
+
+    /// Forgets the runs that are over. One whose task panicked never got to
+    /// report, so it is reported failed here: otherwise its task would read as
+    /// running until the server gave up on its heartbeat.
+    async fn reap(&self, live: &mut Vec<LiveRun>) {
+        let mut index = 0;
+        while index < live.len() {
+            if !live[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let run = live.swap_remove(index);
+            let Err(error) = run.task.await else {
+                continue;
+            };
+            if !error.is_panic() {
+                continue;
+            }
+            tracing::error!(run_id = %run.run_id, "the run's task panicked");
+            run.watch.stop();
+            remove_scratch(&self.data_dir, &run.run_id);
+            remove_run_home(&self.data_dir, &run.run_id);
+            if !run.run_id.is_empty() {
+                let _ = self
+                    .client
+                    .complete_run(
+                        &run.run_id,
+                        run.watch.meter.attach(json!({
+                            "status": "failed",
+                            "error": "the runner failed while executing the run",
+                        })),
+                    )
+                    .await;
+            }
+        }
     }
 
     /// A second runner lane answers questions while a long agent run is active.
     /// Lumi never edits a checkout, so it can share the data directory safely.
     pub async fn tick_lumi(&self) -> Result<bool> {
         if let Some(job) = self.client.claim_job(true).await? {
-            self.run_job(job).await?;
+            self.run_job_apart(job).await?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    async fn run_run(&self, envelope: Value) -> Result<()> {
+    /// A job on a thread of its own: jobs block on jj, git, the dev shell and
+    /// the harness, and the runtime's workers have to stay free for the
+    /// heartbeats of every live run.
+    async fn run_job_apart(&self, job: Value) -> Result<()> {
+        let executor = self.clone();
+        tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(executor.run_job(job))
+        })
+        .await
+        .map_err(|error| anyhow!("the job's task failed: {error}"))?
+    }
+
+    async fn run_run(&self, envelope: Value, watch: Arc<RunWatch>) -> Result<()> {
         let run = &envelope["run"];
         let spec = &envelope["spec"];
         let run_id = run["id"].as_str().context("run has no id")?.to_string();
-        let result = self.execute_run(&run_id, spec).await;
+        // The agent heartbeats while it works. Before it starts the run still
+        // has to look alive: it may be fetching, waiting its turn at a mirror
+        // another run is changing, or in `just setup`, and the server reaps a
+        // run that stays silent for half a minute. The reply says when the
+        // server has stopped the run, cancelled or declared dead, and then
+        // whatever works for it is killed.
+        let keepalive = AbortOnDrop(self.keepalive(&run_id, watch.clone()));
+        let result = self.execute_run(&run_id, spec, &watch).await;
+        drop(keepalive);
+        watch.meter.stopped();
         // A repo-less run's scratch directory is private to the run and goes the
         // moment it is over, whatever the outcome; its artifacts stay under
-        // runs/<id>/ like any other run's.
+        // runs/<id>/ like any other run's. So does its harness home.
         if is_repo_less(spec) {
             remove_scratch(&self.data_dir, &run_id);
+        }
+        remove_run_home(&self.data_dir, &run_id);
+        if watch.is_stopped() {
+            tracing::info!(run_id, "the server stopped the run, so the runner did too");
+            return Ok(());
         }
         if let Err(error) = &result {
             tracing::error!(%error, run_id, "run failed to execute");
@@ -78,24 +279,58 @@ impl Executor {
                 .client
                 .complete_run(
                     &run_id,
-                    json!({
+                    watch.meter.attach(json!({
                         "status": "failed",
                         "error": format!("the runner could not execute the run: {error}"),
-                    }),
+                    })),
                 )
                 .await;
         }
         result.map(|_| ())
     }
 
+    /// Heartbeats for the run while it lives, stops it once the server says
+    /// it is over, and now and then walks its checkout for the room it took.
+    fn keepalive(&self, run_id: &str, watch: Arc<RunWatch>) -> tokio::task::JoinHandle<()> {
+        let (client, run_id) = (self.client.clone(), run_id.to_string());
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(
+                hulahoop_core::HEARTBEAT_INTERVAL_SECS as u64,
+            ));
+            let mut beats = 0u64;
+            loop {
+                every.tick().await;
+                if let Ok(Some(status)) = client.heartbeat(&run_id, None, None).await {
+                    if run_is_over(&status) {
+                        tracing::info!(run_id, %status, "the server stopped the run");
+                        watch.stop();
+                    }
+                }
+                beats += 1;
+                if beats.is_multiple_of(DISK_SAMPLE_EVERY) {
+                    let meter = watch.meter.clone();
+                    let _ = tokio::task::spawn_blocking(move || meter.sample_disk()).await;
+                }
+            }
+        })
+    }
+
     /// A run on a task with no repository: an empty scratch directory, the
     /// agent, and its closing message. No repository, lock, clone, workspace,
     /// setup, checks, diff, commit or push — there is nothing to change but the
     /// answer.
-    async fn execute_scratch_run(&self, run_id: &str, spec: &Value) -> Result<()> {
+    async fn execute_scratch_run(
+        &self,
+        run_id: &str,
+        spec: &Value,
+        watch: &RunWatch,
+    ) -> Result<()> {
+        let meter = &watch.meter;
         let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
         let scratch = prepare_scratch(&self.data_dir, run_id)?;
+        // The scratch directory starts empty, so all of it is the run's.
+        meter.watch_disk(&scratch, 0);
         let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
         std::fs::create_dir_all(&artifact_dir)?;
         let model = spec["model"].as_str().unwrap_or_default().to_string();
@@ -114,12 +349,17 @@ impl Executor {
             .await
             .ok();
 
-        // The run's login files go however this function ends, after the
-        // hand-back has read them: the next run of this shared home must not
-        // start on this run's connector.
-        let home = agent_home(spec, &self.data_dir)?;
+        // The run has a home of its own, gone with the run; its login files
+        // go however this function ends, after the hand-back has read them.
+        let home = run_home(&self.data_dir, run_id)?;
         let login = LoginFiles::new(spec, &home);
         let env = agent_env(spec, &scratch, &self.data_dir, &home)?;
+        let host_login = HostLogin::take(
+            spec,
+            &home,
+            &login_cache(spec, &self.data_dir),
+            host_home().as_deref(),
+        );
         let redactor = Redactor::new(spec, &env);
         self.write_skills(spec, &scratch)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
@@ -138,17 +378,23 @@ impl Executor {
                 wall_clock,
                 None,
                 &redactor,
+                watch,
             )
             .await;
         self.hand_back(&format!("runs/{run_id}"), spec, &home).await;
+        if let Some(host_login) = &host_login {
+            host_login.keep(&home);
+        }
         drop(login);
         let outcome = outcome?;
+        watch.go_on()?;
+        meter.disk_after(dir_size(&scratch));
 
         let artifact_limit_hit = dir_size(&artifact_dir) > hulahoop_core::ARTIFACT_LIMIT_BYTES;
         self.client
             .complete_run(
                 run_id,
-                json!({
+                meter.attach(json!({
                     "status": run_status(&outcome),
                     "exit_code": outcome.exit_code,
                     "error": outcome.error,
@@ -160,24 +406,65 @@ impl Executor {
                     "body": outcome.final_text,
                     "artifact_limit_hit": artifact_limit_hit,
                     "transcript": transcript_tail(&outcome),
-                }),
+                })),
             )
             .await?;
         Ok(())
     }
 
-    async fn execute_run(&self, run_id: &str, spec: &Value) -> Result<()> {
+    async fn execute_run(&self, run_id: &str, spec: &Value, watch: &RunWatch) -> Result<()> {
         if is_repo_less(spec) {
-            return self.execute_scratch_run(run_id, spec).await;
+            return self.execute_scratch_run(run_id, spec, watch).await;
         }
-        let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
-            .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
         let repo_path = host_repository(spec).await?;
         let checkout = owned_checkout(
             &self.data_dir,
             &spec["checkout_project_id"],
             &spec["issue_id"],
         )?;
+        // One run at a time in a task's checkout. The server allows one live
+        // run per task, but a run it has just cancelled or declared dead may
+        // still be finishing here, and a cleanup must not delete the checkout
+        // under a run; both wait for this.
+        let checkout_lock = checkout_lock(&checkout);
+        let _in_checkout = checkout_lock.lock().await;
+        // The checkout is a workspace of the mirror, so the mirror stays while
+        // the run lasts: forgetting it waits.
+        let mirror_use = mirror_use(&repo_path);
+        let _using_mirror = mirror_use.read().await;
+        watch.go_on()?;
+        let mut scaffold = None;
+        let result = self
+            .turn_in_checkout(run_id, spec, watch, &repo_path, &checkout, &mut scaffold)
+            .await;
+        // A turn that failed on the way still leaves its scaffolding merge
+        // behind; it goes before the run is reported failed.
+        if let Some(merge) = scaffold.take() {
+            let lock = mirror_lock(&repo_path);
+            let _turn = lock.lock().await;
+            if let Ok(mirror) = Vcs::detect(&repo_path) {
+                let _ = mirror.abandon(&merge);
+            }
+        }
+        result
+    }
+
+    /// One turn in the task's checkout, with the checkout to itself. The
+    /// carried turn's scaffolding merge is left in `scaffold` until it is
+    /// abandoned, so the caller abandons it on a path out that did not.
+    async fn turn_in_checkout(
+        &self,
+        run_id: &str,
+        spec: &Value,
+        watch: &RunWatch,
+        repo_path: &Path,
+        checkout: &Path,
+        scaffold: &mut Option<String>,
+    ) -> Result<()> {
+        let meter = &watch.meter;
+        let (repo_path, checkout) = (repo_path.to_path_buf(), checkout.to_path_buf());
+        let adapter = Adapter::parse(spec["adapter"].as_str().unwrap_or_default())
+            .ok_or_else(|| anyhow!("unknown adapter in spec"))?;
         let artifact_dir = PathBuf::from(spec["artifact_dir"].as_str().unwrap_or_default());
         std::fs::create_dir_all(&artifact_dir)?;
         let base_bookmark = spec["base_bookmark"].as_str().unwrap_or("main").to_string();
@@ -202,9 +489,23 @@ impl Executor {
             .as_i64()
             .unwrap_or(hulahoop_core::AGENT_WALL_CLOCK_MINUTES);
 
+        // What the checkout held before this turn; a task's first turn makes
+        // the checkout, so all of it counts as the run's.
+        let before = if checkout.exists() {
+            dir_size(&checkout)
+        } else {
+            0
+        };
+        meter.watch_disk(&checkout, before);
+
+        // Other tasks' runs share the mirror, and every jj command writes its
+        // operation log, so changes to it take turns. The agent's own turn runs
+        // without the lock; it only works in this task's checkout.
+        let mirror_turn = mirror_lock(&repo_path);
+        let turn = mirror_turn.lock().await;
         // The task's checkout is a workspace of the mirror, reused across its
-        // turns; the server allows one live run per task, so no other turn is in
-        // it. Everything after this point asks the checkout.
+        // turns; the checkout lock keeps every other turn out of it.
+        // Everything after this point asks the checkout.
         let mirror = Vcs::detect(&repo_path)?;
         mirror.ensure_vcs()?;
         // A task that was in flight when its repository moved to a fresh mirror
@@ -238,12 +539,10 @@ impl Executor {
             },
             None => None,
         };
-        // The scaffolding merge goes however this function ends: a setup failure,
-        // an error from the agent, or a normal finish.
-        let _scaffold = Scaffold {
-            repo: repo_path.clone(),
-            merge: carried.as_ref().and_then(|c| c.merge.clone()),
-        };
+        // The scaffolding merge goes before the run is reported, however it
+        // ends: the server starts the task's next turn the moment it hears.
+        *scaffold = carried.as_ref().and_then(|c| c.merge.clone());
+        drop(turn);
         if let Some(carried) = &carried {
             base = carried.diff_base.clone();
             self.client
@@ -268,19 +567,33 @@ impl Executor {
             .await
             .ok();
 
-        if let Some(failure) = self.run_setup(&checkout, &artifact_dir).await? {
+        let setup = self.run_setup(&checkout, &artifact_dir, watch).await?;
+        watch.go_on()?;
+        if let Some(failure) = setup {
+            if let Some(merge) = scaffold.take() {
+                let _turn = mirror_turn.lock().await;
+                let _ = mirror.abandon(&merge);
+            }
             self.client
-                .complete_run(run_id, json!({ "status": "failed", "error": failure }))
+                .complete_run(
+                    run_id,
+                    meter.attach(json!({ "status": "failed", "error": failure })),
+                )
                 .await?;
             return Ok(());
         }
 
-        // The run's login files go however this function ends, after the
-        // hand-back has read them: the next run of this shared home must not
-        // start on this run's connector.
-        let home = agent_home(spec, &self.data_dir)?;
+        // The run has a home of its own, gone with the run; its login files
+        // go however this function ends, after the hand-back has read them.
+        let home = run_home(&self.data_dir, run_id)?;
         let login = LoginFiles::new(spec, &home);
         let env = agent_env(spec, &checkout, &self.data_dir, &home)?;
+        let host_login = HostLogin::take(
+            spec,
+            &home,
+            &login_cache(spec, &self.data_dir),
+            host_home().as_deref(),
+        );
         let redactor = Redactor::new(spec, &env);
         self.write_skills(spec, &checkout)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
@@ -306,7 +619,11 @@ impl Executor {
         let invocation = adapter::invocation(adapter, &model, &prompt_file, &message)?;
         // The base is resolved once, before the agent starts: from here on the
         // live diff only reads the checkout with git, never with jj.
-        let live_diff = match vcs.resolve(&base) {
+        let resolved = {
+            let _turn = mirror_turn.lock().await;
+            vcs.resolve(&base)
+        };
+        let live_diff = match resolved {
             Ok(commit) => crate::live::LiveDiffSource::new(&checkout, &commit).await,
             Err(error) => {
                 tracing::debug!(run_id, %error, "could not resolve the live diff's base");
@@ -328,11 +645,18 @@ impl Executor {
                 wall_clock,
                 live_diff,
                 &redactor,
+                watch,
             )
             .await;
         self.hand_back(&format!("runs/{run_id}"), spec, &home).await;
+        if let Some(host_login) = &host_login {
+            host_login.keep(&home);
+        }
         drop(login);
         let mut outcome = outcome?;
+        // A stopped run publishes nothing: the server has already ended it,
+        // and the task may have moved on.
+        watch.go_on()?;
 
         // The team is named in the workflow, so the commit carries the agent's
         // own name: `Test Author` becomes `hulahoop-dev-test-author`.
@@ -343,6 +667,7 @@ impl Executor {
             spec["commit_app_slug"].as_str(),
             agent_name,
         );
+        let turn = mirror_turn.lock().await;
         vcs.set_working_copy_author(&checkout, &author_name, &author_email)
             .with_context(|| {
                 format!(
@@ -383,9 +708,13 @@ impl Executor {
             )
             .with_context(|| "describing the commit")?;
         }
+        drop(turn);
         // A head that fails `fmt-check` in CI is a head nobody can merge, so the
         // loop formats the tree before it records the diff.
-        self.format_tree(&checkout, &artifact_dir);
+        self.format_tree(&checkout, &artifact_dir, watch);
+        watch.go_on()?;
+        meter.disk_after(dir_size(&checkout));
+        let turn = mirror_turn.lock().await;
         let (commit_name, commit_email) = vcs.working_copy_author(&checkout).unwrap_or_default();
 
         let diff = vcs.diff_from(&checkout, &base).unwrap_or_default();
@@ -405,6 +734,24 @@ impl Executor {
         // already in the mirror; a pull request job pushes it from there.
         let _ = &published;
 
+        // The checkout stays: the task's next turn reuses it, build outputs and
+        // all, and it goes when the task is merged, closed or cancelled.
+        // Scaffolding and empty commits are litter in everybody's `jj log`: the
+        // merge only measured the diff, and a turn that changed nothing published
+        // nothing, so its working copy has no reason to outlive it. The next turn
+        // brings the stale checkout back with `jj workspace update-stale`. A turn
+        // that left conflicts published nothing either, but its work stays in its
+        // commit for a person to look at. Both go before the run is reported:
+        // the server starts the task's next turn the moment it hears, and that
+        // turn must find the mirror as this one leaves it.
+        if !touched && !commit.is_empty() {
+            let _ = mirror.abandon(&commit);
+        }
+        if let Some(merge) = scaffold.take() {
+            let _ = mirror.abandon(&merge);
+        }
+        drop(turn);
+
         let status = run_status(&outcome);
 
         let artifact_limit_hit = dir_size(&artifact_dir) > hulahoop_core::ARTIFACT_LIMIT_BYTES;
@@ -412,7 +759,7 @@ impl Executor {
         self.client
             .complete_run(
                 run_id,
-                json!({
+                meter.attach(json!({
                     "status": status,
                     "exit_code": outcome.exit_code,
                     "error": outcome.error,
@@ -426,21 +773,9 @@ impl Executor {
                     "commit_name": commit_name,
                     "commit_email": commit_email,
                     "transcript": transcript_tail(&outcome),
-                }),
+                })),
             )
             .await?;
-
-        // The checkout stays: the task's next turn reuses it, build outputs and
-        // all, and it goes when the task is merged, closed or cancelled.
-        // Scaffolding and empty commits are litter in everybody's `jj log`: the
-        // merge only measured the diff, and a turn that changed nothing published
-        // nothing, so its working copy has no reason to outlive it. The next turn
-        // brings the stale checkout back with `jj workspace update-stale`. A turn
-        // that left conflicts published nothing either, but its work stays in its
-        // commit for a person to look at.
-        if !touched && !commit.is_empty() {
-            let _ = mirror.abandon(&commit);
-        }
         Ok(())
     }
 
@@ -454,20 +789,48 @@ impl Executor {
         // mirror first would be work for nothing. Every other job works from an
         // up-to-date mirror, and one that cannot have it fails with the reason.
         let result = match kind.as_str() {
-            "cleanup" => job_cleanup(&self.data_dir, spec),
+            "cleanup" => {
+                // A run still finishing in the checkout (one the server has
+                // just cancelled) keeps it until it is done. Forgetting the
+                // workspace is an operation in the mirror, which a live run of
+                // another task may be changing too.
+                let mirror = spec["repo_path"].as_str().unwrap_or_default().trim();
+                match owned_checkout(
+                    &self.data_dir,
+                    &spec["payload"]["project_id"],
+                    &spec["payload"]["issue_id"],
+                ) {
+                    Ok(checkout) => {
+                        let in_use = checkout_lock(&checkout);
+                        let _in_checkout = in_use.lock().await;
+                        let lock = mirror_lock(Path::new(mirror));
+                        let _turn = lock.lock().await;
+                        job_cleanup(&self.data_dir, spec)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
             "forget_mirror" => job_forget_mirror(&self.data_dir, spec).await,
             _ => match host_repository(spec).await {
                 Ok(repo_path) => match kind.as_str() {
-                    "fetch" => self.job_fetch(&repo_path, spec).await,
+                    "fetch" => {
+                        let lock = mirror_lock(&repo_path);
+                        let _turn = lock.lock().await;
+                        self.job_fetch(&repo_path, spec).await
+                    }
                     "land" => {
                         // Landing moves a bookmark in the mirror, which a fetch
-                        // in the other lane must not interleave with.
+                        // in the other lane or a live run must not interleave with.
                         let lock = mirror_lock(&repo_path);
                         let _turn = lock.lock().await;
                         job_land(&repo_path, spec)
                     }
-                    "preflight" => self.job_preflight(&repo_path, spec).await,
-                    "bookmark" => self.job_bookmark(&repo_path, spec).await,
+                    "preflight" => self.job_preflight(&repo_path, spec, &job_id).await,
+                    "bookmark" => {
+                        let lock = mirror_lock(&repo_path);
+                        let _turn = lock.lock().await;
+                        self.job_bookmark(&repo_path, spec).await
+                    }
                     "open_pr" => self.job_open_pr(&repo_path, spec).await,
                     "review_pr" => job_review_pr(spec).await,
                     "watch_checks" => job_watch_checks(spec).await,
@@ -523,7 +886,7 @@ impl Executor {
         Ok(json!({ "base_revision": revision, "behind": behind, "compared_with": recorded }))
     }
 
-    async fn job_preflight(&self, repo_path: &Path, span: &Value) -> Result<Value> {
+    async fn job_preflight(&self, repo_path: &Path, span: &Value, job_id: &str) -> Result<Value> {
         let payload = &span["payload"];
         let adapter = Adapter::parse(payload["adapter"].as_str().unwrap_or_default())
             .ok_or_else(|| anyhow!("unknown adapter"))?;
@@ -557,8 +920,10 @@ impl Executor {
             cmd.args(&command[1..]);
         }
         // The probe needs a home and a PATH the dev shell agrees with, and
-        // nothing else from the runner.
-        let home = contract::scratch_home(&self.data_dir, adapter);
+        // nothing else from the runner. The home is its own, so seeding it
+        // never clears the home of a run that is going.
+        let id = uuid::Uuid::parse_str(job_id).context("invalid preflight job id")?;
+        let home = self.data_dir.join("home/preflight").join(id.to_string());
         std::fs::create_dir_all(&home)?;
         seed_home(&home);
         let path = if adapter == Adapter::Fake {
@@ -574,6 +939,7 @@ impl Executor {
             .env("XDG_DATA_HOME", &direnv_home)
             .env("NO_COLOR", "1")
             .output();
+        let _ = std::fs::remove_dir_all(&home);
 
         let (ok, detail) = match output {
             Ok(output) => {
@@ -794,6 +1160,9 @@ impl Executor {
         // A rework rewrites the head, so the branch is force-updated rather than
         // rejected; the pull request itself is the same one.
         let existing = pull["number"].as_i64();
+        // The push reads the mirror while live runs of other tasks change it.
+        let lock = mirror_lock(repo_path);
+        let turn = lock.lock().await;
         push_commit(
             repo_path,
             &installation,
@@ -803,6 +1172,7 @@ impl Executor {
             &branch,
             existing.is_some(),
         )?;
+        drop(turn);
 
         // The description says what was asked; the run's own summary says what
         // was done, which is what a reader of the pull request wants first.
@@ -880,13 +1250,19 @@ impl Executor {
 
     /// `just setup` is the only recipe allowed to need the network, and it is
     /// idempotent, so a failure here is a repo problem, not a flake.
-    async fn run_setup(&self, checkout: &Path, artifact_dir: &Path) -> Result<Option<String>> {
+    async fn run_setup(
+        &self,
+        checkout: &Path,
+        artifact_dir: &Path,
+        watch: &RunWatch,
+    ) -> Result<Option<String>> {
         let log = artifact_dir.join("setup.log");
         let outcome = run_command(
             checkout,
             &["direnv", "exec", ".", "just", "setup"],
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             Some(&log),
+            Some(watch),
         )?;
         if outcome.timed_out {
             return Ok(Some(format!(
@@ -905,7 +1281,7 @@ impl Executor {
         Ok(None)
     }
 
-    fn format_tree(&self, checkout: &Path, artifact_dir: &Path) {
+    fn format_tree(&self, checkout: &Path, artifact_dir: &Path, watch: &RunWatch) {
         if std::fs::create_dir_all(artifact_dir).is_err() {
             return;
         }
@@ -914,6 +1290,7 @@ impl Executor {
             &["direnv", "exec", ".", "just", "--summary"],
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             None,
+            Some(watch),
         ) {
             Ok(outcome) => outcome.final_text,
             Err(_) => return,
@@ -927,11 +1304,23 @@ impl Executor {
             &["direnv", "exec", ".", "just", "fmt"],
             hulahoop_core::SETUP_WALL_CLOCK_MINUTES,
             Some(&log),
+            Some(watch),
         );
     }
 
-    /// Hand back a login the harness refreshed, before the next run of this
-    /// home overwrites it. Best effort: a failed hand-back costs a sign-in later,
+    /// One heartbeat for the agent `pid`; a reply that says the server has
+    /// stopped the run stops it here too.
+    async fn beat(&self, run_id: &str, pid: i64, watch: &RunWatch) {
+        if let Ok(Some(status)) = self.client.heartbeat(run_id, Some(pid), Some(pid)).await {
+            if run_is_over(&status) {
+                tracing::info!(run_id, %status, "the server stopped the run");
+                watch.stop();
+            }
+        }
+    }
+
+    /// Hand back a login the harness refreshed, before the home it is in
+    /// goes. Best effort: a failed hand-back costs a sign-in later,
     /// never this run. The login itself is never logged.
     async fn hand_back(&self, owner: &str, spec: &Value, home: &Path) {
         let Some((refresh, entry)) = refreshed_login(spec, home) else {
@@ -962,7 +1351,9 @@ impl Executor {
         wall_clock_minutes: i64,
         live_diff: Option<crate::live::LiveDiffSource>,
         redactor: &Redactor,
+        watch: &RunWatch,
     ) -> Result<Outcome> {
+        let meter = &watch.meter;
         let pid_slot = Arc::new(AtomicI64::new(0));
         let pgid_slot = Arc::new(AtomicI64::new(0));
         let (line_tx, mut line_rx) = mpsc::unbounded_channel::<(String, String)>();
@@ -973,7 +1364,12 @@ impl Executor {
         pgid_slot.store(pid, Ordering::SeqCst);
         tracing::info!(run_id, pid, program = %invocation.program, "agent started");
 
-        let _ = self.client.heartbeat(run_id, Some(pid), Some(pid)).await;
+        // The agent leads its own process group, and everything it starts is in
+        // it: sampling the group on every heartbeat is what the run used. The
+        // group is killed if the server stops the run.
+        watch.enter(pid);
+        meter.sample(pid);
+        self.beat(run_id, pid, watch).await;
 
         let stdout = child
             .stdout
@@ -1062,7 +1458,8 @@ impl Executor {
                     }
                 }
                 _ = tokio::time::sleep(wait) => {
-                    let _ = self.client.heartbeat(run_id, Some(pid), Some(pid)).await;
+                    meter.sample(pid);
+                    self.beat(run_id, pid, watch).await;
                     next_heartbeat = Instant::now() + heartbeat_every;
                 }
             }
@@ -1088,13 +1485,25 @@ impl Executor {
             ));
         }
 
+        // One last sample before the agent is reaped: until then it is still in
+        // the table, with the CPU time of every child it reaped itself.
+        meter.sample(pid);
         // Drain whatever the process wrote between the last read and its exit.
         let status = loop {
-            match child.try_wait()? {
-                Some(status) => break Some(status),
-                None => tokio::time::sleep(Duration::from_millis(100)).await,
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => tokio::time::sleep(Duration::from_millis(100)).await,
+                Err(error) => {
+                    watch.leave();
+                    return Err(error.into());
+                }
             }
         };
+        // The agent's group is gone, and its number free for the system to
+        // hand out again: neither this runner nor a cancel on the server may
+        // signal it from now on.
+        watch.leave();
+        let _ = self.client.heartbeat(run_id, Some(0), Some(0)).await;
         outcome.exit_code = status.and_then(|s| s.code()).map(i64::from);
         if outcome.exit_code != Some(0) && outcome.error.is_none() && !outcome.timed_out {
             let tail: Vec<&str> = outcome
@@ -1232,24 +1641,187 @@ fn agent_env(
     Ok(env)
 }
 
-/// The scratch home an agent run of this spec's adapter uses, created and then
-/// made absolute, so every run of it (and the hand-back after each) names the
-/// same directory even when the data directory sits behind a symlink.
+/// A run's own harness home, `home/runs/<run id>`, empty, created and made
+/// absolute. Runs share the host, so they cannot share a home: one run's
+/// connector login would sign another in, its removal would pull the login
+/// from under another, and seeding a home clears it under any agent using it.
 /// Everything the agent is handed has to be absolute: its working directory is
-/// the checkout, so a relative home resolves to nothing and pi reports a missing
-/// API key instead of a missing directory.
-fn agent_home(spec: &Value, data_dir: &Path) -> Result<PathBuf> {
-    let adapter =
-        Adapter::parse(spec["adapter"].as_str().unwrap_or_default()).unwrap_or(Adapter::Pi);
-    let home = contract::scratch_home(data_dir, adapter);
+/// the checkout, so a relative home resolves to nothing and pi reports a
+/// missing API key instead of a missing directory. The run id must be a uuid,
+/// which also keeps it from naming a path outside `home/runs/`.
+fn run_home(data_dir: &Path, run_id: &str) -> Result<PathBuf> {
+    let id =
+        uuid::Uuid::parse_str(run_id).with_context(|| format!("run id {run_id} is not a uuid"))?;
+    let home = data_dir.join("home/runs").join(id.to_string());
+    // What a killed runner left under this id belongs to no run now.
+    if home.exists() {
+        std::fs::remove_dir_all(&home)
+            .with_context(|| format!("clearing a stale run home at {}", home.display()))?;
+    }
     std::fs::create_dir_all(&home)?;
     Ok(std::fs::canonicalize(&home)?)
 }
 
+/// Deletes a run's home once the run is over, after the hand-back has read
+/// it. Best effort: what is left goes when the runner next starts.
+fn remove_run_home(data_dir: &Path, run_id: &str) {
+    if let Ok(id) = uuid::Uuid::parse_str(run_id) {
+        let _ = std::fs::remove_dir_all(data_dir.join("home/runs").join(id.to_string()));
+    }
+}
+
+/// Removes the homes of runs and probes a killed runner left behind. It runs
+/// before the runner claims anything, so none of them belongs to live work.
+pub fn prune_run_homes(data_dir: &Path) -> usize {
+    let mut pruned = 0;
+    for kind in ["runs", "preflight"] {
+        let Ok(homes) = std::fs::read_dir(data_dir.join("home").join(kind)) else {
+            continue;
+        };
+        for home in homes.flatten() {
+            if std::fs::remove_dir_all(home.path()).is_ok() {
+                pruned += 1;
+            }
+        }
+    }
+    pruned
+}
+
+/// The host's own home, where its logins live.
+fn host_home() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Where host-login runs of this spec's adapter keep a login their harness
+/// refreshed, for the next host-login run: `home/<adapter>`, the home every
+/// run of the adapter shared before runs had homes of their own.
+fn login_cache(spec: &Value, data_dir: &Path) -> PathBuf {
+    let adapter =
+        Adapter::parse(spec["adapter"].as_str().unwrap_or_default()).unwrap_or(Adapter::Pi);
+    contract::scratch_home(data_dir, adapter)
+}
+
+/// Whether the run signs in with a stored connector rather than the host's
+/// own login.
+fn credential_supplied(spec: &Value) -> bool {
+    spec.get("credential").is_some_and(|credential| {
+        credential["env"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+            || credential["files"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty())
+    })
+}
+
+/// Host-login runs that share the login cache take turns at it.
+static LOGIN_CACHE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The host's login as a host-login run started with it, and the cache the
+/// run's refresh goes back to.
+///
+/// A harness that refreshes a subscription's token rewrites its login file,
+/// and the provider may rotate the refresh token away with it, so the host's
+/// own copy can be the stale one. Each run has a home of its own that goes
+/// with the run, so a refresh is kept in the adapter's login cache instead,
+/// and the next host-login run starts on it when it is newer than the host's.
+struct HostLogin {
+    cache: PathBuf,
+    seeded: Vec<(&'static str, Option<String>)>,
+}
+
+impl HostLogin {
+    /// For a run on the host's login, after its home was seeded from the
+    /// host: a newer refresh from the cache replaces the host's file. None for
+    /// a run on a stored connector, whose login is handed back to the server.
+    fn take(spec: &Value, home: &Path, cache: &Path, host: Option<&Path>) -> Option<HostLogin> {
+        if credential_supplied(spec) {
+            return None;
+        }
+        let _turn = LOGIN_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if std::fs::create_dir_all(cache).is_ok() {
+            // The shared home of an older runner may hold a connector's login;
+            // that is no host login to start a run on.
+            if cache.join(CONNECTOR_MARKER).exists() {
+                for relative in LOGIN_FILES {
+                    let _ = remove_home_file(cache, relative);
+                }
+                let _ = std::fs::remove_file(cache.join(CONNECTOR_MARKER));
+            }
+            for relative in LOGIN_FILES {
+                // Without a host login the run has none: a cached one would
+                // outlive the person signing out.
+                let Some(host_time) = host
+                    .and_then(|host| std::fs::metadata(host.join(relative)).ok())
+                    .and_then(|meta| meta.modified().ok())
+                else {
+                    continue;
+                };
+                let cached_time = checked_home_path(cache, relative, false)
+                    .ok()
+                    .flatten()
+                    .and_then(|path| std::fs::symlink_metadata(path).ok())
+                    .filter(|meta| meta.is_file())
+                    .and_then(|meta| meta.modified().ok());
+                if cached_time.is_none_or(|cached| cached <= host_time) {
+                    continue;
+                }
+                if let Ok(contents) = read_home_file(cache, relative) {
+                    if let Err(error) = replace_home_file(home, relative, &contents) {
+                        tracing::warn!(file = relative, %error, "could not start a run on its refreshed login");
+                    }
+                }
+            }
+        }
+        let seeded = LOGIN_FILES
+            .iter()
+            .map(|relative| (*relative, read_home_file(home, relative).ok()))
+            .collect();
+        Some(HostLogin {
+            cache: cache.to_path_buf(),
+            seeded,
+        })
+    }
+
+    /// After the run: a login its harness rewrote goes to the cache, for the
+    /// next host-login run. One it left alone changes nothing, so a run that
+    /// started before another's refresh never puts the older login back.
+    fn keep(&self, home: &Path) {
+        let _turn = LOGIN_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (relative, seeded) in &self.seeded {
+            let Ok(now) = read_home_file(home, relative) else {
+                continue;
+            };
+            if seeded.as_deref() == Some(now.as_str()) {
+                continue;
+            }
+            if let Err(error) = replace_home_file(&self.cache, relative, &now) {
+                tracing::warn!(file = relative, %error, "could not keep a refreshed host login");
+            }
+        }
+    }
+}
+
+/// Writes `contents` as the login file `relative` under `home`, replacing
+/// what is there, through no symlink.
+fn replace_home_file(home: &Path, relative: &str, contents: &str) -> Result<()> {
+    let path = safe_home_path(home, relative)?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    write_private_file(&path, contents)
+}
+
 /// The login files a run's credential writes into its home, removed when this
-/// goes out of scope — after the hand-back, and on every error path too. Agent
-/// homes are shared per adapter, so a file left behind would sign the next run
-/// in as this run's connector.
+/// goes out of scope — after the hand-back, and on every error path too. A
+/// run's home goes with the run, but a Lumi or probe home outlives a failed
+/// removal, and a file left behind there must not sign anything else in.
 struct LoginFiles {
     home: PathBuf,
     files: Vec<String>,
@@ -1332,15 +1904,7 @@ fn apply_credential_from(
     home: &Path,
     host_home: Option<&Path>,
 ) -> Result<()> {
-    let supplied = spec.get("credential").is_some_and(|credential| {
-        credential["env"]
-            .as_array()
-            .is_some_and(|items| !items.is_empty())
-            || credential["files"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty())
-    });
-    if supplied {
+    if credential_supplied(spec) {
         // A chosen connector must not silently fall back to a different host
         // subscription when the CLI sees an old login in this reused home.
         for relative in LOGIN_FILES {
@@ -1596,8 +2160,7 @@ async fn host_repository(spec: &Value) -> Result<PathBuf> {
         if let Some(token) = &token {
             command.envs(git_auth(token));
         }
-        let output = command
-            .output()
+        let output = output_within(&mut command, NETWORK_TIMEOUT)
             .context("running jj git fetch in the mirror")?;
         if !output.status.success() {
             bail!(
@@ -1620,9 +2183,8 @@ async fn host_repository(spec: &Value) -> Result<PathBuf> {
     if let Some(token) = &token {
         command.envs(git_auth(token));
     }
-    let output = command
-        .output()
-        .context("running jj git clone for the mirror");
+    let output =
+        output_within(&mut command, NETWORK_TIMEOUT).context("running jj git clone for the mirror");
     let output = match output {
         Ok(output) => output,
         Err(error) => {
@@ -1652,15 +2214,39 @@ async fn host_repository(spec: &Value) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// The lock that makes clones and fetches of one mirror take turns inside this
-/// runner. jj records every fetch as an operation, and two at once in one
-/// repository leave divergent operations behind.
+/// The lock that makes changes to one mirror take turns inside this runner:
+/// clones, fetches, workspaces, carries, bookmarks, pushes, abandons. jj
+/// records every one as an operation, and two at once in one repository leave
+/// divergent operations behind. One map serves every executor and lane, so
+/// concurrent runs, jobs and Lumi all wait on the same lock per mirror.
 fn mirror_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS
-        .get_or_init(|| Mutex::new(HashMap::new()))
+    static LOCKS: PathLocks<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    path_lock(&LOCKS, path)
+}
+
+/// The lock that gives a task's checkout to one run at a time, and keeps a
+/// cleanup from deleting it under a run. The server allows one live run per
+/// task, but a run it cancelled or declared dead can still be finishing here
+/// when the next one, or the cleanup, comes. Taken before a mirror's lock.
+fn checkout_lock(path: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: PathLocks<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    path_lock(&LOCKS, path)
+}
+
+/// Held shared by every run with a checkout of the mirror, for the whole
+/// run, and alone by forgetting the mirror: its checkouts are workspaces of it.
+fn mirror_use(path: &Path) -> Arc<tokio::sync::RwLock<()>> {
+    static LOCKS: PathLocks<tokio::sync::RwLock<()>> = std::sync::OnceLock::new();
+    path_lock(&LOCKS, path)
+}
+
+type PathLocks<L> =
+    std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<L>>>>;
+
+/// The one lock `locks` keeps for `path`, shared by every executor and lane.
+fn path_lock<L: Default>(locks: &'static PathLocks<L>, path: &Path) -> Arc<L> {
+    let mut locks = locks
+        .get_or_init(Default::default)
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     locks.entry(path.to_path_buf()).or_default().clone()
@@ -1698,21 +2284,6 @@ fn owned_checkout(data_dir: &Path, project: &Value, issue: &Value) -> Result<Pat
         );
     }
     Ok(checkout)
-}
-
-/// Abandons a carried turn's scaffolding merge when the run is over, on every
-/// path out of it.
-struct Scaffold {
-    repo: PathBuf,
-    merge: Option<String>,
-}
-
-impl Drop for Scaffold {
-    fn drop(&mut self) {
-        if let (Some(merge), Ok(repo)) = (self.merge.as_deref(), Vcs::detect(&self.repo)) {
-            let _ = repo.abandon(merge);
-        }
-    }
 }
 
 /// What the agent is told when moving the task onto the newest base conflicted.
@@ -2081,11 +2652,15 @@ fn collect_text(message: &Value) -> Option<String> {
     }
 }
 
+/// Runs `argv` in its own process group until it exits or its time is up.
+/// For a run (`watch`), the group is the run's while it lasts: sampled into
+/// the run's measures, and killed when the server stops the run.
 fn run_command(
     cwd: &Path,
     argv: &[&str],
     timeout_minutes: i64,
     log: Option<&Path>,
+    watch: Option<&RunWatch>,
 ) -> Result<Outcome> {
     let mut command = std::process::Command::new(argv[0]);
     command
@@ -2103,6 +2678,10 @@ fn run_command(
         .spawn()
         .with_context(|| format!("running {argv:?}"))?;
     let pid = child.id() as i64;
+    if let Some(watch) = watch {
+        watch.enter(pid);
+        watch.meter.sample(pid);
+    }
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -2141,19 +2720,34 @@ fn run_command(
     });
 
     let deadline = Instant::now() + Duration::from_secs((timeout_minutes as u64) * 60);
+    let sample_every = Duration::from_secs(hulahoop_core::HEARTBEAT_INTERVAL_SECS as u64);
+    let mut next_sample = Instant::now() + sample_every;
     let mut timed_out = false;
     let exit = loop {
-        match child.try_wait()? {
-            Some(status) => break Some(status),
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
                 if Instant::now() > deadline {
                     timed_out = true;
                     kill_group(pid);
                 }
+                if let Some(watch) = watch.filter(|_| Instant::now() >= next_sample) {
+                    watch.meter.sample(pid);
+                    next_sample = Instant::now() + sample_every;
+                }
                 std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(error) => {
+                if let Some(watch) = watch {
+                    watch.leave();
+                }
+                return Err(error.into());
             }
         }
     };
+    if let Some(watch) = watch {
+        watch.leave();
+    }
     let output = writer.join().unwrap_or_default();
     Ok(Outcome {
         exit_code: exit.and_then(|status| status.code()).map(i64::from),
@@ -2171,6 +2765,12 @@ fn run_command(
     })
 }
 
+/// [`kill_group`] on a thread of its own, for a caller that must not wait the
+/// two seconds it gives the group to stop.
+fn kill_group_apart(pgid: i64) {
+    std::thread::spawn(move || kill_group(pgid));
+}
+
 fn kill_group(pgid: i64) {
     #[cfg(unix)]
     {
@@ -2184,24 +2784,6 @@ fn kill_group(pgid: i64) {
     {
         let _ = pgid;
     }
-}
-
-fn dir_size(path: &Path) -> u64 {
-    let mut total = 0;
-    let Ok(entries) = std::fs::read_dir(path) else {
-        return 0;
-    };
-    for entry in entries.flatten() {
-        let Ok(metadata) = entry.metadata() else {
-            continue;
-        };
-        if metadata.is_dir() {
-            total += dir_size(&entry.path());
-        } else {
-            total += metadata.len();
-        }
-    }
-    total
 }
 
 /// Unused import guard: `Kind` is matched in `vcs`, but the runner also needs to
@@ -2309,16 +2891,18 @@ fn push_commit(
     } else {
         format!("{head}:refs/heads/{branch}")
     };
-    let output = Command::new("git")
-        .args([
-            "push",
-            &format!("https://github.com/{owner}/{repo}.git"),
-            &refspec,
-        ])
-        .current_dir(repo_path)
-        .envs(git_auth(token))
-        .output()
-        .context("running git push")?;
+    let output = output_within(
+        Command::new("git")
+            .args([
+                "push",
+                &format!("https://github.com/{owner}/{repo}.git"),
+                &refspec,
+            ])
+            .current_dir(repo_path)
+            .envs(git_auth(token)),
+        NETWORK_TIMEOUT,
+    )
+    .context("running git push")?;
     if !output.status.success() {
         bail!(
             "git could not push {branch}: {}",
@@ -2790,6 +3374,9 @@ async fn job_forget_mirror(data_dir: &Path, spec: &Value) -> Result<Value> {
             mirror.display()
         );
     }
+    // Every run with a checkout of the mirror finishes first.
+    let in_use = mirror_use(&mirror);
+    let _alone = in_use.write().await;
     let lock = mirror_lock(&mirror);
     let _turn = lock.lock().await;
     match std::fs::symlink_metadata(&mirror) {
@@ -2827,7 +3414,7 @@ fn job_land(repo_path: &Path, spec: &Value) -> Result<Value> {
     if let Some(token) = spec["clone_token"].as_str() {
         command.envs(git_auth(token));
     }
-    let output = command.output().context("running jj git push")?;
+    let output = output_within(&mut command, NETWORK_TIMEOUT).context("running jj git push")?;
     if !output.status.success() {
         bail!(
             "pushing {base} to the repository's remote failed: {}",
@@ -2877,7 +3464,8 @@ fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
 mod lumi_auth_tests {
     use super::{
         apply_credential, apply_credential_from, lumi_failure_category, read_home_file,
-        refresh_login, refreshed_login, remove_home_file, seed_home_from, LoginFiles,
+        refresh_login, refreshed_login, remove_home_file, seed_home_from, HostLogin, LoginFiles,
+        CONNECTOR_MARKER,
     };
     use serde_json::json;
 
@@ -2955,6 +3543,92 @@ mod lumi_auth_tests {
             std::fs::read_to_string(home.join(".pi/agent/auth.json")).unwrap(),
             "refreshed-in-a-run"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Runs have homes of their own that go with them, so a host-login run's
+    /// refresh is kept in the adapter's cache: the next host-login run starts
+    /// on it while it is newer than the host's file, a run that left its login
+    /// alone never puts an older one back, and a connector's login never gets
+    /// there.
+    #[test]
+    fn a_host_login_refresh_outlives_the_run_home() {
+        let root = temp("host-cache");
+        let (host, cache) = (root.join("host"), root.join("cache"));
+        let home = |name: &str| {
+            let home = root.join(name);
+            std::fs::create_dir_all(home.join(".pi/agent")).unwrap();
+            home
+        };
+        let set_time = |path: &std::path::Path, seconds: u64| {
+            let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
+                .unwrap();
+        };
+        let auth = ".pi/agent/auth.json";
+        std::fs::create_dir_all(host.join(".pi/agent")).unwrap();
+        std::fs::write(host.join(auth), "host-login").unwrap();
+        set_time(&host.join(auth), 1_000);
+        let host_login = json!({ "credential": { "env": [], "files": [] }});
+
+        // The first run starts on the host's file and its harness refreshes it.
+        let first = home("first");
+        std::fs::write(first.join(auth), "host-login").unwrap();
+        let kept = HostLogin::take(&host_login, &first, &cache, Some(&host)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(first.join(auth)).unwrap(),
+            "host-login"
+        );
+        std::fs::write(first.join(auth), "refreshed").unwrap();
+        kept.keep(&first);
+        assert_eq!(
+            std::fs::read_to_string(cache.join(auth)).unwrap(),
+            "refreshed"
+        );
+        set_time(&cache.join(auth), 2_000);
+
+        // The next run starts on the refresh; leaving it alone keeps it.
+        let second = home("second");
+        std::fs::write(second.join(auth), "host-login").unwrap();
+        let kept = HostLogin::take(&host_login, &second, &cache, Some(&host)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(second.join(auth)).unwrap(),
+            "refreshed"
+        );
+        kept.keep(&second);
+        assert_eq!(
+            std::fs::read_to_string(cache.join(auth)).unwrap(),
+            "refreshed"
+        );
+
+        // A person signing in again on the host makes the host's file newer.
+        std::fs::write(host.join(auth), "signed-in-again").unwrap();
+        set_time(&host.join(auth), 3_000);
+        let third = home("third");
+        std::fs::write(third.join(auth), "signed-in-again").unwrap();
+        HostLogin::take(&host_login, &third, &cache, Some(&host)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(third.join(auth)).unwrap(),
+            "signed-in-again"
+        );
+
+        // A connector run has nothing to do with the cache.
+        let connector = json!({ "credential": { "env": [], "files": [[auth, "connector"]] }});
+        assert!(HostLogin::take(&connector, &home("fourth"), &cache, Some(&host)).is_none());
+
+        // The shared home of an older runner holding a connector's login is
+        // no host login to start on.
+        std::fs::write(cache.join(CONNECTOR_MARKER), "").unwrap();
+        std::fs::write(cache.join(auth), "old-connector").unwrap();
+        set_time(&cache.join(auth), 9_000);
+        let fifth = home("fifth");
+        std::fs::write(fifth.join(auth), "signed-in-again").unwrap();
+        HostLogin::take(&host_login, &fifth, &cache, Some(&host)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(fifth.join(auth)).unwrap(),
+            "signed-in-again"
+        );
+        assert!(!cache.join(auth).exists() && !cache.join(CONNECTOR_MARKER).exists());
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3222,6 +3896,570 @@ mod lumi_auth_tests {
     }
 }
 
+/// The fake adapter's script is named by a process-wide variable, so tests that
+/// set it take turns.
+#[cfg(test)]
+static FAKE_SCRIPT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// The process-wide variables a test points the runner at (the fake agent, a
+/// PATH with stand-ins), set while this is held and put back as they were when
+/// it is dropped, so no test leaves them behind for another.
+#[cfg(test)]
+struct TestEnv {
+    _turn: tokio::sync::MutexGuard<'static, ()>,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl TestEnv {
+    async fn new() -> TestEnv {
+        TestEnv {
+            _turn: FAKE_SCRIPT.lock().await,
+            previous: Vec::new(),
+        }
+    }
+
+    fn set(&mut self, name: &'static str, value: impl AsRef<std::ffi::OsStr>) {
+        if !self.previous.iter().any(|(kept, _)| *kept == name) {
+            self.previous.push((name, std::env::var_os(name)));
+        }
+        std::env::set_var(name, value);
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnv {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod concurrent_runs_tests {
+    use super::{checkout_lock, mirror_lock, Executor, LiveRun, TestEnv};
+    use crate::client::{Client, Connection};
+    use serde_json::{json, Value};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    type Seen = Arc<Mutex<Vec<(String, Value)>>>;
+
+    /// A server that answers each POST with what `answer` makes of it (no body
+    /// for `null`) and keeps what it was sent.
+    async fn fake_server(answer: impl Fn(&str) -> Value + Send + Sync + 'static) -> (String, Seen) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen: Seen = Arc::default();
+        let kept = seen.clone();
+        let answer = Arc::new(answer);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let (kept, answer) = (kept.clone(), answer.clone());
+                tokio::spawn(async move {
+                    let mut buffer = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    let (head, body) = loop {
+                        let size = socket.read(&mut chunk).await.unwrap_or(0);
+                        if size == 0 {
+                            return;
+                        }
+                        buffer.extend_from_slice(&chunk[..size]);
+                        let text = String::from_utf8_lossy(&buffer).to_string();
+                        let Some(end) = text.find("\r\n\r\n") else {
+                            continue;
+                        };
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buffer.len() >= end + 4 + length {
+                            break (
+                                text[..end].to_string(),
+                                String::from_utf8_lossy(&buffer[end + 4..end + 4 + length])
+                                    .to_string(),
+                            );
+                        }
+                    };
+                    let path = head
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or_default()
+                        .to_string();
+                    let reply = answer(&path);
+                    kept.lock()
+                        .unwrap()
+                        .push((path, serde_json::from_str(&body).unwrap_or(Value::Null)));
+                    let text = if reply.is_null() {
+                        String::new()
+                    } else {
+                        reply.to_string()
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+                        text.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (base, seen)
+    }
+
+    /// A repo-less run of the fake adapter, as a claim hands it out.
+    fn envelope(root: &Path, run_id: &str) -> Value {
+        json!({
+            "run": { "id": run_id },
+            "spec": {
+                "checkout": "none",
+                "adapter": "fake",
+                "model": "fake",
+                "prompt": "",
+                "run_id": run_id,
+                "timeout_minutes": 1,
+                "artifact_dir": root.join("runs").join(run_id),
+                "input_path": root.join("input.json"),
+            },
+            "need": { "memoryBytes": 1_000_000, "diskBytes": 1_000_000, "cpuCores": 0.5 },
+        })
+    }
+
+    /// A fresh, canonical directory for one test.
+    fn temp_root(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("hulahoop-{tag}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        root.canonicalize().unwrap()
+    }
+
+    fn executable(path: &Path, text: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Hands out `envelopes` to claims, one each, then nothing; `heartbeat`
+    /// is the answer to every heartbeat.
+    async fn serve(envelopes: Vec<Value>, heartbeat: Value) -> (String, Seen) {
+        let queue = Arc::new(Mutex::new(envelopes.into_iter()));
+        fake_server(move |path| match path {
+            "/internal/runs/claim" => queue.lock().unwrap().next().unwrap_or(Value::Null),
+            "/internal/jobs/claim" => Value::Null,
+            path if path.ends_with("/heartbeat") => heartbeat.clone(),
+            _ => json!({}),
+        })
+        .await
+    }
+
+    async fn until_finished(live: &[LiveRun], seconds: u64) {
+        for _ in 0..seconds * 10 {
+            if live.iter().all(LiveRun::is_finished) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn posted_to(seen: &Seen, path: &str) -> Vec<Value> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter(|(to, _)| to == path)
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+
+    /// Two runs claimed one after the other execute at the same time: each
+    /// one's agent waits until the other's has started, and both finish and
+    /// report what they used. Each has a home of its own while it runs, so
+    /// one run's connector login never reaches the other, and the homes go
+    /// with the runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_runs_execute_side_by_side() {
+        let mut test_env = TestEnv::new().await;
+        let root = temp_root("side-by-side");
+        let marks = root.join("started");
+        let homes = root.join("homes");
+        std::fs::create_dir_all(&marks).unwrap();
+        std::fs::create_dir_all(&homes).unwrap();
+        let script = root.join("fake-agent.sh");
+        executable(
+            &script,
+            &format!(
+                "#!/bin/sh\ntouch '{marks}'/\"$HULAHOOP_RUN_ID\"\necho \"$HOME\" > '{homes}'/\"$HULAHOOP_RUN_ID\"\nif grep -q connector-A \"$HOME/.pi/agent/auth.json\" 2>/dev/null; then echo yes; else echo no; fi > '{homes}'/\"$HULAHOOP_RUN_ID\".login\ni=0\nwhile [ \"$(ls '{marks}' | wc -l)\" -lt 2 ]; do\n  i=$((i+1)); [ $i -gt 200 ] && exit 7\n  sleep 0.1\ndone\necho 'both runs are going'\n",
+                marks = marks.display(),
+                homes = homes.display(),
+            ),
+        );
+        test_env.set("HULAHOOP_FAKE_SCRIPT", &script);
+
+        let runs = [
+            uuid::Uuid::now_v7().to_string(),
+            uuid::Uuid::now_v7().to_string(),
+        ];
+        let mut first = envelope(&root, &runs[0]);
+        first["spec"]["credential"] = json!({
+            "env": [],
+            "files": [[".pi/agent/auth.json", "{\"connector-A\":{\"type\":\"api_key\",\"key\":\"k\"}}"]],
+        });
+        let (base, seen) = serve(vec![first, envelope(&root, &runs[1])], json!({})).await;
+        let client = Client::new(&Connection::remote(&base, "token", root.clone())).unwrap();
+        let executor = Executor::new(client, root.clone());
+
+        let mut live: Vec<LiveRun> = Vec::new();
+        assert!(executor.tick("runner", &mut live, 4).await.unwrap());
+        assert!(executor.tick("runner", &mut live, 4).await.unwrap());
+        assert_eq!(live.len(), 2, "the loop went on while the first run ran");
+        until_finished(&live, 30).await;
+        assert!(live.iter().all(LiveRun::is_finished));
+
+        let claims = posted_to(&seen, "/internal/runs/claim");
+        assert!(claims[0]["capacity"].is_object(), "{}", claims[0]);
+        assert_eq!(claims[0]["capacity"]["running"], 0);
+        assert_eq!(claims[1]["capacity"]["running"], 1);
+        assert_eq!(claims[1]["capacity"]["maxRuns"], 4);
+        assert!(claims[1]["capacity"]["pressure"].is_boolean());
+        for run in &runs {
+            let body = posted_to(&seen, &format!("/internal/runs/{run}/complete"));
+            let body = body.first().expect("the run completed");
+            assert_eq!(body["status"], "succeeded", "{body}");
+            assert!(body["peakMemoryBytes"].is_u64(), "{body}");
+            assert!(body["diskGrowthBytes"].is_u64(), "{body}");
+        }
+
+        let home =
+            |run: &str| PathBuf::from(std::fs::read_to_string(homes.join(run)).unwrap().trim());
+        let login = |run: &str| {
+            std::fs::read_to_string(homes.join(format!("{run}.login")))
+                .unwrap()
+                .trim()
+                .to_string()
+        };
+        assert_ne!(home(&runs[0]), home(&runs[1]), "each run has its own home");
+        for run in &runs {
+            assert_eq!(home(run), root.join("home/runs").join(run));
+            assert!(!home(run).exists(), "a run's home goes with the run");
+        }
+        assert_eq!(login(&runs[0]), "yes", "the connector run has its login");
+        assert_eq!(login(&runs[1]), "no", "the other run never sees it");
+        let cached =
+            std::fs::read_to_string(root.join("home/fake/.pi/agent/auth.json")).unwrap_or_default();
+        assert!(
+            !cached.contains("connector-A"),
+            "a connector login is never cached"
+        );
+        drop(test_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// With every slot taken the runner claims nothing, whatever the room:
+    /// a server that ignored the room it was told would otherwise hand out
+    /// more runs than the runner may hold. It still says how the host is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_runner_claims_nothing_and_reports_its_room() {
+        let mut test_env = TestEnv::new().await;
+        let root = temp_root("full");
+        let release = root.join("release");
+        let script = root.join("fake-agent.sh");
+        executable(
+            &script,
+            &format!(
+                "#!/bin/sh\ni=0\nwhile [ ! -e '{release}' ]; do\n  i=$((i+1)); [ $i -gt 300 ] && exit 7\n  sleep 0.1\ndone\n",
+                release = release.display()
+            ),
+        );
+        test_env.set("HULAHOOP_FAKE_SCRIPT", &script);
+        let run = uuid::Uuid::now_v7().to_string();
+        let spare = uuid::Uuid::now_v7().to_string();
+        let (base, seen) = serve(
+            vec![envelope(&root, &run), envelope(&root, &spare)],
+            json!({}),
+        )
+        .await;
+        let client = Client::new(&Connection::remote(&base, "token", root.clone())).unwrap();
+        let executor = Executor::new(client, root.clone());
+
+        let mut live: Vec<LiveRun> = Vec::new();
+        assert!(executor.tick("runner", &mut live, 1).await.unwrap());
+        assert!(!executor.tick("runner", &mut live, 1).await.unwrap());
+        assert_eq!(live.len(), 1);
+        assert_eq!(posted_to(&seen, "/internal/runs/claim").len(), 1);
+        let reports = posted_to(&seen, "/internal/runner/capacity");
+        assert_eq!(reports.len(), 1, "the host is still reported");
+        assert_eq!(reports[0]["capacity"]["running"], 1);
+        assert_eq!(reports[0]["capacity"]["maxRuns"], 1);
+
+        std::fs::write(&release, "").unwrap();
+        until_finished(&live, 30).await;
+        assert!(live.iter().all(LiveRun::is_finished));
+        drop(test_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A run the server has cancelled (or declared dead) stops on the runner
+    /// too: the heartbeat's reply says so, the agent's group is killed, and
+    /// the run is not reported again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_run_the_server_stopped_stops_here_too() {
+        let mut test_env = TestEnv::new().await;
+        let root = temp_root("stopped");
+        let script = root.join("fake-agent.sh");
+        executable(&script, "#!/bin/sh\nsleep 60\necho 'never stopped'\n");
+        test_env.set("HULAHOOP_FAKE_SCRIPT", &script);
+        let run = uuid::Uuid::now_v7().to_string();
+        let (base, seen) = serve(
+            vec![envelope(&root, &run)],
+            json!({ "ok": true, "status": "cancelled" }),
+        )
+        .await;
+        let client = Client::new(&Connection::remote(&base, "token", root.clone())).unwrap();
+        let executor = Executor::new(client, root.clone());
+
+        let started = std::time::Instant::now();
+        let mut live: Vec<LiveRun> = Vec::new();
+        assert!(executor.tick("runner", &mut live, 4).await.unwrap());
+        until_finished(&live, 30).await;
+        assert!(live.iter().all(LiveRun::is_finished));
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the agent was stopped, not waited for"
+        );
+        assert!(
+            posted_to(&seen, &format!("/internal/runs/{run}/complete")).is_empty(),
+            "the server already ended the run"
+        );
+        assert!(!root.join("home/runs").join(&run).exists());
+        drop(test_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A cleanup waits for a run still in the task's checkout, and deletes it
+    /// once that run is done.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_cleanup_waits_for_the_run_in_its_checkout() {
+        let root = temp_root("cleanup-waits");
+        let (project, issue) = (uuid::Uuid::now_v7(), uuid::Uuid::now_v7());
+        let checkout = root
+            .join("checkouts")
+            .join(project.to_string())
+            .join(issue.to_string());
+        std::fs::create_dir_all(&checkout).unwrap();
+        let (base, seen) = serve(Vec::new(), json!({})).await;
+        let client = Client::new(&Connection::remote(&base, "token", root.clone())).unwrap();
+        let executor = Executor::new(client, root.clone());
+        let job = uuid::Uuid::now_v7();
+        let cleanup = json!({
+            "job": { "id": job },
+            "spec": {
+                "kind": "cleanup",
+                "repo_path": root.join("mirrors/none"),
+                "payload": { "project_id": project, "issue_id": issue },
+            },
+        });
+
+        let in_use = checkout_lock(&checkout);
+        let run = in_use.lock().await;
+        let waiting = tokio::spawn(async move { executor.run_job_apart(cleanup).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the cleanup waits for the run");
+        assert!(checkout.exists());
+        drop(run);
+        tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the cleanup goes once the run is done")
+            .unwrap()
+            .unwrap();
+        assert!(!checkout.exists());
+        assert_eq!(
+            posted_to(&seen, &format!("/internal/jobs/{job}/complete")).len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn sh(cwd: &Path, program: &str, args: &[&str]) -> String {
+        let output = std::process::Command::new(program)
+            .args(args)
+            .current_dir(cwd)
+            .env("JJ_USER", "t")
+            .env("JJ_EMAIL", "t@example.test")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{program} {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// A turn tidies the mirror before it reports: the server starts the
+    /// task's next turn the moment it hears, and that turn must not race the
+    /// abandon of this one's empty commit. `direnv` and `just` are stand-ins
+    /// here, so the turn needs no dev shell.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_tidies_the_mirror_before_it_reports() {
+        let mut test_env = TestEnv::new().await;
+        let root = temp_root("tidy");
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        executable(
+            &bin.join("direnv"),
+            "#!/bin/sh\ncase \"$1\" in\n  exec) shift 2; exec \"$@\" ;;\n  *) exit 0 ;;\nesac\n",
+        );
+        executable(&bin.join("just"), "#!/bin/sh\nexit 0\n");
+        let path = std::env::var("PATH").unwrap_or_default();
+        test_env.set("PATH", format!("{}:{path}", bin.display()));
+        let script = root.join("fake-agent.sh");
+        executable(&script, "#!/bin/sh\necho 'read it, changed nothing'\n");
+        test_env.set("HULAHOOP_FAKE_SCRIPT", &script);
+
+        let origin = root.join("origin");
+        std::fs::create_dir_all(&origin).unwrap();
+        sh(&origin, "git", &["init", "-q", "-b", "main"]);
+        std::fs::write(origin.join("a.txt"), "one\n").unwrap();
+        std::fs::write(origin.join(".envrc"), "use flake\n").unwrap();
+        std::fs::write(origin.join(".gitignore"), ".hulahoop/\n").unwrap();
+        sh(&origin, "git", &["add", "-A"]);
+        sh(
+            &origin,
+            "git",
+            &[
+                "-c",
+                "user.email=t@example.test",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "one",
+            ],
+        );
+
+        let data = root.join("data");
+        let mirror = data.join("mirrors").join(uuid::Uuid::now_v7().to_string());
+        let run = uuid::Uuid::now_v7().to_string();
+        let envelope = json!({
+            "run": { "id": run },
+            "spec": {
+                "adapter": "fake",
+                "model": "fake",
+                "prompt": "",
+                "run_id": run,
+                "agent_name": "Developer",
+                "timeout_minutes": 1,
+                "artifact_dir": data.join("runs").join(&run),
+                "input_path": data.join("input.json"),
+                "repo_path": mirror,
+                "clone_url": origin,
+                "checkout_project_id": uuid::Uuid::now_v7(),
+                "issue_id": uuid::Uuid::now_v7(),
+                "base_bookmark": "main",
+                "attempt": 1,
+                "issue": { "title": "Tidy" },
+            },
+            "need": { "memoryBytes": 1_000_000, "diskBytes": 1_000_000, "cpuCores": 0.5 },
+        });
+        // What the mirror's last operation was when the run reported.
+        let at_report: Arc<Mutex<Option<String>>> = Arc::default();
+        let (kept, watched, queue) = (
+            at_report.clone(),
+            mirror.clone(),
+            Arc::new(Mutex::new(vec![envelope].into_iter())),
+        );
+        let (base, seen) = fake_server(move |path| match path {
+            "/internal/runs/claim" => queue.lock().unwrap().next().unwrap_or(Value::Null),
+            "/internal/jobs/claim" => Value::Null,
+            path if path.ends_with("/complete") => {
+                let output = std::process::Command::new("jj")
+                    .args([
+                        "--ignore-working-copy",
+                        "op",
+                        "log",
+                        "--no-graph",
+                        "-n",
+                        "1",
+                        "-T",
+                        "description",
+                    ])
+                    .current_dir(&watched)
+                    .output()
+                    .unwrap();
+                *kept.lock().unwrap() = Some(String::from_utf8_lossy(&output.stdout).to_string());
+                json!({})
+            }
+            _ => json!({}),
+        })
+        .await;
+        std::fs::create_dir_all(&data).unwrap();
+        let client = Client::new(&Connection::remote(&base, "token", data.clone())).unwrap();
+        let executor = Executor::new(client, data.clone());
+
+        let mut live: Vec<LiveRun> = Vec::new();
+        assert!(executor.tick("runner", &mut live, 4).await.unwrap());
+        until_finished(&live, 60).await;
+        assert!(live.iter().all(LiveRun::is_finished));
+        let body = posted_to(&seen, &format!("/internal/runs/{run}/complete"));
+        let body = body.first().expect("the run completed");
+        assert_eq!(body["status"], "succeeded", "{body}");
+        assert!(
+            body["commit"].is_null(),
+            "an untouched turn publishes nothing"
+        );
+        let last = at_report.lock().unwrap().clone().unwrap_or_default();
+        assert!(
+            last.starts_with("abandon commit"),
+            "the empty commit went before the report, not after: {last:?}"
+        );
+        drop(test_env);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// One lock per mirror, shared by every run and job: the same mirror gets
+    /// the same lock, another mirror its own.
+    #[tokio::test]
+    async fn runs_on_one_mirror_take_turns_and_other_mirrors_do_not_wait() {
+        let one = PathBuf::from("/data/mirrors/one");
+        let other = PathBuf::from("/data/mirrors/other");
+        assert!(Arc::ptr_eq(&mirror_lock(&one), &mirror_lock(&one)));
+        assert!(!Arc::ptr_eq(&mirror_lock(&one), &mirror_lock(&other)));
+        assert!(
+            !Arc::ptr_eq(&checkout_lock(&one), &mirror_lock(&one)),
+            "a checkout's lock is its own"
+        );
+
+        let held = mirror_lock(&one);
+        let turn = held.lock().await;
+        assert!(
+            mirror_lock(&one).try_lock().is_err(),
+            "the same mirror waits"
+        );
+        assert!(
+            mirror_lock(&other).try_lock().is_ok(),
+            "another mirror does not"
+        );
+        let waiting = tokio::spawn(async move {
+            let lock = mirror_lock(&one);
+            let _turn = lock.lock().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        drop(turn);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the next one gets its turn")
+            .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod hand_back_tests {
     use super::Executor;
@@ -3290,6 +4528,7 @@ mod hand_back_tests {
     /// its reply never carries the token it was given.
     #[tokio::test]
     async fn a_refreshed_lumi_login_is_handed_back_before_it_is_removed() {
+        let mut test_env = super::TestEnv::new().await;
         let root = std::env::temp_dir().join(format!("hulahoop-handback-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let root = root.canonicalize().unwrap();
@@ -3309,7 +4548,7 @@ exit 0
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        std::env::set_var("HULAHOOP_FAKE_SCRIPT", &script);
+        test_env.set("HULAHOOP_FAKE_SCRIPT", &script);
         let (base, seen) = fake_server().await;
         let client = Client::new(&Connection::remote(&base, "token", root.clone())).unwrap();
         let executor = Executor::new(client, root.clone());

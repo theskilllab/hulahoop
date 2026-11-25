@@ -63,6 +63,13 @@ export interface Run {
   /** What the run signed in with: a connector name such as `Claude subscription`,
    *  or `host login`. Null for runs from before it was recorded. */
   credentialSource?: string | null;
+  /** Why a queued run has not started yet: `Waiting for memory: needs ~2.4 GB,
+   *  1.1 GB free`. Null once it runs. */
+  waitReason?: string | null;
+  /** What the run used of the host, as the runner measured it. */
+  peakMemoryBytes?: number | null;
+  cpuCores?: number | null;
+  diskGrowthBytes?: number | null;
 }
 
 /** One normalized line of a run's transcript. */
@@ -176,7 +183,7 @@ export type IssueSummary = Omit<
   Issue,
   "body" | "turnRemaining" | "turnsUsed" | "runsSinceCap" | "runLimit" | "runs" | "reviews" | "comments" | "currentRun" | "files" | "stats"
 > & {
-  currentRun: Pick<Run, "id" | "agentId" | "status"> | null;
+  currentRun: Pick<Run, "id" | "agentId" | "status" | "waitReason"> | null;
 };
 
 export interface Repo {
@@ -499,7 +506,7 @@ export async function gql<T>(query: string, variables?: Record<string, unknown>)
   }
 }
 
-const RUN_FIELDS = `id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt credentialSource`;
+const RUN_FIELDS = `id agentId status attempt adapter flags headBookmark headRevision diffSha commitName commitEmail prUrl prNumber error tokensIn tokensOut startedAt finishedAt credentialSource waitReason peakMemoryBytes cpuCores diskGrowthBytes`;
 
 /** The light shape every list of tasks asks for, every few seconds: no body,
  *  no turn queue, no nested runs or comments. */
@@ -509,7 +516,7 @@ export const ISSUE_SUMMARY_FIELDS = `
   blockedBy projectName prUrl prNumber fileCount
   assignee { type id name }
   moves
-  currentRun { id agentId status }
+  currentRun { id agentId status waitReason }
 `;
 
 /** Everything the task panel shows, fetched for the one task that is open. */
@@ -526,6 +533,30 @@ export const ISSUE_DETAIL_FIELDS = `
   turnRemaining turnsUsed runsSinceCap runLimit moves
   currentRun { ${RUN_FIELDS} }
 `;
+
+/** How many runs share the host and the room the runner last reported. */
+export interface RunnerCapacity {
+  running: number;
+  waiting: number;
+  freeMemoryBytes: number;
+  freeDiskBytes: number;
+  freeCpuCores: number;
+  maxRuns: number | null;
+  reportedAt: string;
+}
+
+/** Null when no runner has reported in the last thirty seconds. */
+export async function loadRunnerCapacity(): Promise<RunnerCapacity | null> {
+  const data = await gql<{ runnerCapacity: RunnerCapacity | null }>(
+    `query { runnerCapacity { running waiting freeMemoryBytes freeDiskBytes freeCpuCores maxRuns reportedAt } }`,
+  );
+  return data.runnerCapacity;
+}
+
+/** Bytes the way the board writes them: decimal gigabytes, one decimal. */
+export function fmtGb(bytes: number): string {
+  return `${(bytes / 1e9).toFixed(1)} GB`;
+}
 
 /** The workspace's tasks. Done and cancelled ones stay on the server unless asked for. */
 export async function loadBoard(workspaceId: string, includeDone = false): Promise<IssueSummary[]> {

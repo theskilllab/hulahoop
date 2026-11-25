@@ -70,6 +70,7 @@ async fn clone_token(engine: &Engine, repo: &Repo) -> Option<String> {
 pub fn router(state: Arc<ApiState>) -> Router {
     Router::new()
         .route("/internal/runs/claim", post(claim_run))
+        .route("/internal/runner/capacity", post(report_capacity))
         .route("/internal/runs/{id}/spec", axum::routing::get(get_spec))
         .route("/internal/runs/{id}/heartbeat", post(heartbeat))
         .route("/internal/runs/{id}/events", post(append_event))
@@ -140,12 +141,40 @@ fn fail(status: StatusCode, message: impl std::fmt::Display) -> (StatusCode, Jso
 struct ClaimRequest {
     #[serde(default)]
     runner_id: Option<String>,
+    /// The room the runner has for another run. A runner that sends none
+    /// takes the oldest queued run, as before runs shared the host.
+    #[serde(default)]
+    capacity: Option<crate::capacity::Capacity>,
 }
 
 #[derive(Serialize)]
 struct RunEnvelope {
     run: Run,
     spec: Value,
+    /// What the run is expected to take, so the runner keeps that much room
+    /// for it while it runs.
+    need: crate::capacity::Need,
+}
+
+#[derive(Deserialize)]
+struct CapacityReport {
+    capacity: crate::capacity::Capacity,
+}
+
+/// The room a runner has while it takes nothing: every slot is taken, so it
+/// does not claim, but the Tasks page and the waiting runs still hear from it.
+async fn report_capacity(
+    State(state): State<Arc<ApiState>>,
+    headers: HeaderMap,
+    Json(body): Json<CapacityReport>,
+) -> ApiResult<Value> {
+    authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
+    state
+        .engine
+        .report_capacity(&body.capacity)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    Ok(Json(json!({ "ok": true })))
 }
 #[derive(Serialize)]
 struct JobEnvelope {
@@ -164,16 +193,16 @@ async fn claim_run(
         .unwrap_or_else(|| state.runner_id_default.clone());
     let run = state
         .engine
-        .claim_run(&runner_id)
+        .claim_run(&runner_id, body.capacity)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    let Some(run) = run else {
+    let Some((run, need)) = run else {
         return Ok(Json(None));
     };
     let spec = build_run_spec(&state.engine, &run)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(Some(RunEnvelope { run, spec })))
+    Ok(Json(Some(RunEnvelope { run, spec, need })))
 }
 
 async fn get_spec(
@@ -209,12 +238,14 @@ async fn heartbeat(
     Json(body): Json<HeartbeatRequest>,
 ) -> ApiResult<Value> {
     authorize(&state, &headers).map_err(|s| fail(s, "bad token"))?;
-    state
+    // The run's status goes back, so a runner stops a run the server has
+    // cancelled or declared dead instead of working on in its checkout.
+    let status = state
         .engine
         .heartbeat(id, body.pid, body.pgid)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
-    Ok(Json(json!({ "ok": true })))
+    Ok(Json(json!({ "ok": true, "status": status })))
 }
 
 #[derive(Deserialize)]

@@ -1,9 +1,10 @@
 import { useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { addComment, gql, type Agent, type Comment, type Issue, type IssueStats, type Run } from "../api";
+import { useRunnerOnline } from "../runnerCapacity";
 import MarkdownView from "./MarkdownView";
 import MentionEditor, { type MentionCandidate } from "./MentionEditor";
 import Seg from "./Seg";
-import { Avatar, RunStatusChip, fmtDuration, fmtTokens, fmtUsd, fmtWhen, isLiveRun, plural } from "./TaskBits";
+import { Avatar, RunStatusChip, fmtDuration, fmtTokens, fmtUsd, fmtWhen, isLiveRun, plural, waitingFor } from "./TaskBits";
 
 /** The REL-104 strip: what this task has cost across every agent and run. */
 export function EffortStats({ stats }: { stats: IssueStats }) {
@@ -169,6 +170,7 @@ export function RunCard({
   onOpenTranscript: (run: Run) => void;
 }) {
   const live = isLiveRun(run.status);
+  const waiting = waitingFor(run, useRunnerOnline());
   const meta = [
     run.actualModel || run.model || null,
     run.modelTurns ? plural(run.modelTurns, "turn") : null,
@@ -187,6 +189,7 @@ export function RunCard({
           <span className="dim">· run {run.attempt} · {fmtWhen(run.startedAt ?? run.createdAt)}</span>
           <RunStatusChip status={run.status} />
         </div>
+        {waiting ? <p className="run-wait">{waiting}</p> : null}
         {showSummary && run.summary ? <ClampedMarkdown value={run.summary} mentions={[]} /> : null}
         {run.error && (run.status === "failed" || run.status === "timed_out") ? (
           <p className="run-why">
