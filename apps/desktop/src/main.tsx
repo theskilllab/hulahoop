@@ -2,6 +2,7 @@ import React from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
 import { installDrag } from "./drag";
+import { installExternalLinks } from "./links";
 import "./styles.css";
 
 // The window's title bar is an overlay on macOS: the traffic lights float over
@@ -43,6 +44,7 @@ class Boundary extends React.Component<{ children: React.ReactNode }, { error: E
 }
 
 installDrag();
+installExternalLinks();
 
 // The native drop handler is off (`dragDropEnabled: false`) so the drop zones can
 // read files through HTML5. A file let go anywhere else would make the webview

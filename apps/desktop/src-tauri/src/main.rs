@@ -55,6 +55,29 @@ fn set_traffic_lights(window: tauri::Window, visible: bool) {
     }
 }
 
+/// The webview ignores `target="_blank"`: a link to GitHub has to be handed to
+/// the system browser. Only web addresses go out, so a page can never use this
+/// to launch a local file or program.
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err(format!("{url} is not a web address"));
+    }
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(not(target_os = "macos"))]
+    let program = "xdg-open";
+    let mut child = std::process::Command::new(program)
+        .arg(&url)
+        .spawn()
+        .map_err(|error| format!("cannot open {url}: {error}"))?;
+    // Reap it, so every opened link does not leave a zombie behind.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn connection() -> Result<Connection, String> {
     let dir = data_dir();
@@ -145,6 +168,7 @@ fn main() {
             connection,
             start_drag,
             set_traffic_lights,
+            open_url,
         ])
         .setup(|app| {
             let dir = data_dir();
