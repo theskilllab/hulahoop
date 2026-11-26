@@ -2077,6 +2077,11 @@ impl Engine {
             payload.disk_growth_bytes,
         )
         .await?;
+        // A person cancelled it: the runner's report of the killed agent (exit 143
+        // and its last output) must not turn the cancel into a failure.
+        if run.status_enum() == RunStatus::Cancelled {
+            return Ok(run);
+        }
         let issue = self.issue(run.issue_id).await?;
         let status = RunStatus::parse(&payload.status)
             .ok_or_else(|| anyhow!("unknown run status {}", payload.status))?;
@@ -2234,6 +2239,13 @@ impl Engine {
                 Some(run.id),
             )
             .await?;
+            // A turn can change the work and still ask something. What it changed
+            // is the newest head all the same: the reviewer judges it, the pull
+            // request shows it, whatever the person answers.
+            if !judged && final_status == RunStatus::Succeeded {
+                self.publish_head(&issue, &run, payload.commit.as_deref())
+                    .await?;
+            }
             self.transition(run.issue_id, IssueEvent::Blocked).await?;
             return self.run(run_id).await;
         }
@@ -2257,37 +2269,8 @@ impl Engine {
         } else {
             match final_status {
                 RunStatus::Succeeded => {
-                    if payload.commit.is_some() {
-                        let bookmark = format!("issue/{}/head/{}", issue.id, run.attempt);
-                        // The revision is what the reviewer and the pull request
-                        // point at, so it is recorded with the bookmark that names
-                        // it. A turn that changed nothing published nothing, and its
-                        // base stays the head the work is actually on.
-                        sqlx::query("update runs set head_bookmark = ?, head_revision = coalesce(?, head_revision) where id = ?")
-                            .bind(&bookmark)
-                            .bind(payload.commit.as_deref())
-                            .bind(run_id)
-                            .execute(&self.db.pool)
-                            .await?;
-                        // An open pull request follows the work: a rework that
-                        // publishes a new head pushes it there, so what a person
-                        // reads and merges is never an older version.
-                        let issue = self.issue(issue.id).await?;
-                        if issue.pr_number.is_some() {
-                            self.ensure_pull_request(&issue).await?;
-                        }
-                    }
-                    // The newest work is what the next reviewer judges and what a
-                    // pull request shows. Without this the task keeps pointing at
-                    // the head from its last trip through review: the reviewer
-                    // would judge stale work, or be held back as having judged it.
-                    if payload.commit.is_some() || issue.repo_id.is_none() {
-                        sqlx::query("update issues set current_run_id = ? where id = ?")
-                            .bind(run_id)
-                            .bind(run.issue_id)
-                            .execute(&self.db.pool)
-                            .await?;
-                    }
+                    self.publish_head(&issue, &run, payload.commit.as_deref())
+                        .await?;
                     // Where the work goes next is the document's decision, not a
                     // constant in here: take the status's first move. A move into
                     // review is what earns a pull request — everything else is just
@@ -2416,6 +2399,42 @@ impl Engine {
     /// own, with nothing on the board to say so. Waiting helps nobody, so the
     /// task goes to a person with the reason. The usual case: a rework that
     /// changed nothing, handing the reviewer the head it already judged.
+    /// Records the work a turn published as the task's newest head.
+    async fn publish_head(&self, issue: &Issue, run: &Run, commit: Option<&str>) -> Result<()> {
+        if commit.is_some() {
+            let bookmark = format!("issue/{}/head/{}", issue.id, run.attempt);
+            // The revision is what the reviewer and the pull request point at, so
+            // it is recorded with the bookmark that names it. A turn that changed
+            // nothing published nothing, and its base stays the head the work is
+            // actually on.
+            sqlx::query("update runs set head_bookmark = ?, head_revision = coalesce(?, head_revision) where id = ?")
+                .bind(&bookmark)
+                .bind(commit)
+                .bind(run.id)
+                .execute(&self.db.pool)
+                .await?;
+            // An open pull request follows the work: a rework that publishes a new
+            // head pushes it there, so what a person reads and merges is never an
+            // older version.
+            let issue = self.issue(issue.id).await?;
+            if issue.pr_number.is_some() {
+                self.ensure_pull_request(&issue).await?;
+            }
+        }
+        // The newest work is what the next reviewer judges and what a pull request
+        // shows. Without this the task keeps pointing at the head from its last
+        // trip through review: the reviewer would judge stale work, or be held
+        // back as having judged it.
+        if commit.is_some() || issue.repo_id.is_none() {
+            sqlx::query("update issues set current_run_id = ? where id = ?")
+                .bind(run.id)
+                .bind(issue.id)
+                .execute(&self.db.pool)
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn block_if_stalled(&self, issue_id: Uuid, agent_id: Uuid, next: &str) -> Result<()> {
         let issue = self.issue(issue_id).await?;
         if issue.status_enum() == IssueStatus::Blocked || issue.status_enum().is_terminal() {
@@ -2465,7 +2484,9 @@ impl Engine {
             hulahoop_core::AuthorType::Server,
             None,
             &format!("{reason} Somebody has to look at it."),
-            false,
+            // Pinned, so the blocked task shows why it stopped instead of
+            // waiting on a question nobody asked.
+            true,
         )
         .await?;
         self.move_to(issue_id, IssueStatus::Blocked).await?;
@@ -3055,15 +3076,33 @@ async fn spent_metrics(
         .unwrap_or_default()
 }
 
+/// The model a harness reported, under the same name Hulahoop configures it by.
+/// Pi reports `qwen3.8-flash` for `opencode-go/qwen3.8-flash`, Claude Code
+/// `claude-sonnet-5-5` for `sonnet`; without the provider one model would be
+/// counted under two names.
+pub(crate) fn qualified_model(configured: &str, adapter: Option<&str>, reported: &str) -> String {
+    if reported.contains('/') || reported == "mixed" {
+        return reported.to_owned();
+    }
+    match configured.split_once('/') {
+        Some((provider, _)) => format!("{provider}/{reported}"),
+        None if adapter == Some("claude_code") => format!("anthropic/{reported}"),
+        None => reported.to_owned(),
+    }
+}
+
 async fn persist_run_metrics(
     db: &Db,
     run: &Run,
     usage: &hulahoop_core::usage::Metrics,
     error: Option<&str>,
 ) -> Result<()> {
+    let actual_model = usage
+        .actual_model
+        .as_deref()
+        .map(|reported| qualified_model(&run.model, run.adapter_snapshot.as_deref(), reported));
     let estimated = if usage.measured
-        && usage
-            .actual_model
+        && actual_model
             .as_deref()
             .is_none_or(|actual| actual == run.model)
     {
@@ -3101,7 +3140,10 @@ async fn persist_run_metrics(
             _ => None,
         }
     };
-    let failure = error.map(|reason| {
+    let failure = error.map(|error| {
+        // Only the reason itself: the agent's last output follows it, and a word
+        // like "artifact" or "model" in there says nothing about why it stopped.
+        let reason = error.lines().next().unwrap_or_default();
         if reason.contains("timed out") {
             "timeout"
         } else if reason.contains("heartbeating") {
@@ -3120,7 +3162,7 @@ async fn persist_run_metrics(
         .bind(usage.input).bind(usage.output)
         .bind(usage.measured.then_some(usage.cache_read.unwrap_or(0)))
         .bind(usage.measured.then_some(usage.cache_write.unwrap_or(0)))
-        .bind(usage.turns).bind(usage.tool_calls).bind(&usage.actual_model)
+        .bind(usage.turns).bind(usage.tool_calls).bind(&actual_model)
         .bind(cost).bind(cash).bind(source).bind(failure).bind(run.id)
         .execute(&db.pool).await?;
     Ok(())
@@ -3402,6 +3444,10 @@ mod rework_tests {
             "got {said}"
         );
         assert!(said.contains("change request is still open"), "got {said}");
+        assert!(
+            task.pinned_comment_id.is_some(),
+            "the blocked task shows why it stopped"
+        );
 
         let _ = std::fs::remove_dir_all(directory);
     }
@@ -3593,6 +3639,85 @@ mod repo_less_tests {
         assert_eq!(engine.issue(issue).await.unwrap().status, "in_progress");
 
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// The runner reports the agent it killed for a cancel as a failure; the run
+    /// stays cancelled, and the agent's last output names no failure category.
+    #[tokio::test]
+    async fn a_cancelled_run_stays_cancelled() {
+        let (directory, engine, workspace, developer) = fixture("cancel-stays").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+        engine.cancel_run(run.id).await.unwrap();
+        let killed: RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "error": "the agent exited with Some(143).\n{\"delta\":\"the artifact id\"}",
+        }))
+        .unwrap();
+        let after = engine.complete_run(run.id, killed).await.unwrap();
+        assert_eq!(after.status, "cancelled");
+        assert_eq!(after.error.as_deref(), Some("cancelled by a human"));
+
+        let other = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+        let crashed: RunCompletion = serde_json::from_value(serde_json::json!({
+            "status": "failed",
+            "error": "the agent exited with Some(1).\n{\"delta\":\"the artifact id\"}",
+        }))
+        .unwrap();
+        let after = engine.complete_run(other.id, crashed).await.unwrap();
+        assert_eq!(after.status, "failed");
+        assert_eq!(after.failure_category.as_deref(), Some("other"));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A turn that changes the work and asks something still leaves its work as
+    /// the head the reviewer judges next.
+    #[tokio::test]
+    async fn a_turn_that_asks_still_publishes_its_work() {
+        let (directory, engine, workspace, developer) = fixture("ask-publishes").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+        engine
+            .complete_run(
+                run.id,
+                finished("Fixed the review.", Some("Build a menu bar?"), None),
+            )
+            .await
+            .unwrap();
+        let task = engine.issue(issue).await.unwrap();
+        assert_eq!(task.status, "blocked");
+        assert_eq!(task.current_run_id, Some(run.id));
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// One model is counted under one name, whatever the harness reported.
+    #[test]
+    fn a_reported_model_keeps_its_provider() {
+        use super::qualified_model;
+        assert_eq!(
+            qualified_model("opencode-go/qwen3.8-flash", Some("pi"), "qwen3.8-flash"),
+            "opencode-go/qwen3.8-flash"
+        );
+        assert_eq!(
+            qualified_model("sonnet", Some("claude_code"), "claude-sonnet-5-5"),
+            "anthropic/claude-sonnet-5-5"
+        );
+        assert_eq!(
+            qualified_model("anthropic/claude-opus-5-5", Some("pi"), "mixed"),
+            "mixed"
+        );
+        assert_eq!(qualified_model("custom", Some("pi"), "custom"), "custom");
     }
 
     /// The run limit stops every agent; allowing more runs resets the count

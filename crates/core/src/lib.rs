@@ -22,7 +22,10 @@ pub const CONTRACT_VERSION: &str = "26.11";
 /// Default caps. Every one of these is a constant in code, never a setting.
 pub const HEARTBEAT_INTERVAL_SECS: i64 = 5;
 pub const HEARTBEAT_DEAD_SECS: i64 = 30;
-pub const AGENT_WALL_CLOCK_MINUTES: i64 = 30;
+/// One agent turn. A careful review (tests, lint, reading the prototype) on a
+/// slower model ran past 30 minutes without being stuck, so the cap is generous;
+/// a hung agent is still stopped, just later.
+pub const AGENT_WALL_CLOCK_MINUTES: i64 = 120;
 pub const SETUP_WALL_CLOCK_MINUTES: i64 = 20;
 /// A Lumi answer is one model call, not a work session.
 pub const LUMI_WALL_CLOCK_MINUTES: i64 = 10;

@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { Comment, Run } from "../api";
+import { gql, type Agent, type Comment, type Issue, type Run } from "../api";
 
 const room = vi.hoisted(() => ({
   running: 1,
@@ -14,7 +14,7 @@ const room = vi.hoisted(() => ({
 vi.mock("../api", () => ({ addComment: vi.fn(), gql: vi.fn(), loadRunnerCapacity: vi.fn(async () => room) }));
 
 import { publishRunnerCapacity } from "../runnerCapacity";
-import { CommentItem, RunCard } from "./Activity";
+import Activity, { CommentItem, RunCard } from "./Activity";
 
 const run = (over: Partial<Run> = {}): Run => ({
   id: "r1",
@@ -47,6 +47,18 @@ describe("RunCard", () => {
     const meta = document.querySelector(".run-meta") as HTMLElement;
     expect(meta.textContent).toContain("anthropic/claude-sonnet-4");
     expect(meta.textContent).toContain("Credential: Claude subscription");
+  });
+
+  it("shows the failure reason, with the agent's last output folded away", () => {
+    render(
+      <RunCard
+        run={run({ status: "failed", error: "the agent exited with Some(1).\n{\"type\":\"delta\"}" })}
+        agentName="Reviewer"
+        onOpenTranscript={vi.fn()}
+      />,
+    );
+    expect((document.querySelector(".run-why") as HTMLElement).textContent).toBe("the agent exited with Some(1).");
+    expect((document.querySelector(".run-tail pre") as HTMLElement).textContent).toBe('{"type":"delta"}');
   });
 
   it("names the host login too", () => {
@@ -122,5 +134,48 @@ describe("agent runs fold long summaries", () => {
   it("keeps the run's own Open transcript button", () => {
     render(<RunCard run={run()} agentName="Reviewer" onOpenTranscript={vi.fn()} />);
     expect(screen.getByRole("button", { name: "Open transcript" })).toBeTruthy();
+  });
+});
+
+describe("running an agent again", () => {
+  const agents = [{ id: "a1", name: "Reviewer" }] as Agent[];
+  const task = (runs: Run[], over: Partial<Issue> = {}) =>
+    ({ id: "i1", status: "in_progress", runs, comments: [], runsSinceCap: runs.length, runLimit: 12, ...over }) as unknown as Issue;
+  const show = (issue: Issue, onChanged = vi.fn()) =>
+    render(
+      <Activity issue={issue} agents={agents} draft="" onDraft={vi.fn()} onOpenTranscript={vi.fn()} onChanged={onChanged} onError={vi.fn()} />,
+    );
+
+  it("starts the same agent from the same work when the newest run timed out", async () => {
+    const onChanged = vi.fn();
+    vi.mocked(gql).mockResolvedValue({ startRun: { id: "r3" } });
+    show(
+      task([
+        run({ id: "r1", status: "succeeded", createdAt: "2026-01-01T00:00:00Z" }),
+        run({ id: "r2", status: "timed_out", parentRunId: "r1", createdAt: "2026-01-01T01:00:00Z" }),
+      ]),
+      onChanged,
+    );
+    const again = screen.getAllByRole("button", { name: "Run Reviewer again" });
+    expect(again).toHaveLength(1);
+    fireEvent.click(again[0]);
+    await vi.waitFor(() => expect(onChanged).toHaveBeenCalled());
+    expect(vi.mocked(gql).mock.calls.at(-1)?.[1]).toEqual({ issue: "i1", agent: "a1", parent: "r1" });
+  });
+
+  it("is not offered after a success, while a run is live, or at the run limit", () => {
+    show(task([run({ id: "r1", status: "succeeded", createdAt: "2026-01-01T00:00:00Z" })]));
+    expect(screen.queryByRole("button", { name: "Run Reviewer again" })).toBeNull();
+    cleanup();
+    show(
+      task([
+        run({ id: "r1", status: "failed", createdAt: "2026-01-01T00:00:00Z" }),
+        run({ id: "r2", status: "running", createdAt: "2026-01-01T01:00:00Z" }),
+      ]),
+    );
+    expect(screen.queryByRole("button", { name: "Run Reviewer again" })).toBeNull();
+    cleanup();
+    show(task([run({ id: "r1", status: "failed", createdAt: "2026-01-01T00:00:00Z" })], { runsSinceCap: 12 }));
+    expect(screen.queryByRole("button", { name: "Run Reviewer again" })).toBeNull();
   });
 });

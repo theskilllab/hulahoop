@@ -569,7 +569,8 @@ function Actions({ issue, busy, run }: { issue: Issue; busy: string | null; run:
   const [abandoning, setAbandoning] = useState(false);
   const [reason, setReason] = useState("");
   const live = issue.currentRun && isLiveRun(issue.currentRun.status) ? issue.currentRun : null;
-  const verdict = issue.reviews[issue.reviews.length - 1];
+  // The server lists reviews newest first; the newest is the one that counts.
+  const verdict = issue.reviews[0];
   const disabled = busy !== null;
   const limit = issue.runLimit ?? 0;
   const capped = limit > 0 && (issue.runsSinceCap ?? 0) >= limit && !live;

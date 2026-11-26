@@ -4520,7 +4520,21 @@ input[type="date"].date-empty::-webkit-datetime-edit { color: var(--line); }
   font-size: var(--fs-xs);
 }
 .act.cm-note .md { font-size: var(--fs-xs); color: var(--muted); }
-.run-why { margin: 0; font-size: var(--fs-sm); }
+.run-why { margin: 0; font-size: var(--fs-sm); overflow-wrap: anywhere; }
+.run-tail { font-size: var(--fs-xs); color: var(--muted); min-width: 0; }
+.run-tail summary { cursor: pointer; }
+.run-tail pre {
+  margin: var(--s1) 0 0;
+  max-height: 200px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  background: var(--bg-sunken, var(--bg-2));
+  border-radius: var(--r-sm);
+  padding: var(--s2);
+}
 .run-wait { margin: 0; color: var(--warn); font-size: var(--fs-sm); }
 .props-text .run-wait { margin-left: var(--s2); font-size: var(--fs-xs); }
 .run-meta { margin: 0; font-size: var(--fs-xs); color: var(--muted); font-variant-numeric: tabular-nums; }

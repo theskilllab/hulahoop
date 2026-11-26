@@ -162,17 +162,26 @@ export function RunCard({
   agentName,
   showSummary = true,
   onOpenTranscript,
+  onRunAgain,
 }: {
   run: Run;
   agentName: string;
   /** Off when the agent posted the summary as its own comment, so it shows once. */
   showSummary?: boolean;
   onOpenTranscript: (run: Run) => void;
+  /** Set on the task's newest run when it ended without finishing and nothing else runs. */
+  onRunAgain?: () => void;
 }) {
   const live = isLiveRun(run.status);
   const waiting = waitingFor(run, useRunnerOnline());
+  // The server stores the reported model with its provider, so this is the
+  // name Cost control counts it under.
+  const model = run.actualModel || run.model;
+  // The reason is the first line; what follows is the agent's last output.
+  const [reason, ...output] = (run.error ?? "").split("\n");
+  const tail = output.join("\n").trim();
   const meta = [
-    run.actualModel || run.model || null,
+    model || null,
     run.modelTurns ? plural(run.modelTurns, "turn") : null,
     run.toolCalls ? plural(run.toolCalls, "tool call") : null,
     fmtDuration(run.startedAt, run.finishedAt),
@@ -194,8 +203,14 @@ export function RunCard({
         {run.error && (run.status === "failed" || run.status === "timed_out") ? (
           <p className="run-why">
             {run.failureCategory ? <strong>{run.failureCategory.replace(/_/g, " ")}: </strong> : null}
-            {run.error}
+            {reason}
           </p>
+        ) : null}
+        {tail && (run.status === "failed" || run.status === "timed_out") ? (
+          <details className="run-tail">
+            <summary>Last output</summary>
+            <pre>{tail}</pre>
+          </details>
         ) : null}
         {meta.length ? <p className="run-meta">{meta.join(" · ")}</p> : null}
         <div className="row">
@@ -208,6 +223,11 @@ export function RunCard({
               "Open transcript"
             )}
           </button>
+          {onRunAgain ? (
+            <button type="button" className="secondary small-btn" onClick={onRunAgain}>
+              Run {agentName} again
+            </button>
+          ) : null}
           {run.prNumber && run.prUrl ? (
             <a className="chip info" href={run.prUrl} target="_blank" rel="noreferrer">
               PR #{run.prNumber}
@@ -248,7 +268,13 @@ function BlockedQuestion({ issue, question, onChanged, onError }: {
     <div className="blocked-q" role="region" aria-label="Question from the agent">
       <div className="act-head">
         <span className="chip bad">Blocked</span>
-        <strong>{question ? `${question.author} asks` : "This task is waiting for an answer"}</strong>
+        <strong>
+          {question?.authorType === "server"
+            ? "Hulahoop stopped the task"
+            : question
+              ? `${question.author} asks`
+              : "This task is waiting for an answer"}
+        </strong>
       </div>
       {question ? <MarkdownView className="cm-body" value={question.body} /> : issue.blockedBy ? <p>{issue.blockedBy}</p> : null}
       <textarea
@@ -330,6 +356,36 @@ export default function Activity({
     [issue.comments],
   );
 
+  // Only the task's newest run can be run again, and only when it ended without
+  // finishing, nothing else is running and the run limit still has room.
+  const [starting, setStarting] = useState(false);
+  const rerunnable = useMemo(() => {
+    if (issue.status === "done" || issue.status === "cancelled") return null;
+    if (issue.runs.some((run) => isLiveRun(run.status))) return null;
+    if (issue.runLimit !== undefined && (issue.runsSinceCap ?? 0) >= issue.runLimit) return null;
+    const newest = issue.runs.reduce<Run | null>(
+      (best, run) => (!best || (run.createdAt ?? "") > (best.createdAt ?? "") ? run : best),
+      null,
+    );
+    return newest && ["failed", "timed_out", "cancelled"].includes(newest.status) ? newest.id : null;
+  }, [issue.status, issue.runs, issue.runsSinceCap, issue.runLimit]);
+
+  async function runAgain(run: Run) {
+    if (starting) return;
+    setStarting(true);
+    try {
+      await gql(
+        `mutation ($issue: UUID!, $agent: UUID!, $parent: UUID) { startRun(issueId: $issue, agentId: $agent, parentRunId: $parent) { id } }`,
+        { issue: issue.id, agent: run.agentId, parent: run.parentRunId ?? null },
+      );
+      await onChanged();
+    } catch (cause) {
+      onError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setStarting(false);
+    }
+  }
+
   async function send() {
     const sent = draft;
     const body = sent.trim();
@@ -391,6 +447,7 @@ export default function Activity({
                 agentName={agentName.get(entry.run.agentId) ?? "Agent"}
                 showSummary={filter === "runs" || !commented.has(entry.run.id)}
                 onOpenTranscript={onOpenTranscript}
+                onRunAgain={entry.run.id === rerunnable && !starting ? () => void runAgain(entry.run!) : undefined}
               />
             ) : null,
           )}

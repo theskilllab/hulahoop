@@ -32,6 +32,8 @@ export interface Run {
   /** Who ran it. Every run records its agent, so a roster can read its own history. */
   agentId: string;
   status: string;
+  /** The turn whose work this one started from; running an agent again reuses it. */
+  parentRunId?: string | null;
   attempt: number;
   adapter: string;
   flags: string[];
@@ -545,7 +547,7 @@ export const ISSUE_DETAIL_FIELDS = `
   assignee { type id name }
   stats { runs failedRuns turns toolCalls tokens apiEquivalentUsd activeMinutes }
   files { id projectId milestoneId issueId title kind filename mime size sha256 createdAt }
-  runs { ${RUN_FIELDS} summary model actualModel modelTurns toolCalls apiEquivalentUsd cacheReadTokens failureCategory createdAt }
+  runs { ${RUN_FIELDS} summary model actualModel modelTurns toolCalls apiEquivalentUsd cacheReadTokens failureCategory parentRunId createdAt }
   reviews { id reviewedRunId reviewerRunId verdict body createdAt }
   comments(newestFirst: true) { id author authorType body pinned createdAt runId mentions { type id name } }
   turnRemaining turnsUsed runsSinceCap runLimit moves
