@@ -26,6 +26,8 @@ import {
 import { invoke, WORKSPACE_KEY } from "./api";
 import { applyTheme, resolvedTheme, savedPalette, themeOf, THEMES } from "./theme";
 import Artifacts from "./screens/Artifacts";
+import NewArtifactDialog from "./components/NewArtifactDialog";
+import { useToast } from "./components/Toast";
 import Agents from "./screens/Agents";
 import Icon from "./Icon";
 import Connect from "./screens/Connect";
@@ -113,6 +115,9 @@ export default function App() {
   }, [collapsed]);
   const [wsMenu, setWsMenu] = useState(false);
   const [palette, setPalette] = useState(false);
+  const [newArtifact, setNewArtifact] = useState<{ issueId?: string; milestoneId?: string } | null>(null);
+  const [artifactToast, showArtifactToast] = useToast();
+  const [openArtifactId, setOpenArtifactId] = useState<string | null>(null);
   const [lumi, setLumi] = useState(false);
   const [settingsTab, setSettingsTab] = useState<"personal" | "workspace" | null>(null);
   const [creatingWorkspace, setCreatingWorkspace] = useState(false);
@@ -184,6 +189,10 @@ export default function App() {
   }, [workspace, includeDone, projectFilter]);
   // Stable, so the pull request screen does not reload its list every time the app re-renders.
   const refreshQuietly = useCallback(() => void refresh(), [refresh]);
+  // The open artifact is a one-shot: leaving the page must not reopen it on return.
+  useEffect(() => {
+    if (view.name !== "artifacts") setOpenArtifactId(null);
+  }, [view.name]);
   const openConnectors = useCallback(() => setView({ name: "connectors" }), []);
 
   const load = useCallback(async (preferred?: string | null) => {
@@ -533,7 +542,8 @@ export default function App() {
           onPick={(target: PaletteTarget) => {
             setPalette(false);
             if (target.kind === "view") {
-              if (target.id === "settings") openSettings();
+              if (target.id === "new-artifact") setNewArtifact({});
+              else if (target.id === "settings") openSettings();
               else setView({ name: target.id } as View);
             }
             if (target.kind === "issue") setView({ name: "issue", id: target.id });
@@ -627,6 +637,12 @@ export default function App() {
             openId={view.name === "issue" ? view.id : null}
             onOpen={(id) => setView(id ? { name: "issue", id } : { name: "tasks" })}
             onNew={() => setCreatingTask(true)}
+            artifacts={artifacts}
+            onNewArtifact={(issueId) => setNewArtifact({ issueId })}
+            onOpenArtifact={(id) => {
+              setOpenArtifactId(id);
+              setView({ name: "artifacts" });
+            }}
             onChanged={refresh}
             onDetail={setOpenDetail}
           />
@@ -647,6 +663,7 @@ export default function App() {
             onChanged={refresh}
             onOpenIssue={(id) => setView({ name: "issue", id })}
             onOpenArtifacts={() => setView({ name: "artifacts" })}
+            onNewArtifact={(milestoneId) => setNewArtifact({ milestoneId })}
           />
         )}
 
@@ -655,8 +672,12 @@ export default function App() {
             workspaceId={workspace.id}
             projects={projects}
             milestones={milestones}
+            issues={issues}
             artifacts={artifacts}
+            initialOpenId={openArtifactId}
             onChanged={refresh}
+            onOpenIssue={(id) => setView({ name: "issue", id })}
+            onOpenMilestones={() => setView({ name: "milestones" })}
           />
         )}
 
@@ -686,6 +707,25 @@ export default function App() {
           onClose={() => setCreatingTask(false)}
         />
       )}
+
+      {newArtifact && (
+        <NewArtifactDialog
+          workspaceId={workspace.id}
+          projects={projects}
+          milestones={milestones}
+          issues={issues}
+          preset={newArtifact}
+          onToast={(text, bad) => showArtifactToast(text, bad)}
+          onCreated={async (artifact) => {
+            await refresh();
+            setOpenArtifactId(artifact.id);
+            setView({ name: "artifacts" });
+          }}
+          onClose={() => setNewArtifact(null)}
+        />
+      )}
+
+      {artifactToast}
 
       {creatingWorkspace && (
         <CreateWorkspace

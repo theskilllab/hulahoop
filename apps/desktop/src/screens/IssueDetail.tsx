@@ -6,12 +6,14 @@ import {
   moveIssue,
   updateIssue,
   type Agent,
+  type Artifact,
   type Issue,
   type Milestone,
   type Project,
   type Run,
 } from "../api";
 import Activity from "../components/Activity";
+import ArtifactsSection from "../components/ArtifactsSection";
 import FilesSection from "../components/FilesSection";
 import MarkdownView from "../components/MarkdownView";
 import { normalizeMarkdown } from "../components/markdown";
@@ -99,6 +101,10 @@ type Props = {
   projects: Project[];
   milestones: Milestone[];
   columns: Column[];
+  /** The artifacts that belong to this task. */
+  artifacts: Artifact[];
+  onNewArtifact: () => void;
+  onOpenArtifact: (id: string) => void;
   onChanged: () => void | Promise<void>;
   onOpenTranscript: (run: Run) => void;
   onSaved: (message: string) => void;
@@ -115,6 +121,9 @@ export default function IssueDetail({
   projects,
   milestones,
   columns,
+  artifacts,
+  onNewArtifact,
+  onOpenArtifact,
   onChanged,
   onOpenTranscript,
   onSaved,
@@ -156,6 +165,7 @@ export default function IssueDetail({
           onDraft={(update) => onDraft("description", update)}
           onSave={(body) => save({ body })}
         />
+        <ArtifactsSection artifacts={artifacts} onNew={onNewArtifact} onOpen={onOpenArtifact} />
         <FilesSection
           files={issue.files ?? []}
           workspaceId={workspaceId}

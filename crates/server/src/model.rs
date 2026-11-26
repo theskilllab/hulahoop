@@ -428,6 +428,7 @@ pub struct Milestone {
 }
 
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+#[graphql(complex)]
 pub struct Artifact {
     pub id: Uuid,
     pub workspace_id: Uuid,
@@ -442,6 +443,27 @@ pub struct Artifact {
     pub sha256: String,
     /// The task this file is attached to, when it is one of a task's files.
     pub issue_id: Option<Uuid>,
+    /// `plan`, `spec`, `report`, `notes` or `file`.
+    #[graphql(name = "type")]
+    pub artifact_type: String,
+    /// Markdown body; empty for a plain file.
+    pub content: String,
+    /// The person or agent who wrote it.
+    pub author: String,
+    pub author_is_agent: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// One file held by an artifact. A migrated file shares its artifact's id.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct ArtifactFile {
+    pub id: Uuid,
+    pub artifact_id: Uuid,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub sha256: String,
     pub created_at: DateTime<Utc>,
 }
 

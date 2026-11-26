@@ -17,6 +17,7 @@ interface Props {
   onChanged: () => Promise<void> | void;
   onOpenIssue: (id: string) => void;
   onOpenArtifacts: () => void;
+  onNewArtifact: (milestoneId: string) => void;
 }
 
 const DAY = 864e5;
@@ -81,7 +82,7 @@ function progressOf(members: Issue[]) {
  * that an issue contributes to one — the milestone is a label for humans, and the
  * loop keeps its own state machine on the issue.
  */
-export default function Milestones({ workspaceId, projects, milestones, issues, artifacts, columns = FALLBACK_COLUMNS, onChanged, onOpenIssue, onOpenArtifacts }: Props) {
+export default function Milestones({ workspaceId, projects, milestones, issues, artifacts, columns = FALLBACK_COLUMNS, onChanged, onOpenIssue, onOpenArtifacts, onNewArtifact }: Props) {
   const order = statusOrder(columns);
   const [busy, setBusy] = useState(false);
   const [linking, setLinking] = useState<string | null>(null);
@@ -255,6 +256,7 @@ export default function Milestones({ workspaceId, projects, milestones, issues, 
               onUnlink={(issueId) => void unlink(issueId)}
               onOpenIssue={onOpenIssue}
               onOpenArtifacts={onOpenArtifacts}
+              onNewArtifact={() => onNewArtifact(current.id)}
             />
           ) : null}
         </div>
@@ -281,6 +283,7 @@ interface DetailProps {
   onUnlink: (issueId: string) => void;
   onOpenIssue: (id: string) => void;
   onOpenArtifacts: () => void;
+  onNewArtifact: () => void;
 }
 
 function Detail({
@@ -301,6 +304,7 @@ function Detail({
   onUnlink,
   onOpenIssue,
   onOpenArtifacts,
+  onNewArtifact,
 }: DetailProps) {
   const { done, pct } = progressOf(members);
   const state = standing(milestone, pct);
@@ -376,7 +380,12 @@ function Detail({
       )}
       {error && <p className="error">{error}</p>}
 
-      <div className="field-label ms-heading">Artifacts · {files.length}</div>
+      <div className="field-label ms-heading">
+        Artifacts · {files.length}
+        <button type="button" className="ghost small" onClick={onNewArtifact}>
+          New artifact
+        </button>
+      </div>
       {files.length ? (
         <div className="mt-list">
           {files.map((file) => (

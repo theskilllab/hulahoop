@@ -424,4 +424,68 @@ mod backup_tests {
         db.pool.close().await;
         std::fs::remove_dir_all(&dir).expect("cleanup");
     }
+
+    /// 0030 turns single-file artifacts into documents that own files. Applied
+    /// over a row written before it, the row keeps its id, becomes type `file`
+    /// and gets its file attached, still at the same path on disk.
+    #[tokio::test]
+    async fn an_artifact_from_before_0030_keeps_its_file() {
+        let dir = scratch("artifact-docs");
+        let file = contract::database_file(&dir);
+        let options = SqliteConnectOptions::from_str(&format!("sqlite://{}", file.display()))
+            .expect("options")
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("pool");
+        let full = sqlx::migrate!("./migrations");
+        let before = sqlx::migrate::Migrator {
+            migrations: std::borrow::Cow::Owned(
+                full.iter()
+                    .filter(|migration| migration.version < 30)
+                    .cloned()
+                    .collect(),
+            ),
+            ..full
+        };
+        before.run(&pool).await.expect("migrations before 0030");
+        let db = Db {
+            pool,
+            data_dir: dir.clone(),
+        };
+        let workspace = db.seed_local().await.expect("seed");
+        let id = uuid::Uuid::now_v7();
+        let now = chrono::Utc::now().to_rfc3339();
+        sqlx::query("insert into artifacts (id, workspace_id, title, filename, mime, size, sha256, created_at) values (?,?, 'Old spec','spec.md','text/markdown',6,'abc',?)")
+            .bind(id).bind(workspace).bind(&now).execute(&db.pool).await.expect("artifact");
+        let on_disk = dir.join("artifacts").join(id.to_string());
+        std::fs::create_dir_all(&on_disk).expect("artifact dir");
+        std::fs::write(on_disk.join("spec.md"), b"# Spec").expect("artifact bytes");
+        db.pool.close().await;
+
+        let db = Db::open(&dir)
+            .await
+            .expect("0030 applies over existing rows");
+        let row: (String, String, String) =
+            sqlx::query_as("select artifact_type, content, updated_at from artifacts where id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await
+                .expect("row");
+        assert_eq!(row, ("file".into(), String::new(), now));
+        let attached: Vec<(uuid::Uuid, String, i64)> =
+            sqlx::query_as("select id, filename, size from artifact_files where artifact_id = ?")
+                .bind(id)
+                .fetch_all(&db.pool)
+                .await
+                .expect("files");
+        assert_eq!(attached, vec![(id, "spec.md".to_string(), 6)]);
+        assert!(on_disk.join("spec.md").exists());
+        db.pool.close().await;
+        std::fs::remove_dir_all(&dir).expect("cleanup");
+    }
 }

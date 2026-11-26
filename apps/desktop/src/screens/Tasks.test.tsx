@@ -24,6 +24,9 @@ function setup(projectFilter: string, onProjectFilter = vi.fn()) {
       projects={[{ id: "p1", name: "Hulahoop", prefix: "HUL" } as never]}
       agents={[]}
       milestones={[]}
+      artifacts={[]}
+      onNewArtifact={() => {}}
+      onOpenArtifact={() => {}}
       projectFilter={projectFilter}
       onProjectFilter={onProjectFilter}
       showDone={false}

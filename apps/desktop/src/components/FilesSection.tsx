@@ -12,14 +12,17 @@ function fmtSize(bytes: number): string {
 const TEXT_MIME = /^(text\/|application\/(json|xml|x-yaml|yaml|toml|javascript|typescript))/;
 const TEXT_EXT = /\.(md|txt|json|ya?ml|toml|csv|log|ts|tsx|js|rs|py|go|sh|sql|html|css)$/i;
 
-function previewKind(file: Artifact): "image" | "text" | null {
+/** What a preview needs of a file: an artifact row or one of an artifact's files. */
+export type Previewable = Pick<Artifact, "id" | "filename" | "mime"> & { title?: string };
+
+export function previewKind(file: Previewable): "image" | "text" | null {
   if (file.mime?.startsWith("image/")) return "image";
   if ((file.mime && TEXT_MIME.test(file.mime)) || TEXT_EXT.test(file.filename)) return "text";
   return null;
 }
 
 /** An image or the first part of a text file, fetched when the row opens. */
-function Preview({ file }: { file: Artifact }) {
+export function Preview({ file }: { file: Previewable }) {
   const kind = previewKind(file);
   const [url, setUrl] = useState<string | null>(null);
   const [text, setText] = useState<string | null>(null);

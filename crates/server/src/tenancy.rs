@@ -561,7 +561,7 @@ impl Engine {
     /// The files attached to one task, oldest first, the order they were added.
     pub async fn issue_files(&self, issue_id: Uuid) -> Result<Vec<Artifact>> {
         Ok(sqlx::query_as::<_, Artifact>(
-            "select * from artifacts where issue_id = ? order by created_at, id",
+            "select * from artifacts where issue_id = ? and filename <> '' order by created_at, id",
         )
         .bind(issue_id)
         .fetch_all(&self.db.pool)
@@ -597,17 +597,8 @@ impl Engine {
         } else {
             title.trim().to_string()
         };
-        let filename = filename
-            .trim()
-            .rsplit('/')
-            .next()
-            .unwrap_or("artifact")
-            .replace(['\n', '\r'], "");
-        let filename = if filename.is_empty() {
-            "artifact".to_string()
-        } else {
-            filename
-        };
+        let filename = filename.trim().to_string();
+        let filename = clean_filename(&filename);
         let id = Uuid::now_v7();
         let dir = self.artifact_dir(id);
         std::fs::create_dir_all(&dir)
@@ -621,8 +612,8 @@ impl Engine {
             _ => "file".into(),
         });
         sqlx::query(
-            "insert into artifacts (id, workspace_id, project_id, milestone_id, issue_id, title, kind, filename, mime, size, sha256, created_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "insert into artifacts (id, workspace_id, project_id, milestone_id, issue_id, title, kind, filename, mime, size, sha256, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(workspace_id)
@@ -636,9 +627,267 @@ impl Engine {
         .bind(bytes.len() as i64)
         .bind(sha256_hex(bytes))
         .bind(crate::db::now_rfc3339())
+        .bind(crate::db::now_rfc3339())
+        .execute(&self.db.pool)
+        .await?;
+        let artifact = self.artifact(id).await?;
+        self.insert_file_row(&artifact, id, &artifact.filename, &artifact.mime, bytes)
+            .await?;
+        Ok(artifact)
+    }
+
+    async fn insert_file_row(
+        &self,
+        artifact: &Artifact,
+        file_id: Uuid,
+        filename: &str,
+        mime: &str,
+        bytes: &[u8],
+    ) -> Result<ArtifactFile> {
+        sqlx::query(
+            "insert into artifact_files (id, artifact_id, filename, mime, size, sha256, created_at)
+             values (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(file_id)
+        .bind(artifact.id)
+        .bind(filename)
+        .bind(mime)
+        .bind(bytes.len() as i64)
+        .bind(sha256_hex(bytes))
+        .bind(crate::db::now_rfc3339())
+        .execute(&self.db.pool)
+        .await?;
+        self.artifact_file(file_id).await
+    }
+
+    /// A document artifact: a type, Markdown content and an author, owned by a
+    /// task or a milestone. Its project is the owner's. Files are added after.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_artifact_document(
+        &self,
+        workspace_id: Uuid,
+        title: String,
+        artifact_type: String,
+        content: String,
+        issue_id: Option<Uuid>,
+        milestone_id: Option<Uuid>,
+        author: String,
+        author_is_agent: bool,
+    ) -> Result<Artifact> {
+        let title = title.trim().to_string();
+        if title.is_empty() {
+            return Err(anyhow!("give the artifact a title"));
+        }
+        check_artifact_type(&artifact_type)?;
+        let (issue_id, milestone_id, project_id) = self
+            .artifact_owner(workspace_id, issue_id, milestone_id)
+            .await?;
+        let id = Uuid::now_v7();
+        let now = crate::db::now_rfc3339();
+        sqlx::query(
+            "insert into artifacts (id, workspace_id, project_id, milestone_id, issue_id, title, kind, filename, mime, size, sha256,
+                                    artifact_type, content, author, author_is_agent, created_at, updated_at)
+             values (?, ?, ?, ?, ?, ?, ?, '', 'application/octet-stream', 0, '', ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(workspace_id)
+        .bind(project_id)
+        .bind(milestone_id)
+        .bind(issue_id)
+        .bind(&title)
+        .bind(if artifact_type == "file" { "file" } else { "document" })
+        .bind(&artifact_type)
+        .bind(&content)
+        .bind(&author)
+        .bind(author_is_agent)
+        .bind(&now)
+        .bind(&now)
         .execute(&self.db.pool)
         .await?;
         self.artifact(id).await
+    }
+
+    /// Checks that the owner is in the workspace and returns it with its project.
+    async fn artifact_owner(
+        &self,
+        workspace_id: Uuid,
+        issue_id: Option<Uuid>,
+        milestone_id: Option<Uuid>,
+    ) -> Result<(Option<Uuid>, Option<Uuid>, Option<Uuid>)> {
+        match (issue_id, milestone_id) {
+            (Some(id), None) => {
+                let issue = self.issue(id).await?;
+                if issue.workspace_id != workspace_id {
+                    return Err(anyhow!("task {id} belongs to another workspace"));
+                }
+                Ok((Some(id), None, issue.project_id))
+            }
+            (None, Some(id)) => {
+                let milestone = sqlx::query_as::<_, crate::model::Milestone>(
+                    "select * from milestones where id = ?",
+                )
+                .bind(id)
+                .fetch_optional(&self.db.pool)
+                .await?
+                .ok_or_else(|| anyhow!("milestone {id} not found"))?;
+                if milestone.workspace_id != workspace_id {
+                    return Err(anyhow!("milestone {id} belongs to another workspace"));
+                }
+                Ok((None, Some(id), milestone.project_id))
+            }
+            _ => Err(anyhow!("an artifact belongs to a task or a milestone")),
+        }
+    }
+
+    /// Edit the title, type or content, and stamp the update time.
+    pub async fn update_artifact(
+        &self,
+        id: Uuid,
+        title: Option<String>,
+        artifact_type: Option<String>,
+        content: Option<String>,
+    ) -> Result<Artifact> {
+        let artifact = self.artifact(id).await?;
+        let title = title
+            .map(|t| t.trim().to_string())
+            .unwrap_or(artifact.title);
+        if title.is_empty() {
+            return Err(anyhow!("give the artifact a title"));
+        }
+        let artifact_type = artifact_type.unwrap_or(artifact.artifact_type);
+        check_artifact_type(&artifact_type)?;
+        sqlx::query(
+            "update artifacts set title = ?, artifact_type = ?, content = ?, updated_at = ? where id = ?",
+        )
+        .bind(&title)
+        .bind(&artifact_type)
+        .bind(content.unwrap_or(artifact.content))
+        .bind(crate::db::now_rfc3339())
+        .bind(id)
+        .execute(&self.db.pool)
+        .await?;
+        self.artifact(id).await
+    }
+
+    /// Hand the artifact to another task or milestone; the project follows.
+    pub async fn move_artifact(
+        &self,
+        id: Uuid,
+        issue_id: Option<Uuid>,
+        milestone_id: Option<Uuid>,
+    ) -> Result<Artifact> {
+        let artifact = self.artifact(id).await?;
+        let (issue_id, milestone_id, project_id) = self
+            .artifact_owner(artifact.workspace_id, issue_id, milestone_id)
+            .await?;
+        sqlx::query(
+            "update artifacts set issue_id = ?, milestone_id = ?, project_id = ?, updated_at = ? where id = ?",
+        )
+        .bind(issue_id)
+        .bind(milestone_id)
+        .bind(project_id)
+        .bind(crate::db::now_rfc3339())
+        .bind(id)
+        .execute(&self.db.pool)
+        .await?;
+        self.artifact(id).await
+    }
+
+    pub async fn artifact_files(&self, artifact_id: Uuid) -> Result<Vec<ArtifactFile>> {
+        Ok(sqlx::query_as::<_, ArtifactFile>(
+            "select * from artifact_files where artifact_id = ? order by created_at, id",
+        )
+        .bind(artifact_id)
+        .fetch_all(&self.db.pool)
+        .await?)
+    }
+
+    pub async fn artifact_file(&self, id: Uuid) -> Result<ArtifactFile> {
+        sqlx::query_as::<_, ArtifactFile>("select * from artifact_files where id = ?")
+            .bind(id)
+            .fetch_optional(&self.db.pool)
+            .await?
+            .ok_or_else(|| anyhow!("artifact file {id} not found"))
+    }
+
+    pub fn artifact_file_path(&self, file: &ArtifactFile) -> std::path::PathBuf {
+        self.artifact_dir(file.artifact_id).join(&file.filename)
+    }
+
+    /// Attach bytes to an artifact. A name already used inside it gets a number,
+    /// so two files never overwrite each other on disk.
+    pub async fn add_artifact_file(
+        &self,
+        artifact_id: Uuid,
+        filename: String,
+        mime: Option<String>,
+        bytes: &[u8],
+    ) -> Result<ArtifactFile> {
+        let artifact = self.artifact(artifact_id).await?;
+        let taken: Vec<String> = self
+            .artifact_files(artifact_id)
+            .await?
+            .into_iter()
+            .map(|file| file.filename)
+            .collect();
+        let filename = unique_filename(&clean_filename(&filename), &taken);
+        let dir = self.artifact_dir(artifact_id);
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating the artifact directory {}", dir.display()))?;
+        std::fs::write(dir.join(&filename), bytes)
+            .with_context(|| format!("writing the artifact into {}", dir.display()))?;
+        let mime = mime.unwrap_or_else(|| "application/octet-stream".into());
+        let file = self
+            .insert_file_row(&artifact, Uuid::now_v7(), &filename, &mime, bytes)
+            .await?;
+        if artifact.filename.is_empty() {
+            self.mirror_first_file(artifact_id).await?;
+        }
+        self.touch_artifact(artifact_id).await?;
+        Ok(file)
+    }
+
+    /// The row's own file columns mirror its first file, which is what a task's
+    /// run reads. With no file left they are cleared, so the artifact stops
+    /// passing for a file.
+    async fn mirror_first_file(&self, artifact_id: Uuid) -> Result<()> {
+        let first = self.artifact_files(artifact_id).await?.into_iter().next();
+        sqlx::query(
+            "update artifacts set filename = ?, mime = ?, size = ?, sha256 = ? where id = ?",
+        )
+        .bind(first.as_ref().map_or("", |file| file.filename.as_str()))
+        .bind(
+            first
+                .as_ref()
+                .map_or("application/octet-stream", |file| file.mime.as_str()),
+        )
+        .bind(first.as_ref().map_or(0, |file| file.size))
+        .bind(first.as_ref().map_or("", |file| file.sha256.as_str()))
+        .bind(artifact_id)
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_artifact_file(&self, file_id: Uuid) -> Result<bool> {
+        let file = self.artifact_file(file_id).await?;
+        sqlx::query("delete from artifact_files where id = ?")
+            .bind(file_id)
+            .execute(&self.db.pool)
+            .await?;
+        let _ = std::fs::remove_file(self.artifact_file_path(&file));
+        self.mirror_first_file(file.artifact_id).await?;
+        self.touch_artifact(file.artifact_id).await?;
+        Ok(true)
+    }
+
+    async fn touch_artifact(&self, id: Uuid) -> Result<()> {
+        sqlx::query("update artifacts set updated_at = ? where id = ?")
+            .bind(crate::db::now_rfc3339())
+            .bind(id)
+            .execute(&self.db.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn delete_artifact(&self, id: Uuid) -> Result<bool> {
@@ -847,4 +1096,46 @@ impl Engine {
             tracing::warn!(repo = %repo_id, %error, "could not queue the fetch after a merge");
         }
     }
+}
+
+const ARTIFACT_TYPES: [&str; 5] = ["plan", "spec", "report", "notes", "file"];
+
+fn check_artifact_type(artifact_type: &str) -> Result<()> {
+    if ARTIFACT_TYPES.contains(&artifact_type) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "an artifact type is one of {}, not {artifact_type:?}",
+        ARTIFACT_TYPES.join(", ")
+    ))
+}
+
+/// The last path segment, with no line breaks, or `artifact` when nothing is left.
+fn clean_filename(filename: &str) -> String {
+    let name = filename
+        .trim()
+        .rsplit('/')
+        .next()
+        .unwrap_or("artifact")
+        .replace(['\n', '\r'], "");
+    if name.is_empty() {
+        "artifact".to_string()
+    } else {
+        name
+    }
+}
+
+/// `report.pdf` becomes `report (2).pdf` when `report.pdf` is taken.
+fn unique_filename(filename: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|name| name == filename) {
+        return filename.to_string();
+    }
+    let (stem, extension) = match filename.rfind('.') {
+        Some(dot) if dot > 0 => filename.split_at(dot),
+        _ => (filename, ""),
+    };
+    (2..)
+        .map(|n| format!("{stem} ({n}){extension}"))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or_else(|| filename.to_string())
 }

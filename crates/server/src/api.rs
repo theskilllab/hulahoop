@@ -1024,6 +1024,21 @@ async fn build_job_spec(engine: &Engine, job: &RunnerJob) -> anyhow::Result<Valu
     }))
 }
 
+/// Name, type and path of what `id` serves: one of an artifact's files, or an
+/// older artifact row that holds a single file itself.
+async fn artifact_download(
+    engine: &crate::engine::Engine,
+    id: Uuid,
+) -> anyhow::Result<(String, String, std::path::PathBuf)> {
+    if let Ok(file) = engine.artifact_file(id).await {
+        let path = engine.artifact_file_path(&file);
+        return Ok((file.filename, file.mime, path));
+    }
+    let artifact = engine.artifact(id).await?;
+    let path = engine.artifact_path(&artifact);
+    Ok((artifact.filename, artifact.mime, path))
+}
+
 /// The bytes behind an artifact row. The token travels in the query string because
 /// a browser download cannot set a header, and the file is served as an attachment.
 async fn artifact_bytes(
@@ -1050,14 +1065,13 @@ async fn artifact_bytes(
     {
         return (StatusCode::UNAUTHORIZED, "the token is missing or wrong").into_response();
     }
-    let Ok(artifact) = state.engine.artifact(id).await else {
+    let Ok((filename, mime, path)) = artifact_download(&state.engine, id).await else {
         return (StatusCode::NOT_FOUND, "no such artifact").into_response();
     };
-    let path = state.engine.artifact_path(&artifact);
     let Ok(bytes) = std::fs::read(&path) else {
         return (
             StatusCode::GONE,
-            format!("{} is registered but its file is gone", artifact.filename),
+            format!("{filename} is registered but its file is gone"),
         )
             .into_response();
     };
@@ -1065,14 +1079,12 @@ async fn artifact_bytes(
     let headers = response.headers_mut();
     headers.insert(
         header::CONTENT_TYPE,
-        artifact
-            .mime
-            .parse()
+        mime.parse()
             .unwrap_or(HeaderValue::from_static("application/octet-stream")),
     );
     if let Ok(value) = HeaderValue::from_str(&format!(
         "attachment; filename=\"{}\"",
-        artifact.filename.replace('"', "")
+        filename.replace('"', "")
     )) {
         headers.insert(header::CONTENT_DISPOSITION, value);
     }

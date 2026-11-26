@@ -1,175 +1,253 @@
-import { useRef, useState } from "react";
-import { downloadArtifact, gql, uploadArtifact, type Artifact, type Milestone, type Project } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { deleteArtifact, type Artifact, type IssueSummary, type Milestone, type Project } from "../api";
+import { ARTIFACT_TYPES, typeLabel } from "../artifactBits";
+import ContextMenu from "../components/ContextMenu";
+import NewArtifactDialog from "../components/NewArtifactDialog";
+import Select from "../components/Select";
+import { StatusIcon } from "../components/TaskBits";
+import { useToast } from "../components/Toast";
+import Icon from "../Icon";
 import PageHeader from "../PageHeader";
+import ArtifactDetail from "./ArtifactDetail";
 
 interface Props {
   workspaceId: string;
   projects: Project[];
   milestones: Milestone[];
+  issues: IssueSummary[];
   artifacts: Artifact[];
+  /** An artifact to open on arrival, e.g. one just created from another screen. */
+  initialOpenId?: string | null;
   onChanged: () => Promise<void> | void;
+  onOpenIssue?: (id: string) => void;
+  onOpenMilestones?: () => void;
 }
 
-function size(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} kB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
+const EMPTY_COPY = "Agents save their plans here automatically when they start a task. You can also add your own.";
+const statusLabel = (status: string) => status.replace(/_/g, " ");
+const typeTone = (type: string) => (type === "plan" ? "info" : type === "report" ? "ok" : "");
+const shortDate = (iso: string) => new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" });
 
 /**
- * The shelf. Bytes live under `artifacts/<id>/<filename>` on the server; the row is
- * the index, and the download is an authenticated read rather than a public URL.
+ * The shelf. Rows are the index; the bytes live on the server and are read with
+ * the bearer token. New artifacts come from one modal dialog; delete asks first.
  */
-export default function Artifacts({ workspaceId, projects, milestones, artifacts, onChanged }: Props) {
-  const fileInput = useRef<HTMLInputElement>(null);
-  const [file, setFile] = useState<File | null>(null);
-  const [title, setTitle] = useState("");
-  const [milestoneId, setMilestoneId] = useState<string>("");
-  const [projectId, setProjectId] = useState<string>("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+export default function Artifacts({ workspaceId, projects, milestones, issues, artifacts, initialOpenId = null, onChanged, onOpenIssue, onOpenMilestones }: Props) {
+  const [query, setQuery] = useState("");
+  const [projectFilter, setProjectFilter] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [openId, setOpenId] = useState<string | null>(initialOpenId);
   const [creating, setCreating] = useState(false);
+  const [menu, setMenu] = useState<{ x: number; y: number; artifact: Artifact } | null>(null);
+  const [confirming, setConfirming] = useState<Artifact | null>(null);
+  const [toast, showToast] = useToast();
 
-  async function upload() {
-    if (!file) {
-      setError("pick a file first");
-      return;
-    }
-    setBusy(true);
-    setError(null);
+  useEffect(() => setOpenId(initialOpenId), [initialOpenId]);
+  useEffect(() => {
+    if (!openId) return;
+    const close = (event: KeyboardEvent) => event.key === "Escape" && !document.querySelector("dialog[open]") && setOpenId(null);
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, [openId]);
+
+  const issueOf = (artifact: Artifact) => issues.find((entry) => entry.id === artifact.issueId);
+  const milestoneOf = (artifact: Artifact) => milestones.find((entry) => entry.id === artifact.milestoneId);
+  const projectOf = (artifact: Artifact) => projects.find((entry) => entry.id === artifact.projectId);
+  const ownerName = (artifact: Artifact) => issueOf(artifact)?.key ?? milestoneOf(artifact)?.title ?? "the workspace";
+
+  const shown = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    const haystack = (artifact: Artifact) => {
+      const issue = issues.find((entry) => entry.id === artifact.issueId);
+      const milestone = milestones.find((entry) => entry.id === artifact.milestoneId);
+      return [artifact.title, issue?.key, issue?.title, milestone?.title, artifact.type, artifact.author, ...artifact.files.map((file) => file.filename)]
+        .join("\n")
+        .toLowerCase();
+    };
+    return artifacts
+      .filter((artifact) => !projectFilter || artifact.projectId === projectFilter)
+      .filter((artifact) => !typeFilter || artifact.type === typeFilter)
+      .filter((artifact) => !needle || haystack(artifact).includes(needle))
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  }, [artifacts, issues, milestones, query, projectFilter, typeFilter]);
+
+  async function remove(artifact: Artifact) {
     try {
-      await uploadArtifact({
-        workspaceId,
-        projectId: projectId || null,
-        milestoneId: milestoneId || null,
-        title: title.trim(),
-        file,
-      });
-      setFile(null);
-      setTitle("");
-      if (fileInput.current) fileInput.current.value = "";
+      await deleteArtifact(artifact.id);
+      setConfirming(null);
+      if (openId === artifact.id) setOpenId(null);
       await onChanged();
     } catch (cause) {
-      setError(String(cause instanceof Error ? cause.message : cause));
-    } finally {
-      setBusy(false);
+      showToast(String(cause instanceof Error ? cause.message : cause), true);
     }
   }
 
-  async function remove(id: string) {
-    await gql(`mutation ($id: UUID!) { deleteArtifact(id: $id) }`, { id });
-    await onChanged();
-  }
+  const opened = artifacts.find((artifact) => artifact.id === openId);
+  const alert = confirming && (
+    <div className="review-bar" role="alert">
+      <span className="od-fill">
+        <strong>Delete this artifact?</strong> It will be removed from {ownerName(confirming)} and from Artifacts{confirming.files.length > 0 && `, along with ${confirming.files.length} ${confirming.files.length === 1 ? "file" : "files"}`}.
+      </span>
+      <button type="button" className="ghost" onClick={() => setConfirming(null)}>
+        Cancel
+      </button>
+      <button type="button" className="danger" onClick={() => void remove(confirming)}>
+        Delete
+      </button>
+    </div>
+  );
 
   return (
     <section className="screen page">
       <PageHeader
         title="Artifacts"
         subtitle={`${artifacts.length} stored`}
+        ownSearch
         actions={
-          <button className="primary" onClick={() => setCreating(!creating)} aria-expanded={creating}>
-            {creating ? "Cancel" : "Add a file"}
-          </button>
+          <>
+            <input type="search" placeholder="Search artifacts" aria-label="Search artifacts" value={query} onChange={(event) => setQuery(event.target.value)} />
+            <Select
+              label="Project"
+              value={projectFilter}
+              options={[{ value: "", label: "All projects" }, ...projects.map((project) => ({ value: project.id, label: project.prefix ? `${project.prefix} · ${project.name}` : project.name }))]}
+              onChange={setProjectFilter}
+            />
+            <Select
+              label="Type"
+              value={typeFilter}
+              options={[{ value: "", label: "All types" }, ...ARTIFACT_TYPES.map((entry) => ({ value: entry.value, label: entry.plural }))]}
+              onChange={setTypeFilter}
+            />
+            <button type="button" className="primary" onClick={() => setCreating(true)}>
+              <Icon name="plus" size={14} /> New artifact
+            </button>
+          </>
         }
       />
+      {alert}
 
-      {creating ? (
-      <div className="panel">
-        <h2>Add a file</h2>
-        <div className="grid-2">
-          <label>
-            <span>file</span>
-            <input
-              ref={fileInput}
-              type="file"
-              onChange={(event) => {
-                const picked = event.target.files?.[0] ?? null;
-                setFile(picked);
-                if (picked && !title) setTitle(picked.name.replace(/\.[^.]+$/, ""));
-              }}
-            />
-          </label>
-          <label>
-            <span>title (optional)</span>
-            <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Spec, v2" />
-          </label>
-          <label>
-            <span>milestone (optional)</span>
-            <select value={milestoneId} onChange={(event) => setMilestoneId(event.target.value)}>
-              <option value="">unfiled</option>
-              {milestones.map((milestone) => (
-                <option key={milestone.id} value={milestone.id}>
-                  {milestone.title}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>project (optional)</span>
-            <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-              <option value="">workspace</option>
-              {projects.map((project) => (
-                <option key={project.id} value={project.id}>
-                  {project.prefix ? `${project.prefix} · ${project.name}` : project.name}
-                </option>
-              ))}
-            </select>
-          </label>
+      {opened ? (
+        <ArtifactDetail
+          artifact={opened}
+          projects={projects}
+          milestones={milestones}
+          issues={issues}
+          onChanged={onChanged}
+          onOpenIssue={(id) => onOpenIssue?.(id)}
+          onOpenMilestone={() => onOpenMilestones?.()}
+          onAskDelete={() => setConfirming(opened)}
+          onToast={showToast}
+        />
+      ) : shown.length === 0 ? (
+        <div className="empty">
+          <strong>{artifacts.length === 0 ? "No artifacts yet" : "No artifacts match these filters"}</strong>
+          {EMPTY_COPY}
         </div>
-        {error && <p className="error">{error}</p>}
-        <div className="row">
-          <button
-            className="primary"
-            onClick={() => void upload().then(() => setCreating(false))}
-            disabled={busy || !file}
-          >
-            {busy ? "uploading…" : "upload"}
-          </button>
-          <button className="ghost" onClick={() => setCreating(false)}>
-            Cancel
-          </button>
-        </div>
-      </div>
-      ) : null}
-
-      {artifacts.length === 0 && <p className="hint">Nothing on the shelf yet.</p>}
-
-      <table className="table">
-        {artifacts.length > 0 && (
-          <thead>
-            <tr>
-              <th>title</th>
-              <th>file</th>
-              <th>milestone</th>
-              <th>size</th>
-              <th />
-            </tr>
-          </thead>
-        )}
-        <tbody>
-          {artifacts.map((artifact) => {
-            const milestone = milestones.find((entry) => entry.id === artifact.milestoneId);
+      ) : (
+        <div className="alist">
+          <div className="arow head">
+            <span>Artifact</span>
+            <span>Belongs to</span>
+            <span>Status</span>
+            <span>Updated</span>
+          </div>
+          {shown.map((artifact) => {
+            const issue = issueOf(artifact);
+            const milestone = milestoneOf(artifact);
+            const project = projectOf(artifact);
             return (
-              <tr key={artifact.id}>
-                <td>{artifact.title}</td>
-                <td>
-                  <button className="link" onClick={() => void downloadArtifact(artifact)}>
-                    {artifact.filename}
-                  </button>{" "}
-                  <span className="dim">{artifact.kind}</span>
-                </td>
-                <td>{milestone ? milestone.title : <span className="dim">unfiled</span>}</td>
-                <td className="dim">{size(artifact.size)}</td>
-                <td>
-                  <button className="link danger" onClick={() => void remove(artifact.id)}>
-                    delete
-                  </button>
-                </td>
-              </tr>
+              <div
+                key={artifact.id}
+                className={`arow${artifact.id === openId ? " sel" : ""}`}
+                tabIndex={0}
+                onClick={() => setOpenId(artifact.id)}
+                onKeyDown={(event) => event.key === "Enter" && setOpenId(artifact.id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  setMenu({ x: event.clientX, y: event.clientY, artifact });
+                }}
+              >
+                <div>
+                  <div className="a-title">
+                    {artifact.title}
+                    {artifact.files.length > 0 && (
+                      <span className="count" data-n={artifact.files.length} title={`${artifact.files.length} files`}>
+                        <Icon name="clip" size={11} />
+                      </span>
+                    )}
+                  </div>
+                  <div className="a-sub">
+                    <span className={`chip ${typeTone(artifact.type)}`}>{typeLabel(artifact.type)}</span>
+                    {artifact.author && <span>{artifact.author}{artifact.authorIsAgent ? " · agent" : ""}</span>}
+                  </div>
+                </div>
+                <div>
+                  <div className="a-owner">
+                    {project ? (
+                      <>
+                        <span className="dot" style={{ background: project.color }} /> {project.name}
+                      </>
+                    ) : (
+                      "All projects"
+                    )}
+                  </div>
+                  <div className="a-sub">
+                    {issue ? (
+                      <>
+                        <span className="mono">{issue.key}</span> {issue.title}
+                      </>
+                    ) : milestone ? (
+                      <>
+                        <Icon name="flag" size={11} /> {milestone.title}
+                      </>
+                    ) : null}
+                  </div>
+                </div>
+                <div className="a-status">
+                  {issue ? (
+                    <>
+                      <StatusIcon status={issue.status} size={14} /> {statusLabel(issue.status)}
+                    </>
+                  ) : milestone ? (
+                    <span className={`chip ${milestone.status === "done" ? "ok" : ""}`}>{statusLabel(milestone.status)}</span>
+                  ) : null}
+                </div>
+                <div className="a-updated">{shortDate(artifact.updatedAt)}</div>
+              </div>
             );
           })}
-        </tbody>
-      </table>
+        </div>
+      )}
+
+      {menu && (
+        <ContextMenu
+          x={menu.x}
+          y={menu.y}
+          label="Artifact actions"
+          onClose={() => setMenu(null)}
+          items={[
+            { label: "Open", hint: "↵", onSelect: () => setOpenId(menu.artifact.id) },
+            "separator",
+            { label: "Delete…", danger: true, onSelect: () => setConfirming(menu.artifact) },
+          ]}
+        />
+      )}
+
+      {creating && (
+        <NewArtifactDialog
+          workspaceId={workspaceId}
+          projects={projects}
+          milestones={milestones}
+          issues={issues}
+          onToast={showToast}
+          onCreated={async (artifact) => {
+            await onChanged();
+            setOpenId(artifact.id);
+          }}
+          onClose={() => setCreating(false)}
+        />
+      )}
+      {toast}
     </section>
   );
 }
