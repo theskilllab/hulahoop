@@ -127,3 +127,32 @@ describe("Select", () => {
     expect(screen.queryByPlaceholderText("Search…")).toBeNull();
   });
 });
+
+describe("Select extensions", () => {
+  it("renders an option's detail text", async () => {
+    const options: SelectOption[] = [
+      { value: "a", label: "Alpha", detail: "$3 / $15" },
+      { value: "b", label: "Bravo", disabled: true, detail: "not connected" },
+    ];
+    setup(options);
+    await userEvent.click(screen.getByRole("button", { name: /Type/ }));
+    expect(document.querySelector(".sel-pop .sp-detail")?.textContent).toBe("$3 / $15");
+    expect(screen.getByText("not connected")).toBeTruthy();
+  });
+
+  it("a disabled Select does not open and accepts an id", async () => {
+    render(<Select label="Type" id="t1" disabled value="a" options={few} onChange={vi.fn()} />);
+    const trigger = screen.getByRole("button", { name: /Type/ }) as HTMLButtonElement;
+    expect(trigger.id).toBe("t1");
+    expect(trigger.disabled).toBe(true);
+    await userEvent.click(trigger);
+    expect(document.querySelector(".sel-pop")).toBeNull();
+  });
+
+  it("search matches the group name", async () => {
+    const { trigger } = setup(many);
+    await userEvent.click(trigger);
+    await userEvent.type(screen.getByPlaceholderText("Search…"), "milestones");
+    expect(screen.getAllByRole("option")).toHaveLength(3);
+  });
+});
