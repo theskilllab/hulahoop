@@ -1,41 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
-import RichText from "../RichText";
-
-import {
-  gql,
-  loadConnections,
-  loadModels,
-  setAgentInstructions,
-  setAgentSkills,
-  type Agent,
-  type IssueSummary,
-  type RecentRun,
-  type ConnectorRow,
-  type ModelOption,
-  type Skill,
-} from "../api";
+import { gql, loadConnections, type Agent, type ConnectorRow, type IssueSummary, type RecentRun, type Skill } from "../api";
+import { plural } from "../components/TaskBits";
+import { useToast } from "../components/Toast";
 import Icon from "../Icon";
 import PageHeader from "../PageHeader";
-import { servesPiModel } from "../piProviders";
-
-/** Harnesses we can run. `harness` is the provider key a connection is stored under. */
-const HARNESSES: { adapter: string; harness: string; name: string }[] = [
-  { adapter: "pi", harness: "pi", name: "Pi" },
-  { adapter: "claude_code", harness: "claude_code", name: "Claude Code" },
-  { adapter: "fake", harness: "", name: "Fake (development)" },
-];
-
-interface Connection {
-  id: string;
-  provider: string;
-  kind: string;
-  connected: boolean;
-  label: string | null;
-  connectedAt: string | null;
-  /** The harness adapters this entry can sign in. */
-  harnesses: string[];
-}
+import AgentDialog from "./AgentDialog";
+import { DiffTab, LogTab, TranscriptTab } from "./AgentTabs";
+import { harnessOf } from "./agentHarness";
 
 interface Preflight {
   agentId: string;
@@ -45,9 +17,46 @@ interface Preflight {
   checkedAt: string;
 }
 
-const harnessOf = (adapter: string) => HARNESSES.find((entry) => entry.adapter === adapter);
-const statusOf = (running: boolean): { label: string; tone: string } =>
-  running ? { label: "Running", tone: "ok" } : { label: "Idle", tone: "" };
+export type AgentState = "running" | "blocked" | "idle";
+
+const startedAt = (run: RecentRun) => run.startedAt ?? "";
+
+/** The run an agent is on: its running one, else the newest it started. */
+export function latestRunFor(agentId: string, runs: RecentRun[]): RecentRun | null {
+  const mine = runs.filter((run) => run.agentId === agentId).sort((a, b) => startedAt(a).localeCompare(startedAt(b)));
+  return mine.filter((run) => run.status === "running").at(-1) ?? mine.at(-1) ?? null;
+}
+
+/**
+ * Running when a run is live. Blocked when the agent's latest run is on a task that
+ * is blocked on a question and nobody else has taken a turn on it since. Idle otherwise.
+ */
+export function agentState(agentId: string, runs: RecentRun[], issues: IssueSummary[]): AgentState {
+  if (runs.some((run) => run.agentId === agentId && run.status === "running")) return "running";
+  const latest = latestRunFor(agentId, runs);
+  const issue = latest && issues.find((entry) => entry.id === latest.issueId);
+  if (!latest || issue?.status !== "blocked" || !issue.blockedBy) return "idle";
+  const taken = runs.some((run) => run.issueId === latest.issueId && startedAt(run) > startedAt(latest));
+  return taken ? "idle" : "blocked";
+}
+
+function StateChip({ state }: { state: AgentState }) {
+  if (state === "running")
+    return (
+      <span className="chip ok">
+        <span className="pulse" aria-hidden="true" />
+        Running
+      </span>
+    );
+  if (state === "blocked")
+    return (
+      <span className="chip warn">
+        <Icon name="alert" size={12} />
+        Blocked
+      </span>
+    );
+  return <span className="chip">Idle</span>;
+}
 
 /**
  * Agents are the workers: a name, a harness, a model, the instructions it works by and
@@ -64,6 +73,8 @@ export default function Agents({
   projectId,
   onChanged,
   onOpenSkills,
+  onOpenIssue,
+  onOpenConnectors,
 }: {
   workspaceId: string;
   agents: Agent[];
@@ -75,20 +86,19 @@ export default function Agents({
   projectId: string | null;
   onChanged: () => Promise<void>;
   onOpenSkills: () => void;
+  onOpenIssue: (issueId: string) => void;
+  onOpenConnectors: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(agents[0]?.id ?? null);
-  const [connections, setConnections] = useState<Connection[]>([]);
+  const [connections, setConnections] = useState<ConnectorRow[]>([]);
   const [preflight, setPreflight] = useState<Preflight[]>([]);
   const [editing, setEditing] = useState<null | "new" | string>(null);
   const [tab, setTab] = useState<"diff" | "tx" | "log">("diff");
-  const [error, setError] = useState<string | null>(null);
-
-  async function loadConnections() {
-    const data = await gql<{ connections: Connection[] }>(
-      `query { connections { id provider kind connected label connectedAt harnesses } }`,
-    );
-    setConnections(data.connections);
-  }
+  // A run picked on the Activity log; its transcript shows instead of the current run's.
+  const [pickedRun, setPickedRun] = useState<RecentRun | null>(null);
+  const [confirmStop, setConfirmStop] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  const [toast, showToast] = useToast();
 
   async function loadPreflight() {
     if (!projectId) return;
@@ -104,7 +114,9 @@ export default function Agents({
   }
 
   useEffect(() => {
-    void loadConnections().catch(() => setConnections([]));
+    void loadConnections()
+      .then(setConnections)
+      .catch(() => setConnections([]));
   }, [workspaceId]);
 
   useEffect(() => {
@@ -116,32 +128,45 @@ export default function Agents({
     if (selected && !agents.some((agent) => agent.id === selected)) setSelected(agents[0]?.id ?? null);
   }, [agents, selected]);
 
+  function select(id: string) {
+    setSelected(id);
+    setPickedRun(null);
+    setConfirmStop(false);
+  }
+
   const agent = agents.find((entry) => entry.id === selected) ?? null;
   // A harness is usable when any entry that can sign it in is connected.
   const connected = (harness: string) =>
     harness === "" || connections.some((entry) => entry.connected && entry.harnesses.includes(harness));
 
-  /** The newest run this agent started. Every run records whose time it was. */
-  const current = useMemo(() => {
-    if (!agent) return null;
-    const mine = runs
-      .filter((run) => run.agentId === agent.id)
-      .sort((a, b) => (a.startedAt ?? "").localeCompare(b.startedAt ?? ""));
-    const run = mine.at(-1);
-    const issue = run ? issues.find((entry) => entry.id === run.issueId) : undefined;
-    return run && issue ? { issue, run } : null;
-  }, [agent, issues, runs]);
+  const issueOf = (run: RecentRun | null) => (run ? issues.find((entry) => entry.id === run.issueId) : undefined);
+  const keyOf = (run: RecentRun) => issueOf(run)?.key ?? "Task";
 
-  const running = current?.run.status === "running";
+  const run = agent ? latestRunFor(agent.id, runs) : null;
+  const issue = issueOf(run);
+  const state = agent ? agentState(agent.id, runs, issues) : "idle";
+  const link = agent ? harnessOf(agent.adapter) : undefined;
+  const lost = !connected(link?.harness ?? "");
+  const check = agent ? preflight.find((entry) => entry.agentId === agent.id) : undefined;
+  const transcriptRun = pickedRun ?? run;
+  const running = runs.filter((entry) => entry.status === "running");
+  const runningCount = agents.filter((entry) => running.some((live) => live.agentId === entry.id)).length;
 
-  /** Which harnesses have a live run right now — the roster's status chip reads it. */
-  const runningAgents = new Set(runs.filter((run) => run.status === "running").map((run) => run.agentId));
+  async function stop(runId: string) {
+    setConfirmStop(false);
+    try {
+      await gql(`mutation ($runId: UUID!) { cancelRun(runId: $runId) { id status } }`, { runId });
+      await onChanged();
+    } catch (cause) {
+      setFailure(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
 
   return (
     <section className="screen agents-screen">
       <PageHeader
         title="Agents"
-        subtitle={`${agents.filter((entry) => runningAgents.has(entry.id)).length} running · local runner`}
+        subtitle={`${runningCount} running · Local runner`}
         actions={
           <button className="primary" onClick={() => setEditing("new")}>
             <Icon name="plus" size={14} /> New agent
@@ -149,43 +174,40 @@ export default function Agents({
         }
       />
 
-      {error ? <p className="error">{error}</p> : null}
+      {failure ? <p className="error">{failure}</p> : null}
 
       <div className="split">
         <div className="roster">
           {agents.map((entry) => {
-            const isRunning = runningAgents.has(entry.id);
-            const link = harnessOf(entry.adapter);
-            const lost = !connected(link?.harness ?? "");
+            const entryLink = harnessOf(entry.adapter);
+            const entryIssue = issueOf(latestRunFor(entry.id, runs));
+            const entryLost = !connected(entryLink?.harness ?? "");
+            const harnessName = entryLink?.name ?? entry.adapter;
             return (
-              <button
-                key={entry.id}
-                className="acard"
-                aria-selected={entry.id === selected}
-                onClick={() => setSelected(entry.id)}
-              >
+              <button key={entry.id} className="acard" aria-selected={entry.id === selected} onClick={() => select(entry.id)}>
                 <span className="row spread">
                   <span className="avatar">
                     <Icon name="bot" size={14} />
                   </span>
                   <strong className="fill truncate">{entry.name}</strong>
-                  <span className={statusOf(isRunning).tone === "ok" ? "chip ok" : "chip"}>
-                    {isRunning ? <span className="pulse" /> : null}
-                    {statusOf(isRunning).label}
-                  </span>
+                  <StateChip state={agentState(entry.id, runs, issues)} />
                 </span>
                 <span className="truncate small dim">
-                  {link?.name ?? entry.adapter} · {entry.model || "default model"}
-                  {entry.skills.length ? ` · ${entry.skills.length} skill${entry.skills.length === 1 ? "" : "s"}` : ""}
+                  {entryIssue ? `${entryIssue.key} · ${entryIssue.title}` : "No task assigned"}
                 </span>
-                <span className={lost ? "truncate tiny warn" : "truncate tiny dim"}>
-                  {lost ? `${link?.name} is not connected` : (current?.issue.key ?? "No task assigned")}
+                <span className={entryLost ? "truncate tiny warn-text" : "truncate tiny dim"}>
+                  {entryLost
+                    ? `${harnessName} · not connected`
+                    : `${harnessName} · ${entry.model || "default model"} · ${plural(entry.skills.length, "skill")}`}
                 </span>
               </button>
             );
           })}
           {agents.length === 0 ? (
-            <p className="dim small">No agents yet. Create one, then give it a harness that has a connection.</p>
+            <div className="empty">
+              <strong>No agents yet</strong>
+              <span className="dim small">Create one, then give it a harness that has a connection.</span>
+            </div>
           ) : null}
         </div>
 
@@ -197,18 +219,13 @@ export default function Agents({
                   <Icon name="bot" size={16} />
                 </span>
                 <h2 className="fill truncate">{agent.name}</h2>
-                <span className={running ? "chip ok" : "chip"}>
-                  {running ? <span className="pulse" /> : null}
-                  {running ? "Running" : "Idle"}
-                </span>
+                <StateChip state={state} />
               </div>
 
               <div className="pillrow">
-                <span className="chip">{harnessOf(agent.adapter)?.name ?? agent.adapter}</span>
+                <span className="chip">{link?.name ?? agent.adapter}</span>
                 <span className="chip">{agent.model || "default model"}</span>
-                {connected(harnessOf(agent.adapter)?.harness ?? "") ? null : (
-                  <span className="chip warn">Not connected</span>
-                )}
+                {lost ? <span className="chip warn">Not connected</span> : null}
                 <button className="linkbtn" onClick={() => setEditing(agent.id)}>
                   AGENTS.md
                 </button>
@@ -221,13 +238,15 @@ export default function Agents({
               </div>
 
               <div className="pillrow">
-                {current ? (
+                {run && issue ? (
                   <>
-                    <span className="chip info mono">{current.issue.key}</span>
-                    <span className="truncate">{current.issue.title}</span>
-                    {current.run.headBookmark ? (
+                    <button className="chip info mono" onClick={() => onOpenIssue(issue.id)}>
+                      {issue.key}
+                    </button>
+                    <span className="truncate agent-task">{issue.title}</span>
+                    {run.headBookmark ? (
                       <span className="chip mono">
-                        <Icon name="branch" size={12} /> {current.run.headBookmark}
+                        <Icon name="branch" size={12} /> {run.headBookmark}
                       </span>
                     ) : null}
                   </>
@@ -236,7 +255,38 @@ export default function Agents({
                 )}
               </div>
 
+              {state === "blocked" && issue ? (
+                <div className="callout warn" role="status">
+                  <span className="fill">{issue.blockedBy}</span>
+                  <button className="primary" onClick={() => onOpenIssue(issue.id)}>
+                    Answer on {issue.key}
+                  </button>
+                </div>
+              ) : null}
+
               <div className="row">
+                {state === "running" && run ? (
+                  confirmStop ? (
+                    <>
+                      <span className="small">Stop this run?</span>
+                      <button className="danger" onClick={() => void stop(run.id)}>
+                        Stop run
+                      </button>
+                      <button className="ghost" onClick={() => setConfirmStop(false)}>
+                        Keep running
+                      </button>
+                    </>
+                  ) : (
+                    <button className="danger" onClick={() => setConfirmStop(true)}>
+                      Stop
+                    </button>
+                  )
+                ) : null}
+                {lost ? (
+                  <button className="primary" onClick={onOpenConnectors}>
+                    Connect {link?.name ?? agent.adapter}
+                  </button>
+                ) : null}
                 <button onClick={() => setEditing(agent.id)}>
                   <Icon name="gear" size={14} /> Edit agent
                 </button>
@@ -250,18 +300,12 @@ export default function Agents({
                       setTimeout(() => void loadPreflight(), 6000);
                     }}
                   >
-                    <Icon name="refresh" size={14} /> Probe
+                    <Icon name="refresh" size={14} /> Check harness
                   </button>
                 ) : null}
-                {preflight.find((entry) => entry.agentId === agent.id) ? (
-                  <span
-                    className={
-                      preflight.find((entry) => entry.agentId === agent.id)!.ok ? "ok small" : "bad small"
-                    }
-                  >
-                    {preflight.find((entry) => entry.agentId === agent.id)!.ok
-                      ? `harness answers (${preflight.find((entry) => entry.agentId === agent.id)!.detail})`
-                      : `probe failed: ${preflight.find((entry) => entry.agentId === agent.id)!.detail}`}
+                {check ? (
+                  <span className={check.ok ? "chip ok" : "chip bad"} title={check.detail}>
+                    {check.ok ? "Harness answers" : "Check failed"}
                   </span>
                 ) : null}
               </div>
@@ -280,31 +324,19 @@ export default function Agents({
             </div>
 
             <div className="tab-body">
-              {tab === "diff" ? (
-                <div className="empty">
-                  <strong>No changes to show</strong>
-                  <span className="dim small">
-                    A run's diff streams here once the run starts. Task runs are shown on the task, not
-                    here.
-                  </span>
-                </div>
-              ) : null}
+              {tab === "diff" ? <DiffTab run={run} blocked={state === "blocked"} agentName={agent.name} /> : null}
               {tab === "tx" ? (
-                <div className="empty">
-                  <strong>Transcript</strong>
-                  <span className="dim small">
-                    The agent's own words for its current run. Open the task to read the full transcript
-                    of a finished one.
-                  </span>
-                </div>
+                <TranscriptTab run={transcriptRun} issueKey={transcriptRun ? keyOf(transcriptRun) : ""} agentName={agent.name} />
               ) : null}
               {tab === "log" ? (
-                <div className="empty">
-                  <strong>Activity log</strong>
-                  <span className="dim small">
-                    Every run this agent started, with its outcome, will be listed here.
-                  </span>
-                </div>
+                <LogTab
+                  runs={runs.filter((entry) => entry.agentId === agent.id).sort((a, b) => startedAt(b).localeCompare(startedAt(a)))}
+                  keyOf={keyOf}
+                  onOpen={(picked) => {
+                    setPickedRun(picked);
+                    setTab("tx");
+                  }}
+                />
               ) : null}
             </div>
           </div>
@@ -320,322 +352,27 @@ export default function Agents({
         <AgentDialog
           workspaceId={workspaceId}
           agent={editing === "new" ? null : (agents.find((entry) => entry.id === editing) ?? null)}
+          takenNames={agents.filter((entry) => entry.id !== editing).map((entry) => entry.name)}
           skills={skills}
           connected={connected}
-          onOpenSkills={onOpenSkills}
-          onClose={() => setEditing(null)}
-          onError={setError}
-          onSaved={async (id) => {
-            await onChanged();
-            if (id) setSelected(id);
+          onOpenSkills={() => {
             setEditing(null);
+            onOpenSkills();
+          }}
+          onOpenConnectors={() => {
+            setEditing(null);
+            onOpenConnectors();
+          }}
+          onClose={() => setEditing(null)}
+          onSaved={async (id, message) => {
+            await onChanged();
+            if (id) select(id);
+            setEditing(null);
+            showToast(message);
           }}
         />
       ) : null}
+      {toast}
     </section>
-  );
-}
-
-/** The edit form: name, harness (only what is connected), model, AGENTS.md, skills. */
-function AgentDialog({
-  workspaceId,
-  agent,
-  skills,
-  connected,
-  onOpenSkills,
-  onClose,
-  onSaved,
-  onError,
-}: {
-  workspaceId: string;
-  agent: Agent | null;
-  skills: Skill[];
-  connected: (harness: string) => boolean;
-  onOpenSkills: () => void;
-  onClose: () => void;
-  onSaved: (id: string | null) => Promise<void>;
-  onError: (message: string | null) => void;
-}) {
-  const [name, setName] = useState(agent?.name ?? "");
-  const [adapter, setAdapter] = useState(agent?.adapter ?? HARNESSES[0].adapter);
-  const [model, setModel] = useState(agent?.model ?? "");
-  // A harness with two ways to pay needs to know which one this agent uses.
-  const [connector, setConnector] = useState(agent?.connector ?? "");
-  // `null` until the list arrives, so a stored choice is not flagged before it can be checked.
-  const [connectors, setConnectors] = useState<ConnectorRow[] | null>(null);
-  const [md, setMd] = useState(agent?.agentsMd ?? "");
-  const [picked, setPicked] = useState<string[]>(agent?.skills.map((skill) => skill.id) ?? []);
-  const [busy, setBusy] = useState<string | null>(null);
-
-  const harness = harnessOf(adapter) ?? HARNESSES[0];
-  const [models, setModels] = useState<ModelOption[]>([]);
-
-  // A Pi model from another provider makes a per-provider choice moot: the server
-  // would ignore it, so the form lets it go instead of saving it.
-  const chooseModel = (next: string) => {
-    setModel(next);
-    if (adapter === "pi") setConnector((current) => (current && !servesPiModel(current, next) ? "" : current));
-  };
-
-  // The list comes from the harness, not from us: pi reports the providers it is
-  // signed in to, Claude Code reports its aliases.
-  useEffect(() => {
-    let live = true;
-    loadModels(adapter)
-      .then((next) => {
-        if (!live) return;
-        setModels(next);
-        if (next.length && !next.some((entry) => entry.id === model)) chooseModel(next[0].id);
-      })
-      .catch(() => live && setModels([]));
-    return () => {
-      live = false;
-    };
-  }, [adapter]);
-
-  const providers = useMemo(() => {
-    const groups = new Map<string, ModelOption[]>();
-    for (const entry of models) {
-      groups.set(entry.provider, [...(groups.get(entry.provider) ?? []), entry]);
-    }
-    return [...groups.entries()];
-  }, [models]);
-
-  useEffect(() => {
-    void loadConnections()
-      .then(setConnectors)
-      .catch(() => setConnectors([]));
-  }, []);
-
-  // The connected entries the server would use for this harness and, on Pi, for
-  // this model's provider (the Pi login serves any model).
-  const offered = (connectors ?? []).filter(
-    (row) =>
-      row.connected && row.harnesses.includes(adapter) && (adapter !== "pi" || servesPiModel(row.id, model)),
-  );
-  // A stored choice that is not on offer stays visible, disabled, instead of reading as Automatic.
-  const stored = connectors?.find((row) => row.id === connector);
-  const stale = connectors !== null && connector !== "" && !offered.some((row) => row.id === connector);
-  const staleReason =
-    stored?.connected && stored.harnesses.includes(adapter) ? "does not serve this model" : "not connected";
-
-  async function save() {
-    setBusy("save");
-    onError(null);
-    try {
-      let id = agent?.id ?? null;
-      if (agent) {
-        await gql(
-          `mutation ($id: UUID!, $name: String!, $adapter: String!, $model: String, $connector: String) {
-             updateAgent(id: $id, name: $name, adapter: $adapter, model: $model, connector: $connector) { id }
-           }`,
-          { id: agent.id, name, adapter, model, connector: connector || null },
-        );
-      } else {
-        const data = await gql<{ createAgent: { id: string } }>(
-          `mutation ($w: UUID!, $n: String!, $a: String!, $m: String, $c: String) {
-             createAgent(workspaceId: $w, name: $n, adapter: $a, model: $m, connector: $c) { id }
-           }`,
-          { w: workspaceId, n: name, a: adapter, m: model, c: connector || null },
-        );
-        id = data.createAgent.id;
-      }
-      if (id) {
-        await setAgentInstructions(id, md);
-        await setAgentSkills(id, picked);
-      }
-      await onSaved(id);
-    } catch (failure) {
-      onError(failure instanceof Error ? failure.message : String(failure));
-    } finally {
-      setBusy(null);
-    }
-  }
-
-  return (
-    <div className="dialog" role="dialog" aria-modal="true" onClick={onClose}>
-      <div
-        className="dialog-card"
-        onClick={(event) => {
-          event.stopPropagation();
-        }}
-      >
-        <header className="row spread">
-          <h2>{agent ? `Edit ${agent.name}` : "New agent"}</h2>
-          <button className="ghost" onClick={onClose} aria-label="Close">
-            <Icon name="close" size={14} />
-          </button>
-        </header>
-
-        <label>
-          Name
-          <input value={name} onChange={(event) => setName(event.target.value)} autoFocus />
-        </label>
-
-        <label>
-          Harness
-          <select
-            value={adapter}
-            onChange={(event) => {
-              const next = event.target.value;
-              setAdapter(next);
-              setModel("");
-              const row = connectors?.find((entry) => entry.id === connector);
-              if (!row?.harnesses.includes(next)) setConnector("");
-            }}
-          >
-            {HARNESSES.map((entry) => {
-              const usable = connected(entry.harness);
-              return (
-                <option key={entry.adapter} value={entry.adapter} disabled={!usable}>
-                  {entry.name}
-                  {usable ? "" : " — not connected"}
-                </option>
-              );
-            })}
-          </select>
-        </label>
-        <p className="dim small">
-          {connected(harness.harness)
-            ? `${harness.name} runs on your ${harness.name} connection.`
-            : `${harness.name} has no connection yet. Connect it on the Connectors screen, then come back.`}
-        </p>
-
-        <label>
-          Model
-          {models.length > 0 ? (
-            <select
-              value={model}
-              onChange={(event) => chooseModel(event.target.value)}
-              disabled={!connected(harness.harness)}
-            >
-              {providers.map(([provider, entries]) => (
-                <optgroup key={provider} label={provider}>
-                  {entries.map((entry) => (
-                    <option key={entry.id} value={entry.id}>
-                      {entry.label}
-                      {entry.costOut !== null ? ` — $${entry.costIn ?? 0}/$${entry.costOut} per Mtok` : ""}
-                    </option>
-                  ))}
-                </optgroup>
-              ))}
-            </select>
-          ) : (
-            <input
-              value={model}
-              placeholder="provider/model"
-              onChange={(event) => chooseModel(event.target.value)}
-            />
-          )}
-        </label>
-        <p className="dim small">
-          {models.length > 0
-            ? `${models.length} models from ${harness.name}'s own catalogue.`
-            : `${harness.name} did not report a catalogue, so type the model it takes.`}
-        </p>
-
-        {offered.length > 1 || (adapter === "pi" && offered.length > 0) || stale ? (
-          <>
-            <label>
-              Signs in with
-              <select value={connector} onChange={(event) => setConnector(event.target.value)}>
-                <option value="">Automatic</option>
-                {offered.map((entry) => (
-                  <option key={entry.id} value={entry.id}>
-                    {entry.name}
-                  </option>
-                ))}
-                {stale ? (
-                  <option value={connector} disabled>
-                    {stored?.name ?? connector} ({staleReason})
-                  </option>
-                ) : null}
-              </select>
-            </label>
-            <p className="dim small">
-              {adapter === "pi"
-                ? "Lists the connectors for this model's provider and your Pi login. Automatic uses the provider's connector, then your Pi login."
-                : `${harness.name} can act on a plan login or a billed key. This chooses which.`}
-            </p>
-          </>
-        ) : null}
-        {adapter !== "pi" && !stale && offered.length === 1 && connector !== offered[0].id ? (
-          <p className="dim small">{harness.name} will sign in with {offered[0].name}.</p>
-        ) : null}
-
-        <label>
-          AGENTS.md
-          <RichText
-            value={md}
-            onChange={setMd}
-            placeholder="How this agent works. Markdown, no toolbar: # headings, - lists, **bold**."
-            minHeight={150}
-            ariaLabel="AGENTS.md"
-          />
-        </label>
-        <p className="dim small">
-          Read on every run, after the run contract and before the skills. This is where an
-          agent that plans differs from one that implements.
-        </p>
-
-        <div className="skills-pick">
-          {skills.length === 0 ? (
-            <p className="dim small">
-              No skills in this workspace yet.{" "}
-              <button type="button" className="link" onClick={onOpenSkills}>
-                Write the first one
-              </button>
-              .
-            </p>
-          ) : (
-            skills.map((skill) => {
-              const on = picked.includes(skill.id);
-              return (
-                <button
-                  key={skill.id}
-                  className={on ? "sk on" : "sk"}
-                  onClick={() =>
-                    setPicked(on ? picked.filter((id) => id !== skill.id) : [...picked, skill.id])
-                  }
-                  aria-pressed={on}
-                >
-                  <Icon name="book" size={12} />
-                  {skill.name}
-                </button>
-              );
-            })
-          )}
-        </div>
-
-        <footer className="row spread">
-          <div className="row">
-            {agent ? (
-              <button
-                className="danger"
-                disabled={busy !== null}
-                onClick={async () => {
-                  const yes = confirm(`Delete ${agent.name}? Runs it started stay in the history.`);
-                  if (!yes) return;
-                  await gql(`mutation ($id: UUID!) { deleteAgent(id: $id) }`, { id: agent.id });
-                  await onSaved(null);
-                }}
-              >
-                Delete agent
-              </button>
-            ) : null}
-          </div>
-          <div className="row">
-            <button onClick={onClose}>Cancel</button>
-            <button
-              className="primary"
-              onClick={() => void save()}
-              disabled={busy !== null || name.trim().length < 2 || !connected(harness.harness)}
-            >
-              {agent ? "Save agent" : "Create agent"}
-            </button>
-          </div>
-        </footer>
-      </div>
-    </div>
   );
 }

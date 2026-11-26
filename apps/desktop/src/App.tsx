@@ -612,6 +612,8 @@ export default function App() {
             projectId={project?.id ?? null}
             onChanged={reload}
             onOpenSkills={() => setView({ name: "skills" })}
+            onOpenIssue={(id) => setView({ name: "issue", id })}
+            onOpenConnectors={() => setView({ name: "connectors" })}
           />
         )}
 

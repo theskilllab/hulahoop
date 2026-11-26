@@ -8,6 +8,8 @@ export interface SelectOption {
   /** Options with the same group sit under one small heading. */
   group?: string;
   disabled?: boolean;
+  /** Muted text on the right of the row: a price, or why the option is disabled. */
+  detail?: string;
 }
 
 const SEARCH_ABOVE = 4;
@@ -26,6 +28,9 @@ export default function Select({
   options,
   onChange,
   prefix,
+  id,
+  disabled,
+  searchable,
 }: {
   label: string;
   value: string;
@@ -33,6 +38,10 @@ export default function Select({
   onChange: (value: string) => void;
   /** Shown before the current choice on the pill, e.g. a colour dot. */
   prefix?: ReactNode;
+  id?: string;
+  disabled?: boolean;
+  /** Force the search row on or off; by default it shows above four options. */
+  searchable?: boolean;
 }) {
   const trigger = useRef<HTMLButtonElement>(null);
   const [open, setOpen] = useState(false);
@@ -47,7 +56,9 @@ export default function Select({
     <span className="sel" onKeyDown={(event) => !open && openOnArrow(event, () => setOpen(true))}>
       <button
         ref={trigger}
+        id={id}
         type="button"
+        disabled={disabled}
         className="pill sel-btn"
         aria-label={label}
         aria-haspopup="listbox"
@@ -64,6 +75,7 @@ export default function Select({
           label={label}
           value={value}
           options={options}
+          searchable={searchable ?? options.length > SEARCH_ABOVE}
           onChoose={(next) => {
             if (next !== value) onChange(next);
             close(true);
@@ -86,6 +98,7 @@ function Popover({
   label,
   value,
   options,
+  searchable,
   onChoose,
   onClose,
 }: {
@@ -93,16 +106,16 @@ function Popover({
   label: string;
   value: string;
   options: SelectOption[];
+  searchable: boolean;
   onChoose: (value: string) => void;
   onClose: (refocus: boolean) => void;
 }) {
   const pop = useRef<HTMLDivElement>(null);
   const searchBox = useRef<HTMLInputElement>(null);
-  const searchable = options.length > SEARCH_ABOVE;
   const [query, setQuery] = useState("");
   const shown = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    return needle ? options.filter((option) => option.label.toLowerCase().includes(needle)) : options;
+    return needle ? options.filter((option) => `${option.label} ${option.group ?? ""}`.toLowerCase().includes(needle)) : options;
   }, [options, query]);
   const [active, setActive] = useState(() => Math.max(0, options.findIndex((option) => option.value === value && !option.disabled)));
   const [place, setPlace] = useState<{ left: number; top: number; minWidth: number }>(() => anchor(trigger));
@@ -172,6 +185,7 @@ function Popover({
         onClick={() => !option.disabled && onChoose(option.value)}
       >
         <span className="sp-label">{option.label}</span>
+        {option.detail ? <span className="sp-detail">{option.detail}</span> : null}
         {option.value === value ? <Icon name="check" size={14} /> : null}
       </div>,
     ];
