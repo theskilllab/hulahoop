@@ -44,6 +44,7 @@ const pr = (over: Partial<PullRequest> = {}): PullRequest => ({
   deletions: 1,
   changedFiles: 1,
   reviewState: "REVIEW_REQUESTED",
+  changesRequested: 0,
   reviewRequestedFromMe: true,
   ciState: "PASSING",
   mergeable: "CLEAN",
@@ -159,6 +160,21 @@ describe("PullRequests list", () => {
     expect(screen.getByText("no GitHub access for northwind/relay-api")).toBeTruthy();
     await userEvent.click(screen.getByRole("button", { name: /Settings → Personal/ }));
     expect(handlers.onOpenSettings).toHaveBeenCalled();
+  });
+
+  it("numbers the review round once a pull request comes back after changes", async () => {
+    api.loadPullRequests.mockResolvedValue([
+      pr({ id: "repo1#12", changesRequested: 1 }),
+      pr({ id: "repo1#13", number: 13, title: "Third pass", changesRequested: 2 }),
+      pr({ id: "repo1#14", number: 14, title: "Still owed", reviewState: "CHANGES_REQUESTED", changesRequested: 1 }),
+    ]);
+    render(<PullRequests {...props()} />);
+    const second = within(await screen.findByRole("button", { name: /Add retry with backoff/ })).getByText("Review requested · 2nd round");
+    expect(second.className).toBe("chip warn");
+    expect(second.getAttribute("title")).toBe("Sent back for changes once; updated since");
+    const third = within(screen.getByRole("button", { name: /Third pass/ })).getByText("Review requested · 3rd round");
+    expect(third.className).toBe("chip bad");
+    expect(within(screen.getByRole("button", { name: /Still owed/ })).getByText("Changes requested")).toBeTruthy();
   });
 
   it("opens the linked task", async () => {

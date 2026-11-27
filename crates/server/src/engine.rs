@@ -2818,6 +2818,12 @@ impl Engine {
                         let url = payload.get("pr_url").and_then(|v| v.as_str());
                         self.announce_pull_request(issue_id, run_id, number, url)
                             .await?;
+                    } else if let Some(repo_id) = job.repo_id {
+                        // The rework answers whoever asked for changes; GitHub
+                        // keeps their request in force until they review again.
+                        if let Err(error) = self.ask_for_review_again(repo_id, number).await {
+                            tracing::warn!(%issue_id, number, "asking for review again: {error:#}");
+                        }
                     }
                     let issue = self.issue(issue_id).await?;
                     self.ensure_pull_request(&issue).await?;

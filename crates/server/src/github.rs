@@ -789,6 +789,24 @@ impl Github {
         .await
     }
 
+    /// Asks these people to review the pull request again.
+    pub async fn request_reviewers(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        logins: &[String],
+    ) -> Result<()> {
+        self.send(
+            reqwest::Method::POST,
+            &format!("/repos/{owner}/{repo}/pulls/{number}/requested_reviewers"),
+            &[],
+            Some(&serde_json::json!({ "reviewers": logins })),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// The check runs reported against a commit.
     pub async fn check_runs(
         &self,

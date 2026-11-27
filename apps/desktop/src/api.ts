@@ -1444,6 +1444,8 @@ export interface PullRequest {
   deletions: number;
   changedFiles: number;
   reviewState: ReviewState;
+  /** How many times a reviewer sent it back for changes; its review round is one more. */
+  changesRequested: number;
   reviewRequestedFromMe: boolean;
   ciState: CiState;
   /** Whether it merges cleanly into `baseRef`; closed and merged ones are `UNKNOWN`. */
@@ -1525,7 +1527,7 @@ export const GITHUB_ACCOUNT_FIELDS = `login name avatarUrl tokenHint validatedAt
 
 export const PULL_REQUEST_FIELDS = `
   id repoId repoName number title url state draft merged authorLogin authorAvatarUrl byAgent
-  headRef headSha baseRef additions deletions changedFiles reviewState reviewRequestedFromMe ciState
+  headRef headSha baseRef additions deletions changedFiles reviewState changesRequested reviewRequestedFromMe ciState
   mergeable createdAt updatedAt mergedAt
   issue { id key title status }
   liveRun { id agentId status }

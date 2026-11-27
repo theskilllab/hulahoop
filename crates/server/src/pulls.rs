@@ -268,6 +268,9 @@ pub struct PullRequest {
     pub deletions: i64,
     pub changed_files: i64,
     pub review_state: ReviewState,
+    /// How many times a reviewer sent it back for changes; withdrawn
+    /// (dismissed) requests are not counted. Its review round is one more.
+    pub changes_requested: i64,
     pub review_requested_from_me: bool,
     pub ci_state: CiState,
     /// Whether it merges cleanly into `base_ref`; only open pull requests are
@@ -565,32 +568,108 @@ fn same_repository(repo: &LinkedRepo, pull: &Value) -> bool {
 /// The review state GitHub shows: each reviewer counts with their latest
 /// review that said something (a plain comment changes nothing), and one
 /// request for changes outweighs any number of approvals.
+///
+/// A request for changes made on an older commit than the head is answered:
+/// the author pushed since, so the pull request waits on its reviewer again.
 pub fn review_state(pull: &Value, reviews: &[Value]) -> ReviewState {
-    if is_merged(pull) {
-        return ReviewState::Merged;
+    review(pull, reviews).state
+}
+
+/// What a pull request's reviews add up to, and how many times somebody sent
+/// it back. `changes_requested` is `None` when the reviews were not read, so
+/// the cached count stays.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Review {
+    pub state: ReviewState,
+    pub changes_requested: Option<i64>,
+}
+
+impl From<ReviewState> for Review {
+    fn from(state: ReviewState) -> Self {
+        Self {
+            state,
+            changes_requested: None,
+        }
     }
-    if pull["state"].as_str() == Some("closed") {
-        return ReviewState::Closed;
+}
+
+/// [`review_state`] together with the number of requests for changes. A
+/// dismissed request is withdrawn, and GitHub reports it as `DISMISSED`, so
+/// it is not counted.
+pub fn review(pull: &Value, reviews: &[Value]) -> Review {
+    let changes_requested = reviews
+        .iter()
+        .filter(|review| review["state"].as_str() == Some("CHANGES_REQUESTED"))
+        .count() as i64;
+    let state = if is_merged(pull) {
+        ReviewState::Merged
+    } else if pull["state"].as_str() == Some("closed") {
+        ReviewState::Closed
+    } else if pull["draft"].as_bool() == Some(true) {
+        ReviewState::Draft
+    } else {
+        let latest = latest_reviews(reviews);
+        let head = pull["head"]["sha"].as_str().filter(|sha| !sha.is_empty());
+        let answered = |review: &Value| {
+            head.zip(review["commit_id"].as_str())
+                .is_some_and(|(head, commit)| head != commit)
+        };
+        let asked = latest
+            .values()
+            .filter(|review| review["state"] == "CHANGES_REQUESTED");
+        if asked.clone().any(|review| !answered(review)) {
+            ReviewState::ChangesRequested
+        } else if asked.count() > 0 {
+            ReviewState::ReviewRequested
+        } else if latest.values().any(|review| review["state"] == "APPROVED") {
+            ReviewState::Approved
+        } else {
+            ReviewState::ReviewRequested
+        }
+    };
+    Review {
+        state,
+        changes_requested: Some(changes_requested),
     }
-    if pull["draft"].as_bool() == Some(true) {
-        return ReviewState::Draft;
-    }
-    let mut latest: HashMap<String, String> = HashMap::new();
+}
+
+/// The people whose latest review asked for changes on an older commit than
+/// the head: the pull request has moved on and waits on them. The author and
+/// bots are left out, since GitHub refuses to ask either.
+fn reviewers_to_ask_again(pull: &Value, reviews: &[Value]) -> Vec<String> {
+    let head = pull["head"]["sha"].as_str().unwrap_or_default();
+    let author = pull["user"]["login"].as_str().unwrap_or_default();
+    let mut logins: Vec<String> = latest_reviews(reviews)
+        .into_iter()
+        .filter(|(login, review)| {
+            review["state"] == "CHANGES_REQUESTED"
+                && !head.is_empty()
+                && review["commit_id"]
+                    .as_str()
+                    .is_some_and(|commit| commit != head)
+                && !login.is_empty()
+                && !login.eq_ignore_ascii_case(author)
+                && review["user"]["type"].as_str() != Some("Bot")
+        })
+        .map(|(login, _)| login)
+        .collect();
+    logins.sort();
+    logins
+}
+
+/// Each reviewer's latest review that said something; a plain comment or a
+/// pending draft changes nothing.
+fn latest_reviews(reviews: &[Value]) -> HashMap<String, &Value> {
+    let mut latest = HashMap::new();
     for review in reviews {
         let state = review["state"].as_str().unwrap_or_default();
         if matches!(state, "COMMENTED" | "PENDING" | "") {
             continue;
         }
         let login = review["user"]["login"].as_str().unwrap_or_default();
-        latest.insert(login.to_string(), state.to_string());
+        latest.insert(login.to_string(), review);
     }
-    if latest.values().any(|s| s == "CHANGES_REQUESTED") {
-        ReviewState::ChangesRequested
-    } else if latest.values().any(|s| s == "APPROVED") {
-        ReviewState::Approved
-    } else {
-        ReviewState::ReviewRequested
-    }
+    latest
 }
 
 /// Conclusions that make a check a failure. `neutral` and `skipped` pass.
@@ -695,6 +774,7 @@ struct PullRow {
     deletions: i64,
     changed_files: i64,
     review_state: String,
+    changes_requested: i64,
     requested_reviewers: String,
     ci_state: String,
     ci_checked_at: Option<DateTime<Utc>>,
@@ -735,6 +815,7 @@ impl PullRow {
             deletions: self.deletions,
             changed_files: self.changed_files,
             review_state: ReviewState::parse(&self.review_state),
+            changes_requested: self.changes_requested,
             review_requested_from_me,
             ci_state: CiState::parse(&self.ci_state),
             mergeable: MergeableState::parse(self.mergeable.as_deref()),
@@ -1021,6 +1102,31 @@ impl Engine {
             .find(|repo| repo.id == repo_id))
     }
 
+    /// After a rework lands on a pull request, asks the people whose request
+    /// for changes it answers to review it again, so GitHub's own lists agree
+    /// with Hulahoop's. Asked as the App, which authors agents' pull requests,
+    /// or else with the person's token.
+    pub async fn ask_for_review_again(&self, repo_id: Uuid, number: i64) -> Result<()> {
+        let Some(repo) = self.linked_repo(repo_id).await? else {
+            return Ok(());
+        };
+        let github = match self.app_github(&repo.owner, &repo.name).await? {
+            Some(github) => github,
+            None => match self.personal_github().await? {
+                Some((github, _)) => github,
+                None => return Ok(()),
+            },
+        };
+        let (o, r) = (repo.owner.as_str(), repo.name.as_str());
+        let (pull, reviews) =
+            futures::try_join!(github.pull(o, r, number), github.reviews(o, r, number))?;
+        let logins = reviewers_to_ask_again(&pull, &reviews);
+        if logins.is_empty() {
+            return Ok(());
+        }
+        github.request_reviewers(o, r, number, &logins).await
+    }
+
     // ---------------------------------------------------------- the list
 
     /// The cached pull requests a filter selects, most recently updated first.
@@ -1051,8 +1157,8 @@ impl Engine {
                         open && !pull.draft
                             && !mine
                             && (pull.review_requested_from_me
-                                || (pull.by_agent
-                                    && pull.review_state == ReviewState::ReviewRequested))
+                                || (pull.review_state == ReviewState::ReviewRequested
+                                    && (pull.by_agent || pull.changes_requested > 0)))
                     }
                     PullRequestFilter::Mine => {
                         open && me
@@ -1386,15 +1492,16 @@ impl Engine {
         // Reviews do not always move `updated_at`, so they are read again on
         // the same clock as CI, not only when the listing says it changed.
         let stale = before.is_none_or(|row| row.ci_checked_at.is_none_or(recheck));
-        let review = if !open || is_merged(&pull) || pull["draft"].as_bool() == Some(true) {
-            review_state(&pull, &[])
+        let review: Review = if !open || is_merged(&pull) || pull["draft"].as_bool() == Some(true) {
+            review_state(&pull, &[]).into()
         } else if changed || stale {
             let reviews = github.reviews(&repo.owner, &repo.name, number).await?;
-            review_state(&pull, &reviews)
+            review(&pull, &reviews)
         } else {
             before
                 .map(|row| ReviewState::parse(&row.review_state))
                 .unwrap_or(ReviewState::ReviewRequested)
+                .into()
         };
 
         let ci_due = stale
@@ -1422,7 +1529,7 @@ impl Engine {
         &self,
         repo: &LinkedRepo,
         pull: &Value,
-        review: ReviewState,
+        review: impl Into<Review>,
         ci: Option<CiState>,
         mergeable: Option<MergeableState>,
         before: Option<&PullRow>,
@@ -1431,6 +1538,11 @@ impl Engine {
             .as_i64()
             .ok_or_else(|| anyhow!("GitHub sent a pull request without a number"))?;
         let count = |key: &str, cached: Option<i64>| pull[key].as_i64().or(cached).unwrap_or(0);
+        let review: Review = review.into();
+        let changes_requested = review
+            .changes_requested
+            .or(before.map(|row| row.changes_requested))
+            .unwrap_or(0);
         let requested: Vec<String> = pull["requested_reviewers"]
             .as_array()
             .map(|users| {
@@ -1464,9 +1576,10 @@ impl Engine {
             "insert into pull_requests
                (repo_id, number, repo_name, title, url, state, draft, merged, author_login,
                 author_avatar_url, head_ref, head_sha, base_ref, additions, deletions, changed_files,
-                review_state, requested_reviewers, ci_state, ci_checked_at, mergeable,
-                mergeable_checked_at, created_at, updated_at, merged_at, closed_at, synced_at)
-             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                review_state, changes_requested, requested_reviewers, ci_state, ci_checked_at,
+                mergeable, mergeable_checked_at, created_at, updated_at, merged_at, closed_at,
+                synced_at)
+             values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              on conflict (repo_id, number) do update set
                repo_name = excluded.repo_name, title = excluded.title, url = excluded.url,
                state = excluded.state, draft = excluded.draft, merged = excluded.merged,
@@ -1474,6 +1587,7 @@ impl Engine {
                head_ref = excluded.head_ref, head_sha = excluded.head_sha, base_ref = excluded.base_ref,
                additions = excluded.additions, deletions = excluded.deletions,
                changed_files = excluded.changed_files, review_state = excluded.review_state,
+               changes_requested = excluded.changes_requested,
                requested_reviewers = excluded.requested_reviewers, ci_state = excluded.ci_state,
                ci_checked_at = excluded.ci_checked_at, mergeable = excluded.mergeable,
                mergeable_checked_at = excluded.mergeable_checked_at,
@@ -1502,7 +1616,8 @@ impl Engine {
         .bind(count("additions", before.map(|row| row.additions)))
         .bind(count("deletions", before.map(|row| row.deletions)))
         .bind(count("changed_files", before.map(|row| row.changed_files)))
-        .bind(review.as_str())
+        .bind(review.state.as_str())
+        .bind(changes_requested)
         .bind(serde_json::to_string(&requested)?)
         .bind(ci_state.as_str())
         .bind(ci_checked_at)
@@ -1730,7 +1845,7 @@ impl Engine {
             github.combined_status(o, r, &head),
             github.repo(o, r),
         )?;
-        let review = review_state(&pull, &reviews);
+        let review = review(&pull, &reviews);
         let ci = ci_state(&runs, &combined);
         let before = self.cached_row(repo.id, number).await?;
         // The conflict check is stored too, so the list shows what the person
@@ -2383,6 +2498,8 @@ mod tests {
         branches: Vec<String>,
         /// How often each pull request was read on its own.
         pull_reads: HashMap<i64, usize>,
+        /// Reviewers asked again: `(number, logins)`.
+        asked_again: Vec<(i64, Value)>,
     }
 
     type Shared = Arc<Mutex<Fake>>;
@@ -2621,6 +2738,20 @@ mod tests {
         }
     }
 
+    async fn ask_again(
+        State(fake): State<Shared>,
+        headers: HeaderMap,
+        UrlPath((_, _, number)): UrlPath<(String, String, i64)>,
+        Json(body): Json<Value>,
+    ) -> Reply {
+        if !authorized(&headers) {
+            return refused(StatusCode::UNAUTHORIZED, "Bad credentials");
+        }
+        let mut fake = fake.lock().unwrap();
+        fake.asked_again.push((number, body["reviewers"].clone()));
+        (StatusCode::CREATED, Json(json!({ "number": number })))
+    }
+
     async fn check_runs(
         State(fake): State<Shared>,
         UrlPath((_, _, sha)): UrlPath<(String, String, String)>,
@@ -2660,6 +2791,10 @@ mod tests {
             .route(
                 "/repos/{owner}/{repo}/pulls/{number}/comments",
                 get(comments),
+            )
+            .route(
+                "/repos/{owner}/{repo}/pulls/{number}/requested_reviewers",
+                axum::routing::post(ask_again),
             )
             .route("/repos/{owner}/{repo}/pulls/{number}/merge", put(merge))
             .route("/repos/{owner}/{repo}/git/ref/heads/{*branch}", get(branch))
@@ -3838,6 +3973,82 @@ mod tests {
             .unwrap();
         assert_eq!(update["runDiff"]["patch"], "second\n");
         assert_eq!(update["runDiff"]["live"], true);
+    }
+
+    fn review_by(login: &str, state: &str, commit: &str) -> Value {
+        json!({ "user": { "login": login, "type": "User" }, "state": state, "commit_id": commit })
+    }
+
+    /// A request for changes holds until the author pushes; then the pull
+    /// request waits on its reviewer again, one round further on.
+    #[test]
+    fn a_push_after_a_change_request_starts_the_next_round() {
+        let pull = pull_json(1, "hulahoop-dev[bot]", "sha2");
+        let waiting = review(&pull, &[review_by(ME, "CHANGES_REQUESTED", "sha2")]);
+        assert_eq!(waiting.state, ReviewState::ChangesRequested);
+        assert_eq!(waiting.changes_requested, Some(1));
+
+        let answered = review(&pull, &[review_by(ME, "CHANGES_REQUESTED", "sha1")]);
+        assert_eq!(answered.state, ReviewState::ReviewRequested);
+        assert_eq!(answered.changes_requested, Some(1));
+
+        let twice = [
+            review_by(ME, "CHANGES_REQUESTED", "sha0"),
+            review_by("octo", "APPROVED", "sha1"),
+            review_by(ME, "CHANGES_REQUESTED", "sha1"),
+        ];
+        let third = review(&pull, &twice);
+        assert_eq!(third.state, ReviewState::ReviewRequested);
+        assert_eq!(third.changes_requested, Some(2));
+
+        let mut withdrawn = review_by(ME, "DISMISSED", "sha1");
+        withdrawn["user"]["login"] = json!("octo");
+        let dismissed = review(&pull, &[withdrawn, review_by(ME, "APPROVED", "sha2")]);
+        assert_eq!(dismissed.state, ReviewState::Approved);
+        assert_eq!(dismissed.changes_requested, Some(0));
+
+        assert_eq!(
+            reviewers_to_ask_again(&pull, &twice),
+            vec![ME.to_string()],
+            "only the requests the push answered are asked again"
+        );
+        assert!(
+            reviewers_to_ask_again(&pull, &[review_by(ME, "CHANGES_REQUESTED", "sha2")]).is_empty()
+        );
+    }
+
+    /// An agent's rework lists the pull request under "Needs my review" again,
+    /// with its round, and GitHub is asked to put the reviewer back on it.
+    #[tokio::test]
+    async fn a_reworked_pull_request_needs_review_again() {
+        let world = world().await;
+        {
+            let mut fake = world.fake.lock().unwrap();
+            fake.pulls = vec![pull_json(1, "hulahoop-dev[bot]", "sha2")];
+            fake.reviews
+                .insert(1, vec![review_by(ME, "CHANGES_REQUESTED", "sha1")]);
+        }
+        world.engine.set_github_token(GOOD).await.unwrap();
+        world.engine.sync_pull_requests(None).await.unwrap();
+
+        let waiting = world
+            .engine
+            .pull_requests(PullRequestFilter::NeedsMyReview)
+            .await
+            .unwrap();
+        assert_eq!(waiting.len(), 1);
+        assert_eq!(waiting[0].review_state, ReviewState::ReviewRequested);
+        assert_eq!(waiting[0].changes_requested, 1);
+
+        world
+            .engine
+            .ask_for_review_again(world.repo, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            world.fake.lock().unwrap().asked_again,
+            vec![(1, json!([ME]))]
+        );
     }
 
     #[test]
