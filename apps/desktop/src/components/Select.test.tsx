@@ -141,12 +141,20 @@ describe("Select extensions", () => {
   });
 
   it("a disabled Select does not open and accepts an id", async () => {
-    render(<Select label="Type" id="t1" disabled value="a" options={few} onChange={vi.fn()} />);
+    render(<Select label="Type" id="t1" title="No moves" disabled value="a" options={few} onChange={vi.fn()} />);
     const trigger = screen.getByRole("button", { name: /Type/ }) as HTMLButtonElement;
     expect(trigger.id).toBe("t1");
+    expect(trigger.getAttribute("title")).toBe("No moves");
     expect(trigger.disabled).toBe(true);
     await userEvent.click(trigger);
     expect(document.querySelector(".sel-pop")).toBeNull();
+  });
+
+  it("a printable key in a non-searchable popover is consumed so global shortcuts do not fire", async () => {
+    const { trigger } = setup(few);
+    await userEvent.click(trigger);
+    const pop = document.querySelector(".sel-pop") as HTMLElement;
+    expect(fireEvent.keyDown(pop, { key: "c" })).toBe(false);
   });
 
   it("search matches the group name", async () => {
