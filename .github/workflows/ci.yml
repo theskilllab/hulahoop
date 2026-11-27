@@ -57,17 +57,34 @@ jobs:
       - name: nix build
         run: nix build .#hulahoop && ./result/bin/hulahoop help
 
-  # The NixOS VM test boots QEMU, which is slow without /dev/kvm, so it has its own
-  # job and timeout and cannot hide a failure in the main one.
+  # The NixOS VM test boots QEMU, so it has its own job and timeout and cannot hide a
+  # failure in the main one. The test derivation requires the `kvm` system feature.
+  # x86_64 runners expose /dev/kvm once the udev rule below opens it; the GitHub arm
+  # runners do not, so there the feature is declared anyway and QEMU falls back to
+  # (slow) TCG emulation, which the test is known to pass under.
   nixos-vm:
-    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            nix-args: ""
+          - os: ubuntu-24.04-arm
+            nix-args: --option system-features "nixos-test benchmark big-parallel kvm"
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+      - name: enable KVM
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
       - uses: DeterminateSystems/nix-installer-action@main
       - uses: nix-community/cache-nix-action@v7
         with:
           primary-key: nix-vm-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
           restore-prefixes-first-match: nix-vm-${{ runner.arch }}-
       - name: nix flake check
-        run: nix flake check
+        run: nix flake check ${{ matrix.nix-args }}
