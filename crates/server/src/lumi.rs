@@ -17,6 +17,8 @@ pub const LUMI_PROMPT: &str = include_str!("lumi.md");
 /// How many conversation turns ride along with a question. Enough to follow a
 /// thread, small enough that the snapshot stays the biggest part.
 const LUMI_HISTORY: i64 = 12;
+/// How many of the newest memories Lumi's snapshot carries.
+const LUMI_MEMORIES: usize = 40;
 
 impl Engine {
     pub async fn lumi_messages(&self, workspace_id: Uuid) -> Result<Vec<LumiMessage>> {
@@ -242,8 +244,12 @@ impl Engine {
                 .bind(workspace_id)
                 .fetch_all(&self.db.pool)
                 .await?;
+        let memories = self.memories(workspace_id, None, None, false).await?;
         Ok(json!({
             "projects": projects.iter().map(|(name,)| name).collect::<Vec<_>>(),
+            "memories": memories.iter().take(LUMI_MEMORIES).map(|m| json!({
+                "scope": m.scope, "kind": m.kind, "title": m.title, "body": m.body,
+            })).collect::<Vec<_>>(),
             "issues": issue_rows,
             "milestones": milestones.iter().map(|(id, title, status, due)| json!({
                 "id": id, "title": title, "status": status, "target_date": due,

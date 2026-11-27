@@ -35,6 +35,8 @@ pub struct NewMemory {
 pub enum Saved {
     Added(Uuid),
     Updated(Uuid),
+    /// Nothing changed: the note already says this.
+    Skipped,
     /// A newer decision took the place of the older one.
     Replaced {
         new: Uuid,
@@ -48,6 +50,10 @@ pub enum Saved {
 pub struct MemoryIndex {
     pub index: String,
     pub notes: Vec<MemoryNote>,
+    /// The notes listed, to be counted as used once the run is claimed.
+    pub used: Vec<Uuid>,
+    /// Notes idle for so long they are due for archiving at the claim.
+    pub expired: Vec<Uuid>,
 }
 
 /// How many full-text matches count as "relevant to the task".
@@ -146,9 +152,8 @@ impl Engine {
 
     /// The memory index for a run on `issue` by `agent_name`, within `budget`
     /// tokens. A run reaches the workspace's notes, its project's, its own
-    /// agent's and the people's; another project's never. Notes idle for
-    /// `MEMORY_ARCHIVE_RUNS` runs are archived here, and every note listed counts
-    /// as used, which is what keeps it out of the stale tail.
+    /// agent's and the people's; another project's never. This only reads:
+    /// `record_memory_use` applies the index's effects when a run is claimed.
     pub async fn memory_index(
         &self,
         issue: &Issue,
@@ -177,14 +182,11 @@ impl Engine {
         .await?;
         let matches = self.matching_rows(issue).await?;
         let mut candidates = Vec::new();
+        let mut expired = Vec::new();
         let mut notes = std::collections::HashMap::new();
         for (seq, id, scope, kind, title, body, use_count, updated, idle) in rows {
             if idle >= MEMORY_ARCHIVE_RUNS {
-                sqlx::query("update memories set archived_at = ? where id = ?")
-                    .bind(crate::db::now_rfc3339())
-                    .bind(id)
-                    .execute(&self.db.pool)
-                    .await?;
+                expired.push(id);
                 continue;
             }
             let text = format!("# {title}\n\n{scope} {kind}\n\n{body}\n");
@@ -206,15 +208,10 @@ impl Engine {
         }
         let chosen = select_index(candidates, budget);
         let mut listed = Vec::new();
+        let mut used = Vec::new();
         for candidate in &chosen {
             let (id, text) = notes.remove(&candidate.seq).unwrap_or_default();
-            sqlx::query(
-                "update memories set last_used_at = ?, use_count = use_count + 1 where id = ?",
-            )
-            .bind(crate::db::now_rfc3339())
-            .bind(id)
-            .execute(&self.db.pool)
-            .await?;
+            used.push(id);
             listed.push(MemoryNote {
                 file: note_file_name(candidate.seq, &candidate.title),
                 body: text,
@@ -223,7 +220,39 @@ impl Engine {
         Ok(MemoryIndex {
             index: render_index(&chosen),
             notes: listed,
+            used,
+            expired,
         })
+    }
+
+    /// Applies what an index implies once its run is claimed: every note listed
+    /// counts as used (which keeps it out of the stale tail) and notes idle past
+    /// `MEMORY_ARCHIVE_RUNS` are archived. One statement each, however many notes.
+    pub async fn record_memory_use(&self, index: &MemoryIndex) -> Result<()> {
+        let now = crate::db::now_rfc3339();
+        if !index.used.is_empty() {
+            let mut update = sqlx::QueryBuilder::new("update memories set last_used_at = ");
+            update.push_bind(&now);
+            update.push(", use_count = use_count + 1 where id in (");
+            let mut ids = update.separated(", ");
+            for id in &index.used {
+                ids.push_bind(*id);
+            }
+            ids.push_unseparated(")");
+            update.build().execute(&self.db.pool).await?;
+        }
+        if !index.expired.is_empty() {
+            let mut archive = sqlx::QueryBuilder::new("update memories set archived_at = ");
+            archive.push_bind(&now);
+            archive.push(" where id in (");
+            let mut ids = archive.separated(", ");
+            for id in &index.expired {
+                ids.push_bind(*id);
+            }
+            ids.push_unseparated(")");
+            archive.build().execute(&self.db.pool).await?;
+        }
+        Ok(())
     }
 
     /// Row ids of the notes that match the task's words, best first.
@@ -232,9 +261,14 @@ impl Engine {
             return Ok(Vec::new());
         };
         Ok(sqlx::query_scalar(
-            "select rowid from memories_fts where memories_fts match ? order by rank limit ?",
+            "select memories_fts.rowid from memories_fts
+             join memories m on m.rowid = memories_fts.rowid
+             where memories_fts match ? and m.workspace_id = ?
+               and m.replaced_by is null and m.archived_at is null
+             order by memories_fts.rank limit ?",
         )
         .bind(query)
+        .bind(issue.workspace_id)
         .bind(MATCH_LIMIT)
         .fetch_all(&self.db.pool)
         .await?)
@@ -247,7 +281,8 @@ impl Engine {
         let live: Vec<Existing> = sqlx::query_as(
             "select id, kind, title, body from memories
              where workspace_id = ? and scope = ? and scope_ref = ?
-               and replaced_by is null and archived_at is null",
+               and replaced_by is null and archived_at is null
+             order by updated_at desc",
         )
         .bind(new.workspace_id)
         .bind(&new.scope)
@@ -266,7 +301,7 @@ impl Engine {
                 // A live decision is never rewritten by another kind of note.
                 if kind == "decision" && new.kind != "decision" {
                     if !changed {
-                        return Ok(Saved::Updated(*old));
+                        return Ok(Saved::Skipped);
                     }
                     return Ok(Saved::Added(self.insert_memory(new).await?));
                 }
@@ -817,7 +852,8 @@ mod tests {
             "HULAHOOP_MEMORY: workspace fact shared — everywhere",
         )
         .await;
-        index_for(&w, issue, 1500).await;
+        let index = index_for(&w, issue, 1500).await;
+        w.engine.record_memory_use(&index).await.unwrap();
         let uses: i64 = sqlx::query_scalar("select use_count from memories")
             .fetch_one(&w.engine.db.pool)
             .await
@@ -842,5 +878,124 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    /// Starts `count` runs on `issue` after the notes were saved, which is what
+    /// makes a note idle.
+    async fn idle_runs(w: &World, issue: Uuid, count: i64) {
+        for _ in 0..count {
+            sqlx::query("insert into runs (id, issue_id, agent_id, status, attempt, base_bookmark, prompt_revision, artifact_dir, created_at) values (?,?,?,'succeeded',1,'main','x','x',?)")
+                .bind(Uuid::now_v7()).bind(issue).bind(w.developer)
+                .bind(Utc::now() - chrono::Duration::days(1)).execute(&w.engine.db.pool).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_note_idle_past_the_stale_mark_sinks_and_past_the_archive_mark_is_archived() {
+        let w = world("tail").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact old lesson — from long ago",
+        )
+        .await;
+        sqlx::query("update memories set created_at = ?")
+            .bind((Utc::now() - chrono::Duration::days(2)).to_rfc3339())
+            .execute(&w.engine.db.pool)
+            .await
+            .unwrap();
+        let busy = task(&w, None, 2).await;
+        idle_runs(&w, busy, MEMORY_STALE_RUNS).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact fresh lesson — just learned",
+        )
+        .await;
+        let index = index_for(&w, issue, 1500).await;
+        assert!(index.expired.is_empty());
+        let (fresh, old) = (
+            index.index.find("fresh lesson").unwrap(),
+            index.index.find("old lesson").unwrap(),
+        );
+        assert!(fresh < old, "the idle note comes last");
+
+        idle_runs(&w, busy, MEMORY_ARCHIVE_RUNS).await;
+        let index = index_for(&w, issue, 1500).await;
+        assert_eq!(index.expired.len(), 1);
+        assert_eq!(index.notes.len(), 1);
+        w.engine.record_memory_use(&index).await.unwrap();
+        let archived: i64 =
+            sqlx::query_scalar("select count(*) from memories where archived_at is not null")
+                .fetch_one(&w.engine.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(archived, 1);
+    }
+
+    #[tokio::test]
+    async fn reading_the_index_changes_nothing_until_a_claim_records_it() {
+        let w = world("tail").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact shared — everywhere",
+        )
+        .await;
+        for _ in 0..2 {
+            index_for(&w, issue, 1500).await;
+        }
+        let uses = || async {
+            sqlx::query_scalar::<_, i64>("select use_count from memories")
+                .fetch_one(&w.engine.db.pool)
+                .await
+                .unwrap()
+        };
+        assert_eq!(uses().await, 0);
+        let index = index_for(&w, issue, 1500).await;
+        w.engine.record_memory_use(&index).await.unwrap();
+        assert_eq!(uses().await, 1);
+    }
+
+    #[tokio::test]
+    async fn matches_ignore_other_workspaces() {
+        let w = world("tail").await;
+        let issue = task(&w, None, 1).await;
+        let other = Uuid::now_v7();
+        sqlx::query(
+            "insert into workspaces (id, name, slug, created_at) values (?, 'Other', 'other', ?)",
+        )
+        .bind(other)
+        .bind(Utc::now())
+        .execute(&w.engine.db.pool)
+        .await
+        .unwrap();
+        for i in 0..MATCH_LIMIT + 5 {
+            w.engine
+                .save_memory(&NewMemory {
+                    workspace_id: other,
+                    scope: "workspace".into(),
+                    scope_ref: String::new(),
+                    kind: "fact".into(),
+                    title: format!("task{i} alpha{i} marker{i}"),
+                    body: format!("task body{i} beta{i}"),
+                    source_issue_id: None,
+                    source_run_id: None,
+                    source_comment_id: None,
+                    author: "x".into(),
+                })
+                .await
+                .unwrap();
+        }
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact task notes — mine",
+        )
+        .await;
+        let issue = w.engine.issue(issue).await.unwrap();
+        assert_eq!(w.engine.matching_rows(&issue).await.unwrap().len(), 1);
     }
 }

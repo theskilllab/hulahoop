@@ -35,6 +35,7 @@ import Palette, { type PaletteTarget } from "./screens/Palette";
 import Tasks from "./screens/Tasks";
 import NewTaskDialog from "./components/NewTaskDialog";
 import Milestones from "./screens/Milestones";
+import Memories from "./screens/Memories";
 import Skills from "./screens/Skills";
 import WorkflowScreen from "./screens/Workflow";
 import Lumi from "./screens/Lumi";
@@ -53,6 +54,7 @@ type View =
   | { name: "artifacts" }
   | { name: "agents" }
   | { name: "skills" }
+  | { name: "memory" }
   | { name: "workflow" }
   | { name: "connectors" }
   | { name: "cost" }
@@ -369,6 +371,7 @@ export default function App() {
     { name: "artifacts", icon: "file", label: "Artifacts", count: artifacts.length },
     { name: "agents", icon: "bot", label: "Agents", count: running },
     { name: "skills", icon: "book", label: "Skills" },
+    { name: "memory", icon: "spark", label: "Memory" },
     { name: "workflow", icon: "flow", label: "Workflow" },
     { name: "connectors", icon: "plug", label: "Connectors" },
     { name: "cost", icon: "coin", label: "Cost control" },
@@ -600,6 +603,14 @@ export default function App() {
         )}
 
         {view.name === "skills" && <Skills workspaceId={workspace.id} />}
+
+        {view.name === "memory" && (
+          <Memories
+            workspaceId={workspace.id}
+            projects={projects}
+            onOpenTask={(id) => setView({ name: "issue", id })}
+          />
+        )}
 
         {view.name === "agents" && (
           <Agents

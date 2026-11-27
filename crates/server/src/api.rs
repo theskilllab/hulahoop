@@ -2,6 +2,7 @@
 //! database, which is what keeps the server the single SQLite writer.
 
 use crate::engine::Engine;
+use crate::memories::MemoryIndex;
 use crate::model::*;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -200,7 +201,13 @@ async fn claim_run(
     let Some((run, need)) = run else {
         return Ok(Json(None));
     };
-    let spec = build_run_spec(&state.engine, &run)
+    let (spec, memory) = build_spec(&state.engine, &run)
+        .await
+        .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
+    // Only a claim counts as using the notes; a spec re-read must not.
+    state
+        .engine
+        .record_memory_use(&memory)
         .await
         .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, e))?;
     Ok(Json(Some(RunEnvelope { run, spec, need })))
@@ -534,6 +541,12 @@ async fn unlock_repo(
 /// server writes for the agent. Building it here means the runner never reads
 /// the database.
 async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
+    Ok(build_spec(engine, run).await?.0)
+}
+
+/// `build_run_spec`, plus the memory index it shipped so the claim can record
+/// the notes as used.
+async fn build_spec(engine: &Engine, run: &Run) -> anyhow::Result<(Value, MemoryIndex)> {
     let issue = engine.issue(run.issue_id).await?;
     // A run on a task with no repository has no checkout: the runner gives it an
     // empty scratch directory instead.
@@ -748,7 +761,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     };
     let checkout_mode = if repo.is_some() { "repo" } else { "none" };
 
-    Ok(json!({
+    let envelope = json!({
         "run_id": run.id,
         "issue_id": issue.id,
         "attempt": run.attempt,
@@ -779,7 +792,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
         "skills": skill_files,
-        "memories": memory.notes,
+        "memories": memory.notes.clone(),
         // A commit is named by the subject its turn gave (`HULAHOOP_COMMIT:`);
         // the task's title is the fallback for a turn that gave none.
         "issue": { "key": issue.issue_key, "title": commit_title(&issue.title) },
@@ -794,7 +807,8 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "timeout_minutes": hulahoop_core::AGENT_WALL_CLOCK_MINUTES,
         "diff_line_limit": hulahoop_core::DIFF_LINE_LIMIT,
         "prompt_revision": engine.prompt_revision(&prompt),
-    }))
+    });
+    Ok((envelope, memory))
 }
 
 /// Write down what a run was given, once, at its first claim: the billing a

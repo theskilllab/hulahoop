@@ -21,8 +21,10 @@ pub const MEMORY_STALE_RUNS: i64 = 40;
 pub const MEMORY_ARCHIVE_RUNS: i64 = 200;
 
 const MARKER: &str = "HULAHOOP_MEMORY:";
-const KINDS: [&str; 5] = ["decision", "convention", "preference", "fact", "gotcha"];
-const SCOPES: [&str; 4] = ["workspace", "project", "person", "agent"];
+/// The kinds a memory can have.
+pub const KINDS: [&str; 5] = ["decision", "convention", "preference", "fact", "gotcha"];
+/// Whose a memory can be.
+pub const SCOPES: [&str; 4] = ["workspace", "project", "person", "agent"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryLine {

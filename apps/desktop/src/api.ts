@@ -308,6 +308,22 @@ export interface Skill {
   updatedAt: string;
 }
 
+/** A note the agents (or a person) keep across turns and tasks. */
+export interface Memory {
+  id: string;
+  scope: "workspace" | "project" | "person" | "agent";
+  /** The project id for `project`, a name for `agent` and `person`. */
+  scopeRef: string;
+  kind: "decision" | "convention" | "preference" | "fact" | "gotcha";
+  title: string;
+  body: string;
+  sourceIssueId: string | null;
+  sourceIssueKey: string | null;
+  author: string;
+  updatedAt: string;
+  useCount: number;
+}
+
 export interface Milestone {
   id: string;
   projectId: string | null;
@@ -756,6 +772,43 @@ export async function deleteSkill(id: string): Promise<boolean> {
     { id },
   );
   return data.deleteSkill;
+}
+
+export const MEMORY_FIELDS = `id scope scopeRef kind title body sourceIssueId sourceIssueKey author updatedAt useCount`;
+
+/** The workspace's live memories, narrowed by scope and by words. */
+export async function loadMemories(
+  workspaceId: string,
+  filter: { scope?: string; query?: string } = {},
+): Promise<Memory[]> {
+  const data = await gql<{ memories: Memory[] }>(
+    `query ($w: UUID!, $s: String, $q: String) {
+      memories(workspaceId: $w, scope: $s, query: $q) { ${MEMORY_FIELDS} }
+    }`,
+    { w: workspaceId, s: filter.scope ?? null, q: filter.query?.trim() || null },
+  );
+  return data.memories;
+}
+
+export async function updateMemory(
+  id: string,
+  fields: { kind: string; title: string; body: string },
+): Promise<Memory> {
+  const data = await gql<{ updateMemory: Memory }>(
+    `mutation ($id: UUID!, $k: String, $t: String, $b: String) {
+      updateMemory(id: $id, kind: $k, title: $t, body: $b) { ${MEMORY_FIELDS} }
+    }`,
+    { id, k: fields.kind, t: fields.title, b: fields.body },
+  );
+  return data.updateMemory;
+}
+
+export async function forgetMemory(id: string): Promise<boolean> {
+  const data = await gql<{ forgetMemory: boolean }>(
+    `mutation ($id: UUID!) { forgetMemory(id: $id) }`,
+    { id },
+  );
+  return data.forgetMemory;
 }
 
 /** Which agents carry which skills. The library shows this before it lets you
