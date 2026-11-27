@@ -51,6 +51,17 @@ pub fn parse_lines(text: &str) -> Vec<Result<MemoryLine, String>> {
         .collect()
 }
 
+/// `text` on one line: whitespace runs (newlines included) become one space and
+/// other control characters are dropped.
+pub fn one_line(text: &str) -> String {
+    let kept: String = text
+        .chars()
+        .map(|c| if c.is_whitespace() { ' ' } else { c })
+        .filter(|c| !c.is_control())
+        .collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Splits `title — body`; agents often write ` -- ` or ` - ` instead.
 fn split_title_body(tail: &str) -> Option<(&str, &str)> {
     tail.split_once('—')

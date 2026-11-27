@@ -4,9 +4,11 @@
 
 use anyhow::Result;
 use hulahoop_core::memory::{
-    normalize_tokens, parse_lines, similarity, MemoryLine, MEMORY_BODY_MAX, MEMORY_DEDUPE_MIN,
-    MEMORY_TITLE_MAX,
+    fts_query, normalize_tokens, note_file_name, one_line, parse_lines, render_index, select_index,
+    similarity, IndexCandidate, MemoryLine, MEMORY_ARCHIVE_RUNS, MEMORY_BODY_MAX,
+    MEMORY_DEDUPE_MIN, MEMORY_STALE_RUNS, MEMORY_TITLE_MAX,
 };
+use hulahoop_core::runspec::MemoryNote;
 use uuid::Uuid;
 
 use crate::engine::Engine;
@@ -39,6 +41,20 @@ pub enum Saved {
         old: Uuid,
     },
 }
+
+/// What a run is told about memory: the index for the prompt and the notes the
+/// runner writes into `.hulahoop/memory/`.
+#[derive(Debug, Clone, Default)]
+pub struct MemoryIndex {
+    pub index: String,
+    pub notes: Vec<MemoryNote>,
+}
+
+/// How many full-text matches count as "relevant to the task".
+const MATCH_LIMIT: i64 = 100;
+
+/// A live memory in reach of a run, as the index query returns it.
+type Reachable = (i64, Uuid, String, String, String, String, i64, String, i64);
 
 type Existing = (Uuid, String, String, String);
 
@@ -79,8 +95,8 @@ impl Engine {
             scope: "project".into(),
             scope_ref: project_id.to_string(),
             kind: "decision".into(),
-            title: clip(question.trim(), MEMORY_TITLE_MAX),
-            body: clip(answer.trim(), MEMORY_BODY_MAX),
+            title: clip(&one_line(question), MEMORY_TITLE_MAX),
+            body: clip(&one_line(answer), MEMORY_BODY_MAX),
             source_issue_id: Some(issue.id),
             source_run_id: None,
             source_comment_id: Some(comment_id),
@@ -128,8 +144,105 @@ impl Engine {
         })
     }
 
+    /// The memory index for a run on `issue` by `agent_name`, within `budget`
+    /// tokens. A run reaches the workspace's notes, its project's, its own
+    /// agent's and the people's; another project's never. Notes idle for
+    /// `MEMORY_ARCHIVE_RUNS` runs are archived here, and every note listed counts
+    /// as used, which is what keeps it out of the stale tail.
+    pub async fn memory_index(
+        &self,
+        issue: &Issue,
+        agent_name: &str,
+        budget: usize,
+    ) -> Result<MemoryIndex> {
+        let project_ref = issue
+            .project_id
+            .map(|id| id.to_string())
+            .unwrap_or_default();
+        let rows: Vec<Reachable> = sqlx::query_as(
+            "select m.rowid, m.id, m.scope, m.kind, m.title, m.body, m.use_count, m.updated_at,
+                (select count(*) from runs r join issues i on i.id = r.issue_id
+                  where i.workspace_id = m.workspace_id
+                    and r.created_at > coalesce(m.last_used_at, m.created_at)) as idle
+             from memories m
+             where m.workspace_id = ? and m.replaced_by is null and m.archived_at is null
+               and (m.scope in ('workspace', 'person')
+                    or (m.scope = 'project' and m.scope_ref = ?)
+                    or (m.scope = 'agent' and m.scope_ref = ?))",
+        )
+        .bind(issue.workspace_id)
+        .bind(&project_ref)
+        .bind(agent_name)
+        .fetch_all(&self.db.pool)
+        .await?;
+        let matches = self.matching_rows(issue).await?;
+        let mut candidates = Vec::new();
+        let mut notes = std::collections::HashMap::new();
+        for (seq, id, scope, kind, title, body, use_count, updated, idle) in rows {
+            if idle >= MEMORY_ARCHIVE_RUNS {
+                sqlx::query("update memories set archived_at = ? where id = ?")
+                    .bind(crate::db::now_rfc3339())
+                    .bind(id)
+                    .execute(&self.db.pool)
+                    .await?;
+                continue;
+            }
+            let text = format!("# {title}\n\n{scope} {kind}\n\n{body}\n");
+            notes.insert(seq, (id, text));
+            candidates.push(IndexCandidate {
+                seq,
+                scope,
+                kind,
+                title,
+                stale: idle >= MEMORY_STALE_RUNS,
+                match_rank: matches
+                    .iter()
+                    .position(|rowid| *rowid == seq)
+                    .map(|p| p as i64),
+                use_count,
+                updated_at: chrono::DateTime::parse_from_rfc3339(&updated)
+                    .map_or(0, |at| at.timestamp()),
+            });
+        }
+        let chosen = select_index(candidates, budget);
+        let mut listed = Vec::new();
+        for candidate in &chosen {
+            let (id, text) = notes.remove(&candidate.seq).unwrap_or_default();
+            sqlx::query(
+                "update memories set last_used_at = ?, use_count = use_count + 1 where id = ?",
+            )
+            .bind(crate::db::now_rfc3339())
+            .bind(id)
+            .execute(&self.db.pool)
+            .await?;
+            listed.push(MemoryNote {
+                file: note_file_name(candidate.seq, &candidate.title),
+                body: text,
+            });
+        }
+        Ok(MemoryIndex {
+            index: render_index(&chosen),
+            notes: listed,
+        })
+    }
+
+    /// Row ids of the notes that match the task's words, best first.
+    async fn matching_rows(&self, issue: &Issue) -> Result<Vec<i64>> {
+        let Some(query) = fts_query(&format!("{} {}", issue.title, issue.body)) else {
+            return Ok(Vec::new());
+        };
+        Ok(sqlx::query_scalar(
+            "select rowid from memories_fts where memories_fts match ? order by rank limit ?",
+        )
+        .bind(query)
+        .bind(MATCH_LIMIT)
+        .fetch_all(&self.db.pool)
+        .await?)
+    }
+
     /// Saves one memory. A note that nearly repeats a live one in the same
-    /// scope updates it; a changed `decision` on the same subject replaces it.
+    /// scope updates it; a changed `decision` on the same subject replaces it, and
+    /// only another `decision` may do so.
     pub async fn save_memory(&self, new: &NewMemory) -> Result<Saved> {
         let live: Vec<Existing> = sqlx::query_as(
             "select id, kind, title, body from memories
@@ -150,7 +263,14 @@ impl Engine {
             None => Ok(Saved::Added(self.insert_memory(new).await?)),
             Some((old, kind, _, body)) => {
                 let changed = normalize_tokens(body) != normalize_tokens(&new.body);
-                if changed && kind == "decision" && new.kind == "decision" {
+                // A live decision is never rewritten by another kind of note.
+                if kind == "decision" && new.kind != "decision" {
+                    if !changed {
+                        return Ok(Saved::Updated(*old));
+                    }
+                    return Ok(Saved::Added(self.insert_memory(new).await?));
+                }
+                if changed && kind == "decision" {
                     let id = self.insert_memory(new).await?;
                     sqlx::query("update memories set replaced_by = ?, updated_at = ? where id = ?")
                         .bind(id)
@@ -224,6 +344,7 @@ mod tests {
     use crate::db::Db;
     use crate::engine::RunCompletion;
     use chrono::Utc;
+    use hulahoop_core::memory::estimate_tokens;
 
     const DOC: &str = "# Workflows\n\nTurns: 6\n\n## Backlog\n\nUsers: human\n\nNext: In progress\n\n## In progress\n\nUsers: @Developer\n\nNext: Done\n\n## Blocked\n\nUsers: human\n\nNext: In progress\n\n## Done\n\nUsers: human\n\nNext: none\n";
 
@@ -474,6 +595,234 @@ mod tests {
         assert_eq!((kind.as_str(), scope.as_str()), ("decision", "project"));
         assert!(comment.is_some() && comment != Some(question));
         assert_eq!(source, Some(issue));
+    }
+
+    async fn finish_as(w: &World, issue: Uuid, status: &str, body: &str) {
+        let run = w
+            .engine
+            .start_run(issue, Some(w.developer), None)
+            .await
+            .unwrap();
+        let done: RunCompletion =
+            serde_json::from_value(serde_json::json!({"status": status, "body": body})).unwrap();
+        w.engine.complete_run(run.id, done).await.unwrap();
+    }
+
+    async fn count(w: &World) -> i64 {
+        sqlx::query_scalar("select count(*) from memories")
+            .fetch_one(&w.engine.db.pool)
+            .await
+            .unwrap()
+    }
+
+    async fn answer(w: &World, issue: Uuid, question: &str, reply: &str) {
+        w.engine
+            .comment(
+                issue,
+                hulahoop_core::AuthorType::Agent,
+                None,
+                question,
+                true,
+            )
+            .await
+            .unwrap();
+        w.engine
+            .move_to(issue, hulahoop_core::IssueStatus::Blocked)
+            .await
+            .unwrap();
+        w.engine.resume_issue(issue, reply).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fact_never_rewrites_a_live_decision() {
+        let w = world("decision-kept").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace decision database choice — use postgres",
+        )
+        .await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact database choice — sqlite ships bundled",
+        )
+        .await;
+        let kinds: Vec<(String, String)> =
+            sqlx::query_as("select kind, body from memories order by created_at")
+                .fetch_all(&w.engine.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            kinds,
+            vec![
+                ("decision".to_string(), "use postgres".to_string()),
+                ("fact".to_string(), "sqlite ships bundled".to_string())
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_is_saved_on_one_line_without_control_characters() {
+        let w = world("answer-clean").await;
+        let p = project(&w, "Alpha").await;
+        let issue = task(&w, Some(p), 1).await;
+        answer(
+            &w,
+            issue,
+            "Use REST\nor GraphQL?\u{1b}[31m",
+            "GraphQL,\n\n  we have\ta schema",
+        )
+        .await;
+        let (title, body): (String, String) = sqlx::query_as("select title, body from memories")
+            .fetch_one(&w.engine.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(title, "Use REST or GraphQL?[31m");
+        assert_eq!(body, "GraphQL, we have a schema");
+    }
+
+    #[tokio::test]
+    async fn an_answer_on_a_task_with_no_project_saves_nothing() {
+        let w = world("answer-none").await;
+        let issue = task(&w, None, 1).await;
+        answer(&w, issue, "Which one?", "The first").await;
+        assert_eq!(count(&w).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_run_saves_no_markers() {
+        let w = world("failed").await;
+        let issue = task(&w, None, 1).await;
+        let line = "HULAHOOP_MEMORY: workspace fact anything — at all";
+        finish_as(&w, issue, "failed", line).await;
+        finish_as(&w, issue, "cancelled", line).await;
+        assert_eq!(count(&w).await, 0);
+    }
+
+    #[tokio::test]
+    async fn agent_and_person_scopes_resolve_to_a_name() {
+        let w = world("names").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: agent fact mine — own note\nHULAHOOP_MEMORY: agent:Reviewer fact theirs — other note\nHULAHOOP_MEMORY: person:Ada preference terse — likes short summaries\nHULAHOOP_MEMORY: person fact nobody — whose?",
+        )
+        .await;
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("select scope, scope_ref, title from memories order by created_at")
+                .fetch_all(&w.engine.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("agent".into(), "Developer".into(), "mine".into()),
+                ("agent".into(), "Reviewer".into(), "theirs".into()),
+                ("person".into(), "Ada".into(), "terse".into()),
+            ]
+        );
+    }
+
+    async fn index_for(w: &World, issue: Uuid, budget: usize) -> MemoryIndex {
+        let issue = w.engine.issue(issue).await.unwrap();
+        w.engine
+            .memory_index(&issue, "Developer", budget)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_index_never_leaks_another_projects_or_agents_notes() {
+        let w = world("index-scope").await;
+        let (a, b) = (project(&w, "Alpha").await, project(&w, "Beta").await);
+        let (ia, ib) = (task(&w, Some(a), 1).await, task(&w, Some(b), 2).await);
+        finish(
+            &w,
+            ia,
+            "HULAHOOP_MEMORY: project fact alpha secret — in alpha",
+        )
+        .await;
+        finish(&w, ib, "HULAHOOP_MEMORY: project fact beta secret — in beta\nHULAHOOP_MEMORY: agent:Reviewer fact reviewer only — nope\nHULAHOOP_MEMORY: workspace fact shared — everywhere").await;
+        let index = index_for(&w, ia, 1500).await;
+        assert!(index.index.contains("alpha secret"));
+        assert!(index.index.contains("shared"));
+        assert!(!index.index.contains("beta secret"));
+        assert!(!index.index.contains("reviewer only"));
+        assert_eq!(index.notes.len(), 2);
+        assert!(index.notes.iter().all(|n| !n.body.contains("beta")));
+    }
+
+    #[tokio::test]
+    async fn a_repo_less_task_gets_workspace_notes() {
+        let w = world("index-none").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact shared — everywhere",
+        )
+        .await;
+        let index = index_for(&w, issue, 1500).await;
+        assert!(index.index.contains("shared"));
+        assert!(index.notes[0].body.contains("everywhere"));
+    }
+
+    #[tokio::test]
+    async fn the_index_stays_within_its_budget_and_lists_only_the_notes_it_ships() {
+        let w = world("index-budget").await;
+        let issue = task(&w, None, 1).await;
+        for i in 0..3 {
+            finish(&w, issue, &format!("HULAHOOP_MEMORY: workspace fact topic{i} unique{i} — body{i} text{i}\nHULAHOOP_MEMORY: workspace fact other{i} distinct{i} — more{i} words{i}")).await;
+        }
+        assert_eq!(count(&w).await, 6);
+        let budget = 40;
+        let index = index_for(&w, issue, budget).await;
+        assert!(estimate_tokens(&index.index) <= budget);
+        let lines = index.index.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(lines > 0 && lines < 6);
+        assert_eq!(index.notes.len(), lines);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_decision_leaves_the_index_and_its_replacement_stays() {
+        let w = world("index-replaced").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace decision database choice — use postgres",
+        )
+        .await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace decision database choice — use sqlite",
+        )
+        .await;
+        let index = index_for(&w, issue, 1500).await;
+        assert_eq!(index.notes.len(), 1);
+        assert!(index.notes[0].body.contains("use sqlite"));
+    }
+
+    #[tokio::test]
+    async fn listed_notes_count_as_used() {
+        let w = world("index-used").await;
+        let issue = task(&w, None, 1).await;
+        finish(
+            &w,
+            issue,
+            "HULAHOOP_MEMORY: workspace fact shared — everywhere",
+        )
+        .await;
+        index_for(&w, issue, 1500).await;
+        let uses: i64 = sqlx::query_scalar("select use_count from memories")
+            .fetch_one(&w.engine.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(uses, 1);
     }
 
     #[tokio::test]

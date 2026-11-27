@@ -183,3 +183,11 @@ fn parse_line_accepts_hyphen_separators_and_strips_control_chars() {
 fn dedupe_threshold_is_named() {
     assert_eq!(MEMORY_DEDUPE_MIN, 0.6);
 }
+
+#[test]
+fn one_line_collapses_whitespace_and_drops_control_characters() {
+    assert_eq!(
+        hulahoop_core::memory::one_line("  a\n\nb\t c\u{1b}[0m \r\n"),
+        "a b c[0m"
+    );
+}

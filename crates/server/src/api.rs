@@ -8,6 +8,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
+use hulahoop_core::memory::MEMORY_INDEX_BUDGET_TOKENS;
 use hulahoop_core::runspec::{
     CheckoutInput, CommentInput, FileInput, IssueInput, Limits, ParentInput, RunSpec,
 };
@@ -687,6 +688,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     // that only exists inside input.json is advertised in the prompt but absent
     // from the path the prompt names.
     let skill_files = serde_json::to_value(&skills)?;
+    let memory = engine
+        .memory_index(&issue, &agent.name, MEMORY_INDEX_BUDGET_TOKENS)
+        .await?;
 
     let spec = RunSpec {
         run_id: run.id,
@@ -709,6 +713,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         blocked_answer,
         limits: Limits::default(),
         skills,
+        memories: memory.notes.clone(),
         files: run_files(engine, issue.id).await?,
         comments: run_comments(engine, issue.id, run.id).await?,
     }
@@ -717,7 +722,9 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
     let input_path = std::path::Path::new(&run.artifact_dir).join("input.json");
     spec.write(&input_path)?;
     let prompt_path = std::path::Path::new(&run.artifact_dir).join("prompt.md");
-    let prompt = engine.compose_prompt(&agent, repo.is_some()).await?;
+    let prompt = engine
+        .compose_prompt(&agent, repo.is_some(), &memory.index)
+        .await?;
     std::fs::write(&prompt_path, &prompt)?;
 
     // What the runner reads to find the repository. A repo-less run sends nulls
@@ -772,6 +779,7 @@ async fn build_run_spec(engine: &Engine, run: &Run) -> anyhow::Result<Value> {
         "artifact_dir": run.artifact_dir,
         "data_dir": engine.db.data_dir,
         "skills": skill_files,
+        "memories": memory.notes,
         // A commit is named by the subject its turn gave (`HULAHOOP_COMMIT:`);
         // the task's title is the fallback for a turn that gave none.
         "issue": { "key": issue.issue_key, "title": commit_title(&issue.title) },
