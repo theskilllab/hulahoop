@@ -1883,7 +1883,7 @@ label > select {
 
 .split {
   display: grid;
-  grid-template-columns: 264px minmax(0, 1fr);
+  grid-template-columns: 280px minmax(0, 1fr);
   min-height: 0;
   border-top: 1px solid var(--line);
 }
@@ -2030,7 +2030,7 @@ label > select {
   font-weight: 600;
 }
 
-/* --- the agent dialog ----------------------------------------------------- */
+/* --- dialog card (Skills) -------------------------------------------------- */
 
 .dialog-card {
   width: min(640px, 92vw);
@@ -2048,33 +2048,6 @@ label > select {
 .dialog-card header h2 {
   font-size: var(--fs-lg);
   margin: 0;
-}
-
-.skills-pick {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-/* A skill is a pill whether or not it is on; on is filled, off is outlined. */
-.sk {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  height: var(--h-chip);
-  padding: 0 8px;
-  border-radius: var(--r-pill);
-  border: 1px solid var(--line);
-  background: transparent;
-  color: var(--muted);
-  font-size: var(--fs-xs);
-}
-
-.sk.on {
-  background: var(--accent);
-  border-color: var(--accent);
-  color: var(--accent-fg);
-  font-weight: 600;
 }
 
 /* --- small helpers -------------------------------------------------------- */
@@ -4940,6 +4913,8 @@ button.link.new-milestone-choose { justify-self: start; font-size: var(--fs-xs);
   font-size: var(--fs-sm);
   cursor: pointer;
 }
+.sp-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sp-detail { flex: none; color: var(--muted); font-size: var(--fs-xs); }
 .sp-opt.active { background: var(--accent-soft); }
 .sp-opt.cur { font-weight: 600; }
 .sp-opt.dis { opacity: 0.5; cursor: default; }
@@ -5015,3 +4990,37 @@ button.link.new-milestone-choose { justify-self: start; font-size: var(--fs-xs);
 .art-mini:hover { background: var(--bg-2); }
 .art-mini-title { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-weight: 500; }
 .art-mini .count { display: inline-flex; align-items: center; gap: 2px; color: var(--muted); font-size: var(--fs-xs); }
+
+/* ---------- Agents screen ---------- */
+.warn-text { color: var(--warn); }
+.agent-task { max-width: 420px; }
+button.chip.info { cursor: pointer; }
+.callout.warn {
+  display: flex;
+  align-items: center;
+  gap: var(--s3);
+  padding: var(--s2) var(--s3);
+  border-radius: var(--r-md);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: var(--fs-sm);
+}
+.diffwrap { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: var(--s3); min-height: 0; }
+.ftree { list-style: none; margin: 0; padding: 0; display: grid; align-content: start; gap: 2px; }
+.ftree button { display: flex; flex-wrap: wrap; align-items: center; gap: 2px var(--s2); width: 100%; padding: var(--s1) var(--s2); border-radius: var(--r-sm); text-align: left; font-size: var(--fs-xs); }
+.ftree button:hover { background: var(--bg-3); }
+.diffwrap-view { min-width: 0; }
+.diffwrap-view .diff-view { padding: 0; }
+.agent-log { display: grid; gap: 2px; max-height: none; white-space: normal; }
+.log-row { display: grid; grid-template-columns: 110px minmax(0, 1fr); gap: var(--s3); padding: var(--s1) var(--s2); border-radius: var(--r-sm); text-align: left; font: inherit; }
+.log-row:hover { background: var(--bg-3); }
+.log-error { display: block; }
+.err { color: var(--bad); font-size: var(--fs-sm); margin: 0; }
+.field .err, .agent-dialog .err { margin: 0; }
+.field > input[aria-invalid="true"] { border-color: var(--bad); }
+.ag-two { display: grid; grid-template-columns: 1fr 1fr; gap: var(--s3); }
+.ag-two .sel, .ag-two .sel-btn { width: 100%; }
+.ag-two .sel-btn { justify-content: space-between; }
+.agent-dialog textarea { font-family: var(--font-mono); font-size: var(--fs-sm); }
+.dlg-f .dlg-del { margin-right: auto; }
+.dlg-confirm { margin-right: auto; font-size: var(--fs-sm); }
