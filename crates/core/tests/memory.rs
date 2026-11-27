@@ -56,6 +56,13 @@ fn similarity_detects_near_duplicates() {
 }
 
 #[test]
+fn similarity_ignores_connective_words() {
+    let a = "The release is cut when the changelog is signed";
+    let b = "The cache is cleared when the build is stale";
+    assert!(similarity(a, b) < 0.3);
+}
+
+#[test]
 fn normalize_tokens_is_case_and_punctuation_insensitive() {
     assert_eq!(
         normalize_tokens("Envrc, IS blocked!"),
@@ -68,6 +75,14 @@ fn fts_query_is_safe_and_none_for_empty() {
     assert_eq!(fts_query("  ?! "), None);
     let q = fts_query("blocking \"envrc\" OR (x*)").unwrap();
     assert!(!q.contains('(') && !q.contains('*'));
+}
+
+#[test]
+fn fts_query_is_capped_and_keeps_every_search_word() {
+    let long: String = (0..500).map(|i| format!("word{i} ")).collect();
+    let q = fts_query(&long).unwrap();
+    assert_eq!(q.matches(" OR ").count() + 1, FTS_QUERY_MAX_WORDS);
+    assert_eq!(fts_query("a a a or").unwrap(), "\"a\" OR \"or\"");
 }
 
 #[test]

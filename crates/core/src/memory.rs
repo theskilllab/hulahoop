@@ -103,10 +103,23 @@ pub fn normalize_tokens(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Word-set overlap (Jaccard) from 0 to 1, for spotting near-duplicates.
+/// Connective words that say nothing about a subject, so two notes sharing only
+/// these are not duplicates.
+const STOP_WORDS: [&str; 24] = [
+    "a", "an", "and", "are", "as", "at", "be", "by", "for", "in", "is", "it", "of", "on", "or",
+    "that", "the", "this", "to", "was", "when", "with", "not", "do",
+];
+
+fn content_words(text: &str) -> HashSet<String> {
+    normalize_tokens(text)
+        .into_iter()
+        .filter(|word| !STOP_WORDS.contains(&word.as_str()))
+        .collect()
+}
+
+/// Content-word overlap (Jaccard) from 0 to 1, for spotting near-duplicates.
 pub fn similarity(a: &str, b: &str) -> f64 {
-    let a: HashSet<String> = normalize_tokens(a).into_iter().collect();
-    let b: HashSet<String> = normalize_tokens(b).into_iter().collect();
+    let (a, b) = (content_words(a), content_words(b));
     let union = a.union(&b).count();
     if union == 0 {
         return 0.0;
@@ -114,12 +127,19 @@ pub fn similarity(a: &str, b: &str) -> f64 {
     a.intersection(&b).count() as f64 / union as f64
 }
 
-/// An FTS5 `OR` query of quoted words, or `None` when there is nothing to
-/// search for. Quoting keeps user text from being read as FTS syntax.
+/// Most words one search query carries; a long task body must not build a query
+/// SQLite refuses.
+pub const FTS_QUERY_MAX_WORDS: usize = 24;
+
+/// An FTS5 `OR` query of the first distinct words, quoted, or `None` when there
+/// is nothing to search for. Quoting keeps user text from being read as FTS
+/// syntax, so no word needs to be dropped as a keyword.
 pub fn fts_query(text: &str) -> Option<String> {
+    let mut seen = HashSet::new();
     let words: Vec<String> = normalize_tokens(text)
         .into_iter()
-        .filter(|word| !matches!(word.as_str(), "or" | "and" | "not" | "near"))
+        .filter(|word| seen.insert(word.clone()))
+        .take(FTS_QUERY_MAX_WORDS)
         .map(|word| format!("\"{word}\""))
         .collect();
     (!words.is_empty()).then(|| words.join(" OR "))

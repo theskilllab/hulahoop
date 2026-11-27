@@ -10,6 +10,7 @@ pub mod engine;
 pub mod github;
 pub mod gql;
 pub mod lumi;
+pub mod memories;
 pub mod mentions;
 pub mod model;
 pub mod models;

@@ -1949,14 +1949,24 @@ impl Engine {
         } else {
             format!("Answer to \"{question}\":\n\n{answer}")
         };
-        self.comment(
-            issue_id,
-            hulahoop_core::AuthorType::Human,
-            None,
-            &body,
-            false,
-        )
-        .await?;
+        let comment = self
+            .comment(
+                issue_id,
+                hulahoop_core::AuthorType::Human,
+                None,
+                &body,
+                false,
+            )
+            .await?;
+        if !question.is_empty() {
+            // Saving a memory never blocks the answer: the task must move.
+            if let Err(error) = self
+                .remember_answer(&issue, comment, &question, answer)
+                .await
+            {
+                tracing::warn!(%issue_id, "saving the answer as a memory: {error:#}");
+            }
+        }
         // The question stays pinned until a turn carries it: the pin is what puts
         // the pair in the next run's input, so it retires with the run that reads
         // it (`build_run_spec`), not with the answer that is only half of it.
@@ -2197,6 +2207,9 @@ impl Engine {
             error.as_deref()
         };
         persist_run_metrics(&self.db, &run, &usage, category_reason).await?;
+        if final_status == RunStatus::Succeeded {
+            self.save_run_memories(&run, &issue, &payload.body).await?;
+        }
 
         // What a turn *was* is read from what it did. A closing message that
         // carries a verdict judged the work before it; anything else is work, and
@@ -3643,6 +3656,31 @@ mod repo_less_tests {
         .unwrap();
         assert_eq!(live, 0);
         assert_eq!(engine.issue(issue).await.unwrap().status, "in_progress");
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Cached input is most of what a run reads, so a stream that reports it
+    /// must land in `tokens_in` rather than the fresh input alone.
+    #[tokio::test]
+    async fn a_run_that_read_from_the_cache_lands_its_input_tokens() {
+        let (directory, engine, workspace, developer) = fixture("cache-tokens").await;
+        let issue = task(&engine, workspace, 1).await;
+        let run = engine
+            .start_run(issue, Some(developer), None)
+            .await
+            .unwrap();
+        std::fs::create_dir_all(&run.artifact_dir).unwrap();
+        std::fs::write(
+            std::path::Path::new(&run.artifact_dir).join("agent.jsonl"),
+            r#"{"type":"message_end","message":{"usage":{"input":10,"output":4,"cacheRead":500,"cacheWrite":30}}}"#,
+        )
+        .unwrap();
+        let done = engine
+            .complete_run(run.id, finished("Done.", None, None))
+            .await
+            .unwrap();
+        assert_eq!((done.tokens_in, done.tokens_out), (540, 4));
 
         let _ = std::fs::remove_dir_all(directory);
     }
