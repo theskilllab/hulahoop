@@ -135,3 +135,36 @@ fn regex_like(n: &str) -> bool {
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         && n.len() > 3
 }
+
+#[test]
+fn parse_lines_caps_saves_per_run() {
+    let text = (0..MEMORY_WRITES_PER_RUN + 2)
+        .map(|i| format!("HULAHOOP_MEMORY: project fact t{i} — b"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let parsed = parse_lines(&text);
+    assert_eq!(parsed.len(), MEMORY_WRITES_PER_RUN + 2);
+    assert_eq!(
+        parsed.iter().filter(|r| r.is_ok()).count(),
+        MEMORY_WRITES_PER_RUN
+    );
+    assert!(parsed[MEMORY_WRITES_PER_RUN].is_err());
+    assert_eq!(parsed[1].as_ref().unwrap().title, "t1");
+}
+
+#[test]
+fn parse_line_accepts_hyphen_separators_and_strips_control_chars() {
+    let a = parse_lines("HULAHOOP_MEMORY: project fact Title -- the body")[0]
+        .clone()
+        .unwrap();
+    assert_eq!((a.title.as_str(), a.body.as_str()), ("Title", "the body"));
+    let b = parse_lines("HULAHOOP_MEMORY: project fact Ti\x1b[31mtle - the body")[0]
+        .clone()
+        .unwrap();
+    assert_eq!(b.title, "Ti[31mtle");
+}
+
+#[test]
+fn dedupe_threshold_is_named() {
+    assert_eq!(MEMORY_DEDUPE_MIN, 0.6);
+}
