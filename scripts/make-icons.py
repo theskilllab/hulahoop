@@ -24,9 +24,14 @@ OUT = Path(__file__).resolve().parent.parent / "apps/desktop/src-tauri/icons"
 # the theme, so the icon reads the same in Finder and in the dock.
 TILE = (0xFF, 0xFF, 0xFF)
 DOT = (0x6F, 0x86, 0xD6)
-DOT_RADIUS = 0.53 / 2
-CORNER_RADIUS = 0.2237
-INSET = 0.0
+# Apple's macOS icon grid: on a 1024 canvas the tile is 824 wide with a 100
+# margin, and its corners have a radius of about 185. A tile that fills the
+# whole canvas looks oversized next to other apps, and macOS 26 shrinks such
+# an icon into a grey tile of its own.
+INSET = 100 / 1024
+TILE_WIDTH = 1.0 - 2 * INSET
+CORNER_RADIUS = 185.4 / 824 * TILE_WIDTH
+DOT_RADIUS = 0.53 / 2 * TILE_WIDTH
 
 
 def _rounded_rect_sd(x: float, y: float, half: float, radius: float) -> float:
@@ -38,15 +43,11 @@ def _rounded_rect_sd(x: float, y: float, half: float, radius: float) -> float:
     return outside + inside - radius
 
 
-def _pixel(px: float, py: float) -> tuple[int, int, int, int]:
-    """Colour of the icon at one point, in unit coordinates from -0.5 to 0.5."""
-    half = 0.5 - INSET
-    if _rounded_rect_sd(px, py, half, CORNER_RADIUS) > 0.0:
-        return (0, 0, 0, 0)
-
-    if math.hypot(px, py) <= DOT_RADIUS:
-        return (DOT[0], DOT[1], DOT[2], 255)
-    return (TILE[0], TILE[1], TILE[2], 255)
+def _coverage(distance: float, pixel: float) -> float:
+    """How much of a pixel a shape covers, from its signed distance at the pixel's
+    centre. A one-pixel ramp across the edge gives every size a smooth outline;
+    sampling a few points per pixel left only four or five shades and a jagged rim."""
+    return max(0.0, min(1.0, 0.5 - distance / pixel))
 
 
 def _byte(value: float) -> int:
@@ -55,37 +56,23 @@ def _byte(value: float) -> int:
 
 def render(size: int) -> bytes:
     """Renders one square size as raw RGBA rows."""
-    samples = 4 if size <= 128 else 2
     rows = bytearray()
-    step = 1.0 / (size * samples)
+    pixel = 1.0 / size
+    half = 0.5 - INSET
     for y in range(size):
         rows.append(0)  # PNG filter: none
+        py = -0.5 + (y + 0.5) * pixel
         for x in range(size):
-            acc = [0, 0, 0, 0]
-            for sy in range(samples):
-                for sx in range(samples):
-                    px = -0.5 + (x * samples + sx + 0.5) * step
-                    py = -0.5 + (y * samples + sy + 0.5) * step
-                    r, g, b, a = _pixel(px, py)
-                    acc[0] += r * a
-                    acc[1] += g * a
-                    acc[2] += b * a
-                    acc[3] += a
-            count = samples * samples
-            alpha = acc[3] / count
-            if alpha < 1.0:
+            px = -0.5 + (x + 0.5) * pixel
+            tile = _coverage(_rounded_rect_sd(px, py, half, CORNER_RADIUS), pixel)
+            if tile <= 0.0:
                 rows.extend((0, 0, 0, 0))
                 continue
-            # Colours were accumulated premultiplied by alpha, so dividing by the
-            # accumulated alpha recovers the un-premultiplied value.
-            rows.extend(
-                (
-                    _byte(acc[0] / acc[3]),
-                    _byte(acc[1] / acc[3]),
-                    _byte(acc[2] / acc[3]),
-                    _byte(alpha),
-                )
-            )
+            dot = _coverage(math.hypot(px, py) - DOT_RADIUS, pixel)
+            # The dot sits wholly inside the tile, so its edge blends dot into
+            # tile colour and the tile's edge alone sets transparency.
+            colour = [TILE[i] * (1.0 - dot) + DOT[i] * dot for i in range(3)]
+            rows.extend((*(_byte(c) for c in colour), _byte(tile * 255)))
     return bytes(rows)
 
 
