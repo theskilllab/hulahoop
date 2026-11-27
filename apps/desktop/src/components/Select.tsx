@@ -30,6 +30,7 @@ export default function Select({
   prefix,
   id,
   disabled,
+  title,
   searchable,
 }: {
   label: string;
@@ -39,7 +40,9 @@ export default function Select({
   /** Shown before the current choice on the pill, e.g. a colour dot. */
   prefix?: ReactNode;
   id?: string;
+  /** A disabled pill cannot open; `title` says why. */
   disabled?: boolean;
+  title?: string;
   /** Force the search row on or off; by default it shows above four options. */
   searchable?: boolean;
 }) {
@@ -63,6 +66,7 @@ export default function Select({
         aria-label={label}
         aria-haspopup="listbox"
         aria-expanded={open}
+        title={title}
         onClick={() => setOpen((was) => !was)}
       >
         {prefix}

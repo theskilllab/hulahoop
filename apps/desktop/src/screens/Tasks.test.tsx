@@ -44,11 +44,13 @@ function setup(projectFilter: string, onProjectFilter = vi.fn()) {
 beforeEach(() => localStorage.clear());
 
 describe("Tasks project filter", () => {
-  it("uses the filled select style and offers No project", () => {
+  it("has no native select and opens the shared popover with a check on the current filter", async () => {
     setup("all");
-    const select = screen.getByLabelText("Project");
-    expect(select.className).toContain("select");
+    expect(document.querySelector("select")).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: "Project" }));
+    expect(document.querySelector(".sel-pop")).not.toBeNull();
     expect(screen.getByRole("option", { name: "No project" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "All projects" }).getAttribute("aria-selected")).toBe("true");
   });
 
   it("shows only tasks without a project for No project", () => {
@@ -59,7 +61,8 @@ describe("Tasks project filter", () => {
 
   it("reports the chosen filter", async () => {
     const onProjectFilter = setup("all");
-    await userEvent.selectOptions(screen.getByLabelText("Project"), "none");
+    await userEvent.click(screen.getByRole("button", { name: "Project" }));
+    await userEvent.click(screen.getByRole("option", { name: "No project" }));
     expect(onProjectFilter).toHaveBeenCalledWith("none");
   });
 });

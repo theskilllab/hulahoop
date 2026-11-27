@@ -1,4 +1,5 @@
 import Icon from "../Icon";
+import type { SelectOption } from "./Select";
 
 /** Small, shared pieces for anything that draws a task or a run. */
 
@@ -185,28 +186,12 @@ export function parseAssigneeKey(key: string): { assigneeType: "human" | "agent"
 }
 
 /** Unassigned, You, then the agents. Agents assign themselves when they pick a task up. */
-export function AssigneeOptions({ agents }: { agents: { id: string; name: string }[] }) {
-  return (
-    <>
-      <option value="">Unassigned</option>
-      <option value="human:me">You</option>
-      {agents.map((agent) => (
-        <option key={agent.id} value={`agent:${agent.id}`}>
-          {agent.name}
-        </option>
-      ))}
-    </>
-  );
+export function assigneeChoices(agents: { id: string; name: string }[]): SelectOption[] {
+  return [
+    { value: "", label: "Unassigned" },
+    { value: "human:me", label: "You" },
+    ...agents.map((agent) => ({ value: `agent:${agent.id}`, label: agent.name })),
+  ];
 }
 
-export function PriorityOptions() {
-  return (
-    <>
-      {PRIORITIES.map((value) => (
-        <option key={value} value={value}>
-          {priorityLabel(value)}
-        </option>
-      ))}
-    </>
-  );
-}
+export const priorityChoices: SelectOption[] = PRIORITIES.map((value) => ({ value, label: priorityLabel(value) }));

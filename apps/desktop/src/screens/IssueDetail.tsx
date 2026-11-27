@@ -17,15 +17,16 @@ import ArtifactsSection from "../components/ArtifactsSection";
 import FilesSection from "../components/FilesSection";
 import MarkdownView from "../components/MarkdownView";
 import { normalizeMarkdown } from "../components/markdown";
+import Select, { type SelectOption } from "../components/Select";
 import { type Column } from "../components/TaskBoard";
 import {
-  AssigneeOptions,
-  PriorityOptions,
   RunStatusChip,
   TurnQueue,
+  assigneeChoices,
   assigneeKey,
   isLiveRun,
   parseAssigneeKey,
+  priorityChoices,
   waitingFor,
 } from "../components/TaskBits";
 import RichText from "../RichText";
@@ -390,46 +391,41 @@ function Properties({
   // is working in the old checkout.
   const live = Boolean(issue.currentRun && isLiveRun(issue.currentRun.status));
   const waiting = waitingFor(issue.currentRun, useRunnerOnline());
+  const projectChoices: SelectOption[] = [
+    ...(issue.projectId && !projects.some((project) => project.id === issue.projectId)
+      ? [{ value: issue.projectId, label: issue.projectName ?? "Project" }]
+      : []),
+    ...projects.map((project) => ({ value: project.id, label: project.name })),
+    { value: "", label: "No project" },
+  ];
 
   return (
     <dl className="props">
       <dt>Status</dt>
       <dd>
-        <select
-          aria-label="Status"
+        <Select
+          label="Status"
           value={issue.status}
+          options={[issue.status, ...moves].map((status) => ({ value: status, label: title(status) }))}
           disabled={busy !== null || moves.length === 0}
           title={moves.length ? undefined : "The workflow declares no moves from here"}
-          onChange={(event) => {
-            const status = event.target.value;
-            void run("move", () => moveIssue(issue.id, status), `Moved to ${title(status)}`);
-          }}
-        >
-          <option value={issue.status}>{title(issue.status)}</option>
-          {moves.map((status) => (
-            <option key={status} value={status}>
-              {title(status)}
-            </option>
-          ))}
-        </select>
+          onChange={(status) => void run("move", () => moveIssue(issue.id, status), `Moved to ${title(status)}`)}
+        />
       </dd>
 
       <dt>Priority</dt>
       <dd>
-        <select aria-label="Priority" value={issue.priority} onChange={(event) => void save({ priority: event.target.value })}>
-          <PriorityOptions />
-        </select>
+        <Select label="Priority" value={issue.priority} options={priorityChoices} onChange={(priority) => void save({ priority })} />
       </dd>
 
       <dt>Assignee</dt>
       <dd>
-        <select
-          aria-label="Assignee"
+        <Select
+          label="Assignee"
           value={assigneeKey(issue.assignee)}
-          onChange={(event) => void save(parseAssigneeKey(event.target.value))}
-        >
-          <AssigneeOptions agents={agents} />
-        </select>
+          options={assigneeChoices(agents)}
+          onChange={(key) => void save(parseAssigneeKey(key))}
+        />
       </dd>
 
       <dt>Due</dt>
@@ -444,33 +440,25 @@ function Properties({
 
       <dt>Project</dt>
       <dd className="props-project">
-        <select
-          aria-label="Project"
+        <Select
+          label="Project"
           value={issue.projectId ?? ""}
+          options={projectChoices}
           disabled={busy !== null || live}
           title={live ? "Wait for the run to finish before moving the task" : undefined}
-          onChange={(event) => void save({ projectId: event.target.value || null })}
-        >
-          {issue.projectId && !projects.some((project) => project.id === issue.projectId) ? (
-            <option value={issue.projectId}>{issue.projectName ?? "Project"}</option>
-          ) : null}
-          {projects.map((project) => (
-            <option key={project.id} value={project.id}>
-              {project.name}
-            </option>
-          ))}
-          <option value="">No project</option>
-        </select>
+          onChange={(projectId) => void save({ projectId: projectId || null })}
+        />
         {issue.projectId ? null : <span className="dim small">No project · runs without a checkout</span>}
       </dd>
 
       <dt>Milestone</dt>
       <dd>
-        <select
-          aria-label="Milestone"
+        <Select
+          label="Milestone"
           value={issue.milestoneId ?? ""}
-          onChange={(event) => {
-            const milestoneId = event.target.value || null;
+          options={[{ value: "", label: "None" }, ...inProject.map((milestone) => ({ value: milestone.id, label: milestone.title }))]}
+          onChange={(id) => {
+            const milestoneId = id || null;
             void run(
               "milestone",
               () =>
@@ -481,14 +469,7 @@ function Properties({
               "Saved",
             );
           }}
-        >
-          <option value="">None</option>
-          {inProject.map((milestone) => (
-            <option key={milestone.id} value={milestone.id}>
-              {milestone.title}
-            </option>
-          ))}
-        </select>
+        />
       </dd>
 
       <dt>Pull request</dt>

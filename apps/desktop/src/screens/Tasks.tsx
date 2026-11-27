@@ -13,6 +13,7 @@ import {
   type RunnerCapacity,
 } from "../api";
 import ContextMenu, { type MenuItem } from "../components/ContextMenu";
+import Select from "../components/Select";
 import Seg from "../components/Seg";
 import SidePanel from "../components/SidePanel";
 import TaskBoard, { FALLBACK_COLUMNS, isDoneStatus, type Column } from "../components/TaskBoard";
@@ -192,15 +193,16 @@ export default function Tasks({
         subtitle={capacity ? `${openCount} open · ${capacityLine(capacity)}` : `${openCount} open`}
         actions={
           <>
-            <select className="select" aria-label="Project" value={projectFilter} onChange={(event) => onProjectFilter(event.target.value)}>
-              <option value="all">All projects</option>
-              <option value="none">No project</option>
-              {projects.map((entry) => (
-                <option key={entry.id} value={entry.id}>
-                  {entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name}
-                </option>
-              ))}
-            </select>
+            <Select
+              label="Project"
+              value={projectFilter}
+              onChange={onProjectFilter}
+              options={[
+                { value: "all", label: "All projects" },
+                { value: "none", label: "No project" },
+                ...projects.map((entry) => ({ value: entry.id, label: entry.prefix ? `${entry.prefix} · ${entry.name}` : entry.name })),
+              ]}
+            />
             <Seg<Layout>
               label="Layout"
               value={layout}
