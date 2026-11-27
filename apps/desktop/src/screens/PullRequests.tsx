@@ -65,6 +65,21 @@ export function age(iso: string, now = Date.now()): string {
   return `${Math.round(hours / 24)} d`;
 }
 
+export function ordinal(n: number): string {
+  const tens = n % 100;
+  if (tens >= 11 && tens <= 13) return `${n}th`;
+  switch (n % 10) {
+    case 1:
+      return `${n}st`;
+    case 2:
+      return `${n}nd`;
+    case 3:
+      return `${n}rd`;
+    default:
+      return `${n}th`;
+  }
+}
+
 function stateClass(pr: PullRequest): string {
   if (pr.merged) return "merged";
   if (pr.state === "closed") return "closed";
@@ -77,8 +92,17 @@ export function ReviewChip({ pr }: { pr: PullRequest }) {
   switch (pr.reviewState) {
     case "DRAFT":
       return <span className="chip">Draft</span>;
-    case "REVIEW_REQUESTED":
-      return <span className="chip warn">Review requested</span>;
+    case "REVIEW_REQUESTED": {
+      if (pr.changesRequested === 0) return <span className="chip warn">Review requested</span>;
+      const round = pr.changesRequested + 1;
+      const times = pr.changesRequested === 1 ? "once" : `${pr.changesRequested} times`;
+      // Three rounds in, the back-and-forth usually says the task was unclear.
+      return (
+        <span className={round >= 3 ? "chip bad" : "chip warn"} title={`Sent back for changes ${times}; updated since`}>
+          Review requested · {ordinal(round)} round
+        </span>
+      );
+    }
     case "APPROVED":
       return (
         <span className="chip ok">
@@ -443,7 +467,7 @@ function PullRequestPane({
   // kept saying "CI is still running" until the app was reopened.
   useEffect(() => {
     void load();
-  }, [load, pr.updatedAt, pr.headSha, pr.merged, pr.mergeable, pr.ciState, pr.reviewState]);
+  }, [load, pr.updatedAt, pr.headSha, pr.merged, pr.mergeable, pr.ciState, pr.reviewState, pr.changesRequested]);
 
   const files = useMemo(() => (detail ? filesFromGithub(detail.files) : []), [detail]);
   const sum = useMemo(() => totals(files), [files]);
