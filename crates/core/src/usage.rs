@@ -354,3 +354,37 @@ mod tests {
         assert_eq!(totals(&stream), (60, 12));
     }
 }
+
+#[cfg(test)]
+mod input_total_tests {
+    use super::Metrics;
+
+    #[test]
+    fn input_total_includes_cache_read_and_write() {
+        let m = Metrics {
+            input: 27,
+            cache_read: Some(511_000),
+            cache_write: Some(40),
+            ..Default::default()
+        };
+        assert_eq!(m.input_total(), 511_067);
+    }
+
+    #[test]
+    fn input_total_treats_unmetered_cache_as_zero_and_saturates() {
+        assert_eq!(
+            Metrics {
+                input: 5,
+                ..Default::default()
+            }
+            .input_total(),
+            5
+        );
+        let m = Metrics {
+            input: i64::MAX,
+            cache_read: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(m.input_total(), i64::MAX);
+    }
+}
