@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type DragEvent, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState, type DragEvent, type KeyboardEvent, type ReactNode } from "react";
 import { createIssue, uploadArtifact, type Agent, type IssueSummary, type Milestone, type Project } from "../api";
 import Icon from "../Icon";
 import RichText from "../RichText";
-import { AssigneeOptions, Avatar, PriorityIcon, PriorityOptions, parseAssigneeKey, priorityLabel } from "./TaskBits";
+import Select from "./Select";
+import { Avatar, PriorityIcon, assigneeChoices, parseAssigneeKey, priorityChoices } from "./TaskBits";
 
 const MAX_TITLE = 80;
 
@@ -56,9 +57,12 @@ function projectLabel(project: Project): string {
   return project.prefix ? `${project.prefix} · ${project.name}` : project.name;
 }
 
-/** A pill's select is as wide as the option it shows, like the prototype's `ntFit`. */
-function fit(label: string) {
-  return { width: `calc(${label.length}ch + 22px)` };
+function pillIcon(icon: ReactNode) {
+  return (
+    <span className="pill-ic" aria-hidden="true">
+      {icon}
+    </span>
+  );
 }
 
 /**
@@ -341,61 +345,37 @@ export default function NewTaskDialog({
             </ul>
           ) : null}
           <div className="new-task-pills">
-            <label className="pill nt-pill">
-              <span className="pill-ic" aria-hidden="true">
-                <Icon name="folder" size={13} />
-              </span>
-              <select
-                aria-label="Project"
-                value={projectId}
-                style={fit(project ? projectLabel(project) : NO_PROJECT)}
-                onChange={(event) => {
-                  setProjectId(event.target.value);
-                  setMilestoneId("");
-                }}
-              >
-                {projects.map((entry) => (
-                  <option key={entry.id} value={entry.id}>
-                    {projectLabel(entry)}
-                  </option>
-                ))}
-                <option value="">{NO_PROJECT}</option>
-              </select>
-            </label>
-            <label className="pill nt-pill">
-              <span className="pill-ic" aria-hidden="true">
-                <PriorityIcon priority={priority} />
-              </span>
-              <select aria-label="Priority" value={priority} style={fit(priorityLabel(priority))} onChange={(event) => setPriority(event.target.value)}>
-                <PriorityOptions />
-              </select>
-            </label>
-            <label className="pill nt-pill">
-              <span className="pill-ic" aria-hidden="true">
-                <Icon name="flag" size={13} />
-              </span>
-              <select
-                aria-label="Milestone"
-                value={milestone?.id ?? ""}
-                style={fit(milestone?.title ?? NO_MILESTONE)}
-                onChange={(event) => setMilestoneId(event.target.value)}
-              >
-                <option value="">{NO_MILESTONE}</option>
-                {milestoneChoices.map((entry) => (
-                  <option key={entry.id} value={entry.id}>
-                    {entry.title}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label className="pill nt-pill">
-              <span className="pill-ic" aria-hidden="true">
-                <Avatar name={assigneeName} kind={agent ? "agent" : "human"} size="sm" />
-              </span>
-              <select aria-label="Assign to" value={assignee} style={fit(assigneeName)} onChange={(event) => setAssignee(event.target.value)}>
-                <AssigneeOptions agents={agents} />
-              </select>
-            </label>
+            <Select
+              label="Project"
+              value={projectId}
+              prefix={pillIcon(<Icon name="folder" size={13} />)}
+              options={[...projects.map((entry) => ({ value: entry.id, label: projectLabel(entry) })), { value: "", label: NO_PROJECT }]}
+              onChange={(id) => {
+                setProjectId(id);
+                setMilestoneId("");
+              }}
+            />
+            <Select
+              label="Priority"
+              value={priority}
+              prefix={pillIcon(<PriorityIcon priority={priority} />)}
+              options={priorityChoices}
+              onChange={setPriority}
+            />
+            <Select
+              label="Milestone"
+              value={milestone?.id ?? ""}
+              prefix={pillIcon(<Icon name="flag" size={13} />)}
+              options={[{ value: "", label: NO_MILESTONE }, ...milestoneChoices.map((entry) => ({ value: entry.id, label: entry.title }))]}
+              onChange={setMilestoneId}
+            />
+            <Select
+              label="Assign to"
+              value={assignee}
+              prefix={pillIcon(<Avatar name={assigneeName} kind={agent ? "agent" : "human"} size="sm" />)}
+              options={assigneeChoices(agents)}
+              onChange={setAssignee}
+            />
           </div>
         </div>
         <div className="settings-actions">

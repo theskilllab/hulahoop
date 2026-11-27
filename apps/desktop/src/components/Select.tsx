@@ -30,6 +30,7 @@ export default function Select({
   prefix,
   id,
   disabled,
+  title,
   searchable,
 }: {
   label: string;
@@ -39,7 +40,9 @@ export default function Select({
   /** Shown before the current choice on the pill, e.g. a colour dot. */
   prefix?: ReactNode;
   id?: string;
+  /** A disabled pill cannot open; `title` says why. */
   disabled?: boolean;
+  title?: string;
   /** Force the search row on or off; by default it shows above four options. */
   searchable?: boolean;
 }) {
@@ -63,6 +66,7 @@ export default function Select({
         aria-label={label}
         aria-haspopup="listbox"
         aria-expanded={open}
+        title={title}
         onClick={() => setOpen((was) => !was)}
       >
         {prefix}
@@ -156,6 +160,7 @@ function Popover({
 
   function onKeyDown(event: KeyboardEvent) {
     const handled = ["ArrowDown", "ArrowUp", "Enter", "Escape"].includes(event.key);
+    const typeAhead = !searchable && event.key.length === 1 && event.key !== " " && !event.metaKey && !event.ctrlKey;
     if (event.key === "Tab") return onClose(false);
     if (event.key === "ArrowDown") step(1);
     else if (event.key === "ArrowUp") step(-1);
@@ -165,8 +170,8 @@ function Popover({
     } else if (event.key === "Enter") {
       const option = shown[active];
       if (option && !option.disabled) onChoose(option.value);
-    } else if (!searchable && event.key.length === 1 && event.key !== " " && !event.metaKey && !event.ctrlKey) jumpTo(event.key);
-    if (handled || (event.key === " " && !searchable)) event.preventDefault();
+    } else if (typeAhead) jumpTo(event.key);
+    if (handled || typeAhead || (event.key === " " && !searchable)) event.preventDefault();
   }
 
   let lastGroup: string | undefined;
