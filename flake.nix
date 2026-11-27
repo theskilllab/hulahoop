@@ -8,6 +8,18 @@
       systems = [ "aarch64-linux" "x86_64-linux" "aarch64-darwin" "x86_64-darwin" ];
       forEach = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
     in {
+      packages = forEach (pkgs: rec {
+        hulahoop = pkgs.callPackage ./nix/package.nix { };
+        default = hulahoop;
+      });
+
+      nixosModules.default = import ./nix/module.nix self;
+
+      checks = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in {
+          vm = import ./nix/vm-test.nix { inherit pkgs; module = self.nixosModules.default; };
+        });
+
       devShells = forEach (pkgs:
         let
           linuxInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (with pkgs; [

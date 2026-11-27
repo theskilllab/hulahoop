@@ -30,6 +30,8 @@ jobs:
           version: 12.9.0
       - name: ci
         run: nix develop --command just ci
+      - name: nix build
+        run: nix build .#hulahoop && ./result/bin/hulahoop help
       # The loop itself: the fake adapter, the real state machine, a throwaway repo.
       - name: end-to-end loop
         run: nix develop --command bash tests/e2e/loop.sh
@@ -45,3 +47,14 @@ jobs:
           name: junit-${{ matrix.os }}
           path: .hulahoop/junit.xml
           if-no-files-found: ignore
+
+  # The NixOS VM test boots QEMU, which is slow without /dev/kvm, so it has its own
+  # job and timeout and cannot hide a failure in the main one.
+  nixos-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix flake check
+        run: nix flake check

@@ -1373,12 +1373,14 @@ Where the binaries come from:
   `/nix/store` paths for glibc — the same trap the macOS bundle had. The glibc floor
   is 2.35 on x86_64 (Ubuntu 22.04) and 2.39 on arm64 (the oldest hosted arm image).
   The desktop app ships for Apple silicon only; a desktop build for Linux is M3.
+- **Nix.** The flake builds the same binary and ships a NixOS module; see
+  [Installing with Nix](#installing-with-nix).
 - **From source.** `nix develop --command cargo build --release -p hulahoop-cli`
   writes `target/release/hulahoop`.
 
 Then paste `http://workstation:9000` and the token into the app's connect screen. The
-app remembers the address; the token it does not, because a server mints a fresh one
-on every start, so a restarted host means pasting again. "Use this machine" switches
+app remembers the address, and the server keeps its token in its database, so a restart
+or a rebuild of the host keeps the same token. "Use this machine" switches
 back to the bundled local server. The runner takes `--server`/`--token`, or `HULAHOOP_SERVER` and
 `HULAHOOP_TOKEN`; without them it reads the `connection.json` a local server wrote,
 which is what `just dev` relies on. `tests/e2e/loop.sh` starts its runner the remote
@@ -1399,6 +1401,73 @@ The app reaches that address over plain HTTP. Its content-security policy permit
 first time an app really opens a socket to the LAN — an entry can only appear after
 that first attempt, so a request that never shows up means the app is running from a
 translocated path such as `~/Downloads`, or a VPN is handling the traffic first.
+
+### Installing with Nix
+
+The flake exports `packages.<system>.hulahoop` (also `default`) for `x86_64-linux`,
+`aarch64-linux`, `aarch64-darwin` and `x86_64-darwin`: the headless binary, wrapped so
+`jj`, `git`, `direnv` and `nix-direnv` are on its `PATH`. It also exports
+`nixosModules.default`, which provides `services.hulahoop`. Try it with
+`nix run github:theskilllab/hulahoop -- --help`.
+
+Two channels, as two flake inputs:
+
+- **Follow `main`:** `github:theskilllab/hulahoop`
+- **Follow releases:** `github:theskilllab/hulahoop/stable`; the release workflow moves
+  the `stable` branch to each `v*` tag.
+
+```nix
+{
+  inputs.hulahoop.url = "github:theskilllab/hulahoop/stable"; # or "github:theskilllab/hulahoop"
+  inputs.hulahoop.inputs.nixpkgs.follows = "nixpkgs";
+
+  outputs = { nixpkgs, hulahoop, ... }: {
+    nixosConfigurations.vps = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        hulahoop.nixosModules.default
+        {
+          services.hulahoop = {
+            enable = true;
+            listen = "127.0.0.1";   # default; use a Tailscale address to reach it
+            port = 9000;
+            maxRuns = 4;
+            harnesses = [ /* agent CLIs for the runner's PATH */ ];
+            # piPackage = pkgs.pi;   # sets HULAHOOP_PI_BIN
+            # environment.FOO = "bar";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Options: `enable`, `package`, `user` / `group` (default `hulahoop`, created unless
+set), `dataDir` (`/var/lib/hulahoop`), `listen` (`127.0.0.1`), `port` (`9000`),
+`openFirewall` (`false`), `maxRuns` (`HULAHOOP_MAX_RUNS`), `harnesses`, `piPackage`
+(`HULAHOOP_PI_BIN`) and `environment`. The service runs `hulahoop up`, restarts on
+failure, can reach the Nix daemon (agents run `direnv allow` and enter each
+repository's dev shell), and keeps its data in `dataDir`, owned by the service user,
+across restarts and rebuilds. Connectors, agents, skills and `WORKFLOWS.md` live in the
+database and are edited in the app; they are not declarative. `harnesses` are on the
+runner's `PATH`, but inside a repository's dev shell that shell's `PATH` comes first,
+so a CLI the dev shell also provides wins. `x86_64-darwin` builds on a nixpkgs
+platform that ends in 26.11; pin an older nixpkgs or use the release tarball if you
+need it.
+
+**Connect the desktop app.** Read the token on the server
+(`sudo jq -r .token /var/lib/hulahoop/connection.json`) and paste the server URL
+(for example `http://vps.tailnet:9000`) and the token into the app's connect screen.
+
+**Security.**
+
+- Do not expose the port to the internet. The app sends connector credentials over
+  plain HTTP, guarded by one bearer token. Reach the server over Tailscale, or put a TLS
+  reverse proxy (Caddy or nginx) in front and keep `listen` on loopback.
+  `openFirewall` is off by default for that reason.
+- Agents run as the service user and can read `dataDir`, including the vault key and
+  the database, until HUL-46 (sandbox agents) lands.
 
 ### Connectors
 
