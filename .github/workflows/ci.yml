@@ -60,10 +60,14 @@ jobs:
   # The NixOS VM test boots QEMU, which is slow without /dev/kvm, so it has its own
   # job and timeout and cannot hide a failure in the main one.
   nixos-vm:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: DeterminateSystems/nix-installer-action@main
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-vm-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-vm-${{ runner.arch }}-
       - name: nix flake check
         run: nix flake check

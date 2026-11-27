@@ -1406,7 +1406,7 @@ translocated path such as `~/Downloads`, or a VPN is handling the traffic first.
 
 The flake exports `packages.<system>.hulahoop` (also `default`) for `x86_64-linux`,
 `aarch64-linux` and `aarch64-darwin`: the headless binary, wrapped so
-`jj`, `git`, `direnv` and `nix-direnv` are on its `PATH`. It also exports
+`jj`, `git` and `direnv` are on its `PATH`. It also exports
 `nixosModules.default`, which provides `services.hulahoop`. Try it with
 `nix run github:theskilllab/hulahoop -- --help`.
 
@@ -1452,7 +1452,10 @@ repository's dev shell), and keeps its data in `dataDir`, owned by the service u
 across restarts and rebuilds. Connectors, agents, skills and `WORKFLOWS.md` live in the
 database and are edited in the app; they are not declarative. `harnesses` are on the
 runner's `PATH`, but inside a repository's dev shell that shell's `PATH` comes first,
-so a CLI the dev shell also provides wins. `x86_64-darwin` is not packaged:
+so a CLI the dev shell also provides wins. Add `pkgs.just` to `harnesses` if your
+repositories do not provide it. The module enables `programs.direnv` with `nix-direnv`
+so dev shells are cached. `dataDir` is mode `0700`; whoever holds the service user's
+access holds the server token and vault key. `x86_64-darwin` is not packaged:
 nixpkgs 26.11 dropped it, so on an Intel Mac use the release tarball.
 
 **Connect the desktop app.** Read the token on the server

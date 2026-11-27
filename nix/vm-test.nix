@@ -46,8 +46,11 @@ pkgs.testers.runNixOSTest {
     assert machine.succeed("stat -c %U:%G /var/lib/hulahoop").strip() == "hulahoop:hulahoop"
 
     # The tools the runner calls come with the package, not the system.
-    for tool in ["jj", "git", "direnv"]:
+    # (direnv is installed system-wide by programs.direnv, so it is not checked here.)
+    for tool in ["jj", "git"]:
         machine.fail(f"which {tool}")
+    # nix-direnv is wired in through direnv's config, which caches dev shells.
+    machine.succeed("grep -q nix-direnv /etc/direnv/direnvrc")
     pid = machine.succeed("systemctl show -p MainPID --value hulahoop.service").strip()
     service_path = machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ | grep '^PATH='")
     for tool in ["jujutsu", "git", "direnv"]:

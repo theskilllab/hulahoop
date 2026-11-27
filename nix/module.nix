@@ -66,7 +66,7 @@ in
     harnesses = mkOption {
       type = types.listOf types.package;
       default = [ ];
-      description = "Agent CLIs put on the runner's PATH.";
+      description = "Agent CLIs put on the runner's PATH. Add `pkgs.just` too if a repository's dev shell does not provide it.";
     };
 
     piPackage = mkOption {
@@ -94,9 +94,17 @@ in
           home = cfg.dataDir;
         };
       };
+      # direnv finds nix-direnv through its config (DIRENV_CONFIG=/etc/direnv), not
+      # PATH; without it every `direnv exec` re-evaluates the repo's flake.
+      programs.direnv.enable = lib.mkDefault true;
+      programs.direnv.nix-direnv.enable = lib.mkDefault true;
+
       users.groups = mkIf (cfg.group == "hulahoop") { hulahoop = { }; };
 
-      systemd.tmpfiles.rules = [ "d ${cfg.dataDir} 0750 ${cfg.user} ${cfg.group} -" ];
+      systemd.tmpfiles.rules = [ "d ${cfg.dataDir} 0700 ${cfg.user} ${cfg.group} -"
+        # `d` leaves an existing directory alone, so re-own it if user/group change.
+        "z ${cfg.dataDir} 0700 ${cfg.user} ${cfg.group} -"
+      ];
 
       systemd.services.hulahoop = {
         description = "Hulahoop server and runner";
@@ -116,7 +124,7 @@ in
         }
         // cfg.environment;
         serviceConfig = {
-          ExecStart = "${lib.getExe cfg.package} up --listen ${cfg.listen} --port ${toString cfg.port} --data-dir ${lib.escapeShellArg cfg.dataDir}";
+          ExecStart = "${lib.getExe cfg.package} up --listen ${lib.escapeShellArg cfg.listen} --port ${toString cfg.port} --data-dir ${lib.escapeShellArg cfg.dataDir}";
           User = cfg.user;
           Group = cfg.group;
           WorkingDirectory = cfg.dataDir;

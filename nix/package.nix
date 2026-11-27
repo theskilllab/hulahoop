@@ -1,7 +1,7 @@
 # The headless binary: server, runner and cli in one executable. Migrations are
 # embedded and no sqlx query is checked at compile time, so no database is needed
 # (sqlite is only linked in, via libsqlite3-sys).
-{ lib, rustPlatform, makeWrapper, pkg-config, sqlite, jujutsu, git, direnv, nix-direnv }:
+{ lib, rustPlatform, makeWrapper, pkg-config, sqlite, jujutsu, git, direnv }:
 
 rustPlatform.buildRustPackage {
   pname = "hulahoop";
@@ -26,7 +26,7 @@ rustPlatform.buildRustPackage {
   # The runner calls these directly, so they ride on the binary's PATH.
   postInstall = ''
     wrapProgram $out/bin/hulahoop \
-      --prefix PATH : ${lib.makeBinPath [ jujutsu git direnv nix-direnv ]}
+      --prefix PATH : ${lib.makeBinPath [ jujutsu git direnv ]}
   '';
 
   meta = {
