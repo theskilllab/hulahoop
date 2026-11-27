@@ -18,6 +18,7 @@ const VIEWS: { id: string; label: string; hint: string }[] = [
   { id: "artifacts", label: "Artifacts", hint: "documents and files" },
   { id: "agents", label: "Agents", hint: "who does the work" },
   { id: "skills", label: "Skills", hint: "the shared library" },
+  { id: "memory", label: "Memory", hint: "what the agents remember" },
   { id: "workflow", label: "Workflow", hint: "statuses, owners, transitions" },
   { id: "connectors", label: "Connectors", hint: "logins and keys" },
   { id: "cost", label: "Cost control", hint: "what the agents spend" },

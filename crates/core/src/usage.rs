@@ -38,6 +38,16 @@ pub struct Metrics {
     pub measured: bool,
 }
 
+impl Metrics {
+    /// Everything the model read: fresh input plus cached input read and written.
+    /// Providers report the cached part separately, so `input` alone undercounts.
+    pub fn input_total(&self) -> i64 {
+        self.input
+            .saturating_add(self.cache_read.unwrap_or(0))
+            .saturating_add(self.cache_write.unwrap_or(0))
+    }
+}
+
 /// Sum Pi's final assistant snapshots; Claude's result record overrides its
 /// repeated assistant events when present. Interrupted streams retain partial
 /// distinct-message usage, with no invented provider-reported cost.
@@ -352,5 +362,39 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(totals(&stream), (60, 12));
+    }
+}
+
+#[cfg(test)]
+mod input_total_tests {
+    use super::Metrics;
+
+    #[test]
+    fn input_total_includes_cache_read_and_write() {
+        let m = Metrics {
+            input: 27,
+            cache_read: Some(511_000),
+            cache_write: Some(40),
+            ..Default::default()
+        };
+        assert_eq!(m.input_total(), 511_067);
+    }
+
+    #[test]
+    fn input_total_treats_unmetered_cache_as_zero_and_saturates() {
+        assert_eq!(
+            Metrics {
+                input: 5,
+                ..Default::default()
+            }
+            .input_total(),
+            5
+        );
+        let m = Metrics {
+            input: i64::MAX,
+            cache_read: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(m.input_total(), i64::MAX);
     }
 }

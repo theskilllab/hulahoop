@@ -362,6 +362,7 @@ impl Executor {
         );
         let redactor = Redactor::new(spec, &env);
         self.write_skills(spec, &scratch)?;
+        write_memories(spec, &scratch)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
         let message = adapter::scratch_message_for(agent_name, &input_path, &scratch);
         let prompt_file = adapter::write_system_prompt(&artifact_dir, &system_prompt)?;
@@ -596,6 +597,7 @@ impl Executor {
         );
         let redactor = Redactor::new(spec, &env);
         self.write_skills(spec, &checkout)?;
+        write_memories(spec, &checkout)?;
         let agent_name = spec["agent_name"].as_str().unwrap_or_default();
         let mut message = adapter::message_for(agent_name, &input_path, &checkout);
         if let Some(conflicts) = carried
@@ -3461,6 +3463,66 @@ fn write_skills(spec: &Value, checkout: &Path) -> Result<()> {
         std::fs::write(dir.join("SKILL.md"), body)?;
     }
     Ok(())
+}
+
+/// Writes the notes the prompt's index lists into `.hulahoop/memory/`. The
+/// directory is rebuilt each turn, so a note forgotten since the last turn is
+/// gone from a reused checkout.
+fn write_memories(spec: &Value, checkout: &Path) -> Result<()> {
+    let root = checkout.join(".hulahoop").join("memory");
+    match std::fs::symlink_metadata(&root) {
+        Ok(meta) if meta.is_dir() => std::fs::remove_dir_all(&root)?,
+        Ok(_) => std::fs::remove_file(&root)?,
+        Err(_) => {}
+    }
+    let Some(notes) = spec["memories"].as_array() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(&root)?;
+    for note in notes {
+        // The name comes from the server, but never let it leave the directory.
+        let file = note["file"].as_str().unwrap_or_default();
+        let Some(name) = Path::new(file).file_name() else {
+            continue;
+        };
+        std::fs::write(root.join(name), note["body"].as_str().unwrap_or_default())?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod write_memories_tests {
+    use super::write_memories;
+
+    #[test]
+    fn notes_are_written_and_a_forgotten_one_is_cleared() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-memory-{}", uuid::Uuid::now_v7()));
+        let old = dir.join(".hulahoop/memory/9-old.md");
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, "old").unwrap();
+        let spec = serde_json::json!({ "memories": [
+            { "file": "1-a.md", "body": "# A" },
+            { "file": "../../escape.md", "body": "x" },
+        ]});
+        write_memories(&spec, &dir).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".hulahoop/memory/1-a.md")).unwrap(),
+            "# A"
+        );
+        assert!(dir.join(".hulahoop/memory/escape.md").exists());
+        assert!(!dir.join("escape.md").exists());
+        assert!(!old.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_spec_without_memories_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("hulahoop-nomem-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_memories(&serde_json::json!({}), &dir).unwrap();
+        assert!(!dir.join(".hulahoop/memory").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(test)]

@@ -298,10 +298,12 @@ impl Engine {
     ///
     /// `has_repo` is false for a task with no repository: the agent is told it
     /// works in an empty scratch directory and reports through its summary.
+    /// `memory_index` is the rendered memory index, empty when there is none.
     pub async fn compose_prompt(
         &self,
         agent: &crate::model::Agent,
         has_repo: bool,
+        memory_index: &str,
     ) -> anyhow::Result<String> {
         let skills = self.agent_skills(agent.id).await?;
         let mut prompt = String::new();
@@ -318,6 +320,10 @@ impl Engine {
             prompt.push_str("# How you work\n\n");
             prompt.push_str(agent.agents_md.trim());
             prompt.push('\n');
+        }
+        if !memory_index.is_empty() {
+            prompt.push_str("\n# What you already know\n\n");
+            prompt.push_str(memory_index);
         }
         let carried: Vec<&Skill> = skills.iter().filter(|skill| skill.builtin == 0).collect();
         if !carried.is_empty() {

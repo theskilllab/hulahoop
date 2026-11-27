@@ -227,7 +227,7 @@ export default function Cost({ workspaceId, agents, onOpen }: {
             <div><span className="label">Run success target</span><strong>{percent(c!.succeeded, c!.runs)} / {report.settings.successTargetPercent === null ? "—" : `${report.settings.successTargetPercent}%`}</strong><p className="dim">Target uses the current period's run success rate.</p></div></div>
           <div className="cost-plans">{selectedPlans.map((plan) => {
             const usage = report.planUsage.find((row) => row.label === plan.connectorId);
-            const used = usage ? tokens(usage) + usage.cacheRead + usage.cacheWrite : 0;
+            const used = usage ? tokens(usage) : 0;
             return <span key={plan.connectorId}>{plan.label}: {money(plan.monthlyFeeUsd)}/mo · {number(used)} tokens used / {plan.allowanceTokens === null ? "—" : number(plan.allowanceTokens)} estimated allowance</span>;
           })}</div>
           <div className="cost-edit"><label>Plan <select value={connector} onChange={(event) => setConnector(event.target.value)}><option value="claude-sub">Claude Max</option><option value="opencode-go">OpenCode Go</option><option value="pi">Pi plan</option><option value="claude-api">Claude API</option></select></label>

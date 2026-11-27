@@ -38,6 +38,10 @@ pub struct RunSpec {
     /// checkout where the harness looks for them.
     #[serde(default)]
     pub skills: Vec<SkillInput>,
+    /// The memory notes listed in the prompt's index, so the runner can write
+    /// them into `.hulahoop/memory/` for the agent to open.
+    #[serde(default)]
+    pub memories: Vec<MemoryNote>,
     /// Files attached to the task, as absolute paths the agent can read.
     #[serde(default)]
     pub files: Vec<FileInput>,
@@ -71,6 +75,13 @@ pub struct CommentInput {
 pub struct SkillInput {
     pub name: String,
     pub description: String,
+    pub body: String,
+}
+
+/// One memory note, ready to be written as `.hulahoop/memory/<file>`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryNote {
+    pub file: String,
     pub body: String,
 }
 
@@ -197,6 +208,7 @@ mod tests {
             blocked_answer: None,
             limits: Limits::default(),
             skills: vec![],
+            memories: vec![],
             files: vec![FileInput {
                 id: Uuid::nil(),
                 title: "Spec".into(),

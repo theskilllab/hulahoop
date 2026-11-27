@@ -7,6 +7,7 @@ use async_graphql::{
 use uuid::Uuid;
 
 use crate::engine::Engine;
+use crate::memory_notes::Memory;
 use crate::model::*;
 use crate::pulls::{
     DiffSide, GithubAccount, MergeMethod, PullRequest, PullRequestComment, PullRequestDetail,
@@ -394,6 +395,26 @@ impl Query {
         workspace_id: Uuid,
     ) -> async_graphql::Result<Vec<Skill>> {
         Ok(engine(ctx).skills(workspace_id).await?)
+    }
+
+    /// What the workspace's agents remember, newest change first. `scope` and
+    /// `query` narrow the list; archived notes show only on request.
+    async fn memories(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        scope: Option<String>,
+        query: Option<String>,
+        include_archived: Option<bool>,
+    ) -> async_graphql::Result<Vec<Memory>> {
+        Ok(engine(ctx)
+            .memories(
+                workspace_id,
+                scope.as_deref(),
+                query.as_deref(),
+                include_archived.unwrap_or(false),
+            )
+            .await?)
     }
 
     /// The document that drives the board.
@@ -993,6 +1014,58 @@ impl Mutation {
 
     async fn delete_skill(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
         Ok(engine(ctx).delete_skill(id).await?)
+    }
+
+    /// Write a memory by hand. `scope_ref` is the project id for `project`, a
+    /// name for `agent` and `person`, and empty for `workspace`.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_memory(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        scope: String,
+        scope_ref: Option<String>,
+        kind: String,
+        title: String,
+        body: String,
+    ) -> async_graphql::Result<Memory> {
+        Ok(engine(ctx)
+            .create_memory(
+                workspace_id,
+                &scope,
+                scope_ref.as_deref().unwrap_or(""),
+                &kind,
+                &title,
+                &body,
+            )
+            .await?)
+    }
+
+    async fn update_memory(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        kind: Option<String>,
+        title: Option<String>,
+        body: Option<String>,
+    ) -> async_graphql::Result<Memory> {
+        Ok(engine(ctx)
+            .edit_memory(id, kind.as_deref(), title.as_deref(), body.as_deref())
+            .await?)
+    }
+
+    /// Archive a memory (`archived: true`) or bring it back.
+    async fn archive_memory(
+        &self,
+        ctx: &Context<'_>,
+        id: Uuid,
+        archived: bool,
+    ) -> async_graphql::Result<Memory> {
+        Ok(engine(ctx).archive_memory(id, archived).await?)
+    }
+
+    async fn forget_memory(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        Ok(engine(ctx).forget_memory(id).await?)
     }
 
     /// Replace the skills an agent carries.

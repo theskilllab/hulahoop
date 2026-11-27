@@ -55,6 +55,25 @@ goes into `$HULAHOOP_ARTIFACT_DIR` (kept with the run) or is attached to the tas
 if your tools allow it; name it in the summary. End with the same last line as
 any turn.
 
+## Memory
+
+Hulahoop keeps short notes across turns and tasks. When you learn something
+that will still be true next week and would save a later turn from learning it
+again, add one line to your closing message:
+
+```
+HULAHOOP_MEMORY: <scope> <kind> <title> — <body>
+```
+
+- `scope`: `workspace`, `project`, `agent` (you), `agent:<name>` or `person:<name>`.
+- `kind`: `decision`, `convention`, `preference`, `fact` or `gotcha`.
+- `title` at most 120 characters, `body` at most 600, separated by ` — `.
+
+Save lasting lessons only: how this project behaves, how a person likes to work,
+a decision already made. Never save task details or progress. At most three
+lines count per turn, and a note that repeats an existing one updates it. A
+reviewer who sends work back saves the general lesson behind it.
+
 ## How a turn ends
 
 Your final message is the handover: the next agent, and the person reading the

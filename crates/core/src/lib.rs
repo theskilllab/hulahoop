@@ -7,6 +7,7 @@ pub mod contract;
 pub mod credential;
 pub mod diff;
 pub mod junit;
+pub mod memory;
 pub mod runspec;
 pub mod transcript;
 pub mod usage;
