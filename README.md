@@ -1465,6 +1465,13 @@ nixpkgs 26.11 dropped it, so on an Intel Mac use the release tarball.
   plain HTTP, guarded by one bearer token. Reach the server over Tailscale, or put a TLS
   reverse proxy (Caddy or nginx) in front and keep `listen` on loopback.
   `openFirewall` is off by default for that reason.
+- A Cloudflare Tunnel also works and keeps `listen = "127.0.0.1"`. Run
+  `cloudflared tunnel run --token …` as its own systemd unit and route a public
+  hostname to `http://127.0.0.1:<port>`. Cloudflare proxies websockets, so
+  `/graphql/ws` and the long-lived sign-in terminal stream pass through the tunnel. The
+  free plan caps a request body at 100 MB, which limits artifact uploads.
+  The hostname is public, so the bearer token is the only gate; add Cloudflare Access
+  if you want a second one.
 - Agents run as the service user and can read `dataDir`, including the vault key and
   the database, until HUL-46 (sandbox agents) lands.
 

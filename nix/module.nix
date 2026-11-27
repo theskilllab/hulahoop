@@ -78,7 +78,10 @@ in
     environment = mkOption {
       type = types.attrsOf types.str;
       default = { };
-      description = "Extra environment variables for the service.";
+      description = ''
+        Extra environment variables for the service. They are written to the unit file in the
+        world-readable Nix store, so do not put secrets here.
+      '';
     };
   };
 
