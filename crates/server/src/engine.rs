@@ -1897,7 +1897,7 @@ impl Engine {
         // The stream the run already wrote is the only record of what it spent. A
         // cancelled run reports it instead of reading as a run that spent nothing.
         let usage = spent_metrics(std::path::Path::new(&run.artifact_dir), None).await;
-        let (tokens_in, tokens_out) = (usage.input, usage.output);
+        let (tokens_in, tokens_out) = (usage.input_total(), usage.output);
         sqlx::query("update runs set status = 'cancelled', finished_at = ?, error = 'cancelled by a human', tokens_in = ?, tokens_out = ? where id = ?")
             .bind(crate::db::now_rfc3339())
             .bind(tokens_in)
@@ -2115,7 +2115,7 @@ impl Engine {
         std::fs::create_dir_all(artifact_dir)?;
         std::fs::write(artifact_dir.join("diff.patch"), &payload.diff)?;
         let usage = spent_metrics(artifact_dir, payload.transcript.as_deref()).await;
-        let (tokens_in, tokens_out) = (usage.input, usage.output);
+        let (tokens_in, tokens_out) = (usage.input_total(), usage.output);
 
         let mut flags = verdict.flags.clone();
         if payload.artifact_limit_hit {
@@ -2964,7 +2964,7 @@ impl Engine {
             // A runner that died after streaming its transcript still spent what
             // the stream says, so the row carries those tokens rather than zero.
             let usage = spent_metrics(std::path::Path::new(&run.artifact_dir), None).await;
-            let (tokens_in, tokens_out) = (usage.input, usage.output);
+            let (tokens_in, tokens_out) = (usage.input_total(), usage.output);
             sqlx::query("update runs set status = 'failed', finished_at = ?, error = 'the runner stopped heartbeating, so the run was declared dead', tokens_in = ?, tokens_out = ? where id = ?")
                 .bind(crate::db::now_rfc3339())
                 .bind(tokens_in)
@@ -3062,7 +3062,7 @@ mod lumi_claim_tests {
 #[cfg(test)]
 async fn spent_tokens(artifact_dir: &std::path::Path, tail: Option<&str>) -> (i64, i64) {
     let usage = spent_metrics(artifact_dir, tail).await;
-    (usage.input, usage.output)
+    (usage.input_total(), usage.output)
 }
 
 async fn spent_metrics(
@@ -3165,7 +3165,7 @@ async fn persist_run_metrics(
         }
     });
     sqlx::query("update runs set tokens_in = ?, tokens_out = ?, cache_read_tokens = ?, cache_write_tokens = ?, model_turns = ?, tool_calls = ?, actual_model = ?, api_equivalent_usd = ?, actual_cost_usd = ?, cost_source = ?, failure_category = ? where id = ?")
-        .bind(usage.input).bind(usage.output)
+        .bind(usage.input_total()).bind(usage.output)
         .bind(usage.measured.then_some(usage.cache_read.unwrap_or(0)))
         .bind(usage.measured.then_some(usage.cache_write.unwrap_or(0)))
         .bind(usage.turns).bind(usage.tool_calls).bind(&actual_model)
