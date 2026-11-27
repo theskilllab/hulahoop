@@ -4,8 +4,10 @@
 pkgs.testers.runNixOSTest {
   name = "hulahoop";
 
-  nodes.machine = { ... }: {
+  nodes.machine = { pkgs, ... }: {
     imports = [ module ];
+    # The test script calls these; `which` makes the absence checks below meaningful.
+    environment.systemPackages = [ pkgs.curl pkgs.which ];
     services.hulahoop.enable = true;
     # Agents enter dev shells through the daemon, which the VM has by default.
   };
@@ -58,6 +60,7 @@ pkgs.testers.runNixOSTest {
     # A restart keeps the data, and with it the same token.
     machine.succeed("systemctl restart hulahoop.service")
     machine.wait_for_open_port(9000)
+    machine.wait_for_file("/var/lib/hulahoop/connection.json")
     assert read_token() == token
     assert status(token) == "200"
   '';

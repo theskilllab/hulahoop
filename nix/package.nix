@@ -34,6 +34,6 @@ rustPlatform.buildRustPackage {
     homepage = "https://github.com/theskilllab/hulahoop";
     license = lib.licenses.mit;
     mainProgram = "hulahoop";
-    platforms = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" "x86_64-darwin" ];
+    platforms = [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ];
   };
 }

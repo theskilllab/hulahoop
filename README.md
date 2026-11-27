@@ -1405,7 +1405,7 @@ translocated path such as `~/Downloads`, or a VPN is handling the traffic first.
 ### Installing with Nix
 
 The flake exports `packages.<system>.hulahoop` (also `default`) for `x86_64-linux`,
-`aarch64-linux`, `aarch64-darwin` and `x86_64-darwin`: the headless binary, wrapped so
+`aarch64-linux` and `aarch64-darwin`: the headless binary, wrapped so
 `jj`, `git`, `direnv` and `nix-direnv` are on its `PATH`. It also exports
 `nixosModules.default`, which provides `services.hulahoop`. Try it with
 `nix run github:theskilllab/hulahoop -- --help`.
@@ -1452,9 +1452,8 @@ repository's dev shell), and keeps its data in `dataDir`, owned by the service u
 across restarts and rebuilds. Connectors, agents, skills and `WORKFLOWS.md` live in the
 database and are edited in the app; they are not declarative. `harnesses` are on the
 runner's `PATH`, but inside a repository's dev shell that shell's `PATH` comes first,
-so a CLI the dev shell also provides wins. `x86_64-darwin` builds on a nixpkgs
-platform that ends in 26.11; pin an older nixpkgs or use the release tarball if you
-need it.
+so a CLI the dev shell also provides wins. `x86_64-darwin` is not packaged:
+nixpkgs 26.11 dropped it, so on an Intel Mac use the release tarball.
 
 **Connect the desktop app.** Read the token on the server
 (`sudo jq -r .token /var/lib/hulahoop/connection.json`) and paste the server URL

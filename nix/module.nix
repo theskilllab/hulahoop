@@ -113,7 +113,7 @@ in
         }
         // cfg.environment;
         serviceConfig = {
-          ExecStart = "${lib.getExe cfg.package} up --listen ${cfg.listen} --port ${toString cfg.port} --data-dir ${cfg.dataDir}";
+          ExecStart = "${lib.getExe cfg.package} up --listen ${cfg.listen} --port ${toString cfg.port} --data-dir ${lib.escapeShellArg cfg.dataDir}";
           User = cfg.user;
           Group = cfg.group;
           WorkingDirectory = cfg.dataDir;

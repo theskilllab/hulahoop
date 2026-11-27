@@ -48,6 +48,15 @@ jobs:
           path: .hulahoop/junit.xml
           if-no-files-found: ignore
 
+  # Nothing else builds the nix package for aarch64-linux.
+  nix-build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix build
+        run: nix build .#hulahoop && ./result/bin/hulahoop help
+
   # The NixOS VM test boots QEMU, which is slow without /dev/kvm, so it has its own
   # job and timeout and cannot hide a failure in the main one.
   nixos-vm:
