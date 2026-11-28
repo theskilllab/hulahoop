@@ -2529,6 +2529,8 @@ struct Transcript {
     texts: Vec<String>,
     /// How many of `texts` were said before the agent's last tool call.
     before_last_tool: usize,
+    /// The same boundary for `plain`.
+    plain_before_last_tool: usize,
     /// Lines the adapter printed as plain text. A verdict sentence is often the
     /// last thing an agent says, and pi's JSON modes are not the only shape.
     plain: Vec<String>,
@@ -2549,7 +2551,22 @@ impl Transcript {
         {
             return;
         }
+        // Claude Code repeats snapshots of a message; keep it once, where it
+        // was first said.
+        if self.texts.contains(&text) {
+            return;
+        }
         self.texts.push(text);
+    }
+
+    fn mark_tool_call(&mut self) {
+        self.before_last_tool = self.texts.len();
+        self.plain_before_last_tool = self.plain.len();
+    }
+
+    /// What the agent said after its last tool call.
+    fn closing(&self) -> &[String] {
+        &self.texts[self.before_last_tool.min(self.texts.len())..]
     }
 
     fn feed(&mut self, line: &str) {
@@ -2570,12 +2587,10 @@ impl Transcript {
         // pi: `message_end` carries the assistant message; `agent_end` carries the
         // whole conversation. claude: `assistant`/`result`.
         match kind {
-            "tool_execution_start" | "tool_execution_end" => {
-                self.before_last_tool = self.texts.len()
-            }
+            "tool_execution_start" | "tool_execution_end" => self.mark_tool_call(),
             "message_end" | "assistant" | "result" => {
                 if collect_tool_use(&value["message"]) {
-                    self.before_last_tool = self.texts.len();
+                    self.mark_tool_call();
                 }
                 if let Some(text) = collect_text(&value["message"]) {
                     self.keep(text);
@@ -2604,8 +2619,7 @@ impl Transcript {
     /// come after it and repeat the marker, so the last message is not it.
     /// Without a marker, the last message closes the turn.
     fn final_text(&self) -> String {
-        let closing = &self.texts[self.before_last_tool.min(self.texts.len())..];
-        closing
+        self.closing()
             .iter()
             .find(|text| has_marker(text))
             .or_else(|| self.texts.last())
@@ -2648,10 +2662,11 @@ impl Transcript {
 
     /// The last question the agent asked after its last tool call.
     fn question(&self) -> Option<String> {
-        let closing = &self.texts[self.before_last_tool.min(self.texts.len())..];
-        let haystack = closing
+        let plain = &self.plain[self.plain_before_last_tool.min(self.plain.len())..];
+        let haystack = self
+            .closing()
             .iter()
-            .chain(&self.plain)
+            .chain(plain)
             .cloned()
             .collect::<Vec<_>>()
             .join("\n");
@@ -2662,9 +2677,13 @@ impl Transcript {
     }
 }
 
+/// Whether a line of the text opens with a verdict or question marker. A
+/// message that quotes a marker mid-sentence is not a handover.
 fn has_marker(text: &str) -> bool {
-    let lower = text.to_lowercase();
-    lower.contains("hulahoop_verdict:") || lower.contains("hulahoop_question:")
+    text.lines().any(|line| {
+        let line = line.trim_start().to_lowercase();
+        line.starts_with("hulahoop_verdict:") || line.starts_with("hulahoop_question:")
+    })
 }
 
 fn collect_tool_use(message: &Value) -> bool {
@@ -5223,5 +5242,49 @@ mod handover_tests {
         );
         assert_eq!(t.final_text(), "Report.\n\nHULAHOOP_VERDICT: approved");
         assert_eq!(t.verdict().as_deref(), Some("approved"));
+    }
+
+    /// Lumi's prose may quote a marker; only a line that opens with one counts.
+    #[test]
+    fn a_marker_quoted_mid_sentence_is_not_a_handover() {
+        let mut t = Transcript::default();
+        say(&mut t, "End with the `HULAHOOP_VERDICT: done` line.");
+        say(&mut t, "Plain closing answer.");
+        assert_eq!(t.final_text(), "Plain closing answer.");
+    }
+
+    /// A stale verdict after a question does not replace the question.
+    #[test]
+    fn a_stale_reply_after_a_question_keeps_the_question() {
+        let mut t = Transcript::default();
+        tool(&mut t, "t1");
+        let report = "Blocked.\n\nHULAHOOP_QUESTION: Which database?";
+        say(&mut t, report);
+        say(&mut t, "Stale monitor.\n\nHULAHOOP_VERDICT: done");
+        assert_eq!(t.question().as_deref(), Some("Which database?"));
+        assert_eq!(t.final_text(), report);
+    }
+
+    /// A plain stdout line from before the last tool call is not a question.
+    #[test]
+    fn plain_lines_before_the_last_tool_call_are_ignored() {
+        let mut t = Transcript::default();
+        t.feed("HULAHOOP_QUESTION: early?");
+        tool(&mut t, "t1");
+        say(&mut t, "Done.\n\nHULAHOOP_VERDICT: done");
+        assert_eq!(t.question(), None);
+    }
+
+    /// Claude Code writes one record per block and repeats snapshots; a
+    /// repeated pre-tool message does not move into the closing messages.
+    #[test]
+    fn repeated_snapshots_do_not_cross_the_tool_boundary() {
+        let mut t = Transcript::default();
+        let early = "Early.\n\nHULAHOOP_VERDICT: done";
+        say(&mut t, early);
+        tool(&mut t, "t1");
+        say(&mut t, early);
+        say(&mut t, "Report.\n\nHULAHOOP_VERDICT: approved");
+        assert_eq!(t.final_text(), "Report.\n\nHULAHOOP_VERDICT: approved");
     }
 }

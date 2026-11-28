@@ -86,9 +86,10 @@ pub fn invocation(
             args.push("--dangerously-skip-permissions".to_string());
             // A turn ends when its work ends. A monitor or background task
             // wakes the agent after it has handed over, and its stray reply
-            // would stand in for the handover.
-            args.push("--disallowedTools".to_string());
-            args.push("Monitor,CronCreate,ScheduleWakeup".to_string());
+            // would stand in for the handover. The tool names were checked
+            // against Claude Code 2.1.332. The option is variadic, so it takes
+            // its value after `=`: a separate value would swallow the prompt.
+            args.push("--disallowedTools=Monitor,CronCreate,ScheduleWakeup".to_string());
             env.push((
                 "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
                 "1".to_string(),
@@ -302,12 +303,14 @@ mod tests {
     fn claude_cannot_start_background_tasks() {
         let file = Path::new("/tmp/system-prompt.md");
         let claude = invocation(Adapter::ClaudeCode, "sonnet", file, "go").unwrap();
-        let at = claude
+        let denied = claude
             .args
             .iter()
-            .position(|arg| arg == "--disallowedTools")
-            .expect("--disallowedTools is set");
-        assert!(claude.args[at + 1].contains("Monitor"));
+            .find_map(|arg| arg.strip_prefix("--disallowedTools="))
+            .expect("--disallowedTools is set with an attached value");
+        assert!(denied.contains("Monitor"));
+        // The option is variadic: the prompt must stay the last argument.
+        assert_eq!(claude.args.last().map(String::as_str), Some("go"));
         assert!(claude
             .env
             .iter()
