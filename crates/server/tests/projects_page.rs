@@ -1,6 +1,7 @@
 //! Backend acceptance tests for the Projects page revamp: a colour stored per
 //! project, and a way to unlink a repository that never destroys run history.
 
+use hulahoop_server::auth::CurrentUser;
 use hulahoop_server::db::Db;
 use hulahoop_server::engine::Engine;
 use hulahoop_server::gql::build_schema;
@@ -36,7 +37,9 @@ async fn fixture(name: &str) -> Fixture {
 }
 
 async fn run(f: &Fixture, query: String) -> Result<Value, String> {
-    let response = build_schema(f.engine.clone()).execute(query).await;
+    let owner = f.engine.db.local_user_id().await.unwrap();
+    let request = async_graphql::Request::new(query).data(CurrentUser { id: owner });
+    let response = build_schema(f.engine.clone()).execute(request).await;
     if let Some(e) = response.errors.first() {
         return Err(e.message.clone());
     }

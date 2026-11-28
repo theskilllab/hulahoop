@@ -3,7 +3,9 @@ import {
   clearGithubToken,
   loadGithubAccount,
   loadModels,
+  savedRemote,
   setGithubToken,
+  signOut,
   setWorkspaceLumi,
   updateWorkspace,
   type GithubAccount,
@@ -11,9 +13,12 @@ import {
   type Workspace,
 } from "../api";
 import { Avatar, fmtWhen } from "../components/TaskBits";
+import ApiTokens from "./ApiTokens";
+import Members from "./Members";
 import { applyTheme, resolvedTheme, savedPalette, THEME_GROUPS, THEMES } from "../theme";
 
-type Tab = "personal" | "workspace";
+type Tab = "personal" | "workspace" | "members";
+const TABS: Tab[] = ["personal", "workspace", "members"];
 
 function Themes() {
   const [palette, setPalette] = useState(savedPalette());
@@ -191,6 +196,21 @@ export function GithubAccountBlock() {
   );
 }
 
+/** Only a connection made by signing in has a session to end; the local one has none. */
+function SignOutBlock() {
+  if (!savedRemote()) return null;
+  return (
+    <div className="settings-block">
+      <span className="field-label">Session</span>
+      <div className="row">
+        <button type="button" className="secondary" onClick={() => void signOut().then(() => window.location.reload())}>
+          Sign out
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function Settings({ workspace, initialTab, onChanged, onClose }: {
   workspace: Workspace;
   initialTab: Tab;
@@ -200,6 +220,7 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
   const dialog = useRef<HTMLDialogElement>(null);
   const firstTab = useRef<HTMLButtonElement>(null);
   const workspaceTab = useRef<HTMLButtonElement>(null);
+  const membersTab = useRef<HTMLButtonElement>(null);
   const [tab, setTab] = useState<Tab>(initialTab);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -211,7 +232,7 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
 
   useEffect(() => {
     dialog.current?.showModal();
-    (initialTab === "workspace" ? workspaceTab : firstTab).current?.focus();
+    tabButton(initialTab).current?.focus();
     return () => { dialog.current?.close(); };
   }, []);
 
@@ -231,9 +252,13 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
     return () => { live = false; };
   }, [lumiHarness]);
 
+  function tabButton(name: Tab) {
+    return name === "members" ? membersTab : name === "workspace" ? workspaceTab : firstTab;
+  }
+
   function switchTab(next: Tab) {
     setTab(next);
-    (next === "workspace" ? workspaceTab : firstTab).current?.focus();
+    tabButton(next).current?.focus();
   }
 
   async function save() {
@@ -270,8 +295,10 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
           onKeyDown={(event) => {
             if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
               event.preventDefault();
-              switchTab(event.key === "Home" ? "personal" : event.key === "End" ? "workspace"
-                : tab === "personal" ? "workspace" : "personal");
+              const at = TABS.indexOf(tab);
+              const next = event.key === "Home" ? 0 : event.key === "End" ? TABS.length - 1
+                : (at + (event.key === "ArrowRight" ? 1 : TABS.length - 1)) % TABS.length;
+              switchTab(TABS[next]);
             }
           }}>
           <button ref={firstTab} id="settings-personal-tab" role="tab" aria-controls="settings-panel"
@@ -280,14 +307,21 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
           <button ref={workspaceTab} id="settings-workspace-tab" role="tab" aria-controls="settings-panel"
             aria-selected={tab === "workspace"} tabIndex={tab === "workspace" ? 0 : -1}
             onClick={() => switchTab("workspace")}>Workspace</button>
+          <button ref={membersTab} id="settings-members-tab" role="tab" aria-controls="settings-panel"
+            aria-selected={tab === "members"} tabIndex={tab === "members" ? 0 : -1}
+            onClick={() => switchTab("members")}>Members</button>
         </div>
       </div>
-      <div id="settings-panel" className="settings-content" role="tabpanel" aria-labelledby={tab === "personal" ? "settings-personal-tab" : "settings-workspace-tab"}>
+      <div id="settings-panel" className="settings-content" role="tabpanel" aria-labelledby={`settings-${tab}-tab`}>
         {tab === "personal" ? (
           <>
             <GithubAccountBlock />
+            <ApiTokens />
+            <SignOutBlock />
             <Themes />
           </>
+        ) : tab === "members" ? (
+          <Members workspaceId={workspace.id} />
         ) : (
           <>
             <div className="settings-block">
@@ -329,7 +363,7 @@ export default function Settings({ workspace, initialTab, onChanged, onClose }: 
       </div>
       <div className="settings-actions">
         {tab === "workspace" && <button onClick={onClose} disabled={busy}>Cancel</button>}
-        {tab === "personal" ? <button className="primary" onClick={onClose}>Done</button>
+        {tab !== "workspace" ? <button className="primary" onClick={onClose}>Done</button>
           : <button className="primary" disabled={busy || !wsName.trim() || ((lumiHarness !== (workspace.lumiHarness ?? "pi") || lumiModel !== (workspace.lumiModel ?? "")) && !lumiModel.trim())}
             onClick={() => void save()}>Save</button>}
       </div>

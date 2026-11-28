@@ -153,6 +153,16 @@ impl Engine {
     }
 
     pub async fn transition(&self, issue_id: Uuid, event: IssueEvent) -> Result<Issue> {
+        self.transition_as(issue_id, event, None).await
+    }
+
+    /// [`Self::transition`] on behalf of a person, who is recorded on the move.
+    pub async fn transition_as(
+        &self,
+        issue_id: Uuid,
+        event: IssueEvent,
+        actor: Option<Uuid>,
+    ) -> Result<Issue> {
         let issue = self.issue(issue_id).await?;
         let from = issue.status_enum();
         let to = hulahoop_core::next(from, &event).map_err(|error| anyhow!(error))?;
@@ -181,6 +191,7 @@ impl Engine {
         // being reset by every attempt.
         if from != to {
             let _ = self.reset_turns(issue_id, to).await;
+            self.record_status_event(issue_id, from, to, actor).await?;
         }
         let issue = self.issue(issue_id).await?;
         self.retire_checkout_when_finished(&issue, from).await;
@@ -205,6 +216,30 @@ impl Engine {
                 .await;
         }
         self.issue(issue_id).await
+    }
+
+    /// Who moved a task where: the history a person reads, with the actor's name.
+    /// A move the server makes itself has no actor.
+    async fn record_status_event(
+        &self,
+        issue_id: Uuid,
+        from: IssueStatus,
+        to: IssueStatus,
+        actor: Option<Uuid>,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into issue_events (id, issue_id, kind, from_status, to_status, actor_id, created_at) \
+             values (?, ?, 'status', ?, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(issue_id)
+        .bind(from.as_str())
+        .bind(to.as_str())
+        .bind(actor)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.db.pool)
+        .await?;
+        Ok(())
     }
 
     /// A task that just became Done or Cancelled takes no more turns, so its
@@ -322,6 +357,16 @@ impl Engine {
     /// declares is a move, so a stopped task has the exits its workflow names and
     /// nothing else.
     pub async fn move_declared(&self, issue_id: Uuid, target: IssueStatus) -> Result<Issue> {
+        self.move_declared_as(issue_id, target, None).await
+    }
+
+    /// [`Self::move_declared`] on behalf of a person, who is recorded on the move.
+    pub async fn move_declared_as(
+        &self,
+        issue_id: Uuid,
+        target: IssueStatus,
+        actor: Option<Uuid>,
+    ) -> Result<Issue> {
         let issue = self.issue(issue_id).await?;
         let moves = self
             .workflow_moves(issue.workspace_id, issue.status_enum())
@@ -342,7 +387,7 @@ impl Engine {
                 allowed
             );
         }
-        self.move_to(issue_id, target).await
+        self.move_to_as(issue_id, target, actor).await
     }
 
     /// The newest head the issue published, whoever published it: the work a
@@ -439,6 +484,15 @@ impl Engine {
     /// the shape — clearing a block, dispatching whoever owns the new status —
     /// happens here too, because the workflow is the source of truth.
     pub async fn move_to(&self, issue_id: Uuid, target: IssueStatus) -> Result<Issue> {
+        self.move_to_as(issue_id, target, None).await
+    }
+
+    async fn move_to_as(
+        &self,
+        issue_id: Uuid,
+        target: IssueStatus,
+        actor: Option<Uuid>,
+    ) -> Result<Issue> {
         let issue_before = self.issue(issue_id).await?;
         if issue_before.status_enum() == target {
             return Ok(issue_before);
@@ -458,6 +512,8 @@ impl Engine {
         .await?;
 
         let _ = self.reset_turns(issue_id, target).await;
+        self.record_status_event(issue_id, issue_before.status_enum(), target, actor)
+            .await?;
         let issue = self.issue(issue_id).await?;
         self.retire_checkout_when_finished(&issue, issue_before.status_enum())
             .await;
@@ -805,15 +861,27 @@ impl Engine {
     /// Developer reads, and the task returns to In progress so it is reworked.
     /// The same path serves the task screen and a pull request review.
     pub async fn request_changes(&self, issue_id: Uuid, body: &str) -> Result<Issue> {
+        self.request_changes_as(issue_id, body, None).await
+    }
+
+    /// [`Self::request_changes`] on behalf of a person, who is named on the
+    /// comment and recorded on the move.
+    pub async fn request_changes_as(
+        &self,
+        issue_id: Uuid,
+        body: &str,
+        actor: Option<Uuid>,
+    ) -> Result<Issue> {
         self.comment(
             issue_id,
             hulahoop_core::AuthorType::Human,
-            None,
+            actor.map(|id| id.to_string()).as_deref(),
             body,
             false,
         )
         .await?;
-        self.transition(issue_id, IssueEvent::RequestChanges).await
+        self.transition_as(issue_id, IssueEvent::RequestChanges, actor)
+            .await
     }
 
     // ----------------------------------------------------------- connectors
@@ -1918,6 +1986,16 @@ impl Engine {
     // ------------------------------------------------------------------ gate
 
     pub async fn resume_issue(&self, issue_id: Uuid, answer: &str) -> Result<Issue> {
+        self.resume_issue_as(issue_id, answer, None).await
+    }
+
+    /// [`Self::resume_issue`] on behalf of a person, who is named on the answer.
+    pub async fn resume_issue_as(
+        &self,
+        issue_id: Uuid,
+        answer: &str,
+        actor: Option<Uuid>,
+    ) -> Result<Issue> {
         let issue = self.issue(issue_id).await?;
         if issue.status_enum() != IssueStatus::Blocked {
             bail!("the issue is {}, not blocked", issue.status_enum());
@@ -1953,7 +2031,7 @@ impl Engine {
             .comment(
                 issue_id,
                 hulahoop_core::AuthorType::Human,
-                None,
+                actor.map(|id| id.to_string()).as_deref(),
                 &body,
                 false,
             )

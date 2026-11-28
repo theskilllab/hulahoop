@@ -1069,22 +1069,14 @@ async fn artifact_bytes(
     Query(params): Query<std::collections::HashMap<String, String>>,
     headers: HeaderMap,
 ) -> Response {
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(str::to_string)
-        .or_else(|| params.get("token").cloned())
-        .unwrap_or_default();
-    if authorize(&state, &{
-        let mut map = HeaderMap::new();
-        if let Ok(value) = HeaderValue::from_str(&format!("Bearer {presented}")) {
-            map.insert(header::AUTHORIZATION, value);
-        }
-        map
-    })
-    .is_err()
-    {
+    // Any signed-in user may read an artifact with a header. The `?token=` form
+    // ends up in logs and history, so it only accepts the machine credential.
+    let authenticator = crate::auth::Authenticator::new(state.engine.clone(), state.token.clone());
+    let allowed = match crate::auth::bearer(&headers) {
+        "" => authenticator.is_server_token(params.get("token").map_or("", String::as_str)),
+        header => matches!(authenticator.resolve(header).await, Ok(Some(_))),
+    };
+    if !allowed {
         return (StatusCode::UNAUTHORIZED, "the token is missing or wrong").into_response();
     }
     let Ok((filename, mime, path)) = artifact_download(&state.engine, id).await else {

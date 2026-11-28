@@ -228,10 +228,13 @@ impl Db {
         Ok(workspace_id)
     }
 
+    /// The machine's own user: the oldest, which is `you` until the setup link
+    /// turns it into the first owner.
     pub async fn local_user_id(&self) -> anyhow::Result<uuid::Uuid> {
-        let (id,): (uuid::Uuid,) = sqlx::query_as("select id from users limit 1")
-            .fetch_one(&self.pool)
-            .await?;
+        let (id,): (uuid::Uuid,) =
+            sqlx::query_as("select id from users order by created_at, id limit 1")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(id)
     }
 }

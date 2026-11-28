@@ -1732,3 +1732,140 @@ export async function deletePullRequestBranch(repoId: string, number: number): P
   );
   return data.deletePullRequestBranch;
 }
+
+// --- people: sign-in, members, registration, personal tokens ---------------
+
+export type Role = "owner" | "member";
+export type RegistrationMode = "closed" | "invite" | "open";
+
+export interface Me {
+  id: string;
+  name: string;
+  email: string | null;
+  role: Role;
+}
+
+export interface Member {
+  userId: string;
+  name: string;
+  email: string | null;
+  role: Role;
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  createdAt: string;
+}
+
+/** Posts to one of the server's public `/auth/*` routes and returns the token it answers with. */
+async function authRequest(server: string, path: string, body: Record<string, unknown>): Promise<string> {
+  const url = normalizeServer(server);
+  let response: Response;
+  try {
+    response = await fetch(`${url}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  } catch {
+    throw new Error(`could not reach ${url}. Is the server running, and does it listen on that address?`);
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      response.status === 401 ? "wrong email or password" : (payload.error ?? `${url} answered ${response.status}`),
+    );
+  }
+  return payload.token as string;
+}
+
+/** A session token is a bearer like any other: it is saved as the connection's token. */
+export async function signIn(server: string, email: string, password: string): Promise<void> {
+  const token = await authRequest(server, "/auth/login", { email, password });
+  await probe(server, token);
+  saveRemote(server, token);
+}
+
+/** Registration is open, or the person holds an invite from an owner. */
+export async function signUp(
+  server: string,
+  person: { name: string; email: string; password: string; invite?: string },
+): Promise<void> {
+  const token = await authRequest(server, "/auth/signup", { ...person, invite: person.invite || null });
+  await probe(server, token);
+  saveRemote(server, token);
+}
+
+/** Forgets this device's session on the server, then the saved connection. */
+export async function signOut(): Promise<void> {
+  const { url, token } = await connect();
+  await fetch(`${url}/auth/logout`, { method: "POST", headers: { authorization: `Bearer ${token}` } }).catch(
+    () => undefined,
+  );
+  useLocalServer();
+}
+
+export async function loadMe(): Promise<Me> {
+  return (await gql<{ me: Me }>(`query { me { id name email role } }`)).me;
+}
+
+export async function loadRegistration(): Promise<RegistrationMode> {
+  return (await gql<{ registration: RegistrationMode }>(`query { registration }`)).registration;
+}
+
+export async function setRegistration(mode: RegistrationMode): Promise<void> {
+  await gql(`mutation ($mode: String!) { setRegistration(mode: $mode) }`, { mode });
+}
+
+export async function loadMembers(workspaceId: string): Promise<Member[]> {
+  const data = await gql<{ workspaceMembers: Member[] }>(
+    `query ($workspaceId: UUID!) { workspaceMembers(workspaceId: $workspaceId) { userId name email role } }`,
+    { workspaceId },
+  );
+  return data.workspaceMembers;
+}
+
+export async function setMemberRole(workspaceId: string, userId: string, role: Role): Promise<void> {
+  await gql(
+    `mutation ($workspaceId: UUID!, $userId: UUID!, $role: String!) { setMemberRole(workspaceId: $workspaceId, userId: $userId, role: $role) }`,
+    { workspaceId, userId, role },
+  );
+}
+
+export async function removeMember(workspaceId: string, userId: string): Promise<void> {
+  await gql(`mutation ($workspaceId: UUID!, $userId: UUID!) { removeMember(workspaceId: $workspaceId, userId: $userId) }`, {
+    workspaceId,
+    userId,
+  });
+}
+
+/** A single-use invite code; whoever enters it on the sign-up form joins with `role`. */
+export async function createInvite(role: Role): Promise<string> {
+  const { url, token } = await connect();
+  const response = await fetch(`${url}/auth/invites`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ role }),
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error ?? `the server answered ${response.status}`);
+  return payload.token as string;
+}
+
+export async function loadApiTokens(): Promise<ApiToken[]> {
+  return (await gql<{ apiTokens: ApiToken[] }>(`query { apiTokens { id name createdAt } }`)).apiTokens;
+}
+
+/** The token's value comes back once; only its hash is kept. */
+export async function createApiToken(name: string): Promise<string> {
+  const data = await gql<{ createApiToken: { token: string } }>(
+    `mutation ($name: String!) { createApiToken(name: $name) { id token } }`,
+    { name },
+  );
+  return data.createApiToken.token;
+}
+
+export async function revokeApiToken(id: string): Promise<void> {
+  await gql(`mutation ($id: UUID!) { revokeApiToken(id: $id) }`, { id });
+}
