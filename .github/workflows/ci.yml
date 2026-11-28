@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   ci:
     strategy:
@@ -30,6 +33,8 @@ jobs:
           version: 12.9.0
       - name: ci
         run: nix develop --command just ci
+      - name: nix build
+        run: nix build .#hulahoop && ./result/bin/hulahoop help
       # The loop itself: the fake adapter, the real state machine, a throwaway repo.
       - name: end-to-end loop
         run: nix develop --command bash tests/e2e/loop.sh
@@ -45,3 +50,34 @@ jobs:
           name: junit-${{ matrix.os }}
           path: .hulahoop/junit.xml
           if-no-files-found: ignore
+
+  # Nothing else builds the nix package for aarch64-linux.
+  nix-build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix build
+        run: nix build .#hulahoop && ./result/bin/hulahoop help
+
+  # The NixOS VM test boots QEMU, so it has its own job and timeout and cannot hide a
+  # failure in the main one. It runs on x86_64 only: the runners expose /dev/kvm once the
+  # udev rule below opens it, while the GitHub arm runners do not and the TCG fallback
+  # failed repeatedly. The aarch64-linux package build is covered by nix-build-arm64.
+  nixos-vm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-vm-${{ runner.arch }}-${{ hashFiles('flake.lock') }}
+          restore-prefixes-first-match: nix-vm-${{ runner.arch }}-
+      - name: nix flake check
+        run: nix flake check
