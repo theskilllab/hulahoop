@@ -29,6 +29,7 @@ hex = "0.4"
 libc = { workspace = true }
 futures = "0.3"
 ring = "0.17"
+password-auth = "1.0"
 rsa = "0.9"
 tokio-stream = "0.1"
 pty-process = { version = "0.5", features = ["async"] }

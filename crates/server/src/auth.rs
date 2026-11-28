@@ -7,8 +7,8 @@
 //! session-cookie stack (`axum-login`, `tower-sessions`) assumes browser cookies,
 //! while the desktop and a future MCP client present a bearer token. Sessions are
 //! therefore random bearer tokens kept hashed in SQLite, and passwords are
-//! PBKDF2-HMAC-SHA256 from `ring`, which the server already ships. Argon2 and
-//! `oauth2`/`openidconnect` can slot in behind `hash_password` and `resolve`.
+//! Argon2id (PHC strings) through `password-auth` 1.0. `oauth2`/`openidconnect`
+//! can slot in behind `resolve`.
 
 use crate::api::{same_token, ApiState};
 use crate::db::{sha256_hex, Db};
@@ -20,14 +20,11 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use rand::RngCore;
-use ring::pbkdf2;
 use serde::Deserialize;
 use serde_json::json;
-use std::num::NonZeroU32;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use uuid::Uuid;
 
-const PBKDF2_ITERATIONS: u32 = 600_000;
 const SETUP_TTL_SECONDS: i64 = 30 * 60;
 const INVITE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const SESSION_TTL_SECONDS: i64 = 30 * 24 * 60 * 60;
@@ -41,7 +38,7 @@ const MAX_EMAIL_LENGTH: usize = 254;
 /// A well-formed hash nobody's password matches. Verifying against it when an
 /// email is unknown makes a failed sign-in cost the same as one with a wrong
 /// password.
-const DUMMY_HASH: &str = "pbkdf2-sha256$600000$00000000000000000000000000000000$0000000000000000000000000000000000000000000000000000000000000000";
+static DUMMY_HASH: LazyLock<String> = LazyLock::new(|| hash_password("no such account"));
 
 pub const REGISTRATION_MODES: [&str; 3] = ["closed", "invite", "open"];
 pub const ROLES: [&str; 2] = ["owner", "member"];
@@ -171,25 +168,11 @@ fn new_token(prefix: &str) -> String {
 // --- passwords -------------------------------------------------------------
 
 fn hash_password(password: &str) -> String {
-    let mut salt = [0u8; 16];
-    rand::rng().fill_bytes(&mut salt);
-    let mut hash = [0u8; 32];
-    pbkdf2::derive(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        NonZeroU32::new(PBKDF2_ITERATIONS).expect("non-zero"),
-        &salt,
-        password.as_bytes(),
-        &mut hash,
-    );
-    format!(
-        "pbkdf2-sha256${PBKDF2_ITERATIONS}${}${}",
-        hex::encode(salt),
-        hex::encode(hash)
-    )
+    password_auth::generate_hash(password)
 }
 
-/// The KDF is CPU-bound for a good fraction of a second, so it runs off the
-/// async workers that serve claims, heartbeats and the log socket.
+/// Hashing is CPU- and memory-bound for a good fraction of a second, so it runs
+/// off the async workers that serve claims, heartbeats and the log socket.
 async fn hash_password_off_thread(password: String) -> anyhow::Result<String> {
     Ok(tokio::task::spawn_blocking(move || hash_password(&password)).await?)
 }
@@ -199,31 +182,7 @@ async fn verify_password_off_thread(password: String, stored: String) -> anyhow:
 }
 
 fn verify_password(password: &str, stored: &str) -> bool {
-    let mut parts = stored.split('$');
-    let (Some("pbkdf2-sha256"), Some(iterations), Some(salt), Some(hash), None) = (
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-        parts.next(),
-    ) else {
-        return false;
-    };
-    let (Some(iterations), Ok(salt), Ok(hash)) = (
-        iterations.parse().ok().and_then(NonZeroU32::new),
-        hex::decode(salt),
-        hex::decode(hash),
-    ) else {
-        return false;
-    };
-    pbkdf2::verify(
-        pbkdf2::PBKDF2_HMAC_SHA256,
-        iterations,
-        &salt,
-        password.as_bytes(),
-        &hash,
-    )
-    .is_ok()
+    password_auth::verify_password(password, stored).is_ok()
 }
 
 // --- the person a form describes ------------------------------------------
@@ -402,7 +361,7 @@ async fn login(db: &Db, email: &str, password: &str) -> Result<String, AuthError
     let stored = row
         .as_ref()
         .and_then(|(_, hash)| hash.clone())
-        .unwrap_or_else(|| DUMMY_HASH.to_string());
+        .unwrap_or_else(|| DUMMY_HASH.clone());
     let verified = verify_password_off_thread(password.to_string(), stored).await?;
     match row {
         Some((id, _)) if verified => Ok(create_session(db, id).await?),
@@ -916,13 +875,17 @@ mod tests {
         assert!(verify_password("correct horse", &stored));
         assert!(!verify_password("wrong horse", &stored));
         assert!(!verify_password("correct horse", "garbage"));
+        assert!(!verify_password(
+            "correct horse",
+            "pbkdf2-sha256$600000$00$00"
+        ));
     }
 
     #[test]
     fn the_dummy_hash_is_well_formed_and_matches_nothing() {
-        assert!(!verify_password("", DUMMY_HASH));
-        assert!(!verify_password("anything at all", DUMMY_HASH));
-        assert!(DUMMY_HASH.starts_with(&format!("pbkdf2-sha256${PBKDF2_ITERATIONS}$")));
+        assert!(!verify_password("", &DUMMY_HASH));
+        assert!(!verify_password("anything at all", &DUMMY_HASH));
+        assert!(DUMMY_HASH.starts_with("$argon2id$"));
     }
 
     #[test]
