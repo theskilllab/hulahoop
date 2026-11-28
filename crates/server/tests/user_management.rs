@@ -917,3 +917,24 @@ async fn only_the_server_token_may_use_the_runner_routes() {
         assert_eq!(res.status().as_u16(), 401, "spec refuses a user credential");
     }
 }
+
+#[tokio::test]
+async fn a_member_invite_never_demotes_an_existing_owner() {
+    let f = fixture().await;
+    let owner = f.setup_owner("ada@example.com").await;
+    let (_, invite) = f
+        .post("/auth/invites", Some(&owner), json!({"role": "member"}))
+        .await;
+    let (status, body) = f
+        .post(
+            "/auth/signup",
+            None,
+            json!({"name": "Ada", "email": "ada@example.com", "password": "correct horse battery", "invite": invite["token"]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    for bearer in [body["token"].as_str().unwrap(), owner.as_str()] {
+        let d = f.data(bearer, "{ me { role } }").await;
+        assert_eq!(d["me"]["role"], "owner");
+    }
+}

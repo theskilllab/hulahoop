@@ -475,9 +475,12 @@ async fn signup(db: &Db, person: Profile, invite: Option<&str>) -> Result<String
         Some(id) => id,
         None => insert_user(&mut tx, &person, password_hash).await?,
     };
+    // An invite can promote a returning person but never lowers a role they
+    // already hold; demotions go through `set_member_role` and its guards.
     sqlx::query(
         "insert into workspace_members (workspace_id, user_id, role) values (?, ?, ?) \
-         on conflict (workspace_id, user_id) do update set role = excluded.role",
+         on conflict (workspace_id, user_id) do update set role = excluded.role \
+         where excluded.role = 'owner'",
     )
     .bind(workspace)
     .bind(id)
