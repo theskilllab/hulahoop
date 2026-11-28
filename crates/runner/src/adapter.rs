@@ -29,6 +29,7 @@ pub fn invocation(
     message: &str,
 ) -> Result<Invocation> {
     let system_prompt_file = system_prompt_file.to_string_lossy().to_string();
+    let mut env: Vec<(String, String)> = Vec::new();
     let (program, args) = match adapter {
         Adapter::Pi => {
             // An empty model means "whatever the adapter is configured for", so the
@@ -83,6 +84,15 @@ pub fn invocation(
             args.push("--permission-mode".to_string());
             args.push("bypassPermissions".to_string());
             args.push("--dangerously-skip-permissions".to_string());
+            // A turn ends when its work ends. A monitor or background task
+            // wakes the agent after it has handed over, and its stray reply
+            // would stand in for the handover.
+            args.push("--disallowedTools".to_string());
+            args.push("Monitor,CronCreate,ScheduleWakeup".to_string());
+            env.push((
+                "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
+                "1".to_string(),
+            ));
             args.push(message.to_string());
             ("claude".to_string(), args)
         }
@@ -102,11 +112,7 @@ pub fn invocation(
             )
         }
     };
-    Ok(Invocation {
-        program,
-        args,
-        env: Vec::new(),
-    })
+    Ok(Invocation { program, args, env })
 }
 
 /// The message the agent receives. Everything it must know is in `input.json`
@@ -192,7 +198,7 @@ pub fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
-    for (key, value) in env {
+    for (key, value) in env.iter().chain(&invocation.env) {
         command.env(key, value);
     }
     #[cfg(unix)]

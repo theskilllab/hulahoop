@@ -2530,6 +2530,8 @@ struct Transcript {
     /// Our own words, so an echo of the prompt is never read as an answer.
     forbidden: Vec<String>,
     texts: Vec<String>,
+    /// How many of `texts` were said before the agent's last tool call.
+    before_last_tool: usize,
     /// Lines the adapter printed as plain text. A verdict sentence is often the
     /// last thing an agent says, and pi's JSON modes are not the only shape.
     plain: Vec<String>,
@@ -2571,7 +2573,13 @@ impl Transcript {
         // pi: `message_end` carries the assistant message; `agent_end` carries the
         // whole conversation. claude: `assistant`/`result`.
         match kind {
+            "tool_execution_start" | "tool_execution_end" => {
+                self.before_last_tool = self.texts.len()
+            }
             "message_end" | "assistant" | "result" => {
+                if collect_tool_use(&value["message"]) {
+                    self.before_last_tool = self.texts.len();
+                }
                 if let Some(text) = collect_text(&value["message"]) {
                     self.keep(text);
                 }
@@ -2594,9 +2602,16 @@ impl Transcript {
         }
     }
 
+    /// The handover: the first message after the agent's last tool call that
+    /// carries a verdict or question marker. Replies to stale monitor wake-ups
+    /// come after it and repeat the marker, so the last message is not it.
+    /// Without a marker, the last message closes the turn.
     fn final_text(&self) -> String {
-        self.texts
-            .last()
+        let closing = &self.texts[self.before_last_tool.min(self.texts.len())..];
+        closing
+            .iter()
+            .find(|text| has_marker(text))
+            .or_else(|| self.texts.last())
             .cloned()
             .or_else(|| self.plain.last().cloned())
             .unwrap_or_default()
@@ -2633,6 +2648,19 @@ impl Transcript {
         let question = rest.lines().next().unwrap_or_default().trim();
         Some(question.to_string())
     }
+}
+
+fn has_marker(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    lower.contains("hulahoop_verdict:") || lower.contains("hulahoop_question:")
+}
+
+fn collect_tool_use(message: &Value) -> bool {
+    message["content"].as_array().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|part| part["type"].as_str() == Some("tool_use"))
+    })
 }
 
 fn collect_text(message: &Value) -> Option<String> {
