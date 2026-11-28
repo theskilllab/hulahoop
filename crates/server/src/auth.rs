@@ -452,10 +452,17 @@ pub async fn require_owner(db: &Db, user: Uuid, workspace: Uuid) -> Result<(), A
 }
 
 async fn signup(db: &Db, person: Profile, invite: Option<&str>) -> Result<String, AuthError> {
+    let invite = invite.map(str::trim).filter(|i| !i.is_empty());
     let workspace = primary_workspace(db).await?;
     if invite.is_none() && registration(db).await? != "open" {
         return Err(AuthError::Forbidden("registration is closed".into()));
     }
+    // Someone removed from the workspace keeps their account; an invite plus
+    // their own password brings them back instead of colliding on the email.
+    let returning = match invite {
+        Some(_) => returning_user(db, &person).await?,
+        None => None,
+    };
     // Hashing takes a fraction of a second; doing it before the transaction keeps
     // the database's one writer free for runners in the meantime.
     let password_hash = hash_password_off_thread(person.password.clone()).await?;
@@ -464,6 +471,56 @@ async fn signup(db: &Db, person: Profile, invite: Option<&str>) -> Result<String
         Some(invite) => spend_invite(&mut tx, invite).await?,
         None => "member".to_string(),
     };
+    let id = match returning {
+        Some(id) => id,
+        None => insert_user(&mut tx, &person, password_hash).await?,
+    };
+    sqlx::query(
+        "insert into workspace_members (workspace_id, user_id, role) values (?, ?, ?) \
+         on conflict (workspace_id, user_id) do update set role = excluded.role",
+    )
+    .bind(workspace)
+    .bind(id)
+    .bind(&role)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(create_session(db, id).await?)
+}
+
+/// The existing account behind `person`'s email, when they proved it with the
+/// password. A wrong password gets the same answer as a taken email.
+async fn returning_user(db: &Db, person: &Profile) -> Result<Option<Uuid>, AuthError> {
+    let row: Option<(Uuid, Option<String>)> =
+        sqlx::query_as("select id, password_hash from users where email = ?")
+            .bind(&person.email)
+            .fetch_optional(&db.pool)
+            .await?;
+    let Some((id, hash)) = row else {
+        return Ok(None);
+    };
+    let known = match hash {
+        Some(hash) => verify_password_off_thread(person.password.clone(), hash).await?,
+        None => false,
+    };
+    if known {
+        Ok(Some(id))
+    } else {
+        Err(taken_email())
+    }
+}
+
+fn taken_email() -> AuthError {
+    // The same answer a closed door gives, so the form does not say who
+    // already has an account.
+    AuthError::Forbidden("could not sign up with those details".into())
+}
+
+async fn insert_user(
+    tx: &mut sqlx::SqliteConnection,
+    person: &Profile,
+    password_hash: String,
+) -> Result<Uuid, AuthError> {
     let id = Uuid::now_v7();
     let inserted = sqlx::query(
         "insert into users (id, name, email, password_hash, created_at) values (?, ?, ?, ?, ?)",
@@ -476,24 +533,10 @@ async fn signup(db: &Db, person: Profile, invite: Option<&str>) -> Result<String
     .execute(&mut *tx)
     .await;
     match inserted {
-        Ok(_) => {}
-        // The same answer a closed door gives, so the form does not say who
-        // already has an account.
-        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
-            return Err(AuthError::Forbidden(
-                "could not sign up with those details".into(),
-            ));
-        }
-        Err(error) => return Err(error.into()),
+        Ok(_) => Ok(id),
+        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => Err(taken_email()),
+        Err(error) => Err(error.into()),
     }
-    sqlx::query("insert into workspace_members (workspace_id, user_id, role) values (?, ?, ?)")
-        .bind(workspace)
-        .bind(id)
-        .bind(&role)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok(create_session(db, id).await?)
 }
 
 // --- invites ---------------------------------------------------------------

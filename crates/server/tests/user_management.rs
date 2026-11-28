@@ -776,3 +776,144 @@ async fn an_api_token_name_is_capped() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn an_empty_invite_field_counts_as_no_invite_on_an_open_server() {
+    let f = fixture().await;
+    let owner = f.setup_owner("ada@example.com").await;
+    f.set_registration(&owner, "open").await;
+    let (status, body) = f.signup("Grace", "grace@example.com", Some("  ")).await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn a_removed_member_can_rejoin_with_an_invite_and_their_own_password() {
+    let f = fixture().await;
+    let (owner, member) = f.owner_and_member().await;
+    let w = f.workspace;
+    let grace = f.data(&member, "{ me { id } }").await["me"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    f.data(
+        &owner,
+        &format!(r#"mutation {{ removeMember(workspaceId: "{w}", userId: "{grace}") }}"#),
+    )
+    .await;
+    f.set_registration(&owner, "closed").await;
+
+    let (_, invite) = f.post("/auth/invites", Some(&owner), json!({})).await;
+    let token = invite["token"].as_str().unwrap();
+
+    // Someone who only knows the email cannot use an invite to get into the account.
+    let (status, _) = f
+        .post(
+            "/auth/signup",
+            None,
+            json!({"name": "Eve", "email": "grace@example.com", "password": "not her password", "invite": token}),
+        )
+        .await;
+    assert_eq!(status, 403);
+
+    let (status, body) = f.signup("Grace", "grace@example.com", Some(token)).await;
+    assert_eq!(status, 200, "{body}");
+    let d = f
+        .data(body["token"].as_str().unwrap(), "{ me { id role } }")
+        .await;
+    assert_eq!(d["me"]["id"], grace.as_str());
+    assert_eq!(d["me"]["role"], "member");
+}
+
+#[tokio::test]
+async fn a_member_cannot_mint_invites_and_an_owner_invite_makes_an_owner() {
+    let f = fixture().await;
+    let (owner, member) = f.owner_and_member().await;
+    let (status, _) = f.post("/auth/invites", Some(&member), json!({})).await;
+    assert_eq!(status, 403);
+
+    let (status, invite) = f
+        .post("/auth/invites", Some(&owner), json!({"role": "owner"}))
+        .await;
+    assert_eq!(status, 200, "{invite}");
+    let (status, body) = f
+        .signup(
+            "Heidi",
+            "heidi@example.com",
+            Some(invite["token"].as_str().unwrap()),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let d = f
+        .data(body["token"].as_str().unwrap(), "{ me { role } }")
+        .await;
+    assert_eq!(d["me"]["role"], "owner");
+}
+
+#[tokio::test]
+async fn simultaneous_signups_on_one_invite_get_one_account() {
+    let f = fixture().await;
+    let owner = f.setup_owner("ada@example.com").await;
+    let (_, invite) = f.post("/auth/invites", Some(&owner), json!({})).await;
+    let token = invite["token"].as_str().unwrap();
+    let (a, b) = tokio::join!(
+        f.signup("Grace", "grace@example.com", Some(token)),
+        f.signup("Heidi", "heidi@example.com", Some(token))
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 403], "{a:?} {b:?}");
+}
+
+#[tokio::test]
+async fn a_personal_token_is_listed_and_revoked_only_by_its_owner() {
+    let f = fixture().await;
+    let (owner, member) = f.owner_and_member().await;
+    let d = f
+        .data(&owner, r#"mutation { createApiToken(name: "ada") { id } }"#)
+        .await;
+    let id = d["createApiToken"]["id"].as_str().unwrap().to_string();
+
+    let d = f.data(&member, "{ apiTokens { id } }").await;
+    assert_eq!(d["apiTokens"].as_array().unwrap().len(), 0);
+    let d = f
+        .data(
+            &member,
+            &format!(r#"mutation {{ revokeApiToken(id: "{id}") }}"#),
+        )
+        .await;
+    assert_eq!(d["revokeApiToken"], false);
+    let d = f.data(&owner, "{ apiTokens { id } }").await;
+    assert_eq!(d["apiTokens"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn only_the_server_token_may_use_the_runner_routes() {
+    let f = fixture().await;
+    let (owner, _member) = f.owner_and_member().await;
+    let d = f
+        .data(
+            &owner,
+            r#"mutation { createApiToken(name: "ada") { token } }"#,
+        )
+        .await;
+    let personal = d["createApiToken"]["token"].as_str().unwrap().to_string();
+    let run = Uuid::now_v7();
+    for credential in [&owner, &personal] {
+        let (status, _) = f
+            .post(
+                &format!("/internal/runs/{run}/complete"),
+                Some(credential),
+                json!({"status": "succeeded"}),
+            )
+            .await;
+        assert_eq!(status, 401, "complete refuses a user credential");
+        let res = f
+            .http
+            .get(format!("{}/internal/runs/{run}/spec", f.base))
+            .bearer_auth(credential)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 401, "spec refuses a user credential");
+    }
+}
