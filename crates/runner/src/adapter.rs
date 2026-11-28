@@ -93,6 +93,17 @@ pub fn invocation(
                 "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
                 "1".to_string(),
             ));
+            // With no background tasks, builds and `just test` run in the
+            // foreground. Claude Code cuts a shell call at 2 minutes by default
+            // and 10 at most; size both against the 120 minute turn limit.
+            env.push((
+                "BASH_DEFAULT_TIMEOUT_MS".to_string(),
+                (15 * 60 * 1000).to_string(),
+            ));
+            env.push((
+                "BASH_MAX_TIMEOUT_MS".to_string(),
+                (90 * 60 * 1000).to_string(),
+            ));
             args.push(message.to_string());
             ("claude".to_string(), args)
         }
@@ -301,6 +312,15 @@ mod tests {
             .env
             .iter()
             .any(|(k, v)| k == "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" && v == "1"));
+        let env_value = |key: &str| {
+            claude
+                .env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env_value("BASH_DEFAULT_TIMEOUT_MS"), Some("900000"));
+        assert_eq!(env_value("BASH_MAX_TIMEOUT_MS"), Some("5400000"));
         let pi = invocation(Adapter::Pi, "m", file, "go").unwrap();
         assert!(pi.env.is_empty());
     }

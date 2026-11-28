@@ -1524,15 +1524,12 @@ impl Executor {
                 tail.into_iter().rev().collect::<Vec<_>>().join("\n")
             ));
         }
-        // Whichever line the agent wrote last is the answer: an agent that reports
-        // and then asks is asking, and the reverse also holds.
+        // The body is the handover. A question asked anywhere after the last
+        // tool call still wins over the report: the person has to answer it.
+        // Otherwise the verdict is the one the handover carries.
         let closing = transcript.final_text();
-        let lower = closing.to_lowercase();
-        let asked = lower.rfind("hulahoop_question:");
-        let told = lower.rfind("hulahoop_verdict:");
-        if asked.is_some() && asked > told {
-            outcome.question = transcript.question();
-        } else {
+        outcome.question = transcript.question();
+        if outcome.question.is_none() {
             outcome.verdict = transcript.verdict();
         }
         outcome.final_text = closing;
@@ -2617,8 +2614,16 @@ impl Transcript {
             .unwrap_or_default()
     }
 
+    /// The verdict the handover carries. Without a marker in the closing
+    /// messages, the last one in the whole transcript.
     fn verdict(&self) -> Option<String> {
-        let haystack = self.haystack().to_lowercase();
+        let handover = self.final_text();
+        let source = if has_marker(&handover) {
+            handover
+        } else {
+            self.haystack()
+        };
+        let haystack = source.to_lowercase();
         let index = haystack.rfind("hulahoop_verdict:")?;
         let rest = &haystack[index + "hulahoop_verdict:".len()..];
         let token: String = rest
@@ -2641,8 +2646,15 @@ impl Transcript {
         all.join("\n")
     }
 
+    /// The last question the agent asked after its last tool call.
     fn question(&self) -> Option<String> {
-        let haystack = self.haystack();
+        let closing = &self.texts[self.before_last_tool.min(self.texts.len())..];
+        let haystack = closing
+            .iter()
+            .chain(&self.plain)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         let index = haystack.to_lowercase().rfind("hulahoop_question:")?;
         let rest = &haystack[index + "hulahoop_question:".len()..];
         let question = rest.lines().next().unwrap_or_default().trim();
@@ -5135,6 +5147,31 @@ mod handover_tests {
             t.question().as_deref(),
             Some("Which database should I use?")
         );
+        assert_eq!(
+            t.final_text(),
+            "Work is complete.\n\nHULAHOOP_VERDICT: done"
+        );
+    }
+
+    /// A question asked before the last tool call was answered by the work.
+    #[test]
+    fn a_question_before_the_last_tool_call_is_not_asked() {
+        let mut t = Transcript::default();
+        say(&mut t, "Hmm.\n\nHULAHOOP_QUESTION: Which database?");
+        tool(&mut t, "t1");
+        say(&mut t, "Done.\n\nHULAHOOP_VERDICT: done");
+        assert_eq!(t.question(), None);
+        assert_eq!(t.verdict().as_deref(), Some("done"));
+    }
+
+    /// The verdict comes from the handover, not from a stale reply after it.
+    #[test]
+    fn the_verdict_comes_from_the_handover() {
+        let mut t = Transcript::default();
+        tool(&mut t, "t1");
+        say(&mut t, "Report.\n\nHULAHOOP_VERDICT: changes_requested");
+        say(&mut t, "Stale.\n\nHULAHOOP_VERDICT: approved");
+        assert_eq!(t.verdict().as_deref(), Some("changes_requested"));
     }
 
     /// A marker said before the last tool call is not the handover.
