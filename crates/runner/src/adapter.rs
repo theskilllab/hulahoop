@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 pub struct Invocation {
     pub program: String,
     pub args: Vec<String>,
+    /// Variables the process starts with, on top of the runner's own.
+    pub env: Vec<(String, String)>,
 }
 
 /// Build the argv for one role run.
@@ -100,7 +102,11 @@ pub fn invocation(
             )
         }
     };
-    Ok(Invocation { program, args })
+    Ok(Invocation {
+        program,
+        args,
+        env: Vec::new(),
+    })
 }
 
 /// The message the agent receives. Everything it must know is in `input.json`
@@ -271,5 +277,25 @@ mod tests {
             assert_eq!(repo_instructions(Adapter::Pi, &dir), "");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Claude Code turn ends when its work ends: no background task or
+    /// monitor can wake the agent after it has handed over.
+    #[test]
+    fn claude_cannot_start_background_tasks() {
+        let file = Path::new("/tmp/system-prompt.md");
+        let claude = invocation(Adapter::ClaudeCode, "sonnet", file, "go").unwrap();
+        let at = claude
+            .args
+            .iter()
+            .position(|arg| arg == "--disallowedTools")
+            .expect("--disallowedTools is set");
+        assert!(claude.args[at + 1].contains("Monitor"));
+        assert!(claude
+            .env
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" && v == "1"));
+        let pi = invocation(Adapter::Pi, "m", file, "go").unwrap();
+        assert!(pi.env.is_empty());
     }
 }
