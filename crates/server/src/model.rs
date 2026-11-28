@@ -119,6 +119,40 @@ pub struct WorkspaceMember {
     pub role: String,
 }
 
+/// The signed-in user and their role in the server's workspace.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject)]
+pub struct Me {
+    pub id: Uuid,
+    pub name: String,
+    pub email: Option<String>,
+    pub role: String,
+}
+
+/// A personal API token as listed: never its value, which is shown once.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct ApiToken {
+    pub id: Uuid,
+    pub name: String,
+    pub created_at: String,
+}
+
+/// A freshly created personal API token with its value, shown only this once.
+#[derive(Debug, Clone, serde::Serialize, SimpleObject)]
+pub struct CreatedApiToken {
+    pub id: Uuid,
+    pub token: String,
+}
+
+/// One status move on a task and who made it (`null`: the server itself).
+#[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
+pub struct IssueEventEntry {
+    pub kind: String,
+    pub from_status: Option<String>,
+    pub to_status: Option<String>,
+    pub actor: Option<String>,
+    pub created_at: String,
+}
+
 // `complex` lets the resolvers in `gql.rs` add the nested reads to this object.
 #[derive(Debug, Clone, serde::Serialize, SimpleObject, sqlx::FromRow)]
 #[graphql(complex)]

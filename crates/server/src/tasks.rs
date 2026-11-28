@@ -582,7 +582,7 @@ mod tests {
             .await;
         let comment = fixture
             .engine
-            .human_comment(issue, "@developer please look at the failing build")
+            .human_comment(issue, None, "@developer please look at the failing build")
             .await
             .unwrap();
 
@@ -604,7 +604,7 @@ mod tests {
         // With a run in flight, a second mention starts nothing.
         fixture
             .engine
-            .human_comment(issue, "@Reviewer heads up")
+            .human_comment(issue, None, "@Reviewer heads up")
             .await
             .unwrap();
         assert_eq!(fixture.runs(issue).await.len(), 1);
@@ -623,7 +623,7 @@ mod tests {
         let issue = fixture.issue(1, "in_progress", &[fixture.developer]).await;
         fixture
             .engine
-            .human_comment(issue, "@Test Writer can you add coverage?")
+            .human_comment(issue, None, "@Test Writer can you add coverage?")
             .await
             .unwrap();
         assert!(fixture.runs(issue).await.is_empty());
@@ -635,7 +635,7 @@ mod tests {
         let blocked = fixture.issue(2, "blocked", &[]).await;
         fixture
             .engine
-            .human_comment(blocked, "@Developer the answer is yes")
+            .human_comment(blocked, None, "@Developer the answer is yes")
             .await
             .unwrap();
         assert!(fixture.runs(blocked).await.is_empty());
@@ -655,7 +655,7 @@ mod tests {
         let issue = fixture.issue(1, "todo", &[]).await;
         fixture
             .engine
-            .human_comment(issue, "@Lumi what is left here?")
+            .human_comment(issue, None, "@Lumi what is left here?")
             .await
             .unwrap();
         let note = fixture.bodies(issue).await.last().unwrap().clone();

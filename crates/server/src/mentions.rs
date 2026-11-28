@@ -87,10 +87,24 @@ fn normalize(name: &str) -> String {
 }
 
 impl Engine {
+    /// A person's name. A comment with no author id predates user accounts and
+    /// belongs to the local user, whatever that user is called now.
+    async fn person_name(&self, user_id: Option<&str>) -> Result<String> {
+        let id = match user_id.and_then(|raw| Uuid::parse_str(raw).ok()) {
+            Some(id) => id,
+            None => self.db.local_user_id().await?,
+        };
+        let name: Option<String> = sqlx::query_scalar("select name from users where id = ?")
+            .bind(id)
+            .fetch_optional(&self.db.pool)
+            .await?;
+        Ok(name.unwrap_or_else(|| "you".into()))
+    }
+
     /// Who wrote a comment, as the thread shows it.
     pub async fn author_name(&self, author_type: &str, author_id: Option<&str>) -> Result<String> {
         if author_type == AuthorType::Human.as_str() {
-            return Ok("you".into());
+            return self.person_name(author_id).await;
         }
         if author_id == Some("lumi") {
             return Ok("Lumi".into());
@@ -145,11 +159,22 @@ impl Engine {
 
     /// A person's comment on a task. The comment is stored first, with the
     /// mentions it carries; then each mention is acted on and explained.
-    pub async fn human_comment(&self, issue_id: Uuid, body: &str) -> Result<Uuid> {
+    pub async fn human_comment(
+        &self,
+        issue_id: Uuid,
+        author: Option<Uuid>,
+        body: &str,
+    ) -> Result<Uuid> {
         let issue = self.issue(issue_id).await?;
         let mentions = self.parse_mentions(issue.workspace_id, body).await?;
         let id = self
-            .comment(issue_id, AuthorType::Human, None, body, false)
+            .comment(
+                issue_id,
+                AuthorType::Human,
+                author.map(|id| id.to_string()).as_deref(),
+                body,
+                false,
+            )
             .await?;
         if !mentions.is_empty() {
             sqlx::query("update comments set mentions = ? where id = ?")

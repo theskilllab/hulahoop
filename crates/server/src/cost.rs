@@ -630,7 +630,10 @@ mod tests {
             result.data.into_json().unwrap()["costReport"]["tasks"]["tasks"],
             2
         );
-        let mutation = schema.execute(format!("mutation {{ saveCostPlan(workspaceId: \"{workspace}\", connectorId: \"claude-sub\", label: \"Claude Max\", monthlyFeeUsd: 100.0, allowanceTokens: 16000000) }}")).await;
+        let owner = db.local_user_id().await.unwrap();
+        let save = async_graphql::Request::new(format!("mutation {{ saveCostPlan(workspaceId: \"{workspace}\", connectorId: \"claude-sub\", label: \"Claude Max\", monthlyFeeUsd: 100.0, allowanceTokens: 16000000) }}"))
+            .data(crate::auth::CurrentUser { id: owner });
+        let mutation = schema.execute(save).await;
         assert!(mutation.errors.is_empty(), "{:?}", mutation.errors);
         assert_eq!(mutation.data.into_json().unwrap()["saveCostPlan"], true);
         assert_eq!(

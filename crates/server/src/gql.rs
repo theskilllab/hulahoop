@@ -6,6 +6,7 @@ use async_graphql::{
 };
 use uuid::Uuid;
 
+use crate::auth::{self, AuthError, CurrentUser};
 use crate::engine::Engine;
 use crate::memory_notes::Memory;
 use crate::model::*;
@@ -37,13 +38,13 @@ pub const WS_INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// The GraphQL WebSocket, which carries subscriptions. Speaks both
 /// `graphql-transport-ws` and the older `graphql-ws`. The client proves it holds
-/// the server token in `connection_init` (`{ "token": "…" }`); without it the
+/// a server, session or API token in `connection_init` (`{ "token": "…" }`); without it the
 /// connection closes before any subscription starts: 4403 for a wrong token,
 /// 4408 when no `connection_init` was accepted within [`WS_INIT_TIMEOUT`], and
 /// 1011 for a subscription sent before it.
 pub async fn serve_websocket(
     schema: HulahoopSchema,
-    token: std::sync::Arc<str>,
+    auth: std::sync::Arc<auth::Authenticator>,
     headers: axum::http::HeaderMap,
     upgrade: axum::extract::WebSocketUpgrade,
 ) -> axum::response::Response {
@@ -77,7 +78,7 @@ pub async fn serve_websocket(
                         _ => None,
                     })
                 });
-            let output = socket_messages(schema, token, input, protocol, WS_INIT_TIMEOUT);
+            let output = socket_messages(schema, auth, input, protocol, WS_INIT_TIMEOUT);
             futures::pin_mut!(output);
             while let Some(message) = output.next().await {
                 let message = match message {
@@ -101,7 +102,7 @@ pub async fn serve_websocket(
 /// has to get a `connection_init` accepted.
 pub fn socket_messages<S>(
     schema: HulahoopSchema,
-    token: std::sync::Arc<str>,
+    auth: std::sync::Arc<auth::Authenticator>,
     input: S,
     protocol: async_graphql::http::WebSocketProtocols,
     init_timeout: std::time::Duration,
@@ -114,11 +115,14 @@ where
     use futures::StreamExt;
     let inner = async_graphql::http::WebSocket::new(schema, input, protocol)
         .on_connection_init(move |payload: serde_json::Value| async move {
-            let provided = payload["token"].as_str().unwrap_or_default();
-            if crate::api::same_token(&token, provided) {
-                Ok(async_graphql::Data::default())
-            } else {
-                Err(async_graphql::Error::new(BAD_TOKEN))
+            let provided = payload["token"].as_str().unwrap_or_default().to_string();
+            match auth.resolve(&provided).await {
+                Ok(Some(user)) => {
+                    let mut data = async_graphql::Data::default();
+                    data.insert(user);
+                    Ok(data)
+                }
+                _ => Err(async_graphql::Error::new(BAD_TOKEN)),
             }
         })
         .boxed();
@@ -168,6 +172,38 @@ pub fn engine<'a>(ctx: &'a Context<'a>) -> &'a Engine {
     ctx.data_unchecked::<std::sync::Arc<Engine>>()
 }
 
+/// The person this request acts as, when the transport authenticated one.
+fn actor(ctx: &Context<'_>) -> Option<Uuid> {
+    ctx.data_opt::<CurrentUser>().map(|user| user.id)
+}
+
+/// The caller, or an error: the request carried no identity.
+fn signed_in(ctx: &Context<'_>) -> async_graphql::Result<Uuid> {
+    actor(ctx).ok_or_else(|| async_graphql::Error::new("sign in first"))
+}
+
+/// Fails unless the caller owns the workspace. Members work on the board;
+/// credentials, agents, repositories, the workflow and workspaces are the
+/// owner's, because they change what the server authenticates as and what
+/// agents are told to do.
+async fn owner_only(ctx: &Context<'_>) -> async_graphql::Result<()> {
+    let db = &engine(ctx).db;
+    let workspace = auth::primary_workspace(db).await?;
+    auth::require_owner(db, signed_in(ctx)?, workspace)
+        .await
+        .map_err(auth_error)
+}
+
+fn auth_error(error: AuthError) -> async_graphql::Error {
+    match error {
+        AuthError::Invalid(message) | AuthError::Forbidden(message) => {
+            async_graphql::Error::new(message)
+        }
+        AuthError::Unauthorized => async_graphql::Error::new("unauthorized"),
+        AuthError::Internal(error) => async_graphql::Error::new(error.to_string()),
+    }
+}
+
 pub struct Query;
 
 #[Object]
@@ -181,6 +217,43 @@ impl Query {
             .github_repositories()
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// The signed-in user and their role in the server's workspace.
+    async fn me(&self, ctx: &Context<'_>) -> async_graphql::Result<Me> {
+        let id = signed_in(ctx)?;
+        let db = &engine(ctx).db;
+        let (name, email): (String, Option<String>) =
+            sqlx::query_as("select name, email from users where id = ?")
+                .bind(id)
+                .fetch_one(&db.pool)
+                .await?;
+        let workspace = auth::primary_workspace(db).await?;
+        let role = auth::role_in(db, id, workspace)
+            .await?
+            .unwrap_or_else(|| "member".into());
+        Ok(Me {
+            id,
+            name,
+            email,
+            role,
+        })
+    }
+
+    /// Who may sign up: `closed`, `invite` or `open`.
+    async fn registration(&self, ctx: &Context<'_>) -> async_graphql::Result<String> {
+        Ok(auth::registration(&engine(ctx).db).await?)
+    }
+
+    /// The caller's own personal API tokens, newest first.
+    async fn api_tokens(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<ApiToken>> {
+        let user = signed_in(ctx)?;
+        Ok(sqlx::query_as::<_, ApiToken>(
+            "select id, name, created_at from api_tokens where user_id = ? and revoked_at is null order by created_at desc",
+        )
+        .bind(user)
+        .fetch_all(&engine(ctx).db.pool)
+        .await?)
     }
 
     async fn workspace_members(
@@ -612,10 +685,12 @@ impl Mutation {
         ctx: &Context<'_>,
         token: String,
     ) -> async_graphql::Result<GithubAccount> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_github_token(&token).await?)
     }
 
     async fn clear_github_token(&self, ctx: &Context<'_>) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).clear_github_token().await?)
     }
 
@@ -699,6 +774,7 @@ impl Mutation {
         api_budget_usd: Option<f64>,
         success_target_percent: Option<f64>,
     ) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         crate::cost::save_settings(
             &engine(ctx).db,
             workspace_id,
@@ -717,6 +793,7 @@ impl Mutation {
         monthly_fee_usd: f64,
         allowance_tokens: Option<i64>,
     ) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         crate::cost::save_plan(
             &engine(ctx).db,
             workspace_id,
@@ -734,6 +811,7 @@ impl Mutation {
         name: String,
         prefix: Option<String>,
     ) -> async_graphql::Result<Workspace> {
+        owner_only(ctx).await?;
         engine(ctx)
             .create_workspace(&name, prefix.as_deref())
             .await
@@ -749,6 +827,7 @@ impl Mutation {
         name: Option<String>,
         default_prefix: Option<String>,
     ) -> async_graphql::Result<Workspace> {
+        owner_only(ctx).await?;
         engine(ctx)
             .update_workspace(id, name, default_prefix)
             .await
@@ -763,6 +842,7 @@ impl Mutation {
         harness: String,
         model: String,
     ) -> async_graphql::Result<Workspace> {
+        owner_only(ctx).await?;
         engine(ctx)
             .set_workspace_lumi(workspace_id, &harness, &model)
             .await
@@ -792,6 +872,7 @@ impl Mutation {
         message_id: Uuid,
         items: Vec<i32>,
     ) -> async_graphql::Result<LumiMessage> {
+        owner_only(ctx).await?;
         let items: Vec<usize> = items.iter().map(|i| *i as usize).collect();
         engine(ctx)
             .apply_lumi_proposal(message_id, &items)
@@ -816,6 +897,7 @@ impl Mutation {
         id: Uuid,
         name: String,
     ) -> async_graphql::Result<Project> {
+        owner_only(ctx).await?;
         engine(ctx)
             .rename_project(id, &name)
             .await
@@ -831,6 +913,10 @@ impl Mutation {
         color: Option<String>,
         repos: Option<Vec<NewRepoInput>>,
     ) -> async_graphql::Result<Project> {
+        // A repository is a clone target on the host, so only an owner may attach one.
+        if repos.as_ref().is_some_and(|repos| !repos.is_empty()) {
+            owner_only(ctx).await?;
+        }
         let engine = engine(ctx);
         let id = Uuid::now_v7();
         // The prefix is what an issue is called by, so it is a decision made when
@@ -919,6 +1005,7 @@ impl Mutation {
         name: Option<String>,
         color: Option<String>,
     ) -> async_graphql::Result<Project> {
+        owner_only(ctx).await?;
         engine(ctx)
             .update_project(id, name.as_deref(), color.as_deref())
             .await
@@ -927,6 +1014,7 @@ impl Mutation {
 
     /// Take a repository off its project. Refused while open tasks use it.
     async fn unlink_repo(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<Project> {
+        owner_only(ctx).await?;
         engine(ctx)
             .unlink_repo(id)
             .await
@@ -939,6 +1027,7 @@ impl Mutation {
         project_id: Uuid,
         prefix: String,
     ) -> async_graphql::Result<Project> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_project_prefix(project_id, &prefix).await?)
     }
 
@@ -984,6 +1073,7 @@ impl Mutation {
         description: Option<String>,
         source: String,
     ) -> async_graphql::Result<Skill> {
+        owner_only(ctx).await?;
         Ok(engine(ctx)
             .create_skill(
                 workspace_id,
@@ -1002,6 +1092,7 @@ impl Mutation {
         description: Option<String>,
         source: Option<String>,
     ) -> async_graphql::Result<Skill> {
+        owner_only(ctx).await?;
         Ok(engine(ctx)
             .update_skill(
                 id,
@@ -1013,6 +1104,7 @@ impl Mutation {
     }
 
     async fn delete_skill(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).delete_skill(id).await?)
     }
 
@@ -1075,6 +1167,7 @@ impl Mutation {
         agent_id: Uuid,
         skill_ids: Vec<Uuid>,
     ) -> async_graphql::Result<Vec<Skill>> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_agent_skills(agent_id, &skill_ids).await?)
     }
 
@@ -1085,6 +1178,7 @@ impl Mutation {
         agent_id: Uuid,
         agents_md: String,
     ) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         engine(ctx)
             .set_agent_instructions(agent_id, &agents_md)
             .await?;
@@ -1098,6 +1192,7 @@ impl Mutation {
         workspace_id: Uuid,
         source: String,
     ) -> async_graphql::Result<WorkflowDoc> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_workflow(workspace_id, &source).await?)
     }
 
@@ -1239,6 +1334,7 @@ impl Mutation {
     }
 
     async fn delete_artifact(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).delete_artifact(id).await?)
     }
 
@@ -1250,6 +1346,7 @@ impl Mutation {
         app_id: String,
         private_key: String,
     ) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_github_app(&app_id, &private_key).await?)
     }
 
@@ -1257,6 +1354,7 @@ impl Mutation {
     /// because it predates the general form and a stored app is the one case where
     /// "disconnect" also changes how commits are authored.
     async fn disconnect_github_app(&self, ctx: &Context<'_>) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).clear_connection("github").await?)
     }
 
@@ -1268,6 +1366,7 @@ impl Mutation {
         id: String,
         key: String,
     ) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_agent_key(&id, &key).await?)
     }
 
@@ -1278,6 +1377,7 @@ impl Mutation {
         id: String,
         contents: String,
     ) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_agent_subscription(&id, &contents).await?)
     }
 
@@ -1289,6 +1389,7 @@ impl Mutation {
         id: String,
         token: String,
     ) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_agent_token(&id, &token).await?)
     }
 
@@ -1299,6 +1400,7 @@ impl Mutation {
         ctx: &Context<'_>,
         id: String,
     ) -> async_graphql::Result<crate::signin::SignIn> {
+        owner_only(ctx).await?;
         let engine = ctx.data_unchecked::<std::sync::Arc<Engine>>();
         Ok(crate::signin::start(engine, &id).await?)
     }
@@ -1310,6 +1412,7 @@ impl Mutation {
         sign_in_id: ID,
         code: String,
     ) -> async_graphql::Result<crate::signin::SignIn> {
+        owner_only(ctx).await?;
         Ok(crate::signin::submit_code(engine(ctx), &sign_in_id, &code).await?)
     }
 
@@ -1319,6 +1422,7 @@ impl Mutation {
         ctx: &Context<'_>,
         sign_in_id: ID,
     ) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         Ok(crate::signin::cancel(engine(ctx), &sign_in_id)?)
     }
 
@@ -1330,6 +1434,7 @@ impl Mutation {
         id: String,
         plan: Option<String>,
     ) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).set_connector_plan(&id, plan.as_deref()).await?)
     }
 
@@ -1341,6 +1446,7 @@ impl Mutation {
         ctx: &Context<'_>,
         id: String,
     ) -> async_graphql::Result<Connection> {
+        owner_only(ctx).await?;
         Ok(engine(ctx).clear_connection(&id).await?)
     }
 
@@ -1356,6 +1462,7 @@ impl Mutation {
         remote_url: String,
         vcs: Option<String>,
     ) -> async_graphql::Result<Repo> {
+        owner_only(ctx).await?;
         let engine = engine(ctx);
         let remote_url = remote_url_to_clone(&remote_url)?;
 
@@ -1398,6 +1505,7 @@ impl Mutation {
         base_bookmark: Option<String>,
         remote_url: Option<String>,
     ) -> async_graphql::Result<Repo> {
+        owner_only(ctx).await?;
         let engine = engine(ctx);
         if let Some(remote_url) = remote_url {
             let remote_url = remote_url_to_clone(&remote_url)?;
@@ -1464,6 +1572,7 @@ impl Mutation {
         // Which connector the agent signs in with; none means automatic.
         connector: Option<String>,
     ) -> async_graphql::Result<Agent> {
+        owner_only(ctx).await?;
         let id = Uuid::now_v7();
         let now = crate::db::now_rfc3339();
         let connector = connector.filter(|id| !id.is_empty());
@@ -1495,6 +1604,7 @@ impl Mutation {
     /// Remove an agent. Its runs keep their history; a workflow that names it
     /// refuses to dispatch until another agent is chosen.
     async fn delete_agent(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         let engine = engine(ctx);
         sqlx::query("delete from agent_preflight where agent_id = ?")
             .bind(id)
@@ -1521,6 +1631,7 @@ impl Mutation {
         // Which connector the agent signs in with, where its harness offers two.
         connector: Option<String>,
     ) -> async_graphql::Result<Agent> {
+        owner_only(ctx).await?;
         let engine = engine(ctx);
         for (column, value) in [
             ("name", name),
@@ -1555,6 +1666,7 @@ impl Mutation {
         agent_id: Uuid,
         repo_id: Uuid,
     ) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
         let agent = engine(ctx).agent(agent_id).await?;
         engine(ctx)
             .queue_job(
@@ -1751,6 +1863,69 @@ impl Mutation {
         Ok(engine(ctx).merge_issue(issue_id).await?)
     }
 
+    /// Owners only: who may sign up (`closed`, `invite` or `open`).
+    async fn set_registration(
+        &self,
+        ctx: &Context<'_>,
+        mode: String,
+    ) -> async_graphql::Result<bool> {
+        owner_only(ctx).await?;
+        auth::set_registration(&engine(ctx).db, &mode).await?;
+        Ok(true)
+    }
+
+    /// Owners only: promote or demote a member. The last owner cannot be demoted.
+    async fn set_member_role(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        user_id: Uuid,
+        role: String,
+    ) -> async_graphql::Result<bool> {
+        auth::set_member_role(
+            &engine(ctx).db,
+            signed_in(ctx)?,
+            workspace_id,
+            user_id,
+            &role,
+        )
+        .await
+        .map_err(auth_error)?;
+        Ok(true)
+    }
+
+    /// Owners only: take someone off the workspace. The last owner cannot go.
+    async fn remove_member(
+        &self,
+        ctx: &Context<'_>,
+        workspace_id: Uuid,
+        user_id: Uuid,
+    ) -> async_graphql::Result<bool> {
+        auth::remove_member(&engine(ctx).db, signed_in(ctx)?, workspace_id, user_id)
+            .await
+            .map_err(auth_error)?;
+        Ok(true)
+    }
+
+    /// A personal API token for the caller. Its value is returned once.
+    async fn create_api_token(
+        &self,
+        ctx: &Context<'_>,
+        name: String,
+    ) -> async_graphql::Result<CreatedApiToken> {
+        let (id, token) = auth::create_api_token(&engine(ctx).db, signed_in(ctx)?, &name)
+            .await
+            .map_err(auth_error)?;
+        Ok(CreatedApiToken { id, token })
+    }
+
+    /// Revokes one of the caller's own tokens.
+    async fn revoke_api_token(&self, ctx: &Context<'_>, id: Uuid) -> async_graphql::Result<bool> {
+        auth::revoke_api_token(&engine(ctx).db, signed_in(ctx)?, id)
+            .await
+            .map_err(auth_error)
+    }
+
     /// Back to To do, for work that is queued again after a merge or an abandon.
     async fn reopen_issue(
         &self,
@@ -1758,7 +1933,7 @@ impl Mutation {
         issue_id: Uuid,
     ) -> async_graphql::Result<Issue> {
         Ok(engine(ctx)
-            .transition(issue_id, hulahoop_core::IssueEvent::Reopen)
+            .transition_as(issue_id, hulahoop_core::IssueEvent::Reopen, actor(ctx))
             .await?)
     }
 
@@ -1772,7 +1947,9 @@ impl Mutation {
     ) -> async_graphql::Result<Issue> {
         let target = hulahoop_core::IssueStatus::parse(&status)
             .ok_or_else(|| async_graphql::Error::new(format!("`{status}` names no status")))?;
-        Ok(engine(ctx).move_declared(issue_id, target).await?)
+        Ok(engine(ctx)
+            .move_declared_as(issue_id, target, actor(ctx))
+            .await?)
     }
 
     /// Backlog and To do are the same task on either side of the human's line.
@@ -1787,7 +1964,9 @@ impl Mutation {
         } else {
             hulahoop_core::IssueEvent::Unplan
         };
-        Ok(engine(ctx).transition(issue_id, event).await?)
+        Ok(engine(ctx)
+            .transition_as(issue_id, event, actor(ctx))
+            .await?)
     }
 
     async fn add_comment(
@@ -1799,7 +1978,7 @@ impl Mutation {
         let engine = engine(ctx);
         // Mentions are acted on after the comment is stored, and each one adds
         // a note of its own, so the comment is fetched by id, not as the newest.
-        let id = engine.human_comment(issue_id, &body).await?;
+        let id = engine.human_comment(issue_id, actor(ctx), &body).await?;
         Ok(
             sqlx::query_as::<_, Comment>("select * from comments where id = ?")
                 .bind(id)
@@ -1843,13 +2022,13 @@ impl Mutation {
             .comment(
                 issue_id,
                 hulahoop_core::AuthorType::Human,
-                None,
+                actor(ctx).map(|id| id.to_string()).as_deref(),
                 &format!("Abandoned: {reason}"),
                 false,
             )
             .await?;
         Ok(engine
-            .transition(issue_id, hulahoop_core::IssueEvent::Abandon)
+            .transition_as(issue_id, hulahoop_core::IssueEvent::Abandon, actor(ctx))
             .await?)
     }
 
@@ -1859,7 +2038,9 @@ impl Mutation {
         issue_id: Uuid,
         answer: String,
     ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).resume_issue(issue_id, &answer).await?)
+        Ok(engine(ctx)
+            .resume_issue_as(issue_id, &answer, actor(ctx))
+            .await?)
     }
 
     async fn request_changes(
@@ -1868,7 +2049,9 @@ impl Mutation {
         issue_id: Uuid,
         body: String,
     ) -> async_graphql::Result<Issue> {
-        Ok(engine(ctx).request_changes(issue_id, &body).await?)
+        Ok(engine(ctx)
+            .request_changes_as(issue_id, &body, actor(ctx))
+            .await?)
     }
 
     /// Asks the runner to read the pull request's checks again at the current
@@ -1959,6 +2142,18 @@ impl Agent {
 
 #[ComplexObject]
 impl Issue {
+    /// Status moves, oldest first, with the name of whoever made each.
+    async fn events(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<IssueEventEntry>> {
+        Ok(sqlx::query_as::<_, IssueEventEntry>(
+            "select e.kind, e.from_status, e.to_status, u.name as actor, e.created_at \
+             from issue_events e left join users u on u.id = e.actor_id \
+             where e.issue_id = ? order by e.created_at, e.id",
+        )
+        .bind(self.id)
+        .fetch_all(&engine(ctx).db.pool)
+        .await?)
+    }
+
     /// The places this task may go, as the workflow document declares them for the
     /// status it sits in. A blocked task shows exactly these exits, so a person
     /// moves it where the document says and nowhere else.
@@ -2371,6 +2566,11 @@ mod repo_less_tests {
     use std::sync::Arc;
     use uuid::Uuid;
 
+    /// A request made by the local owner, as the transport would make it.
+    pub(super) fn as_owner(owner: Uuid, query: String) -> async_graphql::Request {
+        async_graphql::Request::new(query).data(crate::auth::CurrentUser { id: owner })
+    }
+
     async fn run(schema: &super::HulahoopSchema, query: String) -> serde_json::Value {
         let response = schema.execute(query).await;
         assert!(response.errors.is_empty(), "{:?}", response.errors);
@@ -2498,6 +2698,7 @@ mod repo_less_tests {
 
 #[cfg(test)]
 mod repo_url_tests {
+    use super::repo_less_tests::as_owner;
     use super::{build_schema, remote_url_to_clone};
     use crate::db::Db;
     use crate::engine::Engine;
@@ -2578,31 +2779,35 @@ mod repo_url_tests {
     async fn a_new_url_forgets_the_mirror() {
         let (engine, _, project, repo, directory) = workspace_with_repo("repo-url").await;
         let schema = build_schema(engine.clone());
+        let owner = engine.db.local_user_id().await.unwrap();
 
         let refused = schema
-            .execute(format!(
+            .execute(as_owner(owner, format!(
                 r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "--upload-pack=x") {{ id }} }}"#
-            ))
+            )))
             .await;
         assert_eq!(refused.errors.len(), 1);
         let refused = schema
-            .execute(format!(
+            .execute(as_owner(owner, format!(
                 r#"mutation {{ addRepo(projectId: "{project}", name: "bad", remoteUrl: "-uhack") {{ id }} }}"#
-            ))
+            )))
             .await;
         assert_eq!(refused.errors.len(), 1);
         let same = schema
-            .execute(format!(
-                r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "/srv/old") {{ id }} }}"#
+            .execute(as_owner(
+                owner,
+                format!(
+                    r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "/srv/old") {{ id }} }}"#
+                ),
             ))
             .await;
         assert!(same.errors.is_empty(), "{:?}", same.errors);
         assert!(job_kinds(&engine).await.is_empty());
 
         let changed = schema
-            .execute(format!(
+            .execute(as_owner(owner, format!(
                 r#"mutation {{ updateRepo(id: "{repo}", remoteUrl: "https://github.com/acme/app") {{ remoteUrl baseRevision }} }}"#
-            ))
+            )))
             .await;
         assert!(changed.errors.is_empty(), "{:?}", changed.errors);
         let data = changed.data.into_json().unwrap();
@@ -2639,10 +2844,11 @@ mod repo_url_tests {
         sqlx::query("insert into repos (id, project_id, name, remote_url, contract_version, created_at) values (?,?, 'other','/srv/other','1',?)")
             .bind(Uuid::now_v7()).bind(other).bind(Utc::now()).execute(&engine.db.pool).await.unwrap();
         let schema = build_schema(engine.clone());
+        let owner = engine.db.local_user_id().await.unwrap();
         let filed = schema
-            .execute(format!(
+            .execute(as_owner(owner, format!(
                 r#"mutation {{ createIssue(projectId: "{project}", title: "Button", body: "") {{ id }} }}"#
-            ))
+            )))
             .await;
         let id = filed.data.into_json().unwrap()["createIssue"]["id"]
             .as_str()
@@ -2651,8 +2857,9 @@ mod repo_url_tests {
         let issue = Uuid::parse_str(&id).unwrap();
 
         let moved = schema
-            .execute(format!(
-                r#"mutation {{ updateIssue(id: "{id}", projectId: "{other}") {{ id }} }}"#
+            .execute(as_owner(
+                owner,
+                format!(r#"mutation {{ updateIssue(id: "{id}", projectId: "{other}") {{ id }} }}"#),
             ))
             .await;
         assert!(moved.errors.is_empty(), "{:?}", moved.errors);
@@ -2669,8 +2876,11 @@ mod repo_url_tests {
         assert_eq!(payload["reason"], crate::engine::CLEANUP_MOVED);
 
         let back = schema
-            .execute(format!(
-                r#"mutation {{ updateIssue(id: "{id}", projectId: "{project}") {{ id }} }}"#
+            .execute(as_owner(
+                owner,
+                format!(
+                    r#"mutation {{ updateIssue(id: "{id}", projectId: "{project}") {{ id }} }}"#
+                ),
             ))
             .await;
         assert!(back.errors.is_empty(), "{:?}", back.errors);

@@ -2,6 +2,7 @@
 //! runner, and the single writer for the SQLite database.
 
 pub mod api;
+pub mod auth;
 pub mod capacity;
 pub mod connectors;
 pub mod cost;
@@ -38,6 +39,7 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
     let mut port: u16 = 0;
     let mut listen: std::net::IpAddr = std::net::IpAddr::from([127, 0, 0, 1]);
     let mut print_connection = false;
+    let mut registration = std::env::var("HULAHOOP_REGISTRATION").ok();
 
     let mut index = 0;
     while index < args.len() {
@@ -62,6 +64,14 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
                     .context("--listen needs an address")?
                     .parse()
                     .context("--listen takes an IP address; 127.0.0.1 keeps it loopback-only")?;
+            }
+            "--registration" => {
+                index += 1;
+                registration = Some(
+                    args.get(index)
+                        .context("--registration needs closed, invite or open")?
+                        .clone(),
+                );
             }
             "--print-connection" => print_connection = true,
             other => anyhow::bail!("unknown argument {other}"),
@@ -104,6 +114,12 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
             token
         }
     };
+
+    if let Some(mode) = registration {
+        auth::set_registration(&engine.db, &mode)
+            .await
+            .context("--registration / HULAHOOP_REGISTRATION")?;
+    }
 
     let api_state = Arc::new(api::ApiState {
         engine: engine.clone(),
@@ -153,6 +169,14 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
         "listening"
     );
 
+    if !listen.is_loopback() {
+        tracing::warn!(
+            "listening on {listen}, which is not loopback: put Hulahoop behind HTTPS, \
+             because passwords and tokens travel in clear text over plain HTTP"
+        );
+    }
+    announce_setup(&engine, &connection).await?;
+
     // A runner that dies leaves runs `running`; the reaper is the only place
     // that can tell a dead run from a slow one.
     let reaper = engine.clone();
@@ -162,6 +186,9 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
             ticker.tick().await;
             if let Err(error) = reaper.reap_dead_runs().await {
                 tracing::warn!(%error, "reaping runs failed");
+            }
+            if let Err(error) = auth::purge_expired_sessions(&reaper.db).await {
+                tracing::warn!("purging expired sessions: {error:#}");
             }
             if let Err(error) = reaper.reap_lumi_jobs().await {
                 tracing::warn!(%error, "reaping Lumi jobs failed");
@@ -190,30 +217,51 @@ pub async fn serve(args: Vec<String>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// While nobody has a password, logs a fresh single-use setup link. `hulahoop up`
+/// shows the server's log, so the link appears there too.
+async fn announce_setup(
+    engine: &engine::Engine,
+    connection: &serde_json::Value,
+) -> anyhow::Result<()> {
+    if !auth::needs_setup(&engine.db).await? {
+        return Ok(());
+    }
+    let token = auth::issue_setup_token(&engine.db).await?;
+    let url = connection["url"].as_str().unwrap_or_default();
+    tracing::info!(
+        "first run: open {url}/setup?token={token} to create the owner (valid 30 minutes, one use)"
+    );
+    Ok(())
+}
+
 /// Every route the server answers. `serve` binds it; tests drive it directly.
 pub fn router(api_state: Arc<api::ApiState>) -> axum::Router {
     let schema = gql::build_schema(api_state.engine.clone());
     let ws_schema = schema.clone();
-    let ws_token: Arc<str> = Arc::from(api_state.token.as_str());
-    let http_token = ws_token.clone();
+    let authenticator = Arc::new(auth::Authenticator::new(
+        api_state.engine.clone(),
+        api_state.token.clone(),
+    ));
+    let ws_auth = authenticator.clone();
+    let graphql = axum::Router::new()
+        .route("/graphql", axum::routing::post(graphql_handler))
+        .layer(axum::middleware::from_fn_with_state(
+            authenticator,
+            graphql_auth,
+        ))
+        .with_state(schema);
     axum::Router::new()
-        .route(
-            "/graphql",
-            axum::routing::any_service(async_graphql_axum::GraphQL::new(schema)).layer(
-                axum::middleware::from_fn(move |request, next| {
-                    graphql_auth(http_token.clone(), request, next)
-                }),
-            ),
-        )
+        .merge(graphql)
         .route(
             "/graphql/ws",
             axum::routing::get(
                 move |headers: axum::http::HeaderMap, upgrade: axum::extract::WebSocketUpgrade| {
-                    gql::serve_websocket(ws_schema.clone(), ws_token.clone(), headers, upgrade)
+                    gql::serve_websocket(ws_schema.clone(), ws_auth.clone(), headers, upgrade)
                 },
             ),
         )
         .route("/health", axum::routing::get(|| async { "ok" }))
+        .merge(auth::router(api_state.clone()))
         .merge(api::router(api_state))
         // The desktop runs from the Tauri origin (or Vite's fixed dev port).
         // Multi-user deployment also requires identity-aware GraphQL authorization.
@@ -237,26 +285,36 @@ pub fn router(api_state: Arc<api::ApiState>) -> axum::Router {
         .layer(tower_http::trace::TraceLayer::new_for_http())
 }
 
-/// GraphQL over HTTP carries the same bearer token as the internal API and the
-/// WebSocket's `connection_init`. Without it, any page in the browser could post a
-/// `text/plain` "simple request" here and act on the workspace — CORS only stops
-/// it reading the answer.
+/// GraphQL over HTTP carries a bearer token like the WebSocket's `connection_init`:
+/// the server token (the local owner), a session or a personal API token. Without
+/// one, any page in the browser could post a `text/plain` "simple request" here and
+/// act on the workspace — CORS only stops it reading the answer. The user it
+/// resolves to travels to the resolvers as request data.
 async fn graphql_auth(
-    token: Arc<str>,
-    request: axum::extract::Request,
+    axum::extract::State(authenticator): axum::extract::State<Arc<auth::Authenticator>>,
+    mut request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let provided = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or_default();
-    if api::same_token(&token, provided) {
-        next.run(request).await
-    } else {
-        axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED)
+    let user = authenticator
+        .resolve(auth::bearer(request.headers()))
+        .await
+        .ok()
+        .flatten();
+    match user {
+        Some(user) => {
+            request.extensions_mut().insert(user);
+            next.run(request).await
+        }
+        None => axum::response::IntoResponse::into_response(axum::http::StatusCode::UNAUTHORIZED),
     }
+}
+
+async fn graphql_handler(
+    axum::extract::State(schema): axum::extract::State<gql::HulahoopSchema>,
+    axum::Extension(user): axum::Extension<auth::CurrentUser>,
+    request: async_graphql_axum::GraphQLRequest,
+) -> async_graphql_axum::GraphQLResponse {
+    schema.execute(request.into_inner().data(user)).await.into()
 }
 
 /// The host a client should dial: loopback when the server listens everywhere,
@@ -422,7 +480,7 @@ mod auth_tests {
     /// The frames a socket answers to `input`, until it closes or goes quiet.
     async fn answers(input: Vec<serde_json::Value>, init_timeout: Duration) -> Vec<WsMessage> {
         let (engine, directory) = engine().await;
-        let schema = gql::build_schema(engine);
+        let schema = gql::build_schema(engine.clone());
         let frames: Vec<String> = input.iter().map(|frame| frame.to_string()).collect();
         // The client keeps the socket open after its frames, as a real one would.
         let input = futures::stream::iter(frames)
@@ -430,7 +488,7 @@ mod auth_tests {
             .boxed();
         let output = gql::socket_messages(
             schema,
-            Arc::from(TOKEN),
+            Arc::new(auth::Authenticator::new(engine, TOKEN.to_string())),
             input,
             WebSocketProtocols::GraphQLWS,
             init_timeout,
