@@ -30,7 +30,7 @@ in
     };
 
     dataDir = mkOption {
-      type = types.path;
+      type = types.str;
       default = "/var/lib/hulahoop";
       description = "Where the database, vault key, mirrors, checkouts and connection.json live.";
     };
@@ -101,9 +101,9 @@ in
 
       users.groups = mkIf (cfg.group == "hulahoop") { hulahoop = { }; };
 
-      systemd.tmpfiles.rules = [ "d ${cfg.dataDir} 0700 ${cfg.user} ${cfg.group} -"
+      systemd.tmpfiles.rules = [ "d \"${cfg.dataDir}\" 0700 ${cfg.user} ${cfg.group} -"
         # `d` leaves an existing directory alone, so re-own it if user/group change.
-        "z ${cfg.dataDir} 0700 ${cfg.user} ${cfg.group} -"
+        "z \"${cfg.dataDir}\" 0700 ${cfg.user} ${cfg.group} -"
       ];
 
       systemd.services.hulahoop = {
@@ -117,18 +117,23 @@ in
         environment = {
           HOME = cfg.dataDir;
           NIX_REMOTE = "daemon";
+          # NixOS exports this only to login shells; direnv needs it here to read
+          # /etc/direnv/direnvrc and so find nix-direnv.
+          DIRENV_CONFIG = "/etc/direnv";
         }
         // lib.optionalAttrs (cfg.maxRuns != null) { HULAHOOP_MAX_RUNS = toString cfg.maxRuns; }
         // lib.optionalAttrs (cfg.piPackage != null) {
           HULAHOOP_PI_BIN = lib.getExe cfg.piPackage;
         }
         // cfg.environment;
+        # Deliberately unhardened: agents need the nix daemon and write access outside
+        # dataDir until HUL-46 (sandboxed agents) lands.
         serviceConfig = {
           ExecStart = "${lib.getExe cfg.package} up --listen ${lib.escapeShellArg cfg.listen} --port ${toString cfg.port} --data-dir ${lib.escapeShellArg cfg.dataDir}";
           User = cfg.user;
           Group = cfg.group;
           WorkingDirectory = cfg.dataDir;
-          Restart = "on-failure";
+          Restart = "always";
           RestartSec = 5;
         };
       };

@@ -1453,8 +1453,10 @@ across restarts and rebuilds. Connectors, agents, skills and `WORKFLOWS.md` live
 database and are edited in the app; they are not declarative. `harnesses` are on the
 runner's `PATH`, but inside a repository's dev shell that shell's `PATH` comes first,
 so a CLI the dev shell also provides wins. Add `pkgs.just` to `harnesses` if your
-repositories do not provide it. The module enables `programs.direnv` with `nix-direnv`
-so dev shells are cached. `dataDir` is mode `0700`; whoever holds the service user's
+repositories do not provide it. The module enables `programs.direnv` with `nix-direnv` and
+points the service at it (`DIRENV_CONFIG=/etc/direnv`) so dev shells are cached; the bare
+package cannot wire nix-direnv, so this holds only through the module. The flake follows
+`nixos-unstable`, so a rebuild can move nixpkgs under you. `dataDir` is mode `0700`; whoever holds the service user's
 access holds the server token and vault key. `x86_64-darwin` is not packaged:
 nixpkgs 26.11 dropped it, so on an Intel Mac use the release tarball.
 

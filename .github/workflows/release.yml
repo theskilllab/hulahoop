@@ -159,4 +159,4 @@ jobs:
         with:
           fetch-depth: 0
       - name: move stable to the tag
-        run: git push --force origin "${GITHUB_SHA}:refs/heads/stable"
+        run: git push --force origin "HEAD:refs/heads/stable"

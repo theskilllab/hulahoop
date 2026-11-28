@@ -53,6 +53,7 @@ pkgs.testers.runNixOSTest {
     machine.succeed("grep -q nix-direnv /etc/direnv/direnvrc")
     pid = machine.succeed("systemctl show -p MainPID --value hulahoop.service").strip()
     service_path = machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ | grep '^PATH='")
+    assert "DIRENV_CONFIG=/etc/direnv" in machine.succeed(f"tr '\\0' '\\n' < /proc/{pid}/environ")
     for tool in ["jujutsu", "git", "direnv"]:
         assert tool in service_path, f"{tool} missing from the service PATH: {service_path}"
     # pi, claude and just are absent here, so doctor exits non-zero; read its lines.
