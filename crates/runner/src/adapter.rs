@@ -9,6 +9,8 @@ use std::process::{Command, Stdio};
 pub struct Invocation {
     pub program: String,
     pub args: Vec<String>,
+    /// Variables the process starts with, on top of the runner's own.
+    pub env: Vec<(String, String)>,
 }
 
 /// Build the argv for one role run.
@@ -27,6 +29,7 @@ pub fn invocation(
     message: &str,
 ) -> Result<Invocation> {
     let system_prompt_file = system_prompt_file.to_string_lossy().to_string();
+    let mut env: Vec<(String, String)> = Vec::new();
     let (program, args) = match adapter {
         Adapter::Pi => {
             // An empty model means "whatever the adapter is configured for", so the
@@ -81,6 +84,27 @@ pub fn invocation(
             args.push("--permission-mode".to_string());
             args.push("bypassPermissions".to_string());
             args.push("--dangerously-skip-permissions".to_string());
+            // A turn ends when its work ends. A monitor or background task
+            // wakes the agent after it has handed over, and its stray reply
+            // would stand in for the handover. The tool names were checked
+            // against Claude Code 2.1.332. The option is variadic, so it takes
+            // its value after `=`: a separate value would swallow the prompt.
+            args.push("--disallowedTools=Monitor,CronCreate,ScheduleWakeup".to_string());
+            env.push((
+                "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS".to_string(),
+                "1".to_string(),
+            ));
+            // With no background tasks, builds and `just test` run in the
+            // foreground. Claude Code cuts a shell call at 2 minutes by default
+            // and 10 at most; size both against the 120 minute turn limit.
+            env.push((
+                "BASH_DEFAULT_TIMEOUT_MS".to_string(),
+                (15 * 60 * 1000).to_string(),
+            ));
+            env.push((
+                "BASH_MAX_TIMEOUT_MS".to_string(),
+                (90 * 60 * 1000).to_string(),
+            ));
             args.push(message.to_string());
             ("claude".to_string(), args)
         }
@@ -100,7 +124,7 @@ pub fn invocation(
             )
         }
     };
-    Ok(Invocation { program, args })
+    Ok(Invocation { program, args, env })
 }
 
 /// The message the agent receives. Everything it must know is in `input.json`
@@ -186,7 +210,7 @@ pub fn spawn(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_clear();
-    for (key, value) in env {
+    for (key, value) in env.iter().chain(&invocation.env) {
         command.env(key, value);
     }
     #[cfg(unix)]
@@ -271,5 +295,36 @@ mod tests {
             assert_eq!(repo_instructions(Adapter::Pi, &dir), "");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Claude Code turn ends when its work ends: no background task or
+    /// monitor can wake the agent after it has handed over.
+    #[test]
+    fn claude_cannot_start_background_tasks() {
+        let file = Path::new("/tmp/system-prompt.md");
+        let claude = invocation(Adapter::ClaudeCode, "sonnet", file, "go").unwrap();
+        let denied = claude
+            .args
+            .iter()
+            .find_map(|arg| arg.strip_prefix("--disallowedTools="))
+            .expect("--disallowedTools is set with an attached value");
+        assert!(denied.contains("Monitor"));
+        // The option is variadic: the prompt must stay the last argument.
+        assert_eq!(claude.args.last().map(String::as_str), Some("go"));
+        assert!(claude
+            .env
+            .iter()
+            .any(|(k, v)| k == "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS" && v == "1"));
+        let env_value = |key: &str| {
+            claude
+                .env
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(env_value("BASH_DEFAULT_TIMEOUT_MS"), Some("900000"));
+        assert_eq!(env_value("BASH_MAX_TIMEOUT_MS"), Some("5400000"));
+        let pi = invocation(Adapter::Pi, "m", file, "go").unwrap();
+        assert!(pi.env.is_empty());
     }
 }
