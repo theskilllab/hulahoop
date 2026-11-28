@@ -68,6 +68,15 @@ impl<E: Into<anyhow::Error>> From<E> for AuthError {
     }
 }
 
+/// The message a person sees for `error`, outside HTTP.
+pub fn describe(error: &AuthError) -> String {
+    match error {
+        AuthError::Invalid(message) | AuthError::Forbidden(message) => message.clone(),
+        AuthError::Unauthorized => "unauthorized".into(),
+        AuthError::Internal(error) => format!("{error:#}"),
+    }
+}
+
 impl IntoResponse for AuthError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
@@ -318,10 +327,14 @@ async fn complete_setup(
             "the setup link is invalid, used or expired".into(),
         ));
     }
+    // Hash first: a failure here leaves the link unspent.
+    let password_hash = hash_password_off_thread(person.password.clone()).await?;
+    let mut tx = db.pool.begin().await?;
     // Deleting the stored hash is the single-use latch: only one request wins it.
+    // It shares a transaction with the update, so a failed update gives it back.
     let spent = sqlx::query("delete from meta where key = 'setup_token' and value = ?")
         .bind(sha256_hex(token.as_bytes()))
-        .execute(&db.pool)
+        .execute(&mut *tx)
         .await?;
     if spent.rows_affected() != 1 {
         return Err(AuthError::Forbidden("the setup link was just used".into()));
@@ -330,12 +343,33 @@ async fn complete_setup(
     sqlx::query("update users set name = ?, email = ?, password_hash = ? where id = ?")
         .bind(&person.name)
         .bind(&person.email)
-        .bind(hash_password_off_thread(person.password.clone()).await?)
+        .bind(password_hash)
         .bind(user)
-        .execute(&db.pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     let session = create_session(db, user).await?;
     Ok((user, session))
+}
+
+/// The command-line way to set up a headless server: takes over the local user
+/// as the first owner, exactly as the setup link does, and refuses once a
+/// password exists.
+pub async fn create_owner(
+    db: &Db,
+    name: &str,
+    email: &str,
+    password: &str,
+) -> Result<(), AuthError> {
+    let person = profile(name, email, password)?;
+    if !needs_setup(db).await? {
+        return Err(AuthError::Forbidden(
+            "this server already has an owner; invite people from Settings → Members".into(),
+        ));
+    }
+    let token = issue_setup_token(db).await?;
+    complete_setup(db, &token, person).await?;
+    Ok(())
 }
 
 // --- sessions, sign-in, sign-up --------------------------------------------
@@ -419,27 +453,19 @@ pub async fn require_owner(db: &Db, user: Uuid, workspace: Uuid) -> Result<(), A
 
 async fn signup(db: &Db, person: Profile, invite: Option<&str>) -> Result<String, AuthError> {
     let workspace = primary_workspace(db).await?;
-    let open = registration(db).await? == "open";
+    if invite.is_none() && registration(db).await? != "open" {
+        return Err(AuthError::Forbidden("registration is closed".into()));
+    }
+    // Hashing takes a fraction of a second; doing it before the transaction keeps
+    // the database's one writer free for runners in the meantime.
+    let password_hash = hash_password_off_thread(person.password.clone()).await?;
     let mut tx = db.pool.begin().await?;
     let role = match invite {
         Some(invite) => spend_invite(&mut tx, invite).await?,
-        None if open => "member".to_string(),
-        None => return Err(AuthError::Forbidden("registration is closed".into())),
+        None => "member".to_string(),
     };
-    let taken: Option<Uuid> = sqlx::query_scalar("select id from users where email = ?")
-        .bind(&person.email)
-        .fetch_optional(&mut *tx)
-        .await?;
-    if taken.is_some() {
-        // The same answer a closed door gives, so the form does not say who
-        // already has an account.
-        return Err(AuthError::Forbidden(
-            "could not sign up with those details".into(),
-        ));
-    }
     let id = Uuid::now_v7();
-    let password_hash = hash_password_off_thread(person.password.clone()).await?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "insert into users (id, name, email, password_hash, created_at) values (?, ?, ?, ?, ?)",
     )
     .bind(id)
@@ -448,7 +474,18 @@ async fn signup(db: &Db, person: Profile, invite: Option<&str>) -> Result<String
     .bind(password_hash)
     .bind(crate::db::now_rfc3339())
     .execute(&mut *tx)
-    .await?;
+    .await;
+    match inserted {
+        Ok(_) => {}
+        // The same answer a closed door gives, so the form does not say who
+        // already has an account.
+        Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+            return Err(AuthError::Forbidden(
+                "could not sign up with those details".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    }
     sqlx::query("insert into workspace_members (workspace_id, user_id, role) values (?, ?, ?)")
         .bind(workspace)
         .bind(id)
@@ -511,6 +548,9 @@ pub async fn set_member_role(
     if !ROLES.contains(&role) {
         return Err(AuthError::Invalid("a role is owner or member".into()));
     }
+    if role != "owner" {
+        refuse_machine_account(db, user).await?;
+    }
     let changed = sqlx::query(&format!(
         "update workspace_members set role = ? where workspace_id = ? and user_id = ? \
          and (? = 'owner' or {NOT_LAST_OWNER})"
@@ -536,6 +576,7 @@ pub async fn remove_member(
     user: Uuid,
 ) -> Result<(), AuthError> {
     require_owner(db, actor, workspace).await?;
+    refuse_machine_account(db, user).await?;
     let removed = sqlx::query(&format!(
         "delete from workspace_members where workspace_id = ? and user_id = ? and {NOT_LAST_OWNER}"
     ))
@@ -549,6 +590,18 @@ pub async fn remove_member(
         return Err(refused_change(db, workspace, user).await?);
     }
     revoke_credentials(db, user).await?;
+    Ok(())
+}
+
+/// The server token acts as the oldest user. Taking that user out of the owners
+/// would leave the machine with no one to act as and no way back.
+async fn refuse_machine_account(db: &Db, user: Uuid) -> Result<(), AuthError> {
+    if db.local_user_id().await? == user {
+        return Err(AuthError::Forbidden(
+            "the first user is the machine account the server token acts as; it stays an owner"
+                .into(),
+        ));
+    }
     Ok(())
 }
 
@@ -616,6 +669,9 @@ pub async fn create_api_token(
     let name = name.trim();
     if name.is_empty() {
         return Err(AuthError::Invalid("a token needs a name".into()));
+    }
+    if name.chars().count() > MAX_NAME_LENGTH {
+        return Err(AuthError::Invalid("that token name is too long".into()));
     }
     let id = Uuid::now_v7();
     let token = new_token("hat_");
@@ -698,15 +754,21 @@ fn session_response(token: String) -> Response {
 async fn setup_page(
     State(state): State<Arc<ApiState>>,
     Query(query): Query<SetupQuery>,
-) -> Result<Html<String>, AuthError> {
+) -> Result<Response, AuthError> {
     if !setup_token_is_live(&state.engine.db, &query.token).await? {
         return Err(AuthError::Forbidden(
             "the setup link is invalid, used or expired".into(),
         ));
     }
-    Ok(Html(
-        SETUP_PAGE.replace("__TOKEN__", &html_escape(&query.token)),
-    ))
+    // The link is a capability: keep it out of caches and `Referer` headers.
+    Ok((
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(SETUP_PAGE.replace("__TOKEN__", &html_escape(&query.token))),
+    )
+        .into_response())
 }
 
 async fn setup(

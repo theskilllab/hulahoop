@@ -658,3 +658,121 @@ async fn login_refuses_an_oversized_password_before_hashing() {
         .await;
     assert_eq!(status, 400);
 }
+
+#[tokio::test]
+async fn the_machine_account_cannot_be_removed_or_demoted_even_with_another_owner() {
+    let f = fixture().await;
+    let (owner, member) = f.owner_and_member().await;
+    let w = f.workspace;
+    let ada = f.data(&owner, "{ me { id } }").await["me"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let grace = f.data(&member, "{ me { id } }").await["me"]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    f.data(
+        &owner,
+        &format!(
+            r#"mutation {{ setMemberRole(workspaceId: "{w}", userId: "{grace}", role: "owner") }}"#
+        ),
+    )
+    .await;
+
+    // Grace is an owner now, but the user the server token acts as stays one.
+    f.refused(
+        &member,
+        &format!(r#"mutation {{ removeMember(workspaceId: "{w}", userId: "{ada}") }}"#),
+    )
+    .await;
+    f.refused(
+        &member,
+        &format!(
+            r#"mutation {{ setMemberRole(workspaceId: "{w}", userId: "{ada}", role: "member") }}"#
+        ),
+    )
+    .await;
+    assert_eq!(
+        f.data(SERVER_TOKEN, "{ me { role } }").await["me"]["role"],
+        "owner"
+    );
+}
+
+#[tokio::test]
+async fn the_command_line_creates_the_first_owner_once() {
+    let f = fixture().await;
+    let db = &f.engine.db;
+    let created =
+        hulahoop_server::auth::create_owner(db, "Ada", "ada@example.com", "correct horse battery")
+            .await;
+    assert!(created.is_ok(), "{created:?}");
+    let (status, body) = f
+        .post(
+            "/auth/login",
+            None,
+            json!({"email": "ada@example.com", "password": "correct horse battery"}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    let session = body["token"].as_str().unwrap();
+    assert_eq!(
+        f.data(session, "{ me { role } }").await["me"]["role"],
+        "owner"
+    );
+
+    // With an owner in place there is nothing left to take over.
+    let again =
+        hulahoop_server::auth::create_owner(db, "Eve", "eve@example.com", "another long password")
+            .await;
+    assert!(again.is_err());
+    // A weak password is refused before the setup link is spent.
+    assert!(
+        hulahoop_server::auth::create_owner(db, "Eve", "eve@example.com", "short")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn the_setup_page_is_not_cached_or_leaked_through_the_referrer() {
+    let f = fixture().await;
+    let token = hulahoop_server::auth::issue_setup_token(&f.engine.db)
+        .await
+        .unwrap();
+    let response = f
+        .http
+        .get(format!("{}/setup?token={token}", f.base))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
+}
+
+#[tokio::test]
+async fn simultaneous_signups_with_one_email_get_one_account_and_no_server_error() {
+    let f = fixture().await;
+    let owner = f.setup_owner("ada@example.com").await;
+    f.set_registration(&owner, "open").await;
+    let (a, b) = tokio::join!(
+        f.signup("Grace", "grace@example.com", None),
+        f.signup("Grace", "grace@example.com", None)
+    );
+    let mut statuses = [a.0, b.0];
+    statuses.sort();
+    assert_eq!(statuses, [200, 403], "{a:?} {b:?}");
+}
+
+#[tokio::test]
+async fn an_api_token_name_is_capped() {
+    let f = fixture().await;
+    let owner = f.setup_owner("ada@example.com").await;
+    let long = "n".repeat(201);
+    f.refused(
+        &owner,
+        &format!(r#"mutation {{ createApiToken(name: "{long}") {{ id }} }}"#),
+    )
+    .await;
+}

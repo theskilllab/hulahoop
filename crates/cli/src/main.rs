@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
     match args.first().map(String::as_str) {
         Some("serve") => hulahoop_server::serve(args[1..].to_vec()).await,
         Some("runner") => hulahoop_runner::run(args[1..].to_vec()).await,
+        Some("user") => hulahoop_server::user_cmd::run(args[1..].to_vec()).await,
         Some("up") => up(&args[1..]).await,
         Some("doctor") => doctor().await,
         Some("seed") => seed(&args[1..]).await,
@@ -31,7 +32,10 @@ async fn main() -> Result<()> {
                  \n\
                  usage:\n  \
                  hulahoop up [--listen ADDR] [--port N] [--data-dir DIR]   server and runner\n  \
+                 \x20                [--registration closed|invite|open]      (or HULAHOOP_REGISTRATION)\n  \
                  hulahoop serve [--data-dir DIR] [--port N]                just the server\n  \
+                 hulahoop user create --owner --name N --email E           first owner, headless\n  \
+                 hulahoop user setup-link                                  a fresh setup link\n  \
                  hulahoop runner [--server URL --token T]                  just the runner\n  \
                  hulahoop seed --repo URL|PATH [--name NAME]               register a repo\n  \
                  hulahoop doctor                                           check this machine"
@@ -50,6 +54,7 @@ async fn up(args: &[String]) -> Result<()> {
     let mut data_dir: Option<PathBuf> = None;
     let mut listen: Option<String> = None;
     let mut port: Option<String> = None;
+    let mut registration: Option<String> = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -71,6 +76,14 @@ async fn up(args: &[String]) -> Result<()> {
                 index += 1;
                 port = Some(args.get(index).context("--port needs a number")?.clone());
             }
+            "--registration" => {
+                index += 1;
+                registration = Some(
+                    args.get(index)
+                        .context("--registration needs closed, invite or open")?
+                        .clone(),
+                );
+            }
             other => bail!("unknown argument {other}"),
         }
         index += 1;
@@ -90,6 +103,11 @@ async fn up(args: &[String]) -> Result<()> {
     if let Some(port) = &port {
         server_args.push("--port".into());
         server_args.push(port.clone());
+    }
+
+    if let Some(registration) = &registration {
+        server_args.push("--registration".into());
+        server_args.push(registration.clone());
     }
 
     let connection_path = data_dir.join("connection.json");

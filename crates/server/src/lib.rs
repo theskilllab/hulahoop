@@ -23,6 +23,7 @@ pub mod skills;
 pub mod tasks;
 pub mod tenancy;
 pub mod transcript;
+pub mod user_cmd;
 pub mod vault;
 pub mod workflows;
 
@@ -339,7 +340,7 @@ fn primary_ip() -> Option<std::net::IpAddr> {
     socket.local_addr().ok().map(|addr| addr.ip())
 }
 
-fn default_data_dir() -> std::path::PathBuf {
+pub(crate) fn default_data_dir() -> std::path::PathBuf {
     if let Some(dir) = dirs_data_dir() {
         return dir.join("hulahoop");
     }
